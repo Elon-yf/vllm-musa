@@ -8,9 +8,9 @@ MUSA的一大优势是CUDA兼容，通过musify工具，我们可以快速将官
 
 ## 依赖
 
-- musa_toolkit dev3.0.0
-- pytorch v2.2.0
-- [torch_musa v1.3.0](https://github.com/MooreThreads/torch_musa)
+- musa_toolkit >= dev3.0.0
+- pytorch >= v2.2.0
+- [torch_musa](https://github.com/MooreThreads/torch_musa) >= v1.3.0
 - triton >= v2.2.0
 - ray >= 2.9
 - vllm v0.4.2
