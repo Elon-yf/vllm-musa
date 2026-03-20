@@ -1,0 +1,90 @@
+[build-system]
+requires = ["setuptools>=80.10.2", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-musa"
+version = "0.1.1"
+description = "vLLM platform plugin for Moore Threads (MUSA) GPUs"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.9"
+authors = [
+    {name = "vLLM Community"},
+]
+keywords = ["vllm", "musa", "moore-threads", "llm", "inference"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch",
+    "torch_musa",
+    "torchada>=0.1.44",
+    "mate",
+    "mthreads-ml-py>=2.2.11",
+    "numpy<2.0",
+    "openai>=2.24.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "pytest-cov",
+    "ruff",
+    "mypy",
+    "isort",
+    "black",
+    "build",
+    "twine",
+]
+
+[project.scripts]
+vllm_collect_env = "vllm_musa:collect_env"
+
+[project.entry-points."vllm.platform_plugins"]
+musa = "vllm_musa:musa_platform_plugin"
+
+[project.entry-points."vllm.general_plugins"]
+musa_custom_ops = "vllm_musa:register_custom_ops"
+
+[project.urls]
+Homepage = "https://github.com/MooreThreads/vllm-musa"
+Repository = "https://github.com/MooreThreads/vllm-musa"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vllm_musa*"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+
+[tool.isort]
+profile = "black"
+line_length = 88
+known_first_party = ["vllm_musa"]
+skip_gitignore = true
+
+[tool.black]
+line-length = 88
+target-version = ["py39", "py310", "py311", "py312"]

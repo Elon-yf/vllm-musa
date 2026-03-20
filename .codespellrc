@@ -1,0 +1,4 @@
+[codespell]
+skip = .git,*.egg-info,*.pyc,__pycache__,build,dist,.ruff_cache,*.so,third_party
+count =
+quiet-level = 3
