@@ -66,7 +66,7 @@ After installation, verify the plugin is working:
 python -c "from vllm_musa import musa_platform_plugin; print('Plugin loaded successfully')"
 
 # Check MTML device management
-python -c "from vllm_musa.musa import mtml_available; print(f'MTML available: {mtml_available}')"
+python -c "from vllm_musa.platform import mtml_available; print(f'MTML available: {mtml_available}')"
 ```
 
 ## Environment Variables
@@ -140,7 +140,7 @@ vllm-musa/
 ├── docs/                       # Additional documentation
 ├── vllm_musa/                  # Main package
 │   ├── __init__.py             # Plugin entry point
-│   ├── musa.py                 # MUSA platform implementation
+│   ├── platform.py             # MUSA platform implementation
 │   └── patches/                # Runtime compatibility patches
 │       ├── __init__.py         # Patch application logic
 │       └── *.patch.py          # Individual patch files
