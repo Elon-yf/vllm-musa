@@ -6,7 +6,7 @@ from vllm.platforms import current_platform
 from vllm.v1.attention.backends.fa_utils import logger
 
 if current_platform.is_musa():
-    from flash_attn import (  # noqa: F401
+    from flash_attn_interface import (  # noqa: F401
         flash_attn_varlen_func,
         flash_attn_with_kvcache,
         get_scheduler_metadata,
@@ -29,8 +29,7 @@ def flash_attn_supports_fp8() -> bool:
 
 
 def flash_attn_supports_sinks() -> bool:
-    logger.info_once("Cannot use FLASH_ATTN with sinks on MUSA platform")
-    return False
+    return True
 
 
 def flash_attn_supports_mla():
