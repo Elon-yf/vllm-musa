@@ -7,6 +7,7 @@ from typing import Generic, TypeVar
 
 import torch
 from tqdm import tqdm
+from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import get_current_vllm_config
 from vllm.distributed.parallel_state import get_dcp_group, is_global_first_rank
@@ -33,10 +34,9 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionLayer
-from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 
-from vllm import _custom_ops as ops
+from vllm_musa.v1.attention.backends.fa_utils import get_flash_attn_version
 
 try:
     from flashinfer import BatchPrefillWithRaggedKVCacheWrapper
@@ -50,12 +50,12 @@ except ImportError:
 
 
 try:
-    from mate import flash_attn_varlen_func
+    from flash_attn_interface import flash_attn_varlen_func
 
     is_vllm_fa = False
 except ImportError as e:
     raise ImportError(
-        "MUSA platform requires MATE to be installed. Please install mate first."
+        "MUSA platform requires MATE and flash_attn_3 to be installed. Please install them first."
     ) from e
 
 
