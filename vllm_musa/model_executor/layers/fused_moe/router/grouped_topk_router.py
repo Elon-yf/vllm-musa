@@ -29,6 +29,10 @@ def _compute_routing(
     """Compute routing using grouped top-k."""
 
     def valid_grouping() -> bool:
+        # Treat missing grouped-topk metadata as standard top-k routing.
+        if self.num_expert_group is None or self.topk_group is None:
+            return False
+
         # Check if num_experts is greater than num_expert_group
         # and is divisible by num_expert_group
         num_experts = router_logits.shape[-1]

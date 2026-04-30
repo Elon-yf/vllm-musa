@@ -10,9 +10,6 @@ from vllm.model_executor.layers.fused_moe.fused_moe import (
     _get_config_quant_dtype,
     try_get_optimal_moe_config,
 )
-from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
-    moe_align_block_size,
-)
 from vllm.model_executor.layers.fused_moe.utils import (
     disable_inplace,
     moe_kernel_quantize_input,
@@ -228,36 +225,23 @@ def fused_experts_impl(
         block_shape=block_shape,
         ocp_mx_scheme=ocp_mx_scheme,
     )
-    # SPARSITY_FACTOR is a heuristic margin ensuring num_tokens * top_k
-    # activates only a small fraction of total experts
-    SPARSITY_FACTOR = 4
-    # block quantized code path is not implemented yet.
-    naive_block_assignment = (
-        expert_map is None
-        and num_tokens * top_k_num * SPARSITY_FACTOR <= global_num_experts
-        and not (
-            (use_int8_w8a16 or use_int4_w4a16)
-            and block_shape is not None
-            and block_shape[1] > 0
+    # The native MUSA GEMV MoE op expects expert IDs, not the token scheduling
+    # table returned by moe_align_block_size. Convert global expert IDs to local
+    # IDs when expert parallelism provides an expert_map.
+    topk_ids_for_moe = topk_ids
+    if expert_map is not None:
+        topk_ids_for_moe = torch.full(
+            topk_ids.shape,
+            -1,
+            dtype=torch.int32,
+            device=topk_ids.device,
         )
-    )
-
-    if not naive_block_assignment:
-        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-            topk_ids,
-            config["BLOCK_SIZE_M"],
-            global_num_experts,
-            expert_map,
-            ignore_invalid_experts=True,
+        valid_topk_ids = topk_ids >= 0
+        topk_ids_for_moe[valid_topk_ids] = expert_map[topk_ids[valid_topk_ids]].to(
+            torch.int32
         )
-    else:
-        max_num_tokens_padded = topk_ids.numel() * config["BLOCK_SIZE_M"]
-        expert_ids = topk_ids.view(-1)
-        num_tokens_post_padded = torch.empty(
-            (1), dtype=torch.int32, device=topk_ids.device
-        )
-        num_tokens_post_padded.fill_(max_num_tokens_padded)
-        sorted_token_ids = None
+    elif topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous():
+        topk_ids_for_moe = topk_ids.to(torch.int32).contiguous()
 
     # ==================== MUSA ADAPTATION ====================
     musa_ops.musa_fused_gemv_moe(
@@ -267,7 +251,7 @@ def fused_experts_impl(
         None,
         w1_scale,
         topk_weights,
-        sorted_token_ids,
+        topk_ids_for_moe,
         apply_router_weight_on_input,
         topk_ids.shape[1],
         use_int4_w4a16,
@@ -280,7 +264,7 @@ def fused_experts_impl(
         None,
         w2_scale,
         topk_weights,
-        sorted_token_ids,
+        topk_ids_for_moe,
         not apply_router_weight_on_input,
         1,
         use_int4_w4a16,
