@@ -122,6 +122,34 @@ class TestMUSAPlatformBase:
         result = MUSAPlatformBase.get_static_graph_wrapper_cls()
         assert result == "vllm.compilation.cuda_graph.CUDAGraphWrapper"
 
+    def test_register_attention_backends_overrides_turboquant(self):
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+        from vllm_musa.platform import register_attention_backends
+
+        AttentionBackendEnum.TURBOQUANT.clear_override()
+        register_attention_backends()
+
+        assert (
+            AttentionBackendEnum.TURBOQUANT.get_path()
+            == "vllm_musa.v1.attention.backends.turboquant.MUSATurboQuantAttentionBackend"
+        )
+
+    def test_get_valid_backends_includes_turboquant_for_non_mla(self):
+        from vllm.platforms.interface import DeviceCapability
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+        from vllm_musa.platform import _get_backend_priorities
+
+        priorities = _get_backend_priorities(
+            use_mla=False,
+            device_capability=DeviceCapability(3, 1),
+        )
+
+        assert AttentionBackendEnum.TURBOQUANT in priorities
+        assert AttentionBackendEnum.TURBOQUANT not in _get_backend_priorities(
+            use_mla=True,
+            device_capability=DeviceCapability(3, 1),
+        )
+
 
 class TestNonMtmlMUSAPlatform:
     """Tests for NonMtmlMUSAPlatform class."""

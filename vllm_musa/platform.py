@@ -39,8 +39,6 @@ def _get_backend_priorities(
     num_heads: int | None = None,
 ) -> list[AttentionBackendEnum]:
     """Get backend priorities with lazy import to avoid circular dependency."""
-    # MUSA platform prioritizes Triton-based backends since FlashAttention
-    # and other CUDA-specific backends may not be available.
     if use_mla:
         return [
             AttentionBackendEnum.FLASHMLA,
@@ -50,6 +48,7 @@ def _get_backend_priorities(
         return [
             AttentionBackendEnum.FLASH_ATTN,
             AttentionBackendEnum.TRITON_ATTN,
+            AttentionBackendEnum.TURBOQUANT,
         ]
 
 
@@ -77,6 +76,13 @@ def register_attention_backends() -> None:
     register_backend(
         AttentionBackendEnum.FLASH_ATTN,
         class_path="vllm_musa.v1.attention.backends.flash_attn.MUSAFlashAttentionBackend",
+    )
+    register_backend(
+        AttentionBackendEnum.TURBOQUANT,
+        class_path=(
+            "vllm_musa.v1.attention.backends.turboquant."
+            "MUSATurboQuantAttentionBackend"
+        ),
     )
 
 
