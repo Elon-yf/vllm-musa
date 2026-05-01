@@ -63,6 +63,11 @@ class MUSATurboQuantAttentionBackend(_turboquant_attn.TurboQuantAttentionBackend
             return "TurboQuant is not supported with attention sinks on MUSA"
         if use_sparse:
             return "TurboQuant is not supported for sparse attention on MUSA"
+        if kv_cache_dtype == "turboquant_k8v4":
+            return (
+                "TurboQuant k8v4 uses FP8 key storage, which requires Triton float8 "
+                "conversions that are not supported on MUSA"
+            )
         return super().supports_combination(
             head_size=head_size,
             dtype=dtype,
