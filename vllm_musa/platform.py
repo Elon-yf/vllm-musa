@@ -9,6 +9,7 @@ from collections.abc import Callable
 from functools import cache, wraps
 from typing import TYPE_CHECKING, TypeVar
 
+import torchada  # noqa: F401
 import torch
 from typing_extensions import ParamSpec
 from vllm.logger import init_logger
@@ -24,7 +25,6 @@ else:
     CacheDType = None
 
 import pymtml as pynvml
-import torchada  # noqa: F401
 
 logger = init_logger(__name__)
 
