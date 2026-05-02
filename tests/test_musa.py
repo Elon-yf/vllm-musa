@@ -92,6 +92,30 @@ class TestMUSAPlatformBase:
 
         assert MUSAPlatformBase.support_hybrid_kv_cache() is True
 
+    def test_supports_fp8_for_musa_3_1(self):
+        """Test that FP8 is supported on MUSA capability 3.1."""
+        from vllm_musa.platform import MUSAPlatformBase
+        from vllm.platforms.interface import DeviceCapability
+
+        with patch.object(
+            MUSAPlatformBase,
+            "get_device_capability",
+            return_value=DeviceCapability(3, 1),
+        ):
+            assert MUSAPlatformBase.supports_fp8() is True
+
+    def test_supports_fp8_rejects_pre_3_1(self):
+        """Test that pre-3.1 MUSA capability does not support FP8."""
+        from vllm_musa.platform import MUSAPlatformBase
+        from vllm.platforms.interface import DeviceCapability
+
+        with patch.object(
+            MUSAPlatformBase,
+            "get_device_capability",
+            return_value=DeviceCapability(3, 0),
+        ):
+            assert MUSAPlatformBase.supports_fp8() is False
+
     def test_support_static_graph_mode(self):
         """Test that support_static_graph_mode returns True."""
         from vllm_musa.platform import MUSAPlatformBase
@@ -170,6 +194,48 @@ class TestMUSAPlatformBase:
 
         assert reason is not None
         assert "Triton float8 conversions" in reason
+
+    def test_flash_attention_rejects_fp8_kv_cache_dtype(self):
+        import vllm_musa.platform  # noqa: F401
+        from vllm_musa.v1.attention.backends.flash_attn import (
+            MUSAFlashAttentionBackend,
+        )
+
+        assert MUSAFlashAttentionBackend.supports_kv_cache_dtype("fp8") is False
+        assert MUSAFlashAttentionBackend.supports_kv_cache_dtype("fp8_e4m3") is False
+
+    def test_flash_attention_fp8_dtype_error_is_clear(self):
+        import vllm_musa.platform  # noqa: F401
+        from vllm_musa.v1.attention.backends.flash_attn import (
+            MUSAFlashAttentionBackend,
+        )
+
+        with pytest.raises(NotImplementedError, match="FP8 dtype is not supported"):
+            MUSAFlashAttentionBackend.get_fp8_dtype_for_flashattn("fp8")
+
+    def test_fp8_scaled_mm_oot_error_is_clear(self):
+        import torch
+        import vllm_musa
+
+        vllm_musa._apply_vllm_patches()
+
+        from vllm.model_executor.kernels import linear
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            kFp8DynamicTensorSym,
+            kFp8StaticTensorSym,
+        )
+        from vllm.platforms.interface import PlatformEnum
+
+        with patch.object(linear.current_platform, "_enum", PlatformEnum.OOT):
+            with pytest.raises(ValueError, match="platform OOT"):
+                linear.init_fp8_linear_kernel(
+                    activation_quant_key=kFp8DynamicTensorSym,
+                    weight_quant_key=kFp8StaticTensorSym,
+                    input_dtype=torch.float16,
+                    out_dtype=torch.float16,
+                    weight_shape=(16, 16),
+                    module_name="musa_fp8_test",
+                )
 
 
 class TestNonMtmlMUSAPlatform:
