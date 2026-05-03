@@ -213,11 +213,12 @@ class TestMUSAPlatformBase:
         with pytest.raises(NotImplementedError, match="FP8 dtype is not supported"):
             MUSAFlashAttentionBackend.get_fp8_dtype_for_flashattn("fp8")
 
-    def test_fp8_scaled_mm_oot_error_is_clear(self):
+    def test_fp8_scaled_mm_oot_registers_musa_kernel(self):
         import torch
         import vllm_musa
 
         vllm_musa._apply_vllm_patches()
+        import vllm_musa.fp8_linear  # noqa: F401
 
         from vllm.model_executor.kernels import linear
         from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -225,17 +226,52 @@ class TestMUSAPlatformBase:
             kFp8StaticTensorSym,
         )
         from vllm.platforms.interface import PlatformEnum
+        from vllm_musa.fp8_linear import MUSAFP8ScaledMMLinearKernel
 
-        with patch.object(linear.current_platform, "_enum", PlatformEnum.OOT):
-            with pytest.raises(ValueError, match="platform OOT"):
-                linear.init_fp8_linear_kernel(
-                    activation_quant_key=kFp8DynamicTensorSym,
-                    weight_quant_key=kFp8StaticTensorSym,
-                    input_dtype=torch.float16,
-                    out_dtype=torch.float16,
-                    weight_shape=(16, 16),
-                    module_name="musa_fp8_test",
-                )
+        with (
+            patch.object(linear.current_platform, "_enum", PlatformEnum.OOT),
+            patch.object(linear.current_platform, "is_musa", return_value=True),
+        ):
+            kernel = linear.init_fp8_linear_kernel(
+                activation_quant_key=kFp8DynamicTensorSym,
+                weight_quant_key=kFp8StaticTensorSym,
+                input_dtype=torch.float16,
+                out_dtype=torch.float16,
+                weight_shape=(16, 16),
+                module_name="musa_fp8_test",
+            )
+
+        assert isinstance(kernel, MUSAFP8ScaledMMLinearKernel)
+
+    def test_fp8_block_scaled_mm_oot_registers_musa_kernel(self):
+        import torch
+        import vllm_musa
+
+        vllm_musa._apply_vllm_patches()
+        import vllm_musa.fp8_linear  # noqa: F401
+
+        from vllm.model_executor.kernels import linear
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            kFp8Dynamic128Sym,
+            kFp8Static128BlockSym,
+        )
+        from vllm.platforms.interface import PlatformEnum
+        from vllm_musa.fp8_linear import MUSAFp8BlockScaledMMLinearKernel
+
+        with (
+            patch.object(linear.current_platform, "_enum", PlatformEnum.OOT),
+            patch.object(linear.current_platform, "is_musa", return_value=True),
+        ):
+            kernel = linear.init_fp8_linear_kernel(
+                activation_quant_key=kFp8Dynamic128Sym,
+                weight_quant_key=kFp8Static128BlockSym,
+                input_dtype=torch.float16,
+                out_dtype=torch.float16,
+                weight_shape=(256, 256),
+                module_name="musa_fp8_block_test",
+            )
+
+        assert isinstance(kernel, MUSAFp8BlockScaledMMLinearKernel)
 
 
 class TestNonMtmlMUSAPlatform:
