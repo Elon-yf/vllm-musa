@@ -5,11 +5,6 @@ Patch for vllm.model_executor.layers.quantization.utils.fp8_utils.
 """
 
 PATCHES = [
-    # Patch per_token_group_quant_fp8 where per_token_group_fp8_quant need x is_contiguous
-    (
-        "if current_platform.is_cuda() and x.is_contiguous():",
-        "if (current_platform.is_cuda() or current_platform.is_musa()) and x.is_contiguous():",
-    ),
     (
         """        assert self.deepgemm_input_quant_op is not None
         q_input, input_scale = self.deepgemm_input_quant_op(input_2d)
