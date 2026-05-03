@@ -70,4 +70,21 @@ PATCHES = [
 """,
         _MUSA_FP8_FALLBACK,
     ),
+    (
+        """    platform_kernels = possible_kernels.get(current_platform._enum)
+    if platform_kernels is None and current_platform.is_musa():
+        from vllm_musa.fp8_linear import MUSAFP8ScaledMMLinearKernel
+
+        platform_kernels = [MUSAFP8ScaledMMLinearKernel]
+    if platform_kernels is None:
+        raise ValueError(
+            "Failed to find a kernel that can implement the "
+            "ScaledMM linear layer. No kernels are registered for "
+            f"platform {current_platform._enum.name}."
+        )
+
+    for kernel in platform_kernels:
+""",
+        _MUSA_FP8_FALLBACK,
+    ),
 ]
