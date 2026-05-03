@@ -35,6 +35,15 @@ class MUSAFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
     ) -> tuple[bool, str | None]:
         return True, None
 
+    def _get_layer_params(self, layer):
+        w, w_s, x_s, x_s_ub = self.layer_param_names
+        return (
+            getattr(layer, w),
+            getattr(layer, w_s, getattr(layer, "weight_scale_inv", None)),
+            getattr(layer, x_s, None),
+            getattr(layer, x_s_ub, None),
+        )
+
     def apply_scaled_mm(
         self,
         *,

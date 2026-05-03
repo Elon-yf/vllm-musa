@@ -243,6 +243,48 @@ class TestMUSAPlatformBase:
 
         assert isinstance(kernel, MUSAFP8ScaledMMLinearKernel)
 
+    def test_fp8_scaled_mm_uses_weight_scale_inv_fallback(self):
+        import torch
+        import vllm_musa
+
+        vllm_musa._apply_vllm_patches()
+        import vllm_musa.fp8_linear  # noqa: F401
+
+        from vllm.model_executor.kernels import linear
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            kFp8DynamicTensorSym,
+            kFp8StaticTensorSym,
+        )
+        from vllm.platforms.interface import PlatformEnum
+
+        with (
+            patch.object(linear.current_platform, "_enum", PlatformEnum.OOT),
+            patch.object(linear.current_platform, "is_musa", return_value=True),
+        ):
+            kernel = linear.init_fp8_linear_kernel(
+                activation_quant_key=kFp8DynamicTensorSym,
+                weight_quant_key=kFp8StaticTensorSym,
+                input_dtype=torch.float16,
+                out_dtype=torch.float16,
+                weight_shape=(16, 16),
+                module_name="musa_fp8_test",
+            )
+
+        layer = torch.nn.Module()
+        layer.weight = torch.empty(16, 16)
+        layer.weight_scale_inv = torch.ones(1, 1)
+        layer.input_scale = torch.ones(1)
+        layer.input_scale_ub = torch.ones(1)
+
+        weight, weight_scale, input_scale, input_scale_ub = kernel._get_layer_params(
+            layer
+        )
+
+        assert weight is layer.weight
+        assert weight_scale is layer.weight_scale_inv
+        assert input_scale is layer.input_scale
+        assert input_scale_ub is layer.input_scale_ub
+
     def test_fp8_block_scaled_mm_oot_registers_musa_kernel(self):
         import torch
         import vllm_musa
