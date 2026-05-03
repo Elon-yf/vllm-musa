@@ -55,7 +55,16 @@ class MUSAFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         bias: torch.Tensor | None,
         output_shape: list,
     ) -> torch.Tensor:
-        qweight = B.t().contiguous()
+        input_size = A.shape[-1]
+        if B.shape[0] == input_size:
+            qweight = B.t().contiguous()
+            actual_output_shape = output_shape
+        elif B.shape[1] == input_size:
+            qweight = B.contiguous()
+            actual_output_shape = [*output_shape[:-1], B.shape[0]]
+        else:
+            qweight = B.t().contiguous()
+            actual_output_shape = output_shape
         if qweight.shape[0] % 128 == 0 and qweight.shape[1] % 128 == 0:
             qweight_scales = Bs.contiguous()
         else:
@@ -68,7 +77,7 @@ class MUSAFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         )
         if bias is not None:
             output = output + bias
-        return output.to(out_dtype).view(*output_shape)
+        return output.to(out_dtype).view(*actual_output_shape)
 
 
 class MUSAFp8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):

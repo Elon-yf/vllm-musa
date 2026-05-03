@@ -285,6 +285,52 @@ class TestMUSAPlatformBase:
         assert input_scale is layer.input_scale
         assert input_scale_ub is layer.input_scale_ub
 
+    def test_fp8_scaled_mm_accepts_loaded_out_in_weight(self):
+        import torch
+        import vllm_musa
+
+        vllm_musa._apply_vllm_patches()
+
+        from vllm.model_executor.kernels import linear
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            kFp8DynamicTensorSym,
+            kFp8StaticTensorSym,
+        )
+        from vllm.platforms.interface import PlatformEnum
+
+        with (
+            patch.object(linear.current_platform, "_enum", PlatformEnum.OOT),
+            patch.object(linear.current_platform, "is_musa", return_value=True),
+        ):
+            kernel = linear.init_fp8_linear_kernel(
+                activation_quant_key=kFp8DynamicTensorSym,
+                weight_quant_key=kFp8StaticTensorSym,
+                input_dtype=torch.float16,
+                out_dtype=torch.float16,
+                weight_shape=(2048, 576),
+                module_name="musa_fp8_shape_test",
+            )
+
+        captured = {}
+
+        def fake_gemv(x, qweight, x_scales, qweight_scales):
+            captured["qweight_shape"] = qweight.shape
+            return torch.zeros(x.shape[0], qweight.shape[0], dtype=torch.bfloat16)
+
+        with patch("vllm_musa.fp8_linear.musa_ops.musa_fused_gemv", fake_gemv):
+            output = kernel.apply_scaled_mm(
+                A=torch.empty(1, 2048, dtype=torch.float8_e4m3fn),
+                B=torch.empty(576, 2048, dtype=torch.float8_e4m3fn),
+                out_dtype=torch.float16,
+                As=torch.ones(1, 16),
+                Bs=torch.ones(5, 16),
+                bias=None,
+                output_shape=[1, 2048],
+            )
+
+        assert captured["qweight_shape"] == (576, 2048)
+        assert output.shape == (1, 576)
+
     def test_fp8_block_scaled_mm_oot_registers_musa_kernel(self):
         import torch
         import vllm_musa
