@@ -361,6 +361,99 @@ class TestMUSAPlatformBase:
 
         assert isinstance(kernel, MUSAFp8BlockScaledMMLinearKernel)
 
+    def test_fp8_moe_passes_activation_scales_to_musa_gemv(self):
+        import torch
+        from vllm_musa.model_executor.layers.fused_moe import fused_moe
+
+        hidden_states = torch.ones(2, 4, dtype=torch.float32)
+        w1 = torch.empty(3, 8, 4, dtype=torch.float8_e4m3fn)
+        w2 = torch.empty(3, 4, 4, dtype=torch.float8_e4m3fn)
+        topk_weights = torch.ones(2, 2, dtype=torch.float32)
+        topk_ids = torch.tensor([[0, 1], [1, 2]], dtype=torch.int64)
+        w1_scale = torch.ones(3, 1, 1, dtype=torch.float32)
+        w2_scale = torch.ones(3, 1, 1, dtype=torch.float32)
+        a1_scale = torch.ones(1, dtype=torch.float32)
+        a2_scale = torch.ones(1, dtype=torch.float32) * 2
+        a1q_scale = torch.ones(2, 1, dtype=torch.float32)
+        a2q_scale = torch.ones(4, 1, dtype=torch.float32) * 2
+
+        quant_calls = []
+        native_calls = []
+        qintermediate = {}
+
+        def fake_quantize(A, A_scale, **kwargs):
+            quant_calls.append({"A": A, "A_scale": A_scale, "kwargs": kwargs})
+            if len(quant_calls) == 1:
+                return A.clone(), a1q_scale
+            qintermediate["tensor"] = A.clone()
+            return qintermediate["tensor"], a2q_scale
+
+        def fake_musa_gemv_moe(
+            A,
+            B,
+            C,
+            A_scale,
+            B_scale,
+            topk_weights,
+            topk_ids,
+            mul_routed_weight,
+            topk,
+            use_int4_w4a16,
+            use_swigelu,
+        ):
+            native_calls.append(
+                {
+                    "A": A,
+                    "B": B,
+                    "C": C,
+                    "A_scale": A_scale,
+                    "B_scale": B_scale,
+                    "topk": topk,
+                    "use_swigelu": use_swigelu,
+                }
+            )
+            C.zero_()
+
+        def fake_moe_sum(moe_output, output):
+            output.copy_(moe_output.sum(dim=1))
+
+        with (
+            patch.object(
+                fused_moe,
+                "_get_config_quant_dtype",
+                return_value=torch.float8_e4m3fn,
+            ),
+            patch.object(fused_moe, "try_get_optimal_moe_config", return_value={}),
+            patch.object(fused_moe, "moe_kernel_quantize_input", fake_quantize),
+            patch.object(fused_moe.musa_ops, "musa_fused_gemv_moe", fake_musa_gemv_moe),
+            patch.object(fused_moe.ops, "moe_sum", fake_moe_sum),
+        ):
+            output = fused_moe.fused_experts_impl(
+                hidden_states=hidden_states,
+                w1=w1,
+                w2=w2,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                use_fp8_w8a8=True,
+                per_channel_quant=True,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                a1_scale=a1_scale,
+                a2_scale=a2_scale,
+                block_shape=[128, 128],
+            )
+
+        assert output.shape == hidden_states.shape
+        assert quant_calls[0]["A"] is hidden_states
+        assert quant_calls[0]["A_scale"] is a1_scale
+        assert quant_calls[1]["A"] is native_calls[0]["C"]
+        assert quant_calls[1]["A_scale"] is a2_scale
+        assert native_calls[0]["A_scale"] is a1q_scale
+        assert native_calls[0]["B_scale"] is w1_scale
+        assert native_calls[1]["A"] is qintermediate["tensor"]
+        assert native_calls[1]["A_scale"] is a2q_scale
+        assert native_calls[1]["B_scale"] is w2_scale
+
 
 class TestNonMtmlMUSAPlatform:
     """Tests for NonMtmlMUSAPlatform class."""

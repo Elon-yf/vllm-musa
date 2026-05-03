@@ -248,7 +248,7 @@ def fused_experts_impl(
         qhidden_states,
         w1,
         intermediate_cache2,
-        None,
+        a1q_scale,
         w1_scale,
         topk_weights,
         topk_ids_for_moe,
@@ -257,11 +257,19 @@ def fused_experts_impl(
         use_int4_w4a16,
         use_swigelu=True,
     )
+    qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
+        A=intermediate_cache2,
+        A_scale=a2_scale,
+        quant_dtype=quant_dtype,
+        per_act_token_quant=per_channel_quant,
+        block_shape=block_shape,
+        ocp_mx_scheme=ocp_mx_scheme,
+    )
     musa_ops.musa_fused_gemv_moe(
-        intermediate_cache2,
+        qintermediate_cache2,
         w2,
         intermediate_cache3,
-        None,
+        a2q_scale,
         w2_scale,
         topk_weights,
         topk_ids_for_moe,
