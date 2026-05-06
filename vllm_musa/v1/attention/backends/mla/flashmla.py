@@ -36,11 +36,35 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm_musa.v1.attention.ops.flashmla import (
     FlashMLASchedMeta,
     flash_mla_with_kvcache,
+    flash_mla_with_kvcache_fp8,
     get_mla_metadata,
+    get_mla_metadata_dense_fp8,
     is_flashmla_dense_supported,
 )
 
 logger = init_logger(__name__)
+
+
+def _is_fp8_kv_cache(kv_cache_dtype: str) -> bool:
+    return kv_cache_dtype.startswith("fp8")
+
+
+def _flashmla_fp8_descale(
+    layer: AttentionLayer, scale_name: str, device: torch.device
+) -> torch.Tensor:
+    scale = getattr(layer, scale_name, None)
+    if scale is None:
+        raise ValueError(f"FP8 FlashMLA requires layer.{scale_name} for KV-cache descale")
+    if not torch.is_tensor(scale):
+        scale = torch.as_tensor(scale, device=device)
+    else:
+        scale = scale.to(device=device)
+    if scale.numel() != 1:
+        raise ValueError(
+            f"FP8 FlashMLA requires scalar layer.{scale_name}; "
+            f"got shape={tuple(scale.shape)}"
+        )
+    return scale.reshape(1)
 
 
 @register_backend(AttentionBackendEnum.FLASHMLA)
@@ -127,7 +151,7 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
 
         self.cg_buf_tile_scheduler_metadata = None
         self.cg_buf_num_splits = None
-        self.is_fp8_kvcache = vllm_config.cache_config.cache_dtype.startswith("fp8")
+        self.is_fp8_kvcache = _is_fp8_kv_cache(vllm_config.cache_config.cache_dtype)
 
         num_sms = num_compute_units(self.device.index)
 
@@ -159,13 +183,19 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
         # we use the max but all should be the same due to uniform length requirement
         max_query_len = query_lens_cpu.max().item()
         num_q_tokens_per_head_k = max_query_len * self.num_q_heads // 1
-        tile_scheduler_metadata, num_splits = get_mla_metadata(
-            seq_lens_device,
-            num_q_tokens_per_head_k,
-            1,  # MQA for the decode path
-            is_fp8_kvcache=self.is_fp8_kvcache,
-        )
-
+        if self.is_fp8_kvcache:
+            tile_scheduler_metadata, num_splits = get_mla_metadata_dense_fp8(
+                seq_lens_device,
+                num_q_tokens_per_head_k,
+                1,  # MQA for the decode path
+            )
+        else:
+            tile_scheduler_metadata, num_splits = get_mla_metadata(
+                seq_lens_device,
+                num_q_tokens_per_head_k,
+                1,  # MQA for the decode path
+                is_fp8_kvcache=False,
+            )
         # TODO: we can disambiguate between decode and mixed-prefill decode here
         # so we can only use the persistent buffer if a cudagraph is actually
         # being used.
@@ -275,11 +305,10 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
 
         num_decodes = attn_metadata.num_decodes
         q = reshape_query_for_spec_decode(q, num_decodes)
-        tile_scheduler_metadata = (
-            attn_metadata.decode.scheduler_metadata.tile_scheduler_metadata
-        )
-        num_splits = attn_metadata.decode.scheduler_metadata.num_splits
-        if envs.VLLM_BATCH_INVARIANT:
+        scheduler_metadata = attn_metadata.decode.scheduler_metadata
+        tile_scheduler_metadata = scheduler_metadata.tile_scheduler_metadata
+        num_splits = scheduler_metadata.num_splits
+        if envs.VLLM_BATCH_INVARIANT and not _is_fp8_kv_cache(self.kv_cache_dtype):
             device = q.device
             dtype = torch.int32
 
@@ -306,17 +335,34 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
             # Non-split path ignores num_splits, but the API requires it:
             # zeros of length B+1
             num_splits = torch.zeros((B + 1,), dtype=dtype, device=device)
-        o, lse = flash_mla_with_kvcache(
-            q=q,
-            k_cache=kv_c_and_k_pe_cache.unsqueeze(-2),  # Add head dim of 1
-            block_table=attn_metadata.decode.block_table,
-            cache_seqlens=attn_metadata.decode.seq_lens,
-            head_dim_v=self.kv_lora_rank,
-            tile_scheduler_metadata=tile_scheduler_metadata,
-            num_splits=num_splits,
-            softmax_scale=self.scale,
-            causal=True,
-        )
+            scheduler_metadata.tile_scheduler_metadata = tile_scheduler_metadata
+            scheduler_metadata.num_splits = num_splits
+        if _is_fp8_kv_cache(self.kv_cache_dtype):
+            o, lse = flash_mla_with_kvcache_fp8(
+                q=q,
+                k_cache=kv_c_and_k_pe_cache.unsqueeze(-2),  # Add head dim of 1
+                block_table=attn_metadata.decode.block_table,
+                cache_seqlens=attn_metadata.decode.seq_lens,
+                head_dim_v=self.kv_lora_rank,
+                tile_scheduler_metadata=scheduler_metadata.tile_scheduler_metadata,
+                num_splits=scheduler_metadata.num_splits,
+                softmax_scale=self.scale,
+                causal=True,
+                descale_q=_flashmla_fp8_descale(layer, "_q_scale", q.device),
+                descale_k=_flashmla_fp8_descale(layer, "_k_scale", q.device),
+            )
+        else:
+            o, lse = flash_mla_with_kvcache(
+                q=q,
+                k_cache=kv_c_and_k_pe_cache.unsqueeze(-2),  # Add head dim of 1
+                block_table=attn_metadata.decode.block_table,
+                cache_seqlens=attn_metadata.decode.seq_lens,
+                head_dim_v=self.kv_lora_rank,
+                tile_scheduler_metadata=scheduler_metadata.tile_scheduler_metadata,
+                num_splits=scheduler_metadata.num_splits,
+                softmax_scale=self.scale,
+                causal=True,
+            )
         o = reshape_attn_output_for_spec_decode(o)
 
         return o, lse

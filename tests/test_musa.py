@@ -3,6 +3,7 @@
 """Tests for the MUSA Platform implementation."""
 
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -213,6 +214,288 @@ class TestMUSAPlatformBase:
         with pytest.raises(NotImplementedError, match="FP8 dtype is not supported"):
             MUSAFlashAttentionBackend.get_fp8_dtype_for_flashattn("fp8")
 
+    def test_flashmla_fp8_decode_metadata_uses_dense_fp8_helper(self, monkeypatch):
+        import torch
+        import vllm_musa.v1.attention.backends.mla.flashmla as flashmla
+
+        dense_tile_metadata = torch.ones((1, 8), dtype=torch.int32)
+        dense_num_splits = torch.ones((3,), dtype=torch.int32)
+        dense_calls = []
+
+        def get_dense_fp8_metadata(seq_lens, num_q_tokens_per_head_k, num_heads_k):
+            dense_calls.append((seq_lens, num_q_tokens_per_head_k, num_heads_k))
+            return dense_tile_metadata, dense_num_splits
+
+        def get_generic_metadata(*args, **kwargs):
+            raise AssertionError("FP8 decode metadata must not call generic helper")
+
+        monkeypatch.setattr(flashmla, "get_mla_metadata_dense_fp8", get_dense_fp8_metadata)
+        monkeypatch.setattr(flashmla, "get_mla_metadata", get_generic_metadata)
+
+        builder = object.__new__(flashmla.FlashMLAMetadataBuilder)
+        builder.num_q_heads = 4
+        builder.is_fp8_kvcache = True
+        builder.compilation_config = SimpleNamespace(
+            cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: False)
+        )
+        builder.cg_buf_tile_scheduler_metadata = None
+        builder.cg_buf_num_splits = None
+
+        seq_lens = torch.tensor([4, 7], dtype=torch.int32)
+        metadata = builder._build_decode(
+            block_table_tensor=torch.tensor([[0], [1]], dtype=torch.int32),
+            seq_lens_device=seq_lens,
+            max_seq_len=7,
+            query_start_loc_cpu=torch.tensor([0, 2, 4], dtype=torch.int32),
+            query_start_loc_device=torch.tensor([0, 2, 4], dtype=torch.int32),
+            num_decode_tokens=4,
+            dcp_tot_seq_lens_device=None,
+        )
+
+        assert dense_calls == [(seq_lens, 8, 1)]
+        assert metadata.scheduler_metadata.tile_scheduler_metadata is dense_tile_metadata
+        assert metadata.scheduler_metadata.num_splits is dense_num_splits
+
+    def test_flashmla_non_fp8_decode_metadata_uses_generic_helper(self, monkeypatch):
+        import torch
+        import vllm_musa.v1.attention.backends.mla.flashmla as flashmla
+
+        generic_tile_metadata = torch.zeros((1, 8), dtype=torch.int32)
+        generic_num_splits = torch.zeros((2,), dtype=torch.int32)
+        generic_calls = []
+
+        def get_dense_fp8_metadata(*args, **kwargs):
+            raise AssertionError("non-FP8 decode metadata must not call FP8 helper")
+
+        def get_generic_metadata(*args, **kwargs):
+            generic_calls.append((args, kwargs))
+            return generic_tile_metadata, generic_num_splits
+
+        monkeypatch.setattr(flashmla, "get_mla_metadata_dense_fp8", get_dense_fp8_metadata)
+        monkeypatch.setattr(flashmla, "get_mla_metadata", get_generic_metadata)
+
+        builder = object.__new__(flashmla.FlashMLAMetadataBuilder)
+        builder.num_q_heads = 2
+        builder.is_fp8_kvcache = False
+        builder.compilation_config = SimpleNamespace(
+            cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: False)
+        )
+        builder.cg_buf_tile_scheduler_metadata = None
+        builder.cg_buf_num_splits = None
+
+        seq_lens = torch.tensor([3], dtype=torch.int32)
+        metadata = builder._build_decode(
+            block_table_tensor=torch.tensor([[0]], dtype=torch.int32),
+            seq_lens_device=seq_lens,
+            max_seq_len=3,
+            query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.int32),
+            query_start_loc_device=torch.tensor([0, 1], dtype=torch.int32),
+            num_decode_tokens=1,
+            dcp_tot_seq_lens_device=None,
+        )
+
+        assert len(generic_calls) == 1
+        args, kwargs = generic_calls[0]
+        assert args == (seq_lens, 2, 1)
+        assert kwargs == {"is_fp8_kvcache": False}
+        assert metadata.scheduler_metadata.tile_scheduler_metadata is generic_tile_metadata
+        assert metadata.scheduler_metadata.num_splits is generic_num_splits
+
+    def test_flashmla_fp8_forward_mqa_uses_fp8_kernel_and_descales(self, monkeypatch):
+        import torch
+        import vllm_musa.v1.attention.backends.mla.flashmla as flashmla
+
+        monkeypatch.setattr(flashmla, "reshape_query_for_spec_decode", lambda q, _: q)
+        monkeypatch.setattr(flashmla, "reshape_attn_output_for_spec_decode", lambda out: out)
+        fp8_calls = []
+
+        def flash_mla_fp8(**kwargs):
+            fp8_calls.append(kwargs)
+            return torch.full_like(kwargs["q"], 2), torch.tensor([1.0])
+
+        def flash_mla_generic(*args, **kwargs):
+            raise AssertionError("FP8 KV cache must use the FP8 FlashMLA kernel")
+
+        monkeypatch.setattr(flashmla, "flash_mla_with_kvcache_fp8", flash_mla_fp8)
+        monkeypatch.setattr(flashmla, "flash_mla_with_kvcache", flash_mla_generic)
+
+        impl = object.__new__(flashmla.FlashMLAImpl)
+        impl.kv_cache_dtype = "fp8"
+        impl.kv_lora_rank = 64
+        impl.scale = 0.125
+        scheduler_metadata = SimpleNamespace(
+            tile_scheduler_metadata=torch.ones((1, 8), dtype=torch.int32),
+            num_splits=torch.ones((2,), dtype=torch.int32),
+        )
+        decode = SimpleNamespace(
+            scheduler_metadata=scheduler_metadata,
+            block_table=torch.tensor([[0]], dtype=torch.int32),
+            seq_lens=torch.tensor([8], dtype=torch.int32),
+        )
+        metadata = SimpleNamespace(decode=decode, num_decodes=1)
+        layer = SimpleNamespace(_q_scale=torch.tensor(0.25), _k_scale=torch.tensor(0.5))
+        q = torch.ones((1, 2, 4), dtype=torch.float32)
+        kv_cache = torch.ones((1, 3, 4), dtype=torch.float32)
+
+        output, lse = impl.forward_mqa(q, kv_cache, metadata, layer)
+
+        assert len(fp8_calls) == 1
+        call = fp8_calls[0]
+        assert call["q"] is q
+        assert torch.equal(call["k_cache"], kv_cache.unsqueeze(-2))
+        assert call["block_table"] is decode.block_table
+        assert call["cache_seqlens"] is decode.seq_lens
+        assert call["head_dim_v"] == 64
+        assert call["tile_scheduler_metadata"] is scheduler_metadata.tile_scheduler_metadata
+        assert call["num_splits"] is scheduler_metadata.num_splits
+        assert call["softmax_scale"] == 0.125
+        assert call["causal"] is True
+        assert torch.equal(call["descale_q"], layer._q_scale.reshape(1))
+        assert torch.equal(call["descale_k"], layer._k_scale.reshape(1))
+        assert torch.equal(output, torch.full_like(q, 2))
+        assert torch.equal(lse, torch.tensor([1.0]))
+
+    def test_flashmla_fp8_forward_mqa_moves_descales_to_query_device(self, monkeypatch):
+        import torch
+        import vllm_musa.v1.attention.backends.mla.flashmla as flashmla
+
+        monkeypatch.setattr(flashmla, "reshape_query_for_spec_decode", lambda q, _: q)
+        monkeypatch.setattr(flashmla, "reshape_attn_output_for_spec_decode", lambda out: out)
+        fp8_calls = []
+
+        def flash_mla_fp8(**kwargs):
+            fp8_calls.append(kwargs)
+            return torch.empty_like(kwargs["q"]), torch.tensor([1.0])
+
+        monkeypatch.setattr(flashmla, "flash_mla_with_kvcache_fp8", flash_mla_fp8)
+
+        impl = object.__new__(flashmla.FlashMLAImpl)
+        impl.kv_cache_dtype = "fp8"
+        impl.kv_lora_rank = 64
+        impl.scale = 0.125
+        scheduler_metadata = SimpleNamespace(
+            tile_scheduler_metadata=torch.ones((1, 8), dtype=torch.int32),
+            num_splits=torch.ones((2,), dtype=torch.int32),
+        )
+        decode = SimpleNamespace(
+            scheduler_metadata=scheduler_metadata,
+            block_table=torch.tensor([[0]], dtype=torch.int32),
+            seq_lens=torch.tensor([8], dtype=torch.int32),
+        )
+        metadata = SimpleNamespace(decode=decode, num_decodes=1)
+        layer = SimpleNamespace(_q_scale=0.25, _k_scale=0.5)
+        q = torch.ones((1, 2, 4), dtype=torch.float32, device="meta")
+        kv_cache = torch.ones((1, 3, 4), dtype=torch.float32, device="meta")
+
+        output, lse = impl.forward_mqa(q, kv_cache, metadata, layer)
+
+        assert len(fp8_calls) == 1
+        call = fp8_calls[0]
+        assert call["descale_q"].device == q.device
+        assert call["descale_k"].device == q.device
+        assert output.device == q.device
+        assert torch.equal(lse, torch.tensor([1.0]))
+
+    @pytest.mark.parametrize(
+        ("q_scale", "k_scale", "match"),
+        [
+            pytest.param(None, 0.5, r"layer\._q_scale", id="missing-q-scale"),
+            pytest.param(0.25, None, r"layer\._k_scale", id="missing-k-scale"),
+            pytest.param([0.25, 0.5], 0.5, r"scalar layer\._q_scale", id="vector-q-scale"),
+            pytest.param(0.25, [0.5, 1.0], r"scalar layer\._k_scale", id="vector-k-scale"),
+        ],
+    )
+    def test_flashmla_fp8_forward_mqa_validates_descales(
+        self, monkeypatch, q_scale, k_scale, match
+    ):
+        import torch
+        import vllm_musa.v1.attention.backends.mla.flashmla as flashmla
+
+        layer = SimpleNamespace()
+        if q_scale is not None:
+            layer._q_scale = q_scale
+        if k_scale is not None:
+            layer._k_scale = k_scale
+
+        monkeypatch.setattr(flashmla, "reshape_query_for_spec_decode", lambda q, _: q)
+
+        def flash_mla_fp8(**kwargs):
+            raise AssertionError("invalid descale tensors should fail before kernel call")
+
+        monkeypatch.setattr(flashmla, "flash_mla_with_kvcache_fp8", flash_mla_fp8)
+
+        impl = object.__new__(flashmla.FlashMLAImpl)
+        impl.kv_cache_dtype = "fp8"
+        impl.kv_lora_rank = 64
+        impl.scale = 0.125
+        scheduler_metadata = SimpleNamespace(
+            tile_scheduler_metadata=torch.ones((1, 8), dtype=torch.int32),
+            num_splits=torch.ones((2,), dtype=torch.int32),
+        )
+        decode = SimpleNamespace(
+            scheduler_metadata=scheduler_metadata,
+            block_table=torch.tensor([[0]], dtype=torch.int32),
+            seq_lens=torch.tensor([8], dtype=torch.int32),
+        )
+        metadata = SimpleNamespace(decode=decode, num_decodes=1)
+        q = torch.ones((1, 2, 4), dtype=torch.float32)
+        kv_cache = torch.ones((1, 3, 4), dtype=torch.float32)
+
+        with pytest.raises(ValueError, match=match):
+            impl.forward_mqa(q, kv_cache, metadata, layer)
+
+    def test_flashmla_non_fp8_forward_mqa_uses_generic_kernel(self, monkeypatch):
+        import torch
+        import vllm_musa.v1.attention.backends.mla.flashmla as flashmla
+
+        monkeypatch.setattr(flashmla.envs, "VLLM_BATCH_INVARIANT", False)
+        monkeypatch.setattr(flashmla, "reshape_query_for_spec_decode", lambda q, _: q)
+        monkeypatch.setattr(flashmla, "reshape_attn_output_for_spec_decode", lambda out: out)
+        generic_calls = []
+
+        def flash_mla_generic(**kwargs):
+            generic_calls.append(kwargs)
+            return torch.full_like(kwargs["q"], 3), torch.tensor([2.0])
+
+        def flash_mla_fp8(*args, **kwargs):
+            raise AssertionError("non-FP8 KV cache must use the generic FlashMLA kernel")
+
+        monkeypatch.setattr(flashmla, "flash_mla_with_kvcache", flash_mla_generic)
+        monkeypatch.setattr(flashmla, "flash_mla_with_kvcache_fp8", flash_mla_fp8)
+
+        impl = object.__new__(flashmla.FlashMLAImpl)
+        impl.kv_cache_dtype = "auto"
+        impl.kv_lora_rank = 32
+        impl.scale = 0.25
+        scheduler_metadata = SimpleNamespace(
+            tile_scheduler_metadata=torch.zeros((1, 8), dtype=torch.int32),
+            num_splits=torch.zeros((2,), dtype=torch.int32),
+        )
+        decode = SimpleNamespace(
+            scheduler_metadata=scheduler_metadata,
+            block_table=torch.tensor([[0]], dtype=torch.int32),
+            seq_lens=torch.tensor([4], dtype=torch.int32),
+        )
+        metadata = SimpleNamespace(decode=decode, num_decodes=1)
+        q = torch.ones((1, 2, 4), dtype=torch.float32)
+        kv_cache = torch.ones((1, 3, 4), dtype=torch.float32)
+
+        output, lse = impl.forward_mqa(q, kv_cache, metadata, SimpleNamespace())
+
+        assert len(generic_calls) == 1
+        call = generic_calls[0]
+        assert call["q"] is q
+        assert torch.equal(call["k_cache"], kv_cache.unsqueeze(-2))
+        assert call["block_table"] is decode.block_table
+        assert call["cache_seqlens"] is decode.seq_lens
+        assert call["head_dim_v"] == 32
+        assert call["tile_scheduler_metadata"] is scheduler_metadata.tile_scheduler_metadata
+        assert call["num_splits"] is scheduler_metadata.num_splits
+        assert call["softmax_scale"] == 0.25
+        assert call["causal"] is True
+        assert torch.equal(output, torch.full_like(q, 3))
+        assert torch.equal(lse, torch.tensor([2.0]))
+
     def test_fp8_scaled_mm_oot_registers_musa_kernel(self):
         import torch
         import vllm_musa
@@ -243,13 +526,14 @@ class TestMUSAPlatformBase:
 
         assert isinstance(kernel, MUSAFP8ScaledMMLinearKernel)
 
-    def test_fp8_scaled_mm_uses_weight_scale_inv_fallback(self):
+    def test_fp8_scaled_mm_uses_weight_scale(self):
         import torch
         import vllm_musa
 
         vllm_musa._apply_vllm_patches()
         import vllm_musa.fp8_linear  # noqa: F401
 
+        from vllm.config import VllmConfig, set_current_vllm_config
         from vllm.model_executor.kernels import linear
         from vllm.model_executor.layers.quantization.utils.quant_utils import (
             kFp8DynamicTensorSym,
@@ -260,6 +544,51 @@ class TestMUSAPlatformBase:
         with (
             patch.object(linear.current_platform, "_enum", PlatformEnum.OOT),
             patch.object(linear.current_platform, "is_musa", return_value=True),
+            set_current_vllm_config(VllmConfig()),
+        ):
+            kernel = linear.init_fp8_linear_kernel(
+                activation_quant_key=kFp8DynamicTensorSym,
+                weight_quant_key=kFp8StaticTensorSym,
+                input_dtype=torch.float16,
+                out_dtype=torch.float16,
+                weight_shape=(16, 16),
+                module_name="musa_fp8_test",
+            )
+
+        layer = torch.nn.Module()
+        layer.weight = torch.empty(16, 16)
+        layer.weight_scale = torch.ones(1, 1)
+        layer.input_scale = torch.ones(1)
+        layer.input_scale_ub = torch.ones(1)
+
+        weight, weight_scale, input_scale, input_scale_ub = kernel._get_layer_params(
+            layer
+        )
+
+        assert weight is layer.weight
+        assert weight_scale is layer.weight_scale
+        assert input_scale is layer.input_scale
+        assert input_scale_ub is layer.input_scale_ub
+
+    def test_fp8_scaled_mm_falls_back_to_weight_scale_inv(self):
+        import torch
+        import vllm_musa
+
+        vllm_musa._apply_vllm_patches()
+        import vllm_musa.fp8_linear  # noqa: F401
+
+        from vllm.config import VllmConfig, set_current_vllm_config
+        from vllm.model_executor.kernels import linear
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            kFp8DynamicTensorSym,
+            kFp8StaticTensorSym,
+        )
+        from vllm.platforms.interface import PlatformEnum
+
+        with (
+            patch.object(linear.current_platform, "_enum", PlatformEnum.OOT),
+            patch.object(linear.current_platform, "is_musa", return_value=True),
+            set_current_vllm_config(VllmConfig()),
         ):
             kernel = linear.init_fp8_linear_kernel(
                 activation_quant_key=kFp8DynamicTensorSym,
@@ -285,7 +614,7 @@ class TestMUSAPlatformBase:
         assert input_scale is layer.input_scale
         assert input_scale_ub is layer.input_scale_ub
 
-    def test_fp8_scaled_mm_accepts_loaded_out_in_weight(self):
+    def test_fp8_scaled_mm_accepts_upstream_transposed_weight(self):
         import torch
         import vllm_musa
 
@@ -307,20 +636,22 @@ class TestMUSAPlatformBase:
                 weight_quant_key=kFp8StaticTensorSym,
                 input_dtype=torch.float16,
                 out_dtype=torch.float16,
-                weight_shape=(2048, 576),
+                weight_shape=(576, 2048),
                 module_name="musa_fp8_shape_test",
             )
 
+        B = torch.empty(2048, 576, dtype=torch.float8_e4m3fn).contiguous()
         captured = {}
 
         def fake_gemv(x, qweight, x_scales, qweight_scales):
             captured["qweight_shape"] = qweight.shape
+            captured["qweight_is_contiguous"] = qweight.is_contiguous()
             return torch.zeros(x.shape[0], qweight.shape[0], dtype=torch.bfloat16)
 
         with patch("vllm_musa.fp8_linear.musa_ops.musa_fused_gemv", fake_gemv):
             output = kernel.apply_scaled_mm(
                 A=torch.empty(1, 2048, dtype=torch.float8_e4m3fn),
-                B=torch.empty(576, 2048, dtype=torch.float8_e4m3fn),
+                B=B,
                 out_dtype=torch.float16,
                 As=torch.ones(1, 16),
                 Bs=torch.ones(5, 16),
@@ -329,7 +660,408 @@ class TestMUSAPlatformBase:
             )
 
         assert captured["qweight_shape"] == (576, 2048)
+        assert captured["qweight_is_contiguous"]
         assert output.shape == (1, 576)
+
+    def test_fp8_scaled_mm_preserves_square_out_in_weight_orientation(self):
+        import torch
+        import vllm_musa
+
+        vllm_musa._apply_vllm_patches()
+
+        from vllm.model_executor.kernels import linear
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            kFp8DynamicTensorSym,
+            kFp8StaticTensorSym,
+        )
+        from vllm.platforms.interface import PlatformEnum
+
+        with (
+            patch.object(linear.current_platform, "_enum", PlatformEnum.OOT),
+            patch.object(linear.current_platform, "is_musa", return_value=True),
+        ):
+            kernel = linear.init_fp8_linear_kernel(
+                activation_quant_key=kFp8DynamicTensorSym,
+                weight_quant_key=kFp8StaticTensorSym,
+                input_dtype=torch.float16,
+                out_dtype=torch.float16,
+                weight_shape=(256, 256),
+                module_name="musa_fp8_square_orientation_test",
+            )
+
+        B = torch.empty(256, 256, dtype=torch.float8_e4m3fn).contiguous()
+        captured = {}
+
+        def fake_gemv(x, qweight, x_scales, qweight_scales):
+            captured["qweight_data_ptr"] = qweight.data_ptr()
+            captured["qweight_shape"] = qweight.shape
+            return torch.zeros(x.shape[0], qweight.shape[0], dtype=torch.bfloat16)
+
+        with patch("vllm_musa.fp8_linear.musa_ops.musa_fused_gemv", fake_gemv):
+            output = kernel.apply_scaled_mm(
+                A=torch.empty(1, 256, dtype=torch.float8_e4m3fn),
+                B=B,
+                out_dtype=torch.float16,
+                As=torch.ones(1, 2),
+                Bs=torch.ones(2, 2),
+                bias=None,
+                output_shape=[1, 256],
+            )
+
+        assert captured["qweight_data_ptr"] == B.data_ptr()
+        assert captured["qweight_shape"] == (256, 256)
+        assert output.shape == (1, 256)
+
+    def test_fp8_scaled_mm_preserves_square_non_contiguous_out_in_weight_orientation(self):
+        import torch
+        import vllm_musa
+
+        vllm_musa._apply_vllm_patches()
+
+        from vllm.model_executor.kernels import linear
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            kFp8DynamicTensorSym,
+            kFp8StaticTensorSym,
+        )
+        from vllm.platforms.interface import PlatformEnum
+
+        with (
+            patch.object(linear.current_platform, "_enum", PlatformEnum.OOT),
+            patch.object(linear.current_platform, "is_musa", return_value=True),
+        ):
+            kernel = linear.init_fp8_linear_kernel(
+                activation_quant_key=kFp8DynamicTensorSym,
+                weight_quant_key=kFp8StaticTensorSym,
+                input_dtype=torch.float16,
+                out_dtype=torch.float16,
+                weight_shape=(16, 16),
+                module_name="musa_fp8_square_non_contiguous_orientation_test",
+            )
+
+        backing = torch.arange(16 * 17, dtype=torch.float32).reshape(16, 17)
+        B = backing[:, :16].to(torch.float8_e4m3fn)
+        assert not B.is_contiguous()
+        captured = {}
+
+        def fake_gemv(x, qweight, x_scales, qweight_scales):
+            captured["qweight"] = qweight.float().clone()
+            captured["qweight_is_contiguous"] = qweight.is_contiguous()
+            return torch.zeros(x.shape[0], qweight.shape[0], dtype=torch.bfloat16)
+
+        with patch("vllm_musa.fp8_linear.musa_ops.musa_fused_gemv", fake_gemv):
+            output = kernel.apply_scaled_mm(
+                A=torch.empty(1, 16, dtype=torch.float8_e4m3fn),
+                B=B,
+                out_dtype=torch.float16,
+                As=torch.ones(1, 1),
+                Bs=torch.ones(1, 1),
+                bias=None,
+                output_shape=[1, 16],
+            )
+
+        assert torch.equal(captured["qweight"], B.contiguous().float())
+        assert captured["qweight_is_contiguous"]
+        assert output.shape == (1, 16)
+
+    def test_fp8_scaled_mm_transposes_square_upstream_weight_view(self):
+        import torch
+        import vllm_musa
+
+        vllm_musa._apply_vllm_patches()
+
+        from vllm.model_executor.kernels import linear
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            kFp8DynamicTensorSym,
+            kFp8StaticTensorSym,
+        )
+        from vllm.platforms.interface import PlatformEnum
+
+        with (
+            patch.object(linear.current_platform, "_enum", PlatformEnum.OOT),
+            patch.object(linear.current_platform, "is_musa", return_value=True),
+        ):
+            kernel = linear.init_fp8_linear_kernel(
+                activation_quant_key=kFp8DynamicTensorSym,
+                weight_quant_key=kFp8StaticTensorSym,
+                input_dtype=torch.float16,
+                out_dtype=torch.float16,
+                weight_shape=(256, 256),
+                module_name="musa_fp8_square_transposed_test",
+            )
+
+        original_qweight = torch.empty(256, 256, dtype=torch.float8_e4m3fn).contiguous()
+        B = original_qweight.t()
+        captured = {}
+
+        def fake_gemv(x, qweight, x_scales, qweight_scales):
+            captured["qweight_data_ptr"] = qweight.data_ptr()
+            captured["qweight_shape"] = qweight.shape
+            captured["qweight_is_contiguous"] = qweight.is_contiguous()
+            return torch.zeros(x.shape[0], qweight.shape[0], dtype=torch.bfloat16)
+
+        with patch("vllm_musa.fp8_linear.musa_ops.musa_fused_gemv", fake_gemv):
+            output = kernel.apply_scaled_mm(
+                A=torch.empty(1, 256, dtype=torch.float8_e4m3fn),
+                B=B,
+                out_dtype=torch.float16,
+                As=torch.ones(1, 2),
+                Bs=torch.ones(2, 2),
+                bias=None,
+                output_shape=[1, 256],
+            )
+
+        assert captured["qweight_data_ptr"] == original_qweight.data_ptr()
+        assert captured["qweight_shape"] == (256, 256)
+        assert captured["qweight_is_contiguous"]
+        assert output.shape == (1, 256)
+
+    def test_fp8_scaled_mm_expands_qkv_scalar_weight_scale(self):
+        import torch
+        import vllm_musa
+
+        vllm_musa._apply_vllm_patches()
+
+        from vllm.model_executor.kernels import linear
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            kFp8DynamicTensorSym,
+            kFp8StaticTensorSym,
+        )
+        from vllm.platforms.interface import PlatformEnum
+
+        with (
+            patch.object(linear.current_platform, "_enum", PlatformEnum.OOT),
+            patch.object(linear.current_platform, "is_musa", return_value=True),
+        ):
+            kernel = linear.init_fp8_linear_kernel(
+                activation_quant_key=kFp8DynamicTensorSym,
+                weight_quant_key=kFp8StaticTensorSym,
+                input_dtype=torch.float16,
+                out_dtype=torch.float16,
+                weight_shape=(576, 2048),
+                module_name="musa_fp8_qkv_scale_test",
+            )
+
+        captured = {}
+
+        def fake_gemv(x, qweight, x_scales, qweight_scales):
+            captured["qweight_scales_shape"] = qweight_scales.shape
+            return torch.zeros(x.shape[0], qweight.shape[0], dtype=torch.bfloat16)
+
+        with patch("vllm_musa.fp8_linear.musa_ops.musa_fused_gemv", fake_gemv):
+            output = kernel.apply_scaled_mm(
+                A=torch.empty(1, 2048, dtype=torch.float8_e4m3fn),
+                B=torch.empty(2048, 576, dtype=torch.float8_e4m3fn),
+                out_dtype=torch.float16,
+                As=torch.ones(1, 16),
+                Bs=torch.tensor(1.0),
+                bias=None,
+                output_shape=[1, 2048],
+            )
+
+        assert captured["qweight_scales_shape"] == (5, 16)
+        assert output.shape == (1, 576)
+
+    def test_fp8_scaled_mm_expands_qkv_per_shard_weight_scales(self):
+        import torch
+        import vllm_musa
+
+        vllm_musa._apply_vllm_patches()
+
+        from vllm.model_executor.kernels import linear
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            kFp8DynamicTensorSym,
+            kFp8StaticTensorSym,
+        )
+        from vllm.platforms.interface import PlatformEnum
+
+        with (
+            patch.object(linear.current_platform, "_enum", PlatformEnum.OOT),
+            patch.object(linear.current_platform, "is_musa", return_value=True),
+        ):
+            kernel = linear.init_fp8_linear_kernel(
+                activation_quant_key=kFp8DynamicTensorSym,
+                weight_quant_key=kFp8StaticTensorSym,
+                input_dtype=torch.float16,
+                out_dtype=torch.float16,
+                weight_shape=(768, 2048),
+                module_name="musa_fp8_qkv_per_shard_scale_test",
+            )
+
+        captured = {}
+
+        def fake_gemv(x, qweight, x_scales, qweight_scales):
+            captured["qweight_scales"] = qweight_scales
+            return torch.zeros(x.shape[0], qweight.shape[0], dtype=torch.bfloat16)
+
+        Bs = torch.arange(48, dtype=torch.float32).reshape(3, 16)
+        with patch("vllm_musa.fp8_linear.musa_ops.musa_fused_gemv", fake_gemv):
+            output = kernel.apply_scaled_mm(
+                A=torch.empty(1, 2048, dtype=torch.float8_e4m3fn),
+                B=torch.empty(2048, 768, dtype=torch.float8_e4m3fn),
+                out_dtype=torch.float16,
+                As=torch.ones(1, 16),
+                Bs=Bs,
+                bias=None,
+                output_shape=[1, 2048],
+            )
+
+        expected_scales = torch.cat(
+            [
+                Bs[0:1].expand(2, -1),
+                Bs[1:2].expand(2, -1),
+                Bs[2:3].expand(2, -1),
+            ]
+        )
+        assert torch.equal(captured["qweight_scales"], expected_scales)
+        assert captured["qweight_scales"].shape == (6, 16)
+        assert output.shape == (1, 768)
+
+    def test_fp8_scaled_mm_expands_non_uniform_logical_shard_weight_scales(self):
+        import torch
+        import vllm_musa
+
+        vllm_musa._apply_vllm_patches()
+
+        from vllm.model_executor.kernels import linear
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            kFp8DynamicTensorSym,
+            kFp8StaticTensorSym,
+        )
+        from vllm.platforms.interface import PlatformEnum
+
+        with (
+            patch.object(linear.current_platform, "_enum", PlatformEnum.OOT),
+            patch.object(linear.current_platform, "is_musa", return_value=True),
+        ):
+            kernel = linear.init_fp8_linear_kernel(
+                activation_quant_key=kFp8DynamicTensorSym,
+                weight_quant_key=kFp8StaticTensorSym,
+                input_dtype=torch.float16,
+                out_dtype=torch.float16,
+                weight_shape=(1024, 2048),
+                module_name="musa_fp8_non_uniform_qkv_scale_test",
+            )
+
+        layer = SimpleNamespace(logical_widths=[512, 256, 256])
+        kernel.process_weights_after_loading(layer)
+        captured = {}
+
+        def fake_gemv(x, qweight, x_scales, qweight_scales):
+            captured["qweight_scales"] = qweight_scales
+            return torch.zeros(x.shape[0], qweight.shape[0], dtype=torch.bfloat16)
+
+        Bs = torch.arange(48, dtype=torch.float32).reshape(3, 16)
+        with patch("vllm_musa.fp8_linear.musa_ops.musa_fused_gemv", fake_gemv):
+            output = kernel.apply_scaled_mm(
+                A=torch.empty(1, 2048, dtype=torch.float8_e4m3fn),
+                B=torch.empty(2048, 1024, dtype=torch.float8_e4m3fn),
+                out_dtype=torch.float16,
+                As=torch.ones(1, 16),
+                Bs=Bs,
+                bias=None,
+                output_shape=[1, 2048],
+            )
+
+        expected_scales = torch.cat(
+            [
+                Bs[0:1].expand(4, -1),
+                Bs[1:2].expand(2, -1),
+                Bs[2:3].expand(2, -1),
+            ]
+        )
+        assert torch.equal(captured["qweight_scales"], expected_scales)
+        assert captured["qweight_scales"].shape == (8, 16)
+        assert output.shape == (1, 1024)
+
+    def test_fp8_scaled_mm_expands_scalar_weight_scale(self):
+        import torch
+        import vllm_musa
+
+        vllm_musa._apply_vllm_patches()
+
+        from vllm.model_executor.kernels import linear
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            kFp8DynamicTensorSym,
+            kFp8StaticTensorSym,
+        )
+        from vllm.platforms.interface import PlatformEnum
+
+        with (
+            patch.object(linear.current_platform, "_enum", PlatformEnum.OOT),
+            patch.object(linear.current_platform, "is_musa", return_value=True),
+        ):
+            kernel = linear.init_fp8_linear_kernel(
+                activation_quant_key=kFp8DynamicTensorSym,
+                weight_quant_key=kFp8StaticTensorSym,
+                input_dtype=torch.float16,
+                out_dtype=torch.float16,
+                weight_shape=(256, 256),
+                module_name="musa_fp8_aligned_scale_test",
+            )
+
+        captured = {}
+
+        def fake_gemv(x, qweight, x_scales, qweight_scales):
+            captured["x_scales_shape"] = x_scales.shape
+            captured["qweight_scales_shape"] = qweight_scales.shape
+            return torch.zeros(x.shape[0], qweight.shape[0], dtype=torch.bfloat16)
+
+        with patch("vllm_musa.fp8_linear.musa_ops.musa_fused_gemv", fake_gemv):
+            output = kernel.apply_scaled_mm(
+                A=torch.empty(1, 256, dtype=torch.float8_e4m3fn),
+                B=torch.empty(256, 256, dtype=torch.float8_e4m3fn),
+                out_dtype=torch.float16,
+                As=torch.tensor(1.0),
+                Bs=torch.tensor(1.0),
+                bias=None,
+                output_shape=[1, 256],
+            )
+
+        assert captured["x_scales_shape"] == (1, 1)
+        assert captured["qweight_scales_shape"] == (2, 2)
+        assert output.shape == (1, 256)
+
+    def test_fp8_scaled_mm_rejects_invalid_weight_scale_rows(self):
+        import torch
+        import vllm_musa
+
+        vllm_musa._apply_vllm_patches()
+
+        from vllm.model_executor.kernels import linear
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            kFp8DynamicTensorSym,
+            kFp8StaticTensorSym,
+        )
+        from vllm.platforms.interface import PlatformEnum
+
+        with (
+            patch.object(linear.current_platform, "_enum", PlatformEnum.OOT),
+            patch.object(linear.current_platform, "is_musa", return_value=True),
+        ):
+            kernel = linear.init_fp8_linear_kernel(
+                activation_quant_key=kFp8DynamicTensorSym,
+                weight_quant_key=kFp8StaticTensorSym,
+                input_dtype=torch.float16,
+                out_dtype=torch.float16,
+                weight_shape=(256, 128),
+                module_name="musa_fp8_invalid_scale_test",
+            )
+
+        A = torch.ones((1, 128), dtype=torch.bfloat16)
+        B = torch.ones((256, 128), dtype=torch.float8_e4m3fn)
+        As = torch.ones((1, 1), dtype=torch.float32)
+        Bs = torch.ones((3, 1), dtype=torch.float32)
+
+        with pytest.raises(ValueError, match="one weight scale row per 128 output channels"):
+            kernel.apply_scaled_mm(
+                A=A,
+                B=B,
+                out_dtype=torch.bfloat16,
+                As=As,
+                Bs=Bs,
+                bias=None,
+                output_shape=[1, 256],
+            )
 
     def test_fp8_block_scaled_mm_oot_registers_musa_kernel(self):
         import torch
