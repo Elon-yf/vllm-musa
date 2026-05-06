@@ -4,8 +4,11 @@
 
 from typing import ClassVar
 
+# isort: off
 import torchada  # noqa: F401
 import torch
+
+# isort: on
 from vllm.config.cache import CacheDType
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backends import turboquant_attn as _turboquant_attn
@@ -13,7 +16,6 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_b
 
 from vllm_musa.v1.attention.backends import fa_utils as _musa_fa_utils
 
-_turboquant_attn.flash_attn_varlen_func = _musa_fa_utils.flash_attn_varlen_func
 _turboquant_attn.get_flash_attn_version = _musa_fa_utils.get_flash_attn_version
 _turboquant_attn.is_flash_attn_varlen_func_available = (
     _musa_fa_utils.is_flash_attn_varlen_func_available
@@ -24,7 +26,31 @@ _turboquant_attn._HAS_FLASH_ATTN = _musa_fa_utils.is_flash_attn_varlen_func_avai
 class MUSATurboQuantAttentionImpl(_turboquant_attn.TurboQuantAttentionImpl):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.fa_version = _musa_fa_utils.get_flash_attn_version(head_size=self.head_size)
+        self.fa_version = _musa_fa_utils.get_flash_attn_version(
+            head_size=self.head_size
+        )
+
+    def _flash_attn_varlen(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+    ) -> torch.Tensor:
+        return _musa_fa_utils.flash_attn_varlen_func(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=self.scale,
+            causal=True,
+        )
 
 
 @register_backend(AttentionBackendEnum.TURBOQUANT)
