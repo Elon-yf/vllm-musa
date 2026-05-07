@@ -33,8 +33,34 @@ Current patches cover:
 - Distributed communicators (all2all, custom all-reduce)
 - FP8 quantization and utilities
 - Triton unified attention, FlashMLA ops
-- Top-k/top-p sampling (Triton variant)
+- Top-k/top-p sampling and ModelRunnerV2 sampling helpers
+- ModelRunnerV2 block-table pointer handling
 - DeepGEMM utilities, profiler wrapper, GPU worker
+
+## ModelRunnerV2 validation
+
+Set these environment variables before starting vLLM when validating the v0.20.0
+ModelRunnerV2 path on MUSA:
+
+```bash
+export VLLM_USE_V1=1
+export VLLM_USE_V2_MODEL_RUNNER=1
+export TORCHDYNAMO_DISABLE=1
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export PYTHONUNBUFFERED=1
+export VLLM_ATTENTION_BACKEND=FLASH_ATTN
+```
+
+Validation should prove all of the following:
+
+1. `vllm.envs.VLLM_USE_V2_MODEL_RUNNER is True`.
+2. Logs contain `Using V2 Model Runner`.
+3. The selected runner module is `vllm.v1.worker.gpu.model_runner`.
+4. A real generation smoke returns non-empty output with `backend=FLASH_ATTN`.
+
+The v0.20.0 MUSA path relies on the ModelRunnerV2 patch files under
+`vllm_musa/patches/` for gumbel sampling dtype selection, block-table pointer
+loading, and penalties-kernel boolean expression compatibility.
 
 ### `model_executor/` – OOT Layer Implementations
 

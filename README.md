@@ -44,7 +44,7 @@ The plugin leverages the following key components:
 
 | vLLM Version | PyTorch Version | Engine  | Status       |
 |--------------|-----------------|---------|--------------|
-| v0.20.0       | 2.7.1           | V1 only | ✅ Supported |
+| v0.20.0       | 2.7.1           | V1 with optional ModelRunnerV2 | ✅ Supported |
 
 > **Note**: This plugin uses vLLM's V1 engine architecture. V0 engine is not supported.
 
@@ -101,6 +101,67 @@ outputs = llm.generate(["Hello, how are you?"], sampling_params)
 for output in outputs:
     print(output.outputs[0].text)
 ```
+
+### ModelRunnerV2
+
+vLLM v0.20.0 includes an optional V1 GPU ModelRunnerV2 path. Enable it with
+`VLLM_USE_V2_MODEL_RUNNER=1` together with the normal MUSA runtime defaults:
+
+```bash
+export VLLM_USE_V1=1
+export VLLM_USE_V2_MODEL_RUNNER=1
+export TORCHDYNAMO_DISABLE=1
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export PYTHONUNBUFFERED=1
+export VLLM_ATTENTION_BACKEND=FLASH_ATTN
+```
+
+For Python generation, keep `torchada` as the first Torch/vLLM-facing import and
+use eager execution on current MUSA runtimes:
+
+```python
+import torchada  # noqa: F401
+from vllm import LLM, SamplingParams
+
+llm = LLM(
+    model="/path/to/model",
+    enforce_eager=True,
+    gpu_memory_utilization=0.20,
+    max_model_len=512,
+    max_num_seqs=2,
+    trust_remote_code=True,
+)
+outputs = llm.generate(["The capital of China is"], SamplingParams(temperature=0.0, max_tokens=16))
+print(outputs[0].outputs[0].text)
+```
+
+A successful run logs `Using V2 Model Runner` and selects
+`vllm.v1.worker.gpu.model_runner.GPUModelRunner`. The focused MUSA validation
+used Qwen3-0.6B with `FLASH_ATTN` and checked the ModelRunnerV2 patch probes,
+environment flag, generation output, and backend log marker.
+
+To reproduce the focused checks, run from a MUSA host/container with this plugin
+installed in editable mode:
+
+```bash
+python - <<'PY'
+import importlib.metadata as metadata
+
+import torchada  # noqa: F401
+import torch
+from vllm import envs
+
+for package in ["torch", "torch_musa", "torchada", "mate", "vllm"]:
+    print(f"{package}={metadata.version(package)}")
+print(f"torch.version.musa={getattr(torch.version, 'musa', None)}")
+print(f"device_count={torch.musa.device_count()}")
+assert envs.VLLM_USE_V2_MODEL_RUNNER is True
+print("PASS model_runner_v2_env_probe enabled=True")
+PY
+```
+
+Then run one real generation smoke like the Python example above and confirm both
+the `Using V2 Model Runner` log marker and non-empty generated text.
 
 ### OpenAI-Compatible Server
 
