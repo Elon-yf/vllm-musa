@@ -96,6 +96,39 @@ class TestTritonPatch:
                 assert "left: tl.int32 = 0" in old_strs
 
 
+class TestCustomAllReducePatch:
+    """Tests for the MUSA custom all-reduce patch."""
+
+    def test_patch_skips_cuda_p2p_check_on_musa(self):
+        """Test that MUSA custom all-reduce does not run CUDA P2P probing."""
+        from vllm_musa.patches import _get_patch_files, _load_patch_config
+
+        patch_files = _get_patch_files()
+
+        for module_name, patch_path in patch_files:
+            if "custom_all_reduce" in module_name:
+                patches = _load_patch_config(patch_path)
+                old_strs = [old for old, new in patches]
+                new_strs = [new for old, new in patches]
+
+                assert (
+                    "if ( not current_platform.is_rocm() or not "
+                    "current_platform.is_musa() ) and not _can_p2p(rank, world_size):"
+                ) in old_strs
+                assert (
+                    "if not current_platform.is_rocm() and not "
+                    "current_platform.is_musa() and not _can_p2p(rank, world_size):"
+                ) in new_strs
+                assert all(
+                    "not current_platform.is_rocm() or not current_platform.is_musa()"
+                    not in new
+                    for new in new_strs
+                )
+                break
+        else:
+            raise AssertionError("custom_all_reduce patch file was not found")
+
+
 class TestApplyPatches:
     """Tests for the apply_patches function."""
 
