@@ -233,16 +233,18 @@ def fused_experts_impl(
         if tokens_in_chunk == 0:
             break
 
+        curr_intermediate_cache2 = intermediate_cache2[
+            : tokens_in_chunk * topk_ids.size(1)
+        ]
+        curr_intermediate_cache3 = intermediate_cache3[:tokens_in_chunk]
+        curr_out_hidden_states = out_hidden_states[begin_chunk_idx:end_chunk_idx]
+
         if tokens_in_chunk < CHUNK_SIZE and chunk > 0:
             # Adjust the intermediate cache size and config for the last
             # chunk. Note that in most cases we only have one chunk
             # so the cache size and config are already set correctly and
             # do not need to be adjusted.
             intermediate_cache1 = intermediate_cache1[:tokens_in_chunk]
-            intermediate_cache2 = intermediate_cache2[
-                : tokens_in_chunk * topk_ids.size(1)
-            ]
-            intermediate_cache3 = intermediate_cache3[:tokens_in_chunk]
             config = get_config_func(tokens_in_chunk)
 
         curr_topk_ids = topk_ids[begin_chunk_idx:end_chunk_idx]
@@ -251,7 +253,7 @@ def fused_experts_impl(
         musa_ops.musa_fused_gemv_moe(
             curr_hidden_states,
             w1,
-            intermediate_cache2,
+            curr_intermediate_cache2,
             None,
             w1_scale,
             curr_topk_weights,
@@ -262,9 +264,9 @@ def fused_experts_impl(
             use_swigelu=True,
         )
         musa_ops.musa_fused_gemv_moe(
-            intermediate_cache2,
+            curr_intermediate_cache2,
             w2,
-            intermediate_cache3,
+            curr_intermediate_cache3,
             None,
             w2_scale,
             curr_topk_weights,
@@ -276,8 +278,8 @@ def fused_experts_impl(
         )
         # ========================== END ====================
         ops.moe_sum(
-            intermediate_cache3.view(*intermediate_cache3.size()),
-            out_hidden_states,
+            curr_intermediate_cache3.view(*curr_intermediate_cache3.size()),
+            curr_out_hidden_states,
         )
 
     return out_hidden_states
