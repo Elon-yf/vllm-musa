@@ -53,7 +53,6 @@ def test_musa_fused_experts_preserves_output_shape_across_chunks(monkeypatch):
             output.resize_(required_shape)
         output.copy_(intermediate_cache3.sum(dim=1))
 
-    monkeypatch.setattr(fused_moe, "try_get_optimal_moe_config", lambda *a, **k: {})
     monkeypatch.setattr(
         fused_moe.musa_ops, "musa_fused_gemv_moe", fake_musa_fused_gemv_moe
     )

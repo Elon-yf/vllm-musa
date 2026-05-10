@@ -1,15 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import functools
-
 import torch
 from vllm import _custom_ops as ops
-from vllm.model_executor.layers.fused_moe.config import _get_config_dtype_str
-from vllm.model_executor.layers.fused_moe.fused_moe import (
-    _get_config_quant_dtype,
-    try_get_optimal_moe_config,
-)
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.utils import (
     disable_inplace,
 )
@@ -27,6 +21,8 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl
 
 from vllm_musa import _custom_ops as musa_ops
+
+logger = init_logger(__name__)
 
 
 def _supports_quant_scheme(
@@ -125,44 +121,12 @@ def fused_experts_impl(
 
     M = num_tokens
 
-    config_dtype = _get_config_dtype_str(
-        use_fp8_w8a8=use_fp8_w8a8,
-        use_int8_w8a16=use_int8_w8a16,
-        use_int4_w4a16=use_int4_w4a16,
-        ocp_mx_scheme=ocp_mx_scheme,
-        dtype=hidden_states.dtype,
+    intermediate_cache3 = torch.empty(
+        (M, top_k_num, K), device=hidden_states.device, dtype=hidden_states.dtype
     )
 
-    # Note: for use_int8_w8a16 or use_int4_w4a16, the activations are
-    # quantized prior to calling fused_experts.
-    quant_dtype = _get_config_quant_dtype(
-        use_fp8_w8a8=use_fp8_w8a8,
-        use_int8_w8a8=use_int8_w8a8,
-        ocp_mx_scheme=ocp_mx_scheme,
-    )
-
-    get_config_func = functools.partial(
-        try_get_optimal_moe_config,
-        w1.size(),
-        w2.size(),
-        top_k_num,
-        config_dtype,
-        block_shape=block_shape,
-    )
-
-    config = get_config_func(M)
-
-    # We can reuse the memory between these because by the time we need
-    # cache3, we're done with cache1
-    cache13 = torch.empty(
-        M * top_k_num * max(N, K),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
-    )
-    intermediate_cache1 = cache13[: M * top_k_num * N].view(M, top_k_num, N)
-    intermediate_cache3 = cache13[: M * top_k_num * K].view(M, top_k_num, K)
-
-    # This needs separate memory since it's used concurrently with cache1
+    # The first GEMV writes activation input to cache2; the second GEMV writes
+    # top-k outputs to cache3 for moe_sum.
     intermediate_cache2 = torch.empty(
         (M * top_k_num, N // 2), device=hidden_states.device, dtype=hidden_states.dtype
     )
@@ -220,6 +184,11 @@ def fused_experts_impl(
     # Due to the implementation of 0.20.0 relying on per_token_group_quant,
     # which is currently not supported by Musa, please refer to setup.py for details.
     # The version used here is 0.18.0
+    logger.info_once(
+        "MUSA fused MoE uses native GEMV block selection; skipping upstream "
+        "Triton MoE JSON config lookup.",
+        scope="global",
+    )
     CHUNK_SIZE = 16384
     M = min(num_tokens, CHUNK_SIZE)
     for chunk in range((num_tokens // CHUNK_SIZE) + 1):
@@ -238,14 +207,6 @@ def fused_experts_impl(
         ]
         curr_intermediate_cache3 = intermediate_cache3[:tokens_in_chunk]
         curr_out_hidden_states = out_hidden_states[begin_chunk_idx:end_chunk_idx]
-
-        if tokens_in_chunk < CHUNK_SIZE and chunk > 0:
-            # Adjust the intermediate cache size and config for the last
-            # chunk. Note that in most cases we only have one chunk
-            # so the cache size and config are already set correctly and
-            # do not need to be adjusted.
-            intermediate_cache1 = intermediate_cache1[:tokens_in_chunk]
-            config = get_config_func(tokens_in_chunk)
 
         curr_topk_ids = topk_ids[begin_chunk_idx:end_chunk_idx]
         curr_topk_weights = topk_weights[begin_chunk_idx:end_chunk_idx]
