@@ -148,8 +148,10 @@ void musa_reshape_and_cache_flash_nhd(torch::Tensor& key, torch::Tensor& value,
               "value/value_cache dtype mismatch");
   TORCH_CHECK(slot_mapping.scalar_type() == at::ScalarType::Long,
               "slot_mapping must be int64");
-  TORCH_CHECK(key.is_contiguous(), "key must be contiguous");
-  TORCH_CHECK(value.is_contiguous(), "value must be contiguous");
+  TORCH_CHECK(key.stride(2) == 1 && key.stride(1) == key.size(2),
+              "key head/head_size dimensions must be contiguous");
+  TORCH_CHECK(value.stride(2) == 1 && value.stride(1) == value.size(2),
+              "value head/head_size dimensions must be contiguous");
   TORCH_CHECK(key_cache.size(0) == value_cache.size(0),
               "key/value cache block count mismatch");
   TORCH_CHECK(key_cache.size(1) == value_cache.size(1),

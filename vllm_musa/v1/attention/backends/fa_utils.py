@@ -33,17 +33,33 @@ if current_platform.is_musa():
     ) -> bool:
         # Keep this guard cheap: the native op has full TORCH_CHECK coverage.
         # Python only filters known fallback cases that are valid upstream.
+        head_size = key.shape[2] if key.dim() == 3 else None
         return (
             _USE_NATIVE_RESHAPE_CACHE_FLASH
             and _HAS_NATIVE_RESHAPE_CACHE_FLASH
             and kv_cache_dtype in ("auto", "float16", "bfloat16")
             and key.dtype in (torch.float16, torch.bfloat16)
+            and key.dim() == 3
+            and value.dim() == 3
+            and head_size is not None
+            and head_size % 8 == 0
+            and key.stride(2) == 1
+            and value.stride(2) == 1
+            and key.stride(1) == head_size
+            and value.stride(1) == value.shape[2]
             and k_scale.numel() == 1
             and v_scale.numel() == 1
             and key_cache.dim() == 4
             and value_cache.dim() == 4
+            and key_cache.stride(3) == 1
+            and value_cache.stride(3) == 1
             and key_cache.stride(2) == key_cache.shape[3]
             and value_cache.stride(2) == value_cache.shape[3]
+            and key_cache.stride(1) == key_cache.shape[2] * key_cache.shape[3]
+            and (
+                value_cache.stride(1)
+                == value_cache.shape[2] * value_cache.shape[3]
+            )
         )
 
     def reshape_and_cache_flash(
