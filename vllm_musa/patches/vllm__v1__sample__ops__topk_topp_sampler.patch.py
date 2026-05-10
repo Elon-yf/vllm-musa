@@ -82,7 +82,7 @@ def apply_top_k_top_p(
 
     if current_platform.is_musa() and _musa_sampler_fast_path_enabled():
         if k is not None and logits.shape[0] >= 16:
-            if p is None:
+            if p is None and logits.shape[1] >= 65536:
                 max_top_k = int(k.to(torch.long).max().item())
                 if 0 < max_top_k <= 1024:
                     return apply_top_k_only(logits, k)
