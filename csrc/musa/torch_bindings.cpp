@@ -29,6 +29,12 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _musa_ops), musa_ops) {
                 &musa_fused_add_rms_norm);
 
   musa_ops.def(
+      "musa_reshape_and_cache_flash_nhd(Tensor key, Tensor value, "
+      "Tensor! key_cache, Tensor! value_cache, Tensor slot_mapping) -> ()");
+  musa_ops.impl("musa_reshape_and_cache_flash_nhd", torch::kMUSA,
+                &musa_reshape_and_cache_flash_nhd);
+
+  musa_ops.def(
       "per_token_group_fp8_quant(Tensor input, Tensor! output_q, Tensor! "
       "output_s, "
       "int group_size, float eps, float fp8_min, float fp8_max, bool "

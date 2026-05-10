@@ -36,6 +36,13 @@ void musa_fused_add_rms_norm(
     torch::Tensor &weight,
     double eps);
 
+void musa_reshape_and_cache_flash_nhd(
+    torch::Tensor &key,
+    torch::Tensor &value,
+    torch::Tensor &key_cache,
+    torch::Tensor &value_cache,
+    torch::Tensor &slot_mapping);
+
 void per_token_group_quant_fp8(
     const torch::Tensor& input,
     torch::Tensor& output_q, torch::Tensor& output_s,

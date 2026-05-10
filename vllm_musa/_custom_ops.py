@@ -138,3 +138,19 @@ def musa_fused_add_rms_norm(
         weight,
         eps,
     )
+
+
+def musa_reshape_and_cache_flash_nhd(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    return torch.ops._C_musa_ops.musa_reshape_and_cache_flash_nhd(
+        key,
+        value,
+        key_cache,
+        value_cache,
+        slot_mapping,
+    )
