@@ -129,6 +129,29 @@ class TestCustomAllReducePatch:
             raise AssertionError("custom_all_reduce patch file was not found")
 
 
+class TestSamplerPatch:
+    """Tests for the MUSA top-k/top-p sampler patch."""
+
+    def test_sampler_patch_keeps_triton_guard_and_fast_path_gate(self):
+        from vllm_musa.patches import _get_patch_files, _load_patch_config
+
+        patch_files = _get_patch_files()
+
+        for module_name, patch_path in patch_files:
+            if module_name == "vllm.v1.sample.ops.topk_topp_sampler":
+                patches = _load_patch_config(patch_path)
+                new_source = "\n".join(new for _, new in patches)
+
+                assert "not current_platform.is_musa()" in new_source
+                assert "VLLM_MUSA_SAMPLER_FAST_PATH" in new_source
+                assert "_apply_top_k_top_p_musa_topk_prefilter" in new_source
+                assert "logits.shape[0] >= 16" in new_source
+                assert "logits.shape[1] >= 65536" in new_source
+                break
+        else:
+            raise AssertionError("topk_topp_sampler patch file was not found")
+
+
 class TestApplyPatches:
     """Tests for the apply_patches function."""
 
