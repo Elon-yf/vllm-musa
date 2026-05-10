@@ -23,6 +23,12 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _musa_ops), musa_ops) {
   musa_ops.impl("musa_fused_gemv", torch::kMUSA, &musa_fused_gemv);
 
   musa_ops.def(
+      "musa_fused_add_rms_norm(Tensor! input, Tensor! residual, Tensor weight, "
+      "float eps) -> ()");
+  musa_ops.impl("musa_fused_add_rms_norm", torch::kMUSA,
+                &musa_fused_add_rms_norm);
+
+  musa_ops.def(
       "per_token_group_fp8_quant(Tensor input, Tensor! output_q, Tensor! "
       "output_s, "
       "int group_size, float eps, float fp8_min, float fp8_max, bool "

@@ -30,6 +30,12 @@ void musa_fused_gemv(
     const c10::optional<torch::Tensor> &gamma,
     double eps);
 
+void musa_fused_add_rms_norm(
+    torch::Tensor &input,
+    torch::Tensor &residual,
+    torch::Tensor &weight,
+    double eps);
+
 void per_token_group_quant_fp8(
     const torch::Tensor& input,
     torch::Tensor& output_q, torch::Tensor& output_s,

@@ -124,3 +124,17 @@ def musa_fused_gemv(
             eps,
         )
         return output
+
+
+def musa_fused_add_rms_norm(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> None:
+    return torch.ops._C_musa_ops.musa_fused_add_rms_norm(
+        input,
+        residual,
+        weight,
+        eps,
+    )
