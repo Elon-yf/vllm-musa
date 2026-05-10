@@ -30,6 +30,50 @@ _MUSA_GUARDED_APPLY_TOP_K_TOP_P = """def apply_top_k_top_p(
     return apply_top_k_top_p_pytorch(logits, k, p)
 """
 
+_MUSA_FAST_APPLY_TOP_K_TOP_P_WITHOUT_VOCAB_GATE = """def apply_top_k_top_p(
+    logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
+) -> torch.Tensor:
+    if p is None and k is None:
+        return logits
+
+    if current_platform.is_musa() and _musa_sampler_fast_path_enabled():
+        if k is not None and logits.shape[0] >= 16:
+            if p is None:
+                max_top_k = int(k.to(torch.long).max().item())
+                if 0 < max_top_k <= 1024:
+                    return apply_top_k_only(logits, k)
+            elif logits.shape[1] >= 65536:
+                return _apply_top_k_top_p_musa_topk_prefilter(logits, k, p)
+
+    if HAS_TRITON and logits.shape[0] >= 8 and not current_platform.is_musa():
+        return apply_top_k_top_p_triton(logits, k, p)
+
+    # Use pytorch sort implementation for small batch sizes.
+    return apply_top_k_top_p_pytorch(logits, k, p)
+"""
+
+_MUSA_FAST_APPLY_TOP_K_TOP_P_FUNCTION_ONLY = """def apply_top_k_top_p(
+    logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
+) -> torch.Tensor:
+    if p is None and k is None:
+        return logits
+
+    if current_platform.is_musa() and _musa_sampler_fast_path_enabled():
+        if k is not None and logits.shape[0] >= 16:
+            if p is None and logits.shape[1] >= 65536:
+                max_top_k = int(k.to(torch.long).max().item())
+                if 0 < max_top_k <= 1024:
+                    return apply_top_k_only(logits, k)
+            elif logits.shape[1] >= 65536:
+                return _apply_top_k_top_p_musa_topk_prefilter(logits, k, p)
+
+    if HAS_TRITON and logits.shape[0] >= 8 and not current_platform.is_musa():
+        return apply_top_k_top_p_triton(logits, k, p)
+
+    # Use pytorch sort implementation for small batch sizes.
+    return apply_top_k_top_p_pytorch(logits, k, p)
+"""
+
 _MUSA_FAST_APPLY_TOP_K_TOP_P = """def _musa_sampler_fast_path_enabled() -> bool:
     value = __import__("os").environ.get("VLLM_MUSA_SAMPLER_FAST_PATH", "1")
     return value.lower() not in ("0", "false", "no", "off")
@@ -102,4 +146,8 @@ PATCHES = [
     # correctness-preserving top-k prefilter for large decode batches.
     (_ORIGINAL_APPLY_TOP_K_TOP_P, _MUSA_FAST_APPLY_TOP_K_TOP_P),
     (_MUSA_GUARDED_APPLY_TOP_K_TOP_P, _MUSA_FAST_APPLY_TOP_K_TOP_P),
+    (
+        _MUSA_FAST_APPLY_TOP_K_TOP_P_WITHOUT_VOCAB_GATE,
+        _MUSA_FAST_APPLY_TOP_K_TOP_P_FUNCTION_ONLY,
+    ),
 ]
