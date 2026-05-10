@@ -42,6 +42,13 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _musa_ops), musa_ops) {
       ") -> ()");
   musa_ops.impl("per_token_group_fp8_quant", torch::kMUSA,
            &per_token_group_quant_fp8);
+
+  musa_ops.def(
+      "silu_and_mul_per_token_group_fp8_quant(Tensor input, Tensor! output_q, "
+      "Tensor! output_s, int group_size, float eps, float fp8_min, "
+      "float fp8_max) -> ()");
+  musa_ops.impl("silu_and_mul_per_token_group_fp8_quant", torch::kMUSA,
+                &silu_and_mul_per_token_group_fp8_quant);
 #endif
 }
 
