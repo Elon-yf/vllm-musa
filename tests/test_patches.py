@@ -238,9 +238,8 @@ class TestCompilationCachingPatch:
                 new_source = "\n".join(new for _, new in patches)
 
                 assert "GraphPickler, Options" in old_source
-                assert "except ImportError" in new_source
-                assert "Options = None" in new_source
-                assert "GraphPickler.dumps(graph_module)" in new_source
+                assert "getattr(_vllm_graph_pickler, \"Options\", None)" in new_source
+                assert "_musa_graph_pickler_dumps" in new_source
                 break
         else:
             raise AssertionError("compilation caching patch file was not found")
