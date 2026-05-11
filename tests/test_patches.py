@@ -194,6 +194,9 @@ class TestCompilationBackendPatch:
 
                 assert "example_inputs: Sequence[Any]) -> Any" in old_source
                 assert "**kwargs: Any" in new_source
+                assert "autograd_cache_normalize_inputs=True" in old_source
+                assert "functorch_cache_key_ctx" in new_source
+                assert "hasattr(" in new_source
                 break
         else:
             raise AssertionError("compilation backend patch file was not found")
@@ -221,6 +224,36 @@ class TestCompilationBackendPatch:
             "graph",
             ["input"],
         )
+
+    def test_live_functorch_config_patch_skips_missing_keys(self):
+        from contextlib import nullcontext
+
+        import vllm_musa
+
+        calls = []
+
+        def original_patch(*args, **kwargs):
+            calls.append((args, kwargs))
+            return nullcontext()
+
+        functorch_config = SimpleNamespace(existing_key=True)
+        patched = vllm_musa._make_functorch_config_patch(
+            original_patch, functorch_config
+        )
+
+        with patched(missing_key=False):
+            pass
+        with patched("missing_key", True):
+            pass
+        with patched({"existing_key": True, "missing_key": False}):
+            pass
+        with patched(existing_key=True):
+            pass
+
+        assert calls == [
+            (({"existing_key": True},), {}),
+            ((), {"existing_key": True}),
+        ]
 
 
 class TestCompilationCachingPatch:
@@ -296,6 +329,28 @@ class TestCompilationCompilerInterfacePatch:
 
         config = DummyCompilerInterface._get_vllm_functorch_config()
         assert config == {"existing_key": True}
+
+
+class TestCompilationPiecewiseBackendPatch:
+    """Tests for MUSA piecewise backend compile-cache compatibility patches."""
+
+    def test_piecewise_backend_patch_skips_missing_bundled_cache_key(self):
+        from vllm_musa.patches import _get_patch_files, _load_patch_config
+
+        patch_files = _get_patch_files()
+
+        for module_name, patch_path in patch_files:
+            if module_name == "vllm.compilation.piecewise_backend":
+                patches = _load_patch_config(patch_path)
+                old_source = "\n".join(old for old, _ in patches)
+                new_source = "\n".join(new for _, new in patches)
+
+                assert '"bundled_autograd_cache", True' in old_source
+                assert "functorch_cache_ctx" in new_source
+                assert "nullcontext" in new_source
+                break
+        else:
+            raise AssertionError("compilation piecewise_backend patch was not found")
 
 
 class TestMUSAFusedMoEFP8Scales:

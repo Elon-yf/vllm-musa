@@ -13,6 +13,7 @@ Usage:
 """
 
 import logging
+from contextlib import nullcontext
 from functools import wraps
 from typing import Any
 
@@ -125,6 +126,46 @@ def _filter_existing_functorch_config(
     }
 
 
+def _make_functorch_config_patch(original_patch: Any, functorch_config: Any) -> Any:
+    @wraps(original_patch)
+    def patch_existing_config(*args: Any, **kwargs: Any) -> Any:
+        if args and isinstance(args[0], dict):
+            config = _filter_existing_functorch_config(args[0], functorch_config)
+            if not config and not kwargs:
+                return nullcontext()
+            args = (config, *args[1:])
+        elif args and isinstance(args[0], str):
+            if not hasattr(functorch_config, args[0]):
+                return nullcontext()
+
+        if kwargs:
+            kwargs = _filter_existing_functorch_config(kwargs, functorch_config)
+            if not args and not kwargs:
+                return nullcontext()
+
+        return original_patch(*args, **kwargs)
+
+    patch_existing_config._musa_filters_functorch_patch = True
+    return patch_existing_config
+
+
+def _patch_functorch_config_patch() -> None:
+    """Ignore missing functorch config keys in vLLM compile contexts."""
+    try:
+        from torch._functorch import config as functorch_config
+    except Exception as e:
+        logger.debug("Skipping functorch config.patch patch: %s", e)
+        return
+
+    original_patch = functorch_config.patch
+    if getattr(original_patch, "_musa_filters_functorch_patch", False):
+        return
+
+    functorch_config.patch = _make_functorch_config_patch(
+        original_patch, functorch_config
+    )
+
+
 def _patch_vllm_functorch_config() -> None:
     """Filter vLLM functorch config overrides for this Torch version."""
     try:
@@ -143,7 +184,7 @@ def _patch_vllm_functorch_config() -> None:
         return
 
     @wraps(original_get_config)
-    def get_existing_functorch_config():
+    def get_existing_functorch_config() -> dict[str, Any]:
         return _filter_existing_functorch_config(
             original_get_config(), functorch_config
         )
@@ -155,6 +196,7 @@ def _patch_vllm_functorch_config() -> None:
 def _register_patches() -> None:
     """Apply vLLM source patches for MUSA compatibility."""
     _apply_vllm_patches()
+    _patch_functorch_config_patch()
     _patch_vllm_backend_call_options()
     _patch_vllm_functorch_config()
 
