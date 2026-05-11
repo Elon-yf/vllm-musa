@@ -4,6 +4,8 @@
 import torch
 import torch.nn.functional as F
 from vllm.model_executor.layers import utils as vllm_layer_utils
+from vllm.model_executor.layers import linear as vllm_linear
+from vllm.model_executor.layers import vocab_parallel_embedding as vllm_vocab_embedding
 from vllm.utils.torch_utils import direct_register_custom_op
 
 
@@ -54,3 +56,5 @@ if not getattr(
 ):
     _dispatch_unquantized_gemm._musa_dispatches_unquantized_gemm = True
     vllm_layer_utils.dispatch_unquantized_gemm = _dispatch_unquantized_gemm
+    vllm_linear.dispatch_unquantized_gemm = _dispatch_unquantized_gemm
+    vllm_vocab_embedding.dispatch_unquantized_gemm = _dispatch_unquantized_gemm

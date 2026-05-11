@@ -541,6 +541,7 @@ class TestScaledMMKernelPatch:
         assert '"musa_unquantized_gemm"' in source
         assert "_musa_unquantized_gemm_op_fake" in source
         assert "dispatch_unquantized_gemm = _dispatch_unquantized_gemm" in source
+        assert "vllm_linear.dispatch_unquantized_gemm" in source
 
     def test_scaled_mm_patch_registers_musa_fp8_kernel_fallbacks(self):
         from vllm_musa.patches import _get_patch_files, _load_patch_config
