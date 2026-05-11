@@ -14,6 +14,7 @@ Usage:
 
 import logging
 from functools import wraps
+from typing import Any
 
 __all__ = [
     "MUSAPlatform",
@@ -115,10 +116,47 @@ def _patch_vllm_backend_call_options() -> None:
     VllmBackend.__call__ = call_with_ignored_options
 
 
+def _filter_existing_functorch_config(
+    config: dict[str, Any], functorch_config: Any
+) -> dict[str, Any]:
+    """Drop functorch config keys that are absent in the installed Torch."""
+    return {
+        key: value for key, value in config.items() if hasattr(functorch_config, key)
+    }
+
+
+def _patch_vllm_functorch_config() -> None:
+    """Filter vLLM functorch config overrides for this Torch version."""
+    try:
+        import importlib
+
+        compiler_interface = importlib.import_module(
+            "vllm.compilation.compiler_interface"
+        )
+        from torch._functorch import config as functorch_config
+    except Exception as e:
+        logger.debug("Skipping functorch config patch: %s", e)
+        return
+
+    original_get_config = compiler_interface._get_vllm_functorch_config
+    if getattr(original_get_config, "_musa_filters_functorch_config", False):
+        return
+
+    @wraps(original_get_config)
+    def get_existing_functorch_config():
+        return _filter_existing_functorch_config(
+            original_get_config(), functorch_config
+        )
+
+    get_existing_functorch_config._musa_filters_functorch_config = True
+    compiler_interface._get_vllm_functorch_config = get_existing_functorch_config
+
+
 def _register_patches() -> None:
     """Apply vLLM source patches for MUSA compatibility."""
     _apply_vllm_patches()
     _patch_vllm_backend_call_options()
+    _patch_vllm_functorch_config()
 
 
 def _register_ops() -> None:

@@ -245,6 +245,59 @@ class TestCompilationCachingPatch:
             raise AssertionError("compilation caching patch file was not found")
 
 
+class TestCompilationCompilerInterfacePatch:
+    """Tests for MUSA torch compiler-interface compatibility patches."""
+
+    def test_functorch_config_patch_filters_missing_torch_keys(self):
+        from vllm_musa.patches import _get_patch_files, _load_patch_config
+
+        patch_files = _get_patch_files()
+
+        for module_name, patch_path in patch_files:
+            if module_name == "vllm.compilation.compiler_interface":
+                patches = _load_patch_config(patch_path)
+                old_source = "\n".join(old for old, _ in patches)
+                new_source = "\n".join(new for _, new in patches)
+
+                assert 'cfg["bundled_autograd_cache"] = False' in old_source
+                assert "hasattr(functorch_config, key)" in new_source
+                break
+        else:
+            raise AssertionError("compilation compiler_interface patch was not found")
+
+    def test_live_functorch_config_patch_filters_missing_keys(self, monkeypatch):
+        import sys
+
+        import vllm_musa
+
+        class DummyCompilerInterface:
+            @staticmethod
+            def _get_vllm_functorch_config():
+                return {"existing_key": True, "missing_key": False}
+
+        monkeypatch.setitem(
+            sys.modules,
+            "vllm.compilation.compiler_interface",
+            DummyCompilerInterface,
+        )
+
+        dummy_functorch_config = SimpleNamespace(existing_key=True)
+        monkeypatch.setattr(
+            vllm_musa,
+            "_filter_existing_functorch_config",
+            lambda config, functorch_config: {
+                key: value
+                for key, value in config.items()
+                if hasattr(dummy_functorch_config, key)
+            },
+        )
+
+        vllm_musa._patch_vllm_functorch_config()
+
+        config = DummyCompilerInterface._get_vllm_functorch_config()
+        assert config == {"existing_key": True}
+
+
 class TestMUSAFusedMoEFP8Scales:
     """Tests for MUSA FP8 MoE scale adaptation helpers."""
 
