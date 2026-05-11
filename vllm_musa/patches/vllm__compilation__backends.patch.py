@@ -6,8 +6,8 @@ Patch for vllm.compilation.backends.
 
 PATCHES = [
     (
-        "from contextlib import contextmanager",
-        "from contextlib import contextmanager, nullcontext",
+        "from contextlib import contextmanager\n",
+        "from contextlib import contextmanager, nullcontext\n",
     ),
     (
         "def __call__(self, graph: fx.GraphModule, example_inputs: Sequence[Any]) -> Any:",

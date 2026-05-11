@@ -6,8 +6,8 @@ Patch for vllm.compilation.piecewise_backend.
 
 PATCHES = [
     (
-        "import pickle\nfrom collections.abc import Callable",
-        "import pickle\nfrom collections.abc import Callable\nfrom contextlib import nullcontext",
+        "import pickle\nfrom collections.abc import Callable\nfrom pickle import Pickler",
+        "import pickle\nfrom collections.abc import Callable\nfrom contextlib import nullcontext\nfrom pickle import Pickler",
     ),
     (
         """            with torch._functorch.config.patch("bundled_autograd_cache", True):
