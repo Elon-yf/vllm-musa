@@ -157,11 +157,11 @@ def _patch_functorch_config_patch() -> None:
         logger.debug("Skipping functorch config.patch patch: %s", e)
         return
 
-    original_patch = functorch_config.patch
+    original_patch = functorch_config.__dict__.get("patch", functorch_config.patch)
     if getattr(original_patch, "_musa_filters_functorch_patch", False):
         return
 
-    functorch_config.patch = _make_functorch_config_patch(
+    functorch_config.__dict__["patch"] = _make_functorch_config_patch(
         original_patch, functorch_config
     )
 
