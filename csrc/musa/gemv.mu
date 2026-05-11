@@ -513,6 +513,51 @@ struct BlockConfig {
     bool valid;
 };
 
+BlockConfig select_block_config(
+    int current_arch,
+    int reduce_size,
+    int hidden_size,
+    int vlen,
+    int scale_k_group_tile,
+    bool is_fp8) {
+    BlockConfig configs[] = {
+        {8, 16, 0.f, false},
+        {16, 8, 0.f, false},
+        {32, 4, 0.f, false},
+        {4, 32, 0.f, false},
+        {8, 8, 0.f, false},
+    };
+
+    float target_ratio = static_cast<float>(reduce_size) / hidden_size;
+
+    for (auto& config : configs) {
+        int load_size = config.block_k * vlen;
+        config.valid = (reduce_size % config.block_n == 0) &&
+                       (hidden_size % load_size == 0) &&
+                       (load_size % scale_k_group_tile == 0);
+        if (config.block_n == 8 && config.block_k == 8) {
+            config.valid = config.valid && is_fp8 && scale_k_group_tile == 128;
+        }
+
+        if (config.valid) {
+            float block_ratio = static_cast<float>(config.block_n) / config.block_k;
+            config.score = 1.0f / (1.0f + fabsf(block_ratio - target_ratio));
+        }
+    }
+
+    BlockConfig best_config{32, 1, -1.0f, false};
+    if (current_arch < 300) {
+        best_config = {128, 1, -1.0f, false};
+    }
+    for (auto& config : configs) {
+        if (config.valid && config.score > best_config.score) {
+            best_config = config;
+        }
+    }
+
+    return best_config;
+}
+
 void musa_fused_gemv(
     torch::Tensor &A,
     torch::Tensor &B,
@@ -597,69 +642,44 @@ void musa_fused_gemv(
 
     std::function<void()> launch_kernel;
 
-    BlockConfig configs[] = {
-        {8, 16, 0.f, false},
-        {16, 8, 0.f, false},
-        {32, 4, 0.f, false},
-        {4, 32, 0.f, false},
-    };
-
     constexpr int iobit = 128;
     const int bits_of_byte = 8;
     const int vlen = use_int4_w4a16 ?
                       (iobit / 4):
                       (iobit / (torch::elementSize(B.scalar_type()) * bits_of_byte));
 
-    float target_ratio = static_cast<float>(reduce_size) / hidden_size;
+    BlockConfig best_config = select_block_config(
+        current_arch, reduce_size, hidden_size, vlen, scale_k_group_tile, is_fp8);
 
-    for (auto& config : configs) {
-        int load_size = config.block_k * vlen;
-        config.valid = (reduce_size % config.block_n == 0) && (hidden_size % load_size == 0) && (load_size % scale_k_group_tile == 0);
-
-        if (config.valid) {
-            float block_ratio = static_cast<float>(config.block_n) / config.block_k;
-            config.score = 1.0f / (1.0f + fabsf(block_ratio - target_ratio));
-        }
-    }
-
-    BlockConfig* best_config = new BlockConfig{32, 1, -1.0f, false};
-    if (current_arch < 300) {
-        best_config = new BlockConfig{128, 1, -1.0f, false};
-    }
-    for (auto& config : configs) {
-        if (config.valid && config.score > best_config->score) {
-            best_config = &config;
-        }
-    }
-
-    switch (best_config->block_n) {
+    switch (best_config.block_n) {
         case 4:
-            switch (best_config->block_k) {
+            switch (best_config.block_k) {
                 case 32: GEN_LAUNCH_KERN_GEMV(4, 32); break;
                 default: TORCH_CHECK(false, "Unsupported block_k for block_n=4");
             }
             break;
         case 8:
-            switch (best_config->block_k) {
+            switch (best_config.block_k) {
                 case 16: GEN_LAUNCH_KERN_GEMV(8, 16); break;
+                case 8: GEN_LAUNCH_KERN_GEMV(8, 8); break;
                 default: TORCH_CHECK(false, "Unsupported block_k for block_n=8");
             }
             break;
         case 16:
-            switch (best_config->block_k) {
+            switch (best_config.block_k) {
                 case 8: GEN_LAUNCH_KERN_GEMV(16, 8); break;
                 default: TORCH_CHECK(false, "Unsupported block_k for block_n=16");
             }
             break;
         case 32:
-            switch (best_config->block_k) {
+            switch (best_config.block_k) {
                 case 4: GEN_LAUNCH_KERN_GEMV(32, 4); break;
                 case 1: GEN_LAUNCH_KERN_GEMV(32, 1); break;
                 default: TORCH_CHECK(false, "Unsupported block_k for block_n=32");
             }
             break;
         case 128:
-            switch (best_config->block_k) {
+            switch (best_config.block_k) {
                 case 1: GEN_LAUNCH_KERN_GEMV(128, 1);
                     break;
                 default: TORCH_CHECK(false, "Unsupported block_k for block_n=128");
@@ -750,70 +770,44 @@ void musa_fused_gemv_moe(
 
     std::function<void()> launch_kernel;
 
-    BlockConfig configs[] = {
-        {8, 16, 0.f, false},
-        {16, 8, 0.f, false},
-        {32, 4, 0.f, false},
-        {4, 32, 0.f, false},
-    };
-
     constexpr int iobit = 128;
     const int bits_of_byte = 8;
     const int vlen = use_int4_w4a16 ?
                       (iobit / 4):
                       (iobit / (torch::elementSize(B.scalar_type()) * bits_of_byte));
 
-    float target_ratio = static_cast<float>(reduce_size) / hidden_size;
+    BlockConfig best_config = select_block_config(
+        current_arch, reduce_size, hidden_size, vlen, scale_k_group_tile, is_fp8);
 
-    for (auto& config : configs) {
-        int load_size = config.block_k * vlen;
-        config.valid = (reduce_size % config.block_n == 0) && (hidden_size % load_size == 0) && (load_size % scale_k_group_tile == 0);
-
-        if (config.valid) {
-            float block_ratio = static_cast<float>(config.block_n) / config.block_k;
-            config.score = 1.0f / (1.0f + fabsf(block_ratio - target_ratio));
-        }
-    }
-
-    BlockConfig* best_config = new BlockConfig{32, 1, -1.0f, false};
-    if (current_arch < 300) {
-        best_config = new BlockConfig{128, 1, -1.0f, false};
-    }
-
-    for (auto& config : configs) {
-        if (config.valid && config.score > best_config->score) {
-            best_config = &config;
-        }
-    }
-
-    switch (best_config->block_n) {
+    switch (best_config.block_n) {
         case 4:
-            switch (best_config->block_k) {
+            switch (best_config.block_k) {
                 case 32: GEN_LAUNCH_KERN(4, 32); break;
                 default: TORCH_CHECK(false, "Unsupported block_k for block_n=4");
             }
             break;
         case 8:
-            switch (best_config->block_k) {
+            switch (best_config.block_k) {
                 case 16: GEN_LAUNCH_KERN(8, 16); break;
+                case 8: GEN_LAUNCH_KERN(8, 8); break;
                 default: TORCH_CHECK(false, "Unsupported block_k for block_n=8");
             }
             break;
         case 16:
-            switch (best_config->block_k) {
+            switch (best_config.block_k) {
                 case 8: GEN_LAUNCH_KERN(16, 8); break;
                 default: TORCH_CHECK(false, "Unsupported block_k for block_n=16");
             }
             break;
         case 32:
-            switch (best_config->block_k) {
+            switch (best_config.block_k) {
                 case 4: GEN_LAUNCH_KERN(32, 4); break;
                 case 1: GEN_LAUNCH_KERN(32, 1); break;
                 default: TORCH_CHECK(false, "Unsupported block_k for block_n=32");
             }
             break;
         case 128:
-            switch (best_config->block_k) {
+            switch (best_config.block_k) {
                 case 1: GEN_LAUNCH_KERN(128, 1); break;
                 default: TORCH_CHECK(false, "Unsupported block_k for block_n=128");
             }
