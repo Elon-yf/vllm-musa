@@ -13,6 +13,7 @@ Usage:
 """
 
 import logging
+from functools import wraps
 
 __all__ = [
     "MUSAPlatform",
@@ -94,9 +95,30 @@ def _apply_vllm_patches() -> None:
     _patches_applied = True
 
 
+def _patch_vllm_backend_call_options() -> None:
+    """Accept torch.compile backend keyword options on this vLLM snapshot."""
+    try:
+        from vllm.compilation.backends import VllmBackend
+    except Exception as e:
+        logger.debug("Skipping VllmBackend options patch: %s", e)
+        return
+
+    original_call = VllmBackend.__call__
+    if getattr(original_call, "_musa_accepts_backend_options", False):
+        return
+
+    @wraps(original_call)
+    def call_with_ignored_options(self, graph, example_inputs, **kwargs):
+        return original_call(self, graph, example_inputs)
+
+    call_with_ignored_options._musa_accepts_backend_options = True
+    VllmBackend.__call__ = call_with_ignored_options
+
+
 def _register_patches() -> None:
     """Apply vLLM source patches for MUSA compatibility."""
     _apply_vllm_patches()
+    _patch_vllm_backend_call_options()
 
 
 def _register_ops() -> None:

@@ -178,6 +178,51 @@ class TestDeepGemmPatch:
             raise AssertionError("deep_gemm patch file was not found")
 
 
+class TestCompilationBackendPatch:
+    """Tests for MUSA torch.compile backend compatibility patches."""
+
+    def test_vllm_backend_patch_accepts_torch_compile_options(self):
+        from vllm_musa.patches import _get_patch_files, _load_patch_config
+
+        patch_files = _get_patch_files()
+
+        for module_name, patch_path in patch_files:
+            if module_name == "vllm.compilation.backends":
+                patches = _load_patch_config(patch_path)
+                old_source = "\n".join(old for old, _ in patches)
+                new_source = "\n".join(new for _, new in patches)
+
+                assert "example_inputs: Sequence[Any]) -> Any" in old_source
+                assert "**kwargs: Any" in new_source
+                break
+        else:
+            raise AssertionError("compilation backend patch file was not found")
+
+    def test_live_vllm_backend_patch_ignores_options_kwarg(self, monkeypatch):
+        import vllm_musa
+
+        class DummyBackend:
+            def __call__(self, graph, example_inputs):
+                return graph, example_inputs
+
+        class DummyModule:
+            VllmBackend = DummyBackend
+
+        monkeypatch.setitem(
+            __import__("sys").modules,
+            "vllm.compilation.backends",
+            DummyModule,
+        )
+
+        vllm_musa._patch_vllm_backend_call_options()
+
+        backend = DummyBackend()
+        assert backend("graph", ["input"], options={"ignored": True}) == (
+            "graph",
+            ["input"],
+        )
+
+
 class TestMUSAFusedMoEFP8Scales:
     """Tests for MUSA FP8 MoE scale adaptation helpers."""
 
