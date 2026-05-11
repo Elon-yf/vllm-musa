@@ -373,6 +373,86 @@ class TestAttentionCompilePatch:
             raise AssertionError("attention compile patch file was not found")
 
 
+class TestMUSAPlatformDefaults:
+    """Tests for MUSA platform-level vLLM config defaults."""
+
+    def _make_vllm_config(
+        self,
+        *,
+        architectures=None,
+        quantization="fp8",
+        quantization_config=None,
+        max_cudagraph_capture_size=None,
+        cudagraph_capture_sizes=None,
+    ):
+        from types import SimpleNamespace
+
+        hf_config = SimpleNamespace(
+            architectures=architectures,
+            quantization_config=quantization_config,
+        )
+        return SimpleNamespace(
+            model_config=SimpleNamespace(
+                architectures=architectures,
+                hf_config=hf_config,
+                quantization=quantization,
+            ),
+            compilation_config=SimpleNamespace(
+                custom_ops=[],
+                max_cudagraph_capture_size=max_cudagraph_capture_size,
+                cudagraph_capture_sizes=cudagraph_capture_sizes,
+            ),
+        )
+
+    def test_qwen3_moe_fp8_caps_default_cudagraph_capture_size(self):
+        from vllm_musa.platform import MUSAPlatformBase
+
+        vllm_config = self._make_vllm_config(
+            architectures=["Qwen3MoeForCausalLM"],
+        )
+
+        MUSAPlatformBase.apply_config_platform_defaults(vllm_config)
+
+        assert vllm_config.compilation_config.max_cudagraph_capture_size == 64
+        assert vllm_config.compilation_config.custom_ops == ["all"]
+
+    def test_qwen3_moe_fp8_preserves_user_cudagraph_capture_size(self):
+        from vllm_musa.platform import MUSAPlatformBase
+
+        vllm_config = self._make_vllm_config(
+            architectures=["Qwen3MoeForCausalLM"],
+            max_cudagraph_capture_size=128,
+        )
+
+        MUSAPlatformBase.apply_config_platform_defaults(vllm_config)
+
+        assert vllm_config.compilation_config.max_cudagraph_capture_size == 128
+
+    def test_qwen3_moe_fp8_preserves_user_cudagraph_capture_sizes(self):
+        from vllm_musa.platform import MUSAPlatformBase
+
+        vllm_config = self._make_vllm_config(
+            architectures=["Qwen3MoeForCausalLM"],
+            cudagraph_capture_sizes=[1, 2, 4, 8],
+        )
+
+        MUSAPlatformBase.apply_config_platform_defaults(vllm_config)
+
+        assert vllm_config.compilation_config.max_cudagraph_capture_size is None
+        assert vllm_config.compilation_config.cudagraph_capture_sizes == [1, 2, 4, 8]
+
+    def test_dense_fp8_does_not_cap_cudagraph_capture_size(self):
+        from vllm_musa.platform import MUSAPlatformBase
+
+        vllm_config = self._make_vllm_config(
+            architectures=["Qwen3ForCausalLM"],
+        )
+
+        MUSAPlatformBase.apply_config_platform_defaults(vllm_config)
+
+        assert vllm_config.compilation_config.max_cudagraph_capture_size is None
+
+
 class TestMUSAFusedMoEFP8Scales:
     """Tests for MUSA FP8 MoE scale adaptation helpers."""
 
