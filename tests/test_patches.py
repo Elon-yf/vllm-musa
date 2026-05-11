@@ -531,18 +531,18 @@ class TestScaledMMKernelPatch:
 
         assert MUSAPerTensorTorchFP8ScaledMMLinearKernel.get_output_padding(None) is None
 
-    def test_musa_unquantized_gemm_uses_custom_op_for_compile(self):
+    def test_musa_unquantized_gemm_materializes_plain_parameter_for_compile(self):
         source = (
             Path(__file__).parents[1] / "vllm_musa/model_executor/layers/utils.py"
         ).read_text()
 
-        assert "torch.ops.vllm.musa_unquantized_gemm" in source
-        assert "DisableTorchFunction" in source
-        assert "direct_register_custom_op(" in source
-        assert '"musa_unquantized_gemm"' in source
-        assert "_musa_unquantized_gemm_op_fake" in source
-        assert "dispatch_unquantized_gemm = _dispatch_unquantized_gemm" in source
-        assert "vllm_linear.dispatch_unquantized_gemm" in source
+        assert "BasevLLMParameter" in source
+        assert "torch.nn.Parameter(weight.detach(), requires_grad=False)" in source
+        assert "plain_weight.__dict__.update(weight.__dict__)" in source
+        assert "current_platform.is_musa()" in source
+        assert "process_weights_after_loading" in source
+        assert "_musa_materializes_plain_parameter" in source
+        assert "DisableTorchFunction" not in source
 
     def test_scaled_mm_patch_registers_musa_fp8_kernel_fallbacks(self):
         from vllm_musa.patches import _get_patch_files, _load_patch_config
