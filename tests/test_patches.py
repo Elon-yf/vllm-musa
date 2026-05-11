@@ -152,6 +152,28 @@ class TestSamplerPatch:
             raise AssertionError("topk_topp_sampler patch file was not found")
 
 
+class TestDeepGemmPatch:
+    """Tests for the MUSA DeepGEMM compatibility patch."""
+
+    def test_deep_gemm_patch_disables_unsupported_e8m0_on_musa(self):
+        from vllm_musa.patches import _get_patch_files, _load_patch_config
+
+        patch_files = _get_patch_files()
+
+        for module_name, patch_path in patch_files:
+            if module_name == "vllm.utils.deep_gemm":
+                patches = _load_patch_config(patch_path)
+                new_source = "\n".join(new for _, new in patches)
+
+                assert "current_platform.is_musa()" in new_source
+                assert "DeepGEMM E8M0 disabled on MUSA" in new_source
+                assert "grouped FP8 UE8M0 cast is " in new_source
+                assert "not supported by the MUSA DeepGEMM backend" in new_source
+                break
+        else:
+            raise AssertionError("deep_gemm patch file was not found")
+
+
 class TestApplyPatches:
     """Tests for the apply_patches function."""
 
