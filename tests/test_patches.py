@@ -351,6 +351,28 @@ class TestCompilationPiecewiseBackendPatch:
             raise AssertionError("compilation piecewise_backend patch was not found")
 
 
+class TestAttentionCompilePatch:
+    """Tests for MUSA attention torch.compile compatibility patches."""
+
+    def test_attention_output_shape_patch_avoids_torch_size_constructor(self):
+        from vllm_musa.patches import _get_patch_files, _load_patch_config
+
+        patch_files = _get_patch_files()
+
+        for module_name, patch_path in patch_files:
+            if module_name == "vllm.model_executor.layers.attention.attention":
+                patches = _load_patch_config(patch_path)
+                old_source = "\n".join(old for old, _ in patches)
+                new_source = "\n".join(new for _, new in patches)
+
+                assert "output_shape = torch.Size(" in old_source
+                assert "output_shape = (num_tokens," in new_source
+                assert "torch.Size(" not in new_source
+                break
+        else:
+            raise AssertionError("attention compile patch file was not found")
+
+
 class TestMUSAFusedMoEFP8Scales:
     """Tests for MUSA FP8 MoE scale adaptation helpers."""
 
