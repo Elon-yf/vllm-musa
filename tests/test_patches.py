@@ -237,9 +237,7 @@ class TestCompilationBackendPatch:
             return nullcontext()
 
         functorch_config = SimpleNamespace(existing_key=True)
-        patched = vllm_musa._make_functorch_config_patch(
-            original_patch, functorch_config
-        )
+        patched = vllm_musa._make_config_patch_filter(original_patch, functorch_config)
 
         with patched(missing_key=False):
             pass
@@ -317,7 +315,7 @@ class TestCompilationCompilerInterfacePatch:
         dummy_functorch_config = SimpleNamespace(existing_key=True)
         monkeypatch.setattr(
             vllm_musa,
-            "_filter_existing_functorch_config",
+            "_filter_existing_config",
             lambda config, functorch_config: {
                 key: value
                 for key, value in config.items()
