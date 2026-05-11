@@ -5,6 +5,8 @@
 from pathlib import Path
 from unittest.mock import patch
 
+import torch
+
 
 class TestPatchFileNaming:
     """Tests for patch file naming convention."""
@@ -172,6 +174,38 @@ class TestDeepGemmPatch:
                 break
         else:
             raise AssertionError("deep_gemm patch file was not found")
+
+
+class TestMUSAFusedMoEFP8Scales:
+    """Tests for MUSA FP8 MoE scale adaptation helpers."""
+
+    def test_static_tensor_fp8_moe_scales_expand_to_block_layout(self):
+        from vllm_musa.model_executor.layers.fused_moe.fused_moe import (
+            _maybe_expand_fp8_moe_per_tensor_scale,
+        )
+
+        weight = torch.empty((2, 260, 300), dtype=torch.float8_e4m3fn)
+        scale = torch.tensor([0.5, 1.5], dtype=torch.float32)
+
+        expanded = _maybe_expand_fp8_moe_per_tensor_scale(scale, weight)
+
+        assert expanded is not None
+        assert expanded.shape == (2, 3, 3)
+        assert expanded.is_contiguous()
+        assert torch.all(expanded[0] == scale[0])
+        assert torch.all(expanded[1] == scale[1])
+
+    def test_block_fp8_moe_scales_are_left_unchanged(self):
+        from vllm_musa.model_executor.layers.fused_moe.fused_moe import (
+            _maybe_expand_fp8_moe_per_tensor_scale,
+        )
+
+        weight = torch.empty((2, 256, 256), dtype=torch.float8_e4m3fn)
+        scale = torch.ones((2, 2, 2), dtype=torch.float32)
+
+        expanded = _maybe_expand_fp8_moe_per_tensor_scale(scale, weight)
+
+        assert expanded is scale
 
 
 class TestScaledMMKernelPatch:

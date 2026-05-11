@@ -25,6 +25,50 @@ from vllm_musa import _custom_ops as musa_ops
 logger = init_logger(__name__)
 
 
+def _maybe_expand_fp8_moe_per_tensor_scale(
+    scale: torch.Tensor | None,
+    weight: torch.Tensor,
+) -> torch.Tensor | None:
+    """Expand static per-tensor FP8 MoE scales for the native MUSA GEMV op.
+
+    The native op indexes FP8 scales as block scales with shape
+    [expert, output_block, input_block]. Static FP8 checkpoints store one
+    weight scale per expert, so materialize the equivalent block view here.
+    """
+    if (
+        scale is None
+        or weight.dtype != torch.float8_e4m3fn
+        or scale.dim() >= 3
+    ):
+        return scale
+
+    num_experts, output_size, input_size = weight.shape
+
+    if scale.dim() == 0:
+        per_expert_scale = scale.expand(num_experts)
+    elif scale.dim() == 1:
+        if scale.numel() == 1:
+            per_expert_scale = scale.expand(num_experts)
+        elif scale.numel() == num_experts:
+            per_expert_scale = scale
+        else:
+            return scale
+    elif scale.dim() == 2 and scale.shape == (num_experts, 1):
+        per_expert_scale = scale[:, 0]
+    else:
+        return scale
+
+    block_n = 128
+    block_k = 128
+    output_blocks = (output_size + block_n - 1) // block_n
+    input_blocks = (input_size + block_k - 1) // block_k
+    return (
+        per_expert_scale.view(num_experts, 1, 1)
+        .expand(num_experts, output_blocks, input_blocks)
+        .contiguous()
+    )
+
+
 def _supports_quant_scheme(
     weight_key,
     activation_key,
@@ -139,6 +183,10 @@ def fused_experts_impl(
         compute_type = tl.float32
     else:
         raise ValueError(f"Unsupported compute_type: {hidden_states.dtype}")
+
+    if use_fp8_w8a8:
+        w1_scale = _maybe_expand_fp8_moe_per_tensor_scale(w1_scale, w1)
+        w2_scale = _maybe_expand_fp8_moe_per_tensor_scale(w2_scale, w2)
 
     if inplace and not disable_inplace():
         out_hidden_states = hidden_states
