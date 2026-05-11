@@ -227,6 +227,17 @@ class TestMUSAFusedMoEFP8Scales:
 class TestScaledMMKernelPatch:
     """Tests for the MUSA scaled-mm kernel registry patch."""
 
+    def test_musa_deepgemm_fp8_uses_custom_op_for_compile(self):
+        source = (
+            Path(__file__).parents[1]
+            / "vllm_musa/model_executor/kernels/linear/scaled_mm/deep_gemm.py"
+        ).read_text()
+
+        assert "torch.ops.vllm.musa_deepgemm_fp8_op" in source
+        assert "direct_register_custom_op(" in source
+        assert '"musa_deepgemm_fp8_op"' in source
+        assert "_musa_deepgemm_fp8_op_fake" in source
+
     def test_musa_torch_fp8_scaled_mm_disables_fp8_output_padding(self):
         from vllm_musa.model_executor.kernels.linear.scaled_mm.torch_scaled_mm import (
             MUSAPerTensorTorchFP8ScaledMMLinearKernel,
