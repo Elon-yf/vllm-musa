@@ -537,7 +537,7 @@ class TestScaledMMKernelPatch:
         ).read_text()
 
         assert "torch.ops.vllm.musa_unquantized_gemm" in source
-        assert "weight = weight.data" in source
+        assert "DisableTorchFunction" in source
         assert "direct_register_custom_op(" in source
         assert '"musa_unquantized_gemm"' in source
         assert "_musa_unquantized_gemm_op_fake" in source

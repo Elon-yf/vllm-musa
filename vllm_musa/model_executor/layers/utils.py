@@ -15,10 +15,8 @@ def _musa_unquantized_gemm(
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    weight = weight.data
-    if bias is not None:
-        bias = bias.data
-    return torch.ops.vllm.musa_unquantized_gemm(x, weight, bias)
+    with torch._C.DisableTorchFunction():
+        return torch.ops.vllm.musa_unquantized_gemm(x, weight, bias)
 
 
 def _musa_unquantized_gemm_op(
