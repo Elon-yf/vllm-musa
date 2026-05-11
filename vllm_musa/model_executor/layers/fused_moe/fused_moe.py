@@ -25,6 +25,17 @@ from vllm_musa import _custom_ops as musa_ops
 logger = init_logger(__name__)
 
 
+def _musa_fp8_moe_scale_block_size(input_size: int) -> int:
+    if input_size % 128 == 0:
+        return 128
+    if input_size % 64 == 0:
+        return 64
+    raise ValueError(
+        "MUSA static FP8 MoE scale expansion requires the weight input "
+        f"dimension to be divisible by 64 or 128, got {input_size}."
+    )
+
+
 def _maybe_expand_fp8_moe_per_tensor_scale(
     scale: torch.Tensor | None,
     weight: torch.Tensor,
@@ -58,10 +69,9 @@ def _maybe_expand_fp8_moe_per_tensor_scale(
     else:
         return scale
 
-    block_n = 128
-    block_k = 128
-    output_blocks = (output_size + block_n - 1) // block_n
-    input_blocks = (input_size + block_k - 1) // block_k
+    block_size = _musa_fp8_moe_scale_block_size(input_size)
+    output_blocks = (output_size + block_size - 1) // block_size
+    input_blocks = input_size // block_size
     return (
         per_expert_scale.view(num_experts, 1, 1)
         .expand(num_experts, output_blocks, input_blocks)

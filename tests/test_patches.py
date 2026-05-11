@@ -184,16 +184,30 @@ class TestMUSAFusedMoEFP8Scales:
             _maybe_expand_fp8_moe_per_tensor_scale,
         )
 
-        weight = torch.empty((2, 260, 300), dtype=torch.float8_e4m3fn)
+        weight = torch.empty((2, 260, 320), dtype=torch.float8_e4m3fn)
         scale = torch.tensor([0.5, 1.5], dtype=torch.float32)
 
         expanded = _maybe_expand_fp8_moe_per_tensor_scale(scale, weight)
 
         assert expanded is not None
-        assert expanded.shape == (2, 3, 3)
+        assert expanded.shape == (2, 5, 5)
         assert expanded.is_contiguous()
         assert torch.all(expanded[0] == scale[0])
         assert torch.all(expanded[1] == scale[1])
+
+    def test_static_tensor_fp8_moe_scales_prefer_128_block_layout(self):
+        from vllm_musa.model_executor.layers.fused_moe.fused_moe import (
+            _maybe_expand_fp8_moe_per_tensor_scale,
+        )
+
+        weight = torch.empty((2, 260, 256), dtype=torch.float8_e4m3fn)
+        scale = torch.tensor([0.5, 1.5], dtype=torch.float32)
+
+        expanded = _maybe_expand_fp8_moe_per_tensor_scale(scale, weight)
+
+        assert expanded is not None
+        assert expanded.shape == (2, 3, 2)
+        assert expanded.is_contiguous()
 
     def test_block_fp8_moe_scales_are_left_unchanged(self):
         from vllm_musa.model_executor.layers.fused_moe.fused_moe import (
