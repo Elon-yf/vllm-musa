@@ -1,0 +1,31 @@
+#pragma once
+
+#include <musa_runtime.h>
+
+namespace vllm_musa {
+
+template <typename T>
+struct Vec16 {
+  static_assert(sizeof(T) == 2, "T must be fp16 or bf16");
+  static constexpr int VLEN = 8;
+  T x[VLEN];
+};
+
+template <typename T>
+__device__ __forceinline__ Vec16<T> vload16_byp_slc(const T* ptr) {
+  Vec16<T> dst;
+  asm volatile(
+      "LSU.LD.B128 %0, %1, _, 16, 1, 1, inner_persist=0, "
+      "outer_persist=2, chrnt=l2_l3, slc=byp, persist=0, "
+      "stride_add_first=0"
+      : "=R"(dst)
+      : "R"(ptr));
+  return dst;
+}
+
+template <typename T>
+__device__ __forceinline__ void vstore16(T* ptr, const Vec16<T>& value) {
+  *reinterpret_cast<Vec16<T>*>(ptr) = value;
+}
+
+}  // namespace vllm_musa

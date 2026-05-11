@@ -148,7 +148,15 @@ AttributeError("'AnnAssign' object has no attribute 'targets'")
 
 **Issue:** Triton-based sampling kernel not compatible with MUSA Triton compiler
 
-**Fix:** Disable Triton path for MUSA and use PyTorch fallback implementation
+**Fix:** Disable Triton path for MUSA and use PyTorch fallback implementation.
+For large decode batches, enable `VLLM_MUSA_SAMPLER_FAST_PATH` by default to
+use a MUSA-safe top-k prefilter path:
+- top-k only: use the existing `apply_top_k_only` path for batch >= 16,
+  vocab >= 65536, and `max_k <= 1024`.
+- top-k + top-p: prefilter with `torch.topk` only for batch >= 16,
+  vocab >= 65536, and `max_k <= 1024`; fall back to the PyTorch sort path for
+  top-k-disabled rows, large `k`, or kth-logit ties.
+- top-p only and unsupported shapes stay on the current PyTorch fallback.
 
 ### vllm__v1__sample__ops__topk_topp_triton.patch.py
 

@@ -86,6 +86,30 @@ class TestMUSAPlatformBase:
 
         assert MUSAPlatformBase.use_custom_allreduce() is True
 
+    def test_supports_fp8_for_musa_3_1(self):
+        """Test that FP8 is supported on MUSA capability 3.1."""
+        from vllm_musa.platform import MUSAPlatformBase
+        from vllm.platforms.interface import DeviceCapability
+
+        with patch.object(
+            MUSAPlatformBase,
+            "get_device_capability",
+            return_value=DeviceCapability(3, 1),
+        ):
+            assert MUSAPlatformBase.supports_fp8() is True
+
+    def test_supports_fp8_rejects_pre_3_1(self):
+        """Test that pre-3.1 MUSA capability does not support FP8."""
+        from vllm_musa.platform import MUSAPlatformBase
+        from vllm.platforms.interface import DeviceCapability
+
+        with patch.object(
+            MUSAPlatformBase,
+            "get_device_capability",
+            return_value=DeviceCapability(3, 0),
+        ):
+            assert MUSAPlatformBase.supports_fp8() is False
+
     def test_support_hybrid_kv_cache(self):
         """Test that support_hybrid_kv_cache returns True."""
         from vllm_musa.platform import MUSAPlatformBase

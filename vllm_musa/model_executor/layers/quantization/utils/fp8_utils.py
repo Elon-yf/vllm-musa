@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+
 import torch
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_fp8_min_max,
@@ -114,6 +116,92 @@ def per_token_group_quant_fp8(
         f"per_token_group_fp8_quant is not supported for platform: {current_platform} or input is not contiguous. "
         "MUSA Triton fallback is currently not supported."
     )
+
+
+def _silu_fp8_fusion_enabled() -> bool:
+    value = os.getenv("VLLM_MUSA_SILU_FP8_QUANT_FUSION", "1").lower()
+    return value not in ("0", "false", "no", "off")
+
+
+def _silu_fp8_fusion_max_tokens() -> int:
+    try:
+        return int(os.getenv("VLLM_MUSA_SILU_FP8_QUANT_MAX_TOKENS", "512"))
+    except ValueError:
+        return 512
+
+
+def silu_mul_per_token_group_quant_fp8_musa(
+    input: torch.Tensor,
+    output: torch.Tensor | None = None,
+    use_ue8m0: bool | None = None,
+    eps: float = 1e-10,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """MUSA small-M SiLU+mul plus FP8 group-quant fast path.
+
+    This mirrors vLLM's DeepGEMM helper contract for gate-up tensors shaped
+    ``[tokens, 2 * hidden]`` but only returns row-major contiguous FP32 scales.
+    Unsupported shapes fall back to the upstream helper.
+    """
+
+    from vllm.model_executor.layers.quantization.utils import (
+        fp8_utils as upstream_fp8_utils,
+    )
+
+    if use_ue8m0 is None:
+        use_ue8m0 = is_deep_gemm_e8m0_used()
+
+    def fallback() -> tuple[torch.Tensor, torch.Tensor]:
+        return upstream_fp8_utils.silu_mul_per_token_group_quant_fp8_colmajor(
+            input=input,
+            output=output,
+            use_ue8m0=use_ue8m0,
+            eps=eps,
+        )
+
+    group_size = 128
+    if (
+        not _silu_fp8_fusion_enabled()
+        or not current_platform.is_musa()
+        or use_ue8m0
+        or input.dim() != 2
+        or not input.is_contiguous()
+        or input.dtype not in (torch.bfloat16, torch.float16)
+        or input.shape[0] > _silu_fp8_fusion_max_tokens()
+        or input.shape[-1] % (2 * group_size) != 0
+    ):
+        return fallback()
+
+    tokens = input.shape[0]
+    hidden = input.shape[-1] // 2
+    if output is None:
+        output = torch.empty(
+            (tokens, hidden),
+            device=input.device,
+            dtype=current_platform.fp8_dtype(),
+        )
+    elif (
+        output.shape != (tokens, hidden)
+        or not output.is_contiguous()
+        or output.dtype != current_platform.fp8_dtype()
+    ):
+        return fallback()
+
+    output_s = torch.empty(
+        (tokens, hidden // group_size),
+        device=input.device,
+        dtype=torch.float32,
+    )
+    fp8_min, fp8_max = get_fp8_min_max()
+    torch.ops._C_musa_ops.silu_and_mul_per_token_group_fp8_quant(
+        input,
+        output,
+        output_s,
+        group_size,
+        eps,
+        fp8_min,
+        fp8_max,
+    )
+    return output, output_s
 
 
 import vllm.model_executor.layers.quantization.utils.fp8_utils

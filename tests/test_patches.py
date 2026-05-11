@@ -5,6 +5,8 @@
 from pathlib import Path
 from unittest.mock import patch
 
+import torch
+
 
 class TestPatchFileNaming:
     """Tests for patch file naming convention."""
@@ -94,6 +96,160 @@ class TestTritonPatch:
                 old_strs = [old for old, new in patches]
 
                 assert "left: tl.int32 = 0" in old_strs
+
+
+class TestCustomAllReducePatch:
+    """Tests for the MUSA custom all-reduce patch."""
+
+    def test_patch_skips_cuda_p2p_check_on_musa(self):
+        """Test that MUSA custom all-reduce does not run CUDA P2P probing."""
+        from vllm_musa.patches import _get_patch_files, _load_patch_config
+
+        patch_files = _get_patch_files()
+
+        for module_name, patch_path in patch_files:
+            if "custom_all_reduce" in module_name:
+                patches = _load_patch_config(patch_path)
+                old_strs = [old for old, new in patches]
+                new_strs = [new for old, new in patches]
+
+                assert (
+                    "if ( not current_platform.is_rocm() or not "
+                    "current_platform.is_musa() ) and not _can_p2p(rank, world_size):"
+                ) in old_strs
+                assert (
+                    "if not current_platform.is_rocm() and not "
+                    "current_platform.is_musa() and not _can_p2p(rank, world_size):"
+                ) in new_strs
+                assert all(
+                    "not current_platform.is_rocm() or not current_platform.is_musa()"
+                    not in new
+                    for new in new_strs
+                )
+                break
+        else:
+            raise AssertionError("custom_all_reduce patch file was not found")
+
+
+class TestSamplerPatch:
+    """Tests for the MUSA top-k/top-p sampler patch."""
+
+    def test_sampler_patch_keeps_triton_guard_and_fast_path_gate(self):
+        from vllm_musa.patches import _get_patch_files, _load_patch_config
+
+        patch_files = _get_patch_files()
+
+        for module_name, patch_path in patch_files:
+            if module_name == "vllm.v1.sample.ops.topk_topp_sampler":
+                patches = _load_patch_config(patch_path)
+                new_source = "\n".join(new for _, new in patches)
+
+                assert "not current_platform.is_musa()" in new_source
+                assert "VLLM_MUSA_SAMPLER_FAST_PATH" in new_source
+                assert "_apply_top_k_top_p_musa_topk_prefilter" in new_source
+                assert "logits.shape[0] >= 16" in new_source
+                assert "logits.shape[1] >= 65536" in new_source
+                break
+        else:
+            raise AssertionError("topk_topp_sampler patch file was not found")
+
+
+class TestDeepGemmPatch:
+    """Tests for the MUSA DeepGEMM compatibility patch."""
+
+    def test_deep_gemm_patch_disables_unsupported_e8m0_on_musa(self):
+        from vllm_musa.patches import _get_patch_files, _load_patch_config
+
+        patch_files = _get_patch_files()
+
+        for module_name, patch_path in patch_files:
+            if module_name == "vllm.utils.deep_gemm":
+                patches = _load_patch_config(patch_path)
+                new_source = "\n".join(new for _, new in patches)
+
+                assert "current_platform.is_musa()" in new_source
+                assert "DeepGEMM E8M0 disabled on MUSA" in new_source
+                assert "grouped FP8 UE8M0 cast is " in new_source
+                assert "not supported by the MUSA DeepGEMM backend" in new_source
+                break
+        else:
+            raise AssertionError("deep_gemm patch file was not found")
+
+
+class TestMUSAFusedMoEFP8Scales:
+    """Tests for MUSA FP8 MoE scale adaptation helpers."""
+
+    def test_static_tensor_fp8_moe_scales_expand_to_block_layout(self):
+        from vllm_musa.model_executor.layers.fused_moe.fused_moe import (
+            _maybe_expand_fp8_moe_per_tensor_scale,
+        )
+
+        weight = torch.empty((2, 260, 320), dtype=torch.float8_e4m3fn)
+        scale = torch.tensor([0.5, 1.5], dtype=torch.float32)
+
+        expanded = _maybe_expand_fp8_moe_per_tensor_scale(scale, weight)
+
+        assert expanded is not None
+        assert expanded.shape == (2, 5, 5)
+        assert expanded.is_contiguous()
+        assert torch.all(expanded[0] == scale[0])
+        assert torch.all(expanded[1] == scale[1])
+
+    def test_static_tensor_fp8_moe_scales_prefer_128_block_layout(self):
+        from vllm_musa.model_executor.layers.fused_moe.fused_moe import (
+            _maybe_expand_fp8_moe_per_tensor_scale,
+        )
+
+        weight = torch.empty((2, 260, 256), dtype=torch.float8_e4m3fn)
+        scale = torch.tensor([0.5, 1.5], dtype=torch.float32)
+
+        expanded = _maybe_expand_fp8_moe_per_tensor_scale(scale, weight)
+
+        assert expanded is not None
+        assert expanded.shape == (2, 3, 2)
+        assert expanded.is_contiguous()
+
+    def test_block_fp8_moe_scales_are_left_unchanged(self):
+        from vllm_musa.model_executor.layers.fused_moe.fused_moe import (
+            _maybe_expand_fp8_moe_per_tensor_scale,
+        )
+
+        weight = torch.empty((2, 256, 256), dtype=torch.float8_e4m3fn)
+        scale = torch.ones((2, 2, 2), dtype=torch.float32)
+
+        expanded = _maybe_expand_fp8_moe_per_tensor_scale(scale, weight)
+
+        assert expanded is scale
+
+
+class TestScaledMMKernelPatch:
+    """Tests for the MUSA scaled-mm kernel registry patch."""
+
+    def test_musa_torch_fp8_scaled_mm_disables_fp8_output_padding(self):
+        from vllm_musa.model_executor.kernels.linear.scaled_mm.torch_scaled_mm import (
+            MUSAPerTensorTorchFP8ScaledMMLinearKernel,
+        )
+
+        assert MUSAPerTensorTorchFP8ScaledMMLinearKernel.get_output_padding(None) is None
+
+    def test_scaled_mm_patch_registers_musa_fp8_kernel_fallbacks(self):
+        from vllm_musa.patches import _get_patch_files, _load_patch_config
+
+        patch_files = _get_patch_files()
+
+        for module_name, patch_path in patch_files:
+            if module_name == "vllm.model_executor.kernels.linear":
+                patches = _load_patch_config(patch_path)
+                new_source = "\n".join(new for _, new in patches)
+
+                assert "possible_kernels is _POSSIBLE_FP8_BLOCK_KERNELS" in new_source
+                assert "MUSADeepGemmFp8BlockScaledMMKernel" in new_source
+                assert "possible_kernels is _POSSIBLE_FP8_KERNELS" in new_source
+                assert "MUSAPerTensorTorchFP8ScaledMMLinearKernel" in new_source
+                assert "MUSAChannelWiseTorchFP8ScaledMMLinearKernel" in new_source
+                break
+        else:
+            raise AssertionError("linear kernel patch file was not found")
 
 
 class TestApplyPatches:

@@ -18,6 +18,11 @@ PATCHES = [
     # Patch CustomAllreduce enable musa's custom_allreduce
     (
         "if not current_platform.is_rocm() and not _can_p2p(rank, world_size):",
+        "if not current_platform.is_rocm() and not current_platform.is_musa() and not _can_p2p(rank, world_size):",
+    ),
+    # Upgrade the previous MUSA patch if it was already persisted on disk.
+    (
         "if ( not current_platform.is_rocm() or not current_platform.is_musa() ) and not _can_p2p(rank, world_size):",
+        "if not current_platform.is_rocm() and not current_platform.is_musa() and not _can_p2p(rank, world_size):",
     ),
 ]
