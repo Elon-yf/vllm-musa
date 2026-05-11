@@ -174,6 +174,29 @@ class TestDeepGemmPatch:
             raise AssertionError("deep_gemm patch file was not found")
 
 
+class TestScaledMMKernelPatch:
+    """Tests for the MUSA scaled-mm kernel registry patch."""
+
+    def test_scaled_mm_patch_registers_musa_fp8_kernel_fallbacks(self):
+        from vllm_musa.patches import _get_patch_files, _load_patch_config
+
+        patch_files = _get_patch_files()
+
+        for module_name, patch_path in patch_files:
+            if module_name == "vllm.model_executor.kernels.linear":
+                patches = _load_patch_config(patch_path)
+                new_source = "\n".join(new for _, new in patches)
+
+                assert "possible_kernels is _POSSIBLE_FP8_BLOCK_KERNELS" in new_source
+                assert "MUSADeepGemmFp8BlockScaledMMKernel" in new_source
+                assert "possible_kernels is _POSSIBLE_FP8_KERNELS" in new_source
+                assert "MUSAPerTensorTorchFP8ScaledMMLinearKernel" in new_source
+                assert "MUSAChannelWiseTorchFP8ScaledMMLinearKernel" in new_source
+                break
+        else:
+            raise AssertionError("linear kernel patch file was not found")
+
+
 class TestApplyPatches:
     """Tests for the apply_patches function."""
 
