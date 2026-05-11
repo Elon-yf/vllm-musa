@@ -225,6 +225,13 @@ class TestMUSAFusedMoEFP8Scales:
 class TestScaledMMKernelPatch:
     """Tests for the MUSA scaled-mm kernel registry patch."""
 
+    def test_musa_torch_fp8_scaled_mm_disables_fp8_output_padding(self):
+        from vllm_musa.model_executor.kernels.linear.scaled_mm.torch_scaled_mm import (
+            MUSAPerTensorTorchFP8ScaledMMLinearKernel,
+        )
+
+        assert MUSAPerTensorTorchFP8ScaledMMLinearKernel.get_output_padding(None) is None
+
     def test_scaled_mm_patch_registers_musa_fp8_kernel_fallbacks(self):
         from vllm_musa.patches import _get_patch_files, _load_patch_config
 

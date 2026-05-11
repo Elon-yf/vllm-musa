@@ -25,6 +25,11 @@ class MUSATorchFP8ScaledMMKernelMixin:
             return False, "requires MUSA."
         return True, None
 
+    def get_output_padding(self) -> int | None:
+        # torch_musa/muDNN cannot currently pad FP8 tensors via torch.nn.functional.pad.
+        # Padding is only a torch._scaled_mm performance hint, so skip it on MUSA.
+        return None
+
 
 class MUSAPerTensorTorchFP8ScaledMMLinearKernel(
     MUSATorchFP8ScaledMMKernelMixin,
