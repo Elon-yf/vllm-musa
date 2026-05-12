@@ -1,5 +1,6 @@
 #include <musa_runtime.h>
 #include <cassert>
+#include <cstdlib>
 #include <mutex>
 #include <musa_bf16.h>
 #include <musa_fp16.h>
@@ -513,6 +514,14 @@ struct BlockConfig {
     bool valid;
 };
 
+constexpr const char* kDeepSeekFp8W1BlockEnv =
+    "VLLM_MUSA_DEEPSEEK_FP8_W1_32X4";
+
+bool IsDeepSeekFp8W1BlockEnabled() {
+    const char* value = std::getenv(kDeepSeekFp8W1BlockEnv);
+    return value == nullptr || value[0] != '0';
+}
+
 void musa_fused_gemv(
     torch::Tensor &A,
     torch::Tensor &B,
@@ -780,9 +789,27 @@ void musa_fused_gemv_moe(
         best_config = new BlockConfig{128, 1, -1.0f, false};
     }
 
-    for (auto& config : configs) {
-        if (config.valid && config.score > best_config->score) {
-            best_config = &config;
+    BlockConfig deepseek_fp8_w1_config{32, 4, 0.f, true};
+    const bool use_deepseek_fp8_w1_config =
+        IsDeepSeekFp8W1BlockEnabled() &&
+        is_fp8 &&
+        use_swigelu &&
+        !use_int4_w4a16 &&
+        topk == 6 &&
+        hidden_size == 2048 &&
+        reduce_size == 2816 &&
+        num_experts == 64 &&
+        scale_k_group_tile == 128 &&
+        nr_n % deepseek_fp8_w1_config.block_n == 0 &&
+        hidden_size % (deepseek_fp8_w1_config.block_k * vlen) == 0;
+
+    if (use_deepseek_fp8_w1_config) {
+        best_config = &deepseek_fp8_w1_config;
+    } else {
+        for (auto& config : configs) {
+            if (config.valid && config.score > best_config->score) {
+                best_config = &config;
+            }
         }
     }
 
