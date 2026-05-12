@@ -1,7 +1,5 @@
 #include <musa_runtime.h>
 #include <cassert>
-#include <cstdio>
-#include <cstdlib>
 #include <mutex>
 #include <musa_bf16.h>
 #include <musa_fp16.h>
@@ -788,41 +786,15 @@ void musa_fused_gemv_moe(
         }
     }
 
-    BlockConfig forced_config{0, 0, 0.f, false};
-    if (is_fp8) {
-        const char* forced = std::getenv("VLLM_MUSA_GEMV_MOE_BLOCK");
-        if (forced != nullptr && forced[0] != '\0') {
-            int forced_n = 0;
-            int forced_k = 0;
-            TORCH_CHECK(std::sscanf(forced, "%dx%d", &forced_n, &forced_k) == 2,
-                        "VLLM_MUSA_GEMV_MOE_BLOCK must be formatted as <block_n>x<block_k>");
-            int load_size = forced_k * vlen;
-            forced_config.block_n = forced_n;
-            forced_config.block_k = forced_k;
-            forced_config.valid =
-                (forced_n > 0) && (forced_k > 0) &&
-                (reduce_size % forced_n == 0) &&
-                (hidden_size % load_size == 0) &&
-                ((load_size % scale_k_group_tile == 0) ||
-                 (scale_k_group_tile % load_size == 0));
-            TORCH_CHECK(forced_config.valid,
-                        "Invalid VLLM_MUSA_GEMV_MOE_BLOCK for this GEMV shape");
-            best_config = &forced_config;
-        }
-    }
-
     switch (best_config->block_n) {
         case 4:
             switch (best_config->block_k) {
-                case 8: GEN_LAUNCH_KERN(4, 8); break;
-                case 16: GEN_LAUNCH_KERN(4, 16); break;
                 case 32: GEN_LAUNCH_KERN(4, 32); break;
                 default: TORCH_CHECK(false, "Unsupported block_k for block_n=4");
             }
             break;
         case 8:
             switch (best_config->block_k) {
-                case 8: GEN_LAUNCH_KERN(8, 8); break;
                 case 16: GEN_LAUNCH_KERN(8, 16); break;
                 default: TORCH_CHECK(false, "Unsupported block_k for block_n=8");
             }
@@ -830,14 +802,12 @@ void musa_fused_gemv_moe(
         case 16:
             switch (best_config->block_k) {
                 case 8: GEN_LAUNCH_KERN(16, 8); break;
-                case 16: GEN_LAUNCH_KERN(16, 16); break;
                 default: TORCH_CHECK(false, "Unsupported block_k for block_n=16");
             }
             break;
         case 32:
             switch (best_config->block_k) {
                 case 4: GEN_LAUNCH_KERN(32, 4); break;
-                case 8: GEN_LAUNCH_KERN(32, 8); break;
                 case 1: GEN_LAUNCH_KERN(32, 1); break;
                 default: TORCH_CHECK(false, "Unsupported block_k for block_n=32");
             }
