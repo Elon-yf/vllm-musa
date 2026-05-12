@@ -8,6 +8,8 @@
 
 #include <torch/all.h>
 
+#include <cstdlib>
+
 #include "vectorization.cuh"
 #include "vectorization_utils.cuh"
 #include "dispatch_utils.h"
@@ -152,6 +154,78 @@ inline int GetGroupsPerBlock(int64_t num_groups) {
     return 2;
   }
   return 1;
+}
+
+inline bool UseGroup128RegisterFastPath() {
+  const char* value = std::getenv("VLLM_MUSA_PTGQ128_REGISTER_FASTPATH");
+  if (value == nullptr) {
+    return true;
+  }
+  return value[0] != '0' && value[0] != 'f' && value[0] != 'F' &&
+         value[0] != 'n' && value[0] != 'N';
+}
+
+template <typename T, typename DST_DTYPE, bool IS_COLUMN_MAJOR = false,
+          bool SCALE_UE8M0 = false>
+__global__ void per_token_group_quant_128_register_kernel(
+    const T* __restrict__ input, void* __restrict__ output_q,
+    float* __restrict__ output_s, const int num_groups,
+    const int groups_per_block, const float eps, const float min_8bit,
+    const float max_8bit, const int scale_num_rows = 0,
+    const int scale_stride = 0) {
+  constexpr int GROUP_SIZE = 128;
+  constexpr int THREADS_PER_GROUP = 16;
+  constexpr int ELEMS_PER_THREAD = GROUP_SIZE / THREADS_PER_GROUP;
+
+  const int local_group_id = threadIdx.x / THREADS_PER_GROUP;
+  const int lane_id = threadIdx.x % THREADS_PER_GROUP;
+  const int global_group_id = blockIdx.x * groups_per_block + local_group_id;
+  if (global_group_id >= num_groups) {
+    return;
+  }
+
+  const int64_t block_group_offset =
+      static_cast<int64_t>(global_group_id) * GROUP_SIZE;
+  const T* group_input = input + block_group_offset;
+  DST_DTYPE* group_output =
+      static_cast<DST_DTYPE*>(output_q) + block_group_offset;
+
+  float values[ELEMS_PER_THREAD];
+  float local_absmax = eps;
+
+#pragma unroll
+  for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
+    const int col = lane_id * ELEMS_PER_THREAD + i;
+    const float value = static_cast<float>(group_input[col]);
+    values[i] = value;
+    local_absmax = fmaxf(local_absmax, fabsf(value));
+  }
+
+  const float group_absmax = GroupReduceMax(local_absmax);
+  float y_s = group_absmax / max_8bit;
+  if constexpr (SCALE_UE8M0) {
+    y_s = exp2f(ceilf(log2f(fmaxf(fabsf(y_s), 1e-10f))));
+  }
+
+  if (lane_id == 0) {
+    float* scale_output;
+    if constexpr (IS_COLUMN_MAJOR) {
+      const int row_idx = global_group_id / scale_num_rows;
+      const int col_idx = global_group_id % scale_num_rows;
+      scale_output = output_s + col_idx * scale_stride + row_idx;
+    } else {
+      scale_output = output_s + global_group_id;
+    }
+    *scale_output = y_s;
+  }
+
+#pragma unroll
+  for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
+    const int col = lane_id * ELEMS_PER_THREAD + i;
+    float q = values[i] / y_s;
+    q = fminf(fmaxf(q, min_8bit), max_8bit);
+    group_output[col] = DST_DTYPE(q);
+  }
 }
 
 template <typename T, typename DST_DTYPE, int GROUP_SIZE>
@@ -299,6 +373,49 @@ void per_token_group_quant_8bit(const torch::Tensor& input,
   const int scale_num_rows = output_s.size(1);
   const int scale_stride = output_s.stride(1);
 
+#define LAUNCH_GROUP128_REGISTER_KERNEL(T, DST_DTYPE)                    \
+  do {                                                                   \
+    dim3 grid(num_blocks);                                               \
+    dim3 block(num_threads);                                             \
+    if (is_column_major) {                                               \
+      if (scale_ue8m0) {                                                 \
+        per_token_group_quant_128_register_kernel<T, DST_DTYPE, true,    \
+                                                  true>                  \
+            <<<grid, block, 0, stream>>>(                                \
+                static_cast<T*>(input.data_ptr()), output_q.data_ptr(),  \
+                static_cast<float*>(output_s.data_ptr()), num_groups,    \
+                groups_per_block, (float)eps, (float)min_8bit,           \
+                (float)max_8bit, scale_num_rows, scale_stride);          \
+      } else {                                                           \
+        per_token_group_quant_128_register_kernel<T, DST_DTYPE, true,    \
+                                                  false>                 \
+            <<<grid, block, 0, stream>>>(                                \
+                static_cast<T*>(input.data_ptr()), output_q.data_ptr(),  \
+                static_cast<float*>(output_s.data_ptr()), num_groups,    \
+                groups_per_block, (float)eps, (float)min_8bit,           \
+                (float)max_8bit, scale_num_rows, scale_stride);          \
+      }                                                                  \
+    } else {                                                             \
+      if (scale_ue8m0) {                                                 \
+        per_token_group_quant_128_register_kernel<T, DST_DTYPE, false,   \
+                                                  true>                  \
+            <<<grid, block, 0, stream>>>(                                \
+                static_cast<T*>(input.data_ptr()), output_q.data_ptr(),  \
+                static_cast<float*>(output_s.data_ptr()), num_groups,    \
+                groups_per_block, (float)eps, (float)min_8bit,           \
+                (float)max_8bit);                                        \
+      } else {                                                           \
+        per_token_group_quant_128_register_kernel<T, DST_DTYPE, false,   \
+                                                  false>                 \
+            <<<grid, block, 0, stream>>>(                                \
+                static_cast<T*>(input.data_ptr()), output_q.data_ptr(),  \
+                static_cast<float*>(output_s.data_ptr()), num_groups,    \
+                groups_per_block, (float)eps, (float)min_8bit,           \
+                (float)max_8bit);                                        \
+      }                                                                  \
+    }                                                                    \
+  } while (0)
+
 #define LAUNCH_KERNEL(T, DST_DTYPE)                                        \
   do {                                                                     \
     dim3 grid(num_blocks);                                                 \
@@ -343,12 +460,21 @@ void per_token_group_quant_8bit(const torch::Tensor& input,
   VLLM_DISPATCH_FLOATING_TYPES(
       input.scalar_type(), "per_token_group_quant_8bit", ([&] {
         if (dst_type == at::ScalarType::Float8_e4m3fn) {
-          LAUNCH_KERNEL(scalar_t, __nv_fp8_e4m3);
+          if (group_size == 128 && UseGroup128RegisterFastPath()) {
+            LAUNCH_GROUP128_REGISTER_KERNEL(scalar_t, __nv_fp8_e4m3);
+          } else {
+            LAUNCH_KERNEL(scalar_t, __nv_fp8_e4m3);
+          }
         } else if (dst_type == at::ScalarType::Char) {
-          LAUNCH_KERNEL(scalar_t, int8_t);
+          if (group_size == 128 && UseGroup128RegisterFastPath()) {
+            LAUNCH_GROUP128_REGISTER_KERNEL(scalar_t, int8_t);
+          } else {
+            LAUNCH_KERNEL(scalar_t, int8_t);
+          }
         }
       }));
 
+#undef LAUNCH_GROUP128_REGISTER_KERNEL
 #undef LAUNCH_KERNEL
 }
 
