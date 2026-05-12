@@ -512,6 +512,27 @@ class TestScaledMMKernelPatch:
         assert "direct_register_custom_op(" in source
         assert '"musa_deepgemm_fp8_op"' in source
         assert "_musa_deepgemm_fp8_op_fake" in source
+        assert "VLLM_MUSA_DEEPGEMM_ROW_MAJOR_ACT_SCALES" in source
+
+    def test_musa_deepgemm_row_major_scale_gate(self, monkeypatch):
+        from vllm_musa.model_executor.kernels.linear.scaled_mm import deep_gemm
+
+        monkeypatch.setattr(
+            deep_gemm.envs, "VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES", False
+        )
+        monkeypatch.delenv("VLLM_MUSA_DEEPGEMM_ROW_MAJOR_ACT_SCALES", raising=False)
+
+        assert deep_gemm._use_row_major_activation_scales(False) is True
+        assert deep_gemm._use_row_major_activation_scales(True) is False
+
+        monkeypatch.setenv("VLLM_MUSA_DEEPGEMM_ROW_MAJOR_ACT_SCALES", "0")
+        assert deep_gemm._use_row_major_activation_scales(False) is False
+
+        monkeypatch.setenv("VLLM_MUSA_DEEPGEMM_ROW_MAJOR_ACT_SCALES", "1")
+        monkeypatch.setattr(
+            deep_gemm.envs, "VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES", True
+        )
+        assert deep_gemm._use_row_major_activation_scales(False) is True
 
     def test_musa_swiglu_uses_custom_op_for_compile(self):
         source = (
