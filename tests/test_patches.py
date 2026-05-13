@@ -3,8 +3,10 @@
 """Tests for the MUSA platform patches module."""
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 
 
@@ -225,6 +227,17 @@ class TestMUSAFusedMoEFP8Scales:
 class TestScaledMMKernelPatch:
     """Tests for the MUSA scaled-mm kernel registry patch."""
 
+    def test_musa_deepgemm_fp8_uses_custom_op_for_compile(self):
+        source = (
+            Path(__file__).parents[1]
+            / "vllm_musa/model_executor/kernels/linear/scaled_mm/deep_gemm.py"
+        ).read_text()
+
+        assert "torch.ops.vllm.musa_deepgemm_fp8_op" in source
+        assert "direct_register_custom_op(" in source
+        assert '"musa_deepgemm_fp8_op"' in source
+        assert "_musa_deepgemm_fp8_op_fake" in source
+
     def test_musa_torch_fp8_scaled_mm_disables_fp8_output_padding(self):
         from vllm_musa.model_executor.kernels.linear.scaled_mm.torch_scaled_mm import (
             MUSAPerTensorTorchFP8ScaledMMLinearKernel,
@@ -250,6 +263,93 @@ class TestScaledMMKernelPatch:
                 break
         else:
             raise AssertionError("linear kernel patch file was not found")
+
+
+class TestMUSAFP8ActivationQuant:
+    """Tests for MUSA FP8 activation quantization helpers."""
+
+    def test_per_token_group_quant_accepts_strided_2d_input(self, monkeypatch):
+        from vllm_musa.model_executor.layers.quantization.utils import fp8_utils
+
+        calls = []
+
+        def fake_quant(
+            x,
+            x_q,
+            x_s,
+            group_size,
+            eps,
+            fp8_min,
+            fp8_max,
+            use_ue8m0,
+            column_major_scales,
+            tma_aligned_scales,
+        ):
+            calls.append(
+                {
+                    "x": x,
+                    "x_q": x_q,
+                    "x_s": x_s,
+                    "group_size": group_size,
+                    "column_major_scales": column_major_scales,
+                }
+            )
+
+        monkeypatch.setattr(
+            fp8_utils,
+            "current_platform",
+            SimpleNamespace(
+                is_musa=lambda: True,
+                fp8_dtype=lambda: torch.float8_e4m3fn,
+            ),
+        )
+        monkeypatch.setattr(
+            torch.ops,
+            "_C_musa_ops",
+            SimpleNamespace(per_token_group_fp8_quant=fake_quant),
+            raising=False,
+        )
+
+        base = torch.randn(4, 3, 128, dtype=torch.float32)
+        x = base[:, 1, :]
+        assert x.stride(-1) == 1
+        assert not x.is_contiguous()
+
+        x_q, x_s = fp8_utils.per_token_group_quant_fp8(
+            x,
+            group_size=128,
+            use_ue8m0=False,
+        )
+
+        assert len(calls) == 1
+        assert calls[0]["x"].is_contiguous()
+        assert calls[0]["x"].shape == x.shape
+        assert x_q.shape == x.shape
+        assert x_q.is_contiguous()
+        assert x_s.shape == (4, 1)
+
+    def test_per_token_group_quant_rejects_noncontiguous_groups(self, monkeypatch):
+        from vllm_musa.model_executor.layers.quantization.utils import fp8_utils
+
+        monkeypatch.setattr(
+            fp8_utils,
+            "current_platform",
+            SimpleNamespace(
+                is_musa=lambda: True,
+                fp8_dtype=lambda: torch.float8_e4m3fn,
+            ),
+        )
+
+        x = torch.randn(128, 4, dtype=torch.float32).t()
+        assert x.shape == (4, 128)
+        assert x.stride(-1) != 1
+
+        with pytest.raises(AssertionError, match="groups must be contiguous"):
+            fp8_utils.per_token_group_quant_fp8(
+                x,
+                group_size=128,
+                use_ue8m0=False,
+            )
 
 
 class TestApplyPatches:

@@ -87,17 +87,18 @@ def per_token_group_quant_fp8(
         shape = x.shape[:-1] + (x.shape[-1] // group_size,)
         x_s = torch.empty(shape, device=x.device, dtype=torch.float32)
 
-    # prefer CUDA kernel if available
-    # TODO(bnell): this causes some fp8 moe test to fail.
-    if current_platform.is_musa() and x.is_contiguous():
+    # Prefer the MUSA kernel when possible. MUSA Triton fallback is unavailable,
+    # so materialize supported strided 2D activations before dispatching.
+    if current_platform.is_musa():
         if x.dim() != 2:
             raise NotImplementedError(
                 f"MUSA backend currently only supports 2D tensors for per_token_group_fp8_quant. "
                 f"Got tensor with {x.dim()} dimensions, shape={x.shape}"
             )
+        x_kernel = x if x.is_contiguous() else x.contiguous()
 
         torch.ops._C_musa_ops.per_token_group_fp8_quant(
-            x,
+            x_kernel,
             x_q,
             x_s,
             group_size,

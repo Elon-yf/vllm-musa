@@ -14,6 +14,7 @@ from vllm.model_executor.kernels.linear.scaled_mm.deep_gemm import (
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
+from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_musa.model_executor.layers.quantization.utils.fp8_utils import (
     deepgemm_post_process_fp8_weight_block,
@@ -106,6 +107,22 @@ def run_deepgemm(
     group_size: int,
     use_deep_gemm_e8m0: bool,
 ) -> torch.Tensor:
+    return torch.ops.vllm.musa_deepgemm_fp8_op(
+        input,
+        weight,
+        weight_scale,
+        group_size,
+        use_deep_gemm_e8m0,
+    )
+
+
+def _musa_deepgemm_fp8_op(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    group_size: int,
+    use_deep_gemm_e8m0: bool,
+) -> torch.Tensor:
     q_input, input_scale = per_token_group_quant_fp8(
         input,
         group_size=group_size,
@@ -125,3 +142,24 @@ def run_deepgemm(
         is_deep_gemm_e8m0_used=use_deep_gemm_e8m0,
     )
     return output
+
+
+def _musa_deepgemm_fp8_op_fake(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    group_size: int,
+    use_deep_gemm_e8m0: bool,
+) -> torch.Tensor:
+    return torch.empty(
+        (input.shape[0], weight.shape[0]),
+        dtype=torch.bfloat16,
+        device=input.device,
+    )
+
+
+direct_register_custom_op(
+    "musa_deepgemm_fp8_op",
+    _musa_deepgemm_fp8_op,
+    fake_impl=_musa_deepgemm_fp8_op_fake,
+)
