@@ -178,6 +178,281 @@ class TestDeepGemmPatch:
             raise AssertionError("deep_gemm patch file was not found")
 
 
+class TestCompilationBackendPatch:
+    """Tests for MUSA torch.compile backend compatibility patches."""
+
+    def test_vllm_backend_patch_accepts_torch_compile_options(self):
+        from vllm_musa.patches import _get_patch_files, _load_patch_config
+
+        patch_files = _get_patch_files()
+
+        for module_name, patch_path in patch_files:
+            if module_name == "vllm.compilation.backends":
+                patches = _load_patch_config(patch_path)
+                old_source = "\n".join(old for old, _ in patches)
+                new_source = "\n".join(new for _, new in patches)
+
+                assert "example_inputs: Sequence[Any]) -> Any" in old_source
+                assert "**kwargs: Any" in new_source
+                assert "autograd_cache_normalize_inputs=True" in old_source
+                assert "functorch_cache_key_ctx" in new_source
+                assert "hasattr(" in new_source
+                break
+        else:
+            raise AssertionError("compilation backend patch file was not found")
+
+    def test_live_vllm_backend_patch_ignores_options_kwarg(self, monkeypatch):
+        import vllm_musa
+
+        class DummyBackend:
+            def __call__(self, graph, example_inputs):
+                return graph, example_inputs
+
+        class DummyModule:
+            VllmBackend = DummyBackend
+
+        monkeypatch.setitem(
+            __import__("sys").modules,
+            "vllm.compilation.backends",
+            DummyModule,
+        )
+
+        vllm_musa._patch_vllm_backend_call_options()
+
+        backend = DummyBackend()
+        assert backend("graph", ["input"], options={"ignored": True}) == (
+            "graph",
+            ["input"],
+        )
+
+    def test_live_functorch_config_patch_skips_missing_keys(self):
+        from contextlib import nullcontext
+
+        import vllm_musa
+
+        calls = []
+
+        def original_patch(*args, **kwargs):
+            calls.append((args, kwargs))
+            return nullcontext()
+
+        functorch_config = SimpleNamespace(existing_key=True)
+        patched = vllm_musa._make_config_patch_filter(original_patch, functorch_config)
+
+        with patched(missing_key=False):
+            pass
+        with patched("missing_key", True):
+            pass
+        with patched({"existing_key": True, "missing_key": False}):
+            pass
+        with patched(existing_key=True):
+            pass
+
+        assert calls == [
+            (({"existing_key": True},), {}),
+            ((), {"existing_key": True}),
+        ]
+
+
+class TestCompilationCachingPatch:
+    """Tests for MUSA torch compile-cache compatibility patches."""
+
+    def test_graph_pickler_options_patch_supports_torch_27(self):
+        from vllm_musa.patches import _get_patch_files, _load_patch_config
+
+        patch_files = _get_patch_files()
+
+        for module_name, patch_path in patch_files:
+            if module_name == "vllm.compilation.caching":
+                patches = _load_patch_config(patch_path)
+                old_source = "\n".join(old for old, _ in patches)
+                new_source = "\n".join(new for _, new in patches)
+
+                assert "GraphPickler, Options" in old_source
+                assert "getattr(_vllm_graph_pickler, \"Options\", None)" in new_source
+                assert "_musa_graph_pickler_dumps" in new_source
+                break
+        else:
+            raise AssertionError("compilation caching patch file was not found")
+
+
+class TestCompilationCompilerInterfacePatch:
+    """Tests for MUSA torch compiler-interface compatibility patches."""
+
+    def test_functorch_config_patch_filters_missing_torch_keys(self):
+        from vllm_musa.patches import _get_patch_files, _load_patch_config
+
+        patch_files = _get_patch_files()
+
+        for module_name, patch_path in patch_files:
+            if module_name == "vllm.compilation.compiler_interface":
+                patches = _load_patch_config(patch_path)
+                old_source = "\n".join(old for old, _ in patches)
+                new_source = "\n".join(new for _, new in patches)
+
+                assert 'cfg["bundled_autograd_cache"] = False' in old_source
+                assert "hasattr(functorch_config, key)" in new_source
+                break
+        else:
+            raise AssertionError("compilation compiler_interface patch was not found")
+
+    def test_live_functorch_config_patch_filters_missing_keys(self, monkeypatch):
+        import sys
+
+        import vllm_musa
+
+        class DummyCompilerInterface:
+            @staticmethod
+            def _get_vllm_functorch_config():
+                return {"existing_key": True, "missing_key": False}
+
+        monkeypatch.setitem(
+            sys.modules,
+            "vllm.compilation.compiler_interface",
+            DummyCompilerInterface,
+        )
+
+        dummy_functorch_config = SimpleNamespace(existing_key=True)
+        monkeypatch.setattr(
+            vllm_musa,
+            "_filter_existing_config",
+            lambda config, functorch_config: {
+                key: value
+                for key, value in config.items()
+                if hasattr(dummy_functorch_config, key)
+            },
+        )
+
+        vllm_musa._patch_vllm_functorch_config()
+
+        config = DummyCompilerInterface._get_vllm_functorch_config()
+        assert config == {"existing_key": True}
+
+
+class TestCompilationPiecewiseBackendPatch:
+    """Tests for MUSA piecewise backend compile-cache compatibility patches."""
+
+    def test_piecewise_backend_patch_skips_missing_bundled_cache_key(self):
+        from vllm_musa.patches import _get_patch_files, _load_patch_config
+
+        patch_files = _get_patch_files()
+
+        for module_name, patch_path in patch_files:
+            if module_name == "vllm.compilation.piecewise_backend":
+                patches = _load_patch_config(patch_path)
+                old_source = "\n".join(old for old, _ in patches)
+                new_source = "\n".join(new for _, new in patches)
+
+                assert '"bundled_autograd_cache", True' in old_source
+                assert "functorch_cache_ctx" in new_source
+                assert "nullcontext" in new_source
+                break
+        else:
+            raise AssertionError("compilation piecewise_backend patch was not found")
+
+
+class TestAttentionCompilePatch:
+    """Tests for MUSA attention torch.compile compatibility patches."""
+
+    def test_attention_output_shape_patch_avoids_torch_size_constructor(self):
+        from vllm_musa.patches import _get_patch_files, _load_patch_config
+
+        patch_files = _get_patch_files()
+
+        for module_name, patch_path in patch_files:
+            if module_name == "vllm.model_executor.layers.attention.attention":
+                patches = _load_patch_config(patch_path)
+                old_source = "\n".join(old for old, _ in patches)
+                new_source = "\n".join(new for _, new in patches)
+
+                assert "output_shape = torch.Size(" in old_source
+                assert "output_shape = (num_tokens," in new_source
+                assert "torch.Size(" not in new_source
+                break
+        else:
+            raise AssertionError("attention compile patch file was not found")
+
+
+class TestMUSAPlatformDefaults:
+    """Tests for MUSA platform-level vLLM config defaults."""
+
+    def _make_vllm_config(
+        self,
+        *,
+        architectures=None,
+        quantization="fp8",
+        quantization_config=None,
+        max_cudagraph_capture_size=None,
+        cudagraph_capture_sizes=None,
+    ):
+        from types import SimpleNamespace
+
+        hf_config = SimpleNamespace(
+            architectures=architectures,
+            quantization_config=quantization_config,
+        )
+        return SimpleNamespace(
+            model_config=SimpleNamespace(
+                architectures=architectures,
+                hf_config=hf_config,
+                quantization=quantization,
+            ),
+            compilation_config=SimpleNamespace(
+                custom_ops=[],
+                max_cudagraph_capture_size=max_cudagraph_capture_size,
+                cudagraph_capture_sizes=cudagraph_capture_sizes,
+            ),
+        )
+
+    def test_qwen3_moe_fp8_caps_default_cudagraph_capture_size(self):
+        from vllm_musa.platform import MUSAPlatformBase
+
+        vllm_config = self._make_vllm_config(
+            architectures=["Qwen3MoeForCausalLM"],
+        )
+
+        MUSAPlatformBase.apply_config_platform_defaults(vllm_config)
+
+        assert vllm_config.compilation_config.max_cudagraph_capture_size == 64
+        assert vllm_config.compilation_config.custom_ops == ["all"]
+
+    def test_qwen3_moe_fp8_preserves_user_cudagraph_capture_size(self):
+        from vllm_musa.platform import MUSAPlatformBase
+
+        vllm_config = self._make_vllm_config(
+            architectures=["Qwen3MoeForCausalLM"],
+            max_cudagraph_capture_size=128,
+        )
+
+        MUSAPlatformBase.apply_config_platform_defaults(vllm_config)
+
+        assert vllm_config.compilation_config.max_cudagraph_capture_size == 128
+
+    def test_qwen3_moe_fp8_preserves_user_cudagraph_capture_sizes(self):
+        from vllm_musa.platform import MUSAPlatformBase
+
+        vllm_config = self._make_vllm_config(
+            architectures=["Qwen3MoeForCausalLM"],
+            cudagraph_capture_sizes=[1, 2, 4, 8],
+        )
+
+        MUSAPlatformBase.apply_config_platform_defaults(vllm_config)
+
+        assert vllm_config.compilation_config.max_cudagraph_capture_size is None
+        assert vllm_config.compilation_config.cudagraph_capture_sizes == [1, 2, 4, 8]
+
+    def test_dense_fp8_does_not_cap_cudagraph_capture_size(self):
+        from vllm_musa.platform import MUSAPlatformBase
+
+        vllm_config = self._make_vllm_config(
+            architectures=["Qwen3ForCausalLM"],
+        )
+
+        MUSAPlatformBase.apply_config_platform_defaults(vllm_config)
+
+        assert vllm_config.compilation_config.max_cudagraph_capture_size is None
+
+
 class TestMUSAFusedMoEFP8Scales:
     """Tests for MUSA FP8 MoE scale adaptation helpers."""
 
@@ -238,12 +513,36 @@ class TestScaledMMKernelPatch:
         assert '"musa_deepgemm_fp8_op"' in source
         assert "_musa_deepgemm_fp8_op_fake" in source
 
+    def test_musa_swiglu_uses_custom_op_for_compile(self):
+        source = (
+            Path(__file__).parents[1]
+            / "vllm_musa/model_executor/layers/activation.py"
+        ).read_text()
+
+        assert "torch.ops.vllm.musa_swish_glu_op" in source
+        assert "direct_register_custom_op(" in source
+        assert '"musa_swish_glu_op"' in source
+        assert "_musa_swish_glu_op_fake" in source
+
     def test_musa_torch_fp8_scaled_mm_disables_fp8_output_padding(self):
         from vllm_musa.model_executor.kernels.linear.scaled_mm.torch_scaled_mm import (
             MUSAPerTensorTorchFP8ScaledMMLinearKernel,
         )
 
         assert MUSAPerTensorTorchFP8ScaledMMLinearKernel.get_output_padding(None) is None
+
+    def test_musa_unquantized_gemm_materializes_plain_parameter_for_compile(self):
+        source = (
+            Path(__file__).parents[1] / "vllm_musa/model_executor/layers/utils.py"
+        ).read_text()
+
+        assert "BasevLLMParameter" in source
+        assert "torch.nn.Parameter(weight.detach(), requires_grad=False)" in source
+        assert "plain_weight.__dict__.update(weight.__dict__)" in source
+        assert "current_platform.is_musa()" in source
+        assert "process_weights_after_loading" in source
+        assert "_musa_materializes_plain_parameter" in source
+        assert "DisableTorchFunction" not in source
 
     def test_scaled_mm_patch_registers_musa_fp8_kernel_fallbacks(self):
         from vllm_musa.patches import _get_patch_files, _load_patch_config
