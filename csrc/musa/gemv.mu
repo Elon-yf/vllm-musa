@@ -540,6 +540,25 @@ bool IsForcedBlockConfigValid(const BlockConfig& config, int nr_n, int hidden_si
            (hidden_size % (config.block_k * vlen) == 0);
 }
 
+bool ShouldUseQwenFp8Moe32x4(
+    int current_arch,
+    bool is_fp8,
+    bool use_swigelu,
+    int nr_n,
+    int hidden_size,
+    int scale_k_group_tile,
+    int vlen) {
+    if (current_arch < 300 || !is_fp8 || scale_k_group_tile != 128) {
+        return false;
+    }
+
+    const bool qwen_w1_swiglu = use_swigelu && hidden_size == 2048 && nr_n == 6144;
+    const bool qwen_w2_project = !use_swigelu && hidden_size == 6144 && nr_n == 2048;
+    const BlockConfig config{32, 4, 0.f, true};
+    return (qwen_w1_swiglu || qwen_w2_project) &&
+           IsForcedBlockConfigValid(config, nr_n, hidden_size, vlen);
+}
+
 void musa_fused_gemv(
     torch::Tensor &A,
     torch::Tensor &B,
@@ -821,6 +840,7 @@ void musa_fused_gemv_moe(
         fallback_config = BlockConfig{128, 1, -1.0f, false};
     }
     BlockConfig forced_config{0, 0, 0.f, false};
+    BlockConfig qwen_fp8_moe_config{32, 4, 0.f, true};
     BlockConfig* best_config = &fallback_config;
     if (ParseForcedBlockConfig(&forced_config)) {
         TORCH_CHECK(
@@ -829,6 +849,15 @@ void musa_fused_gemv_moe(
             forced_config.block_k, " is invalid for nr_n=", nr_n,
             ", hidden_size=", hidden_size, ", vlen=", vlen);
         best_config = &forced_config;
+    } else if (ShouldUseQwenFp8Moe32x4(
+                   current_arch,
+                   is_fp8,
+                   use_swigelu,
+                   nr_n,
+                   hidden_size,
+                   scale_k_group_tile,
+                   vlen)) {
+        best_config = &qwen_fp8_moe_config;
     } else {
         for (auto& config : configs) {
             if (config.valid && config.score > best_config->score) {
