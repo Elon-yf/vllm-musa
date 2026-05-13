@@ -3,6 +3,7 @@
 """Tests for the MUSA Platform implementation."""
 
 import sys
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -197,6 +198,27 @@ class TestMUSAPlatformBase:
 
         assert reason is not None
         assert "Triton float8 conversions" in reason
+
+
+class TestNativeGemvSource:
+    """Source-level checks for native MUSA GEMV dispatch gates."""
+
+    def test_qwen_fp8_moe_uses_32x4_shape_gate(self):
+        source = Path("csrc/musa/gemv.mu").read_text()
+
+        assert "ShouldUseQwenFp8Moe32x4(" in source
+        assert "hidden_size == 2048 && nr_n == 768" in source
+        assert "hidden_size == 768 && nr_n == 2048" in source
+        assert "BlockConfig qwen_fp8_moe_config{32, 4" in source
+        assert "case 4: GEN_LAUNCH_KERN(32, 4)" in source
+
+    def test_gemv_block_override_validates_env_config(self):
+        source = Path("csrc/musa/gemv.mu").read_text()
+
+        assert 'kGemvMoeBlockEnv = "VLLM_MUSA_GEMV_MOE_BLOCK"' in source
+        assert "std::getenv(kGemvMoeBlockEnv)" in source
+        assert "must use '<block_n>x<block_k>'" in source
+        assert "IsForcedBlockConfigValid(forced_config" in source
 
 
 class TestNonMtmlMUSAPlatform:
