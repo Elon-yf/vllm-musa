@@ -384,6 +384,8 @@ class TestMUSAPlatformDefaults:
         quantization_config=None,
         max_cudagraph_capture_size=None,
         cudagraph_capture_sizes=None,
+        cudagraph_mode=None,
+        tensor_parallel_size=1,
     ):
         from types import SimpleNamespace
 
@@ -396,9 +398,21 @@ class TestMUSAPlatformDefaults:
                 architectures=architectures,
                 hf_config=hf_config,
                 quantization=quantization,
+                use_mla=False,
+                is_mm_prefix_lm=False,
+            ),
+            parallel_config=SimpleNamespace(
+                tensor_parallel_size=tensor_parallel_size,
+                worker_cls="auto",
+            ),
+            cache_config=SimpleNamespace(block_size=16),
+            scheduler_config=SimpleNamespace(
+                is_multimodal_model=False,
+                disable_chunked_mm_input=False,
             ),
             compilation_config=SimpleNamespace(
                 custom_ops=[],
+                cudagraph_mode=cudagraph_mode,
                 max_cudagraph_capture_size=max_cudagraph_capture_size,
                 cudagraph_capture_sizes=cudagraph_capture_sizes,
             ),
@@ -439,6 +453,40 @@ class TestMUSAPlatformDefaults:
         MUSAPlatformBase.apply_config_platform_defaults(vllm_config)
 
         assert vllm_config.compilation_config.max_cudagraph_capture_size is None
+        assert vllm_config.compilation_config.cudagraph_capture_sizes == [1, 2, 4, 8]
+
+    def test_tp4_disables_cudagraph_capture(self):
+        from vllm.config import CUDAGraphMode
+        from vllm_musa.platform import MUSAPlatformBase
+
+        vllm_config = self._make_vllm_config(
+            cudagraph_mode=CUDAGraphMode.PIECEWISE,
+            max_cudagraph_capture_size=512,
+            cudagraph_capture_sizes=[1, 2, 4, 8],
+            tensor_parallel_size=4,
+        )
+
+        MUSAPlatformBase.check_and_update_config(vllm_config)
+
+        assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+        assert vllm_config.compilation_config.max_cudagraph_capture_size == 0
+        assert vllm_config.compilation_config.cudagraph_capture_sizes == []
+
+    def test_tp2_preserves_cudagraph_capture(self):
+        from vllm.config import CUDAGraphMode
+        from vllm_musa.platform import MUSAPlatformBase
+
+        vllm_config = self._make_vllm_config(
+            cudagraph_mode=CUDAGraphMode.PIECEWISE,
+            max_cudagraph_capture_size=512,
+            cudagraph_capture_sizes=[1, 2, 4, 8],
+            tensor_parallel_size=2,
+        )
+
+        MUSAPlatformBase.check_and_update_config(vllm_config)
+
+        assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE
+        assert vllm_config.compilation_config.max_cudagraph_capture_size == 512
         assert vllm_config.compilation_config.cudagraph_capture_sizes == [1, 2, 4, 8]
 
     def test_dense_fp8_does_not_cap_cudagraph_capture_size(self):
