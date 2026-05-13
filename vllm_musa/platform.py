@@ -417,7 +417,7 @@ class MUSAPlatformBase(Platform):
 
     @classmethod
     def supports_fp8(cls) -> bool:
-        return cls.has_device_capability(89)
+        return cls.has_device_capability((3, 1))
 
     @classmethod
     def use_custom_allreduce(cls) -> bool:
