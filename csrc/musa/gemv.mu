@@ -552,8 +552,8 @@ bool ShouldUseQwenFp8Moe32x4(
         return false;
     }
 
-    const bool qwen_w1_swiglu = use_swigelu && hidden_size == 2048 && nr_n == 6144;
-    const bool qwen_w2_project = !use_swigelu && hidden_size == 6144 && nr_n == 2048;
+    const bool qwen_w1_swiglu = use_swigelu && hidden_size == 2048 && nr_n == 768;
+    const bool qwen_w2_project = !use_swigelu && hidden_size == 768 && nr_n == 2048;
     const BlockConfig config{32, 4, 0.f, true};
     return (qwen_w1_swiglu || qwen_w2_project) &&
            IsForcedBlockConfigValid(config, nr_n, hidden_size, vlen);
