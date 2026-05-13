@@ -516,6 +516,8 @@ struct BlockConfig {
 };
 
 constexpr const char* kGemvMoeBlockEnv = "VLLM_MUSA_GEMV_MOE_BLOCK";
+constexpr const char* kDeepSeekFp8W1BlockEnv =
+    "VLLM_MUSA_DEEPSEEK_FP8_W1_32X4";
 
 bool ParseForcedBlockConfig(BlockConfig* config) {
     const char* value = std::getenv(kGemvMoeBlockEnv);
@@ -540,6 +542,11 @@ bool IsForcedBlockConfigValid(const BlockConfig& config, int nr_n, int hidden_si
            (hidden_size % (config.block_k * vlen) == 0);
 }
 
+bool IsDeepSeekFp8W1BlockEnabled() {
+    const char* value = std::getenv(kDeepSeekFp8W1BlockEnv);
+    return value == nullptr || value[0] != '0';
+}
+
 bool ShouldUseQwenFp8Moe32x4(
     int current_arch,
     bool is_fp8,
@@ -556,6 +563,30 @@ bool ShouldUseQwenFp8Moe32x4(
     const bool qwen_w2_project = !use_swigelu && hidden_size == 768 && nr_n == 2048;
     const BlockConfig config{32, 4, 0.f, true};
     return (qwen_w1_swiglu || qwen_w2_project) &&
+           IsForcedBlockConfigValid(config, nr_n, hidden_size, vlen);
+}
+
+bool ShouldUseDeepSeekFp8W1Moe32x4(
+    bool is_fp8,
+    bool use_swigelu,
+    bool use_int4_w4a16,
+    int64_t topk,
+    int hidden_size,
+    int reduce_size,
+    int num_experts,
+    int scale_k_group_tile,
+    int nr_n,
+    int vlen) {
+    const BlockConfig config{32, 4, 0.f, true};
+    return IsDeepSeekFp8W1BlockEnabled() &&
+           is_fp8 &&
+           use_swigelu &&
+           !use_int4_w4a16 &&
+           topk == 6 &&
+           hidden_size == 2048 &&
+           reduce_size == 2816 &&
+           num_experts == 64 &&
+           scale_k_group_tile == 128 &&
            IsForcedBlockConfigValid(config, nr_n, hidden_size, vlen);
 }
 
@@ -841,6 +872,7 @@ void musa_fused_gemv_moe(
     }
     BlockConfig forced_config{0, 0, 0.f, false};
     BlockConfig qwen_fp8_moe_config{32, 4, 0.f, true};
+    BlockConfig deepseek_fp8_w1_config{32, 4, 0.f, true};
     BlockConfig* best_config = &fallback_config;
     if (ParseForcedBlockConfig(&forced_config)) {
         TORCH_CHECK(
@@ -858,6 +890,18 @@ void musa_fused_gemv_moe(
                    scale_k_group_tile,
                    vlen)) {
         best_config = &qwen_fp8_moe_config;
+    } else if (ShouldUseDeepSeekFp8W1Moe32x4(
+                   is_fp8,
+                   use_swigelu,
+                   use_int4_w4a16,
+                   topk,
+                   hidden_size,
+                   reduce_size,
+                   num_experts,
+                   scale_k_group_tile,
+                   nr_n,
+                   vlen)) {
+        best_config = &deepseek_fp8_w1_config;
     } else {
         for (auto& config : configs) {
             if (config.valid && config.score > best_config->score) {

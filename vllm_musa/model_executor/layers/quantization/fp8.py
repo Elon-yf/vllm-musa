@@ -1,6 +1,113 @@
+import math
+
 import torch
+import vllm.model_executor.layers.quantization.fp8 as vllm_fp8
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import FusedMoE, fused_experts
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import is_torch_equal_or_newer
+
+logger = init_logger(__name__)
+
+
+def _round_up(value: int, multiple: int) -> int:
+    return ((value + multiple - 1) // multiple) * multiple
+
+
+def _zero_fp8_weight(weight: torch.Tensor) -> None:
+    # MUSA muDNN fill does not support FP8_E4M3 directly.
+    weight.view(torch.uint8).zero_()
+
+
+_ORIGINAL_FP8_MOE_MAYBE_ROUNDUP_SIZES = vllm_fp8.Fp8MoEMethod.maybe_roundup_sizes
+_ORIGINAL_FP8_MOE_CREATE_WEIGHTS = vllm_fp8.Fp8MoEMethod.create_weights
+
+
+def maybe_roundup_sizes(
+    self,
+    hidden_size: int,
+    intermediate_size_per_partition: int,
+    act_dtype: torch.dtype,
+    moe_parallel_config,
+) -> tuple[int, int]:
+    hidden_size, intermediate_size_per_partition = (
+        _ORIGINAL_FP8_MOE_MAYBE_ROUNDUP_SIZES(
+            self,
+            hidden_size,
+            intermediate_size_per_partition,
+            act_dtype,
+            moe_parallel_config,
+        )
+    )
+
+    if not (
+        current_platform.is_musa()
+        and getattr(self, "block_quant", False)
+        and getattr(moe_parallel_config, "tp_size", 1) > 1
+    ):
+        return hidden_size, intermediate_size_per_partition
+
+    weight_block_size = getattr(self, "weight_block_size", None)
+    if weight_block_size is None:
+        return hidden_size, intermediate_size_per_partition
+
+    block_n, block_k = int(weight_block_size[0]), int(weight_block_size[1])
+    block_multiple = math.lcm(block_n, block_k)
+    padded_intermediate = _round_up(
+        intermediate_size_per_partition,
+        block_multiple,
+    )
+    if padded_intermediate != intermediate_size_per_partition:
+        logger.info_once(
+            "Padding MUSA FP8 MoE intermediate partition from %d to %d "
+            "for block_shape=[%d, %d].",
+            intermediate_size_per_partition,
+            padded_intermediate,
+            block_n,
+            block_k,
+        )
+    return hidden_size, padded_intermediate
+
+
+def create_weights(
+    self,
+    layer: torch.nn.Module,
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size_per_partition: int,
+    params_dtype: torch.dtype,
+    **extra_weight_attrs,
+):
+    _ORIGINAL_FP8_MOE_CREATE_WEIGHTS(
+        self,
+        layer=layer,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size_per_partition=intermediate_size_per_partition,
+        params_dtype=params_dtype,
+        **extra_weight_attrs,
+    )
+
+    if not (current_platform.is_musa() and getattr(self, "block_quant", False)):
+        return
+
+    unpadded_intermediate = getattr(
+        layer.moe_config,
+        "intermediate_size_per_partition_unpadded",
+        intermediate_size_per_partition,
+    )
+    if intermediate_size_per_partition == unpadded_intermediate:
+        return
+
+    _zero_fp8_weight(layer.w13_weight.data)
+    _zero_fp8_weight(layer.w2_weight.data)
+    logger.debug(
+        "Zero initialized padded MUSA FP8 MoE weights for %s "
+        "(intermediate=%d, unpadded=%d).",
+        getattr(layer, "prefix", "<unknown>"),
+        intermediate_size_per_partition,
+        unpadded_intermediate,
+    )
 
 
 def apply(
@@ -43,6 +150,6 @@ def apply(
         )
 
 
-import vllm.model_executor.layers.quantization.fp8
-
-vllm.model_executor.layers.quantization.fp8.Fp8MoEMethod.apply = apply
+vllm_fp8.Fp8MoEMethod.maybe_roundup_sizes = maybe_roundup_sizes
+vllm_fp8.Fp8MoEMethod.create_weights = create_weights
+vllm_fp8.Fp8MoEMethod.apply = apply

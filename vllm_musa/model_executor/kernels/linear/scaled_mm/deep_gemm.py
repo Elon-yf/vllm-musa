@@ -1,3 +1,4 @@
+import os
 from typing import ClassVar
 
 import torch
@@ -22,6 +23,13 @@ from vllm_musa.model_executor.layers.quantization.utils.fp8_utils import (
 )
 
 
+def _use_row_major_activation_scales(use_deep_gemm_e8m0: bool) -> bool:
+    if use_deep_gemm_e8m0:
+        return False
+    value = os.getenv("VLLM_MUSA_DEEPGEMM_ROW_MAJOR_ACT_SCALES", "1").lower()
+    return value not in ("0", "false", "no", "off")
+
+
 class MUSADeepGemmFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
     apply_input_quant: ClassVar[bool] = False
 
@@ -35,7 +43,9 @@ class MUSADeepGemmFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
             group_shape=act_scale_descriptor.group_shape,
             use_ue8m0=self.use_deep_gemm_e8m0,
             tma_aligned_scales=envs.VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES,
-            column_major_scales=True,
+            column_major_scales=not _use_row_major_activation_scales(
+                self.use_deep_gemm_e8m0
+            ),
         )
 
     def process_weights_after_loading(self, layer):
@@ -126,7 +136,9 @@ def _musa_deepgemm_fp8_op(
     q_input, input_scale = per_token_group_quant_fp8(
         input,
         group_size=group_size,
-        column_major_scales=True,
+        column_major_scales=not _use_row_major_activation_scales(
+            use_deep_gemm_e8m0
+        ),
         use_ue8m0=use_deep_gemm_e8m0,
     )
     output = torch.empty(

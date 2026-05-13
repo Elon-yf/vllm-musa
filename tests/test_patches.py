@@ -499,6 +499,95 @@ class TestMUSAFusedMoEFP8Scales:
         assert expanded is scale
 
 
+class TestMUSAFp8MoEPadding:
+    """Tests for MUSA FP8 MoE TP padding helpers."""
+
+    def test_musa_fp8_moe_tp_padding_rounds_partition_to_block_lcm(
+        self, monkeypatch
+    ):
+        from vllm_musa.model_executor.layers.quantization import fp8 as musa_fp8
+
+        monkeypatch.setattr(
+            musa_fp8,
+            "current_platform",
+            SimpleNamespace(is_musa=lambda: True),
+        )
+        monkeypatch.setattr(
+            musa_fp8,
+            "_ORIGINAL_FP8_MOE_MAYBE_ROUNDUP_SIZES",
+            lambda self, hidden_size, intermediate_size_per_partition, act_dtype,
+            moe_parallel_config: (
+                hidden_size,
+                intermediate_size_per_partition,
+            ),
+        )
+
+        method = SimpleNamespace(block_quant=True, weight_block_size=(128, 128))
+
+        assert musa_fp8.maybe_roundup_sizes(
+            method,
+            hidden_size=2048,
+            intermediate_size_per_partition=704,
+            act_dtype=torch.bfloat16,
+            moe_parallel_config=SimpleNamespace(tp_size=2),
+        ) == (2048, 768)
+        assert musa_fp8.maybe_roundup_sizes(
+            method,
+            hidden_size=2048,
+            intermediate_size_per_partition=704,
+            act_dtype=torch.bfloat16,
+            moe_parallel_config=SimpleNamespace(tp_size=1),
+        ) == (2048, 704)
+
+    @pytest.mark.skipif(
+        not hasattr(torch, "float8_e4m3fn"),
+        reason="FP8 tensor dtype is not available in this torch build",
+    )
+    def test_musa_fp8_moe_padded_weights_are_zero_initialized(self, monkeypatch):
+        from vllm_musa.model_executor.layers.quantization import fp8 as musa_fp8
+
+        monkeypatch.setattr(
+            musa_fp8,
+            "current_platform",
+            SimpleNamespace(is_musa=lambda: True),
+        )
+
+        layer = SimpleNamespace(
+            moe_config=SimpleNamespace(intermediate_size_per_partition_unpadded=704),
+            prefix="model.layers.0.mlp",
+        )
+
+        def fake_create_weights(self, layer, **kwargs):
+            layer.w13_weight = SimpleNamespace(
+                data=torch.full((8,), 42, dtype=torch.uint8).view(
+                    torch.float8_e4m3fn
+                )
+            )
+            layer.w2_weight = SimpleNamespace(
+                data=torch.full((8,), 43, dtype=torch.uint8).view(
+                    torch.float8_e4m3fn
+                )
+            )
+
+        monkeypatch.setattr(
+            musa_fp8,
+            "_ORIGINAL_FP8_MOE_CREATE_WEIGHTS",
+            fake_create_weights,
+        )
+
+        musa_fp8.create_weights(
+            SimpleNamespace(block_quant=True),
+            layer=layer,
+            num_experts=64,
+            hidden_size=2048,
+            intermediate_size_per_partition=768,
+            params_dtype=torch.bfloat16,
+        )
+
+        assert torch.all(layer.w13_weight.data.view(torch.uint8) == 0)
+        assert torch.all(layer.w2_weight.data.view(torch.uint8) == 0)
+
+
 class TestScaledMMKernelPatch:
     """Tests for the MUSA scaled-mm kernel registry patch."""
 
@@ -512,6 +601,27 @@ class TestScaledMMKernelPatch:
         assert "direct_register_custom_op(" in source
         assert '"musa_deepgemm_fp8_op"' in source
         assert "_musa_deepgemm_fp8_op_fake" in source
+        assert "VLLM_MUSA_DEEPGEMM_ROW_MAJOR_ACT_SCALES" in source
+
+    def test_musa_deepgemm_row_major_scale_gate(self, monkeypatch):
+        from vllm_musa.model_executor.kernels.linear.scaled_mm import deep_gemm
+
+        monkeypatch.setattr(
+            deep_gemm.envs, "VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES", False
+        )
+        monkeypatch.delenv("VLLM_MUSA_DEEPGEMM_ROW_MAJOR_ACT_SCALES", raising=False)
+
+        assert deep_gemm._use_row_major_activation_scales(False) is True
+        assert deep_gemm._use_row_major_activation_scales(True) is False
+
+        monkeypatch.setenv("VLLM_MUSA_DEEPGEMM_ROW_MAJOR_ACT_SCALES", "0")
+        assert deep_gemm._use_row_major_activation_scales(False) is False
+
+        monkeypatch.setenv("VLLM_MUSA_DEEPGEMM_ROW_MAJOR_ACT_SCALES", "1")
+        monkeypatch.setattr(
+            deep_gemm.envs, "VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES", True
+        )
+        assert deep_gemm._use_row_major_activation_scales(False) is True
 
     def test_musa_swiglu_uses_custom_op_for_compile(self):
         source = (

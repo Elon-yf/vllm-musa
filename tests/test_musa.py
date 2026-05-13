@@ -212,6 +212,21 @@ class TestNativeGemvSource:
         assert "BlockConfig qwen_fp8_moe_config{32, 4" in source
         assert "case 4: GEN_LAUNCH_KERN(32, 4)" in source
 
+    def test_deepseek_fp8_w1_uses_32x4_shape_gate(self):
+        source = Path("csrc/musa/gemv.mu").read_text()
+
+        assert (
+            'kDeepSeekFp8W1BlockEnv = "VLLM_MUSA_DEEPSEEK_FP8_W1_32X4"'
+            in source
+        )
+        assert "ShouldUseDeepSeekFp8W1Moe32x4(" in source
+        assert "topk == 6" in source
+        assert "hidden_size == 2048" in source
+        assert "reduce_size == 2816" in source
+        assert "num_experts == 64" in source
+        assert "BlockConfig deepseek_fp8_w1_config{32, 4" in source
+        assert "best_config = &deepseek_fp8_w1_config" in source
+
     def test_gemv_block_override_validates_env_config(self):
         source = Path("csrc/musa/gemv.mu").read_text()
 
