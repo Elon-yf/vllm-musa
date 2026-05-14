@@ -350,24 +350,30 @@ class MUSAPlatformBase(Platform):
 
         compilation_config = vllm_config.compilation_config
         cudagraph_mode = getattr(compilation_config, "cudagraph_mode", None)
-        # MUSA-0061 investigated lifting this TP>2 cudagraph force-disable
-        # once custom_all_reduce (MUSA-0062) replaced the MCCL TP allreduce
-        # with a cudagraph-capturable kernel. It does NOT help: at TP>2 the
-        # MCCL ProcessGroup itself is incompatible with MUSA stream capture
-        # -- vLLM's profile_cudagraph_memory() (the first stream-capture
-        # op) crashes with "operation not permitted when stream is
-        # capturing", in BOTH MCCL async-watchdog mode and
-        # TORCH_MCCL_BLOCKING_WAIT=1 mode, for PIECEWISE / FULL_DECODE_ONLY
-        # / FULL alike. The force-disable is therefore kept unconditional
-        # for TP>2. See generated/musa0061/ for the full sweep evidence.
-        if parallel_config.tensor_parallel_size > 2 and cudagraph_mode is not None:
+        # MUSA-0061 found cudagraph capture is blocked for TP>2 + EP:
+        # the MCCL ProcessGroup is incompatible with MUSA stream capture
+        # (profile_cudagraph_memory crashes with "operation not permitted
+        # when stream is capturing"), and the EP all-to-all collective is
+        # a key blocker. custom_all_reduce (MUSA-0062) made the TP
+        # allreduce capturable, but the EP all-to-all is not.
+        # MUSA-0063 narrows the force-disable to TP>2 *with expert
+        # parallelism enabled* -- a non-EP TP>2 shape has no EP all-to-all
+        # collective, so cudagraph capture is permitted there (whether it
+        # actually captures is validated by MUSA-0063 Part 2). See
+        # generated/musa006{1,3}/ for the full evidence.
+        if (
+            parallel_config.tensor_parallel_size > 2
+            and parallel_config.enable_expert_parallel
+            and cudagraph_mode is not None
+        ):
             from vllm.config import CUDAGraphMode
 
             if cudagraph_mode != CUDAGraphMode.NONE:
                 logger.warning(
                     "Disabling MUSA cudagraph capture for tensor parallel "
-                    "size %d because MCCL collectives are not safe during "
-                    "stream capture on this platform.",
+                    "size %d with expert parallelism because the MCCL "
+                    "EP all-to-all collective is not safe during stream "
+                    "capture on this platform.",
                     parallel_config.tensor_parallel_size,
                 )
                 compilation_config.cudagraph_mode = CUDAGraphMode.NONE
