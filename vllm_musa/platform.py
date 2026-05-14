@@ -350,14 +350,26 @@ class MUSAPlatformBase(Platform):
 
         compilation_config = vllm_config.compilation_config
         cudagraph_mode = getattr(compilation_config, "cudagraph_mode", None)
-        if parallel_config.tensor_parallel_size > 2 and cudagraph_mode is not None:
+        # MUSA-0061: the TP>2 cudagraph force-disable below exists because
+        # MCCL collectives are not safe during MUSA stream capture. That
+        # reasoning only holds when custom_all_reduce is disabled -- with
+        # custom_all_reduce enabled (MUSA-0062), the TP allreduce uses the
+        # cudagraph-capturable custom kernel instead of MCCL, so cudagraph
+        # capture is allowed. Gate the force-disable on
+        # disable_custom_all_reduce accordingly.
+        if (
+            parallel_config.tensor_parallel_size > 2
+            and parallel_config.disable_custom_all_reduce
+            and cudagraph_mode is not None
+        ):
             from vllm.config import CUDAGraphMode
 
             if cudagraph_mode != CUDAGraphMode.NONE:
                 logger.warning(
                     "Disabling MUSA cudagraph capture for tensor parallel "
                     "size %d because MCCL collectives are not safe during "
-                    "stream capture on this platform.",
+                    "stream capture on this platform and custom_all_reduce "
+                    "is disabled.",
                     parallel_config.tensor_parallel_size,
                 )
                 compilation_config.cudagraph_mode = CUDAGraphMode.NONE
