@@ -167,10 +167,19 @@ class MUSAPlatformBase(Platform):
     def get_default_ir_op_priority(cls, vllm_config):
         """Platform-default priority list for vllm.ir.ops on MUSA.
 
-        Place the `musa` provider ahead of `vllm_c` / `native` for ops
-        where vllm-musa has registered a kernel implementation. The IR
-        lowering pass replaces `torch.ops.vllm_ir.<op>` with the first
-        supported impl in this list during torch.compile.
+        IMPORTANT (MUSA-0057): when compiling with Inductor, prefer the
+        `native` (pure-PyTorch) IR impl. The native rms_norm is a handful
+        of elementwise/reduction ops that Inductor FUSES with its
+        neighbours, whereas a `torch.ops._C.*` custom op is an opaque
+        fusion barrier. MUSA-0055 measured the `musa` provider regressing
+        low-concurrency throughput 20-56% precisely because it broke
+        Inductor fusion; MUSA-0057 bisected the cause to this priority
+        list. This mirrors the upstream `cuda.py` pattern
+        (`default = ["native"] if using_inductor else ["vllm_c", "native"]`).
+
+        The `musa` provider stays registered (see
+        `vllm_musa/kernels/musa_ops.py`) and IS preferred in the
+        non-Inductor / eager path, where there is no fusion to lose.
         """
         from vllm.config.compilation import CompilationMode
         from vllm.config.kernel import IrOpPriorityConfig
@@ -179,16 +188,15 @@ class MUSAPlatformBase(Platform):
         using_inductor = (
             cc.backend == "inductor" and cc.mode != CompilationMode.NONE
         )
-        # Mirror cuda.py's pattern: when compiling, keep `native` first so
-        # Inductor sees the reference impl and the lowering pass swaps in
-        # the kernel; when not compiling, take the kernel path directly.
-        default = ["native"] if using_inductor else ["musa", "native"]
-        # rms_norm: `musa` first, `native` fallback. Build the list
-        # explicitly — do NOT do `["musa"] + default`, because in the
-        # non-inductor branch `default` already starts with "musa", which
-        # would yield ["musa", "musa", "native"] and trip the IR op
-        # priority validator / dispatcher.
-        rms_norm = ["musa", "native"]
+        if using_inductor:
+            # Let Inductor fuse the native reference impl. Do NOT put the
+            # `musa` custom-op provider here — it is a fusion barrier.
+            default = ["native"]
+            rms_norm = ["native"]
+        else:
+            # Eager path: no Inductor fusion to lose, so take the kernel.
+            default = ["musa", "native"]
+            rms_norm = ["musa", "native"]
         return IrOpPriorityConfig.with_default(default, rms_norm=rms_norm)
 
     @classmethod
