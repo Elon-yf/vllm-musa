@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for the MUSA platform patches module."""
 
+import importlib
+import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -371,6 +373,138 @@ class TestAttentionCompilePatch:
                 break
         else:
             raise AssertionError("attention compile patch file was not found")
+
+
+class TestMUSAFlashAttentionReshapeCache:
+    """Tests for MUSA FlashAttention reshape+cache dispatch guards."""
+
+    def _load_fa_utils_with_musa_platform(self, monkeypatch, musa_ops_namespace):
+        import vllm
+        import vllm.platforms as vllm_platforms
+        import vllm_musa
+
+        monkeypatch.setenv("VLLM_MUSA_RESHAPE_CACHE_FLASH", "1")
+        monkeypatch.setattr(
+            vllm_platforms,
+            "current_platform",
+            SimpleNamespace(is_musa=lambda: True),
+        )
+
+        flash_attn = ModuleType("flash_attn_interface")
+        flash_attn.flash_attn_varlen_func = object()
+        flash_attn.flash_attn_with_kvcache = object()
+        flash_attn.get_scheduler_metadata = object()
+        monkeypatch.setitem(sys.modules, "flash_attn_interface", flash_attn)
+
+        vllm_ops = ModuleType("vllm._custom_ops")
+        vllm_ops.reshape_and_cache_flash = lambda *args, **kwargs: None
+        monkeypatch.setitem(sys.modules, "vllm._custom_ops", vllm_ops)
+        monkeypatch.setattr(vllm, "_custom_ops", vllm_ops, raising=False)
+
+        musa_custom_ops = ModuleType("vllm_musa._custom_ops")
+        musa_custom_ops.musa_reshape_and_cache_flash_nhd = (
+            lambda *args, **kwargs: None
+        )
+        monkeypatch.setitem(sys.modules, "vllm_musa._custom_ops", musa_custom_ops)
+        monkeypatch.setattr(vllm_musa, "_custom_ops", musa_custom_ops, raising=False)
+
+        if musa_ops_namespace is None:
+            torch_ops = SimpleNamespace()
+        else:
+            torch_ops = SimpleNamespace(_C_musa_ops=musa_ops_namespace)
+        monkeypatch.setattr(torch, "ops", torch_ops)
+
+        module_name = "vllm_musa.v1.attention.backends.fa_utils"
+        previous_module = sys.modules.pop(module_name, None)
+        try:
+            module = importlib.import_module(module_name)
+        finally:
+            sys.modules.pop(module_name, None)
+            if previous_module is not None:
+                sys.modules[module_name] = previous_module
+        return module
+
+    def test_missing_musa_ops_namespace_disables_native_cache_path(self, monkeypatch):
+        module = self._load_fa_utils_with_musa_platform(
+            monkeypatch, musa_ops_namespace=None
+        )
+
+        assert module._HAS_NATIVE_RESHAPE_CACHE_FLASH is False
+
+    def test_native_cache_path_requires_matching_cache_dtypes(self, monkeypatch):
+        module = self._load_fa_utils_with_musa_platform(
+            monkeypatch,
+            musa_ops_namespace=SimpleNamespace(
+                musa_reshape_and_cache_flash_nhd=object()
+            ),
+        )
+
+        key = torch.empty((2, 4, 64), dtype=torch.float16)
+        value = torch.empty((2, 4, 64), dtype=torch.float16)
+        key_cache = torch.empty((1, 16, 4, 64), dtype=torch.float16)
+        value_cache = torch.empty((1, 16, 4, 64), dtype=torch.float16)
+        slot_mapping = torch.arange(2, dtype=torch.long)
+        k_scale = torch.ones(1, dtype=torch.float32)
+        v_scale = torch.ones(1, dtype=torch.float32)
+
+        assert module._can_use_musa_reshape_and_cache_flash_nhd(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            "auto",
+            k_scale,
+            v_scale,
+        )
+        assert not module._can_use_musa_reshape_and_cache_flash_nhd(
+            key,
+            value.to(torch.bfloat16),
+            key_cache,
+            value_cache,
+            slot_mapping,
+            "auto",
+            k_scale,
+            v_scale,
+        )
+        assert not module._can_use_musa_reshape_and_cache_flash_nhd(
+            key,
+            value,
+            key_cache.to(torch.bfloat16),
+            value_cache,
+            slot_mapping,
+            "auto",
+            k_scale,
+            v_scale,
+        )
+        assert not module._can_use_musa_reshape_and_cache_flash_nhd(
+            key,
+            value,
+            key_cache,
+            value_cache.to(torch.bfloat16),
+            slot_mapping,
+            "auto",
+            k_scale,
+            v_scale,
+        )
+
+
+class TestMUSANativeKernelReviewHardening:
+    """Source-level tests for native MUSA kernel review fixes."""
+
+    def test_fused_rmsnorm_forced_block_env_is_validated(self):
+        source = (
+            Path(__file__).parents[1] / "csrc/musa/fused_add_rmsnorm.mu"
+        ).read_text()
+
+        assert "forced_block == 128" in source
+        assert "forced_block == 256" in source
+        assert "forced_block == 512" in source
+        assert "forced_block == 1024" in source
+        assert (
+            "VLLM_MUSA_FUSED_ADD_RMSNORM_BLOCK_X must be one of "
+            "128, 256, 512, or 1024"
+        ) in source
 
 
 class TestMUSAPlatformDefaults:

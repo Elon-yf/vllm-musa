@@ -135,6 +135,10 @@ void dispatch_fused_add_rmsnorm(T* input, T* residual, const T* weight,
 
   int block_x;
   if (forced_block > 0) {
+    TORCH_CHECK(forced_block == 128 || forced_block == 256 ||
+                    forced_block == 512 || forced_block == 1024,
+                "VLLM_MUSA_FUSED_ADD_RMSNORM_BLOCK_X must be one of "
+                "128, 256, 512, or 1024");
     block_x = forced_block;
   } else if (rows >= 512 && vec_hidden_size <= 640) {
     block_x = 128;
