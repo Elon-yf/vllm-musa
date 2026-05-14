@@ -8,6 +8,7 @@ to ensure compatibility with the MUSA Triton version.
 """
 
 import importlib.util
+import os
 from pathlib import Path
 
 from vllm.logger import init_logger
@@ -109,12 +110,38 @@ def apply_patches():
                     patched_source = patched_source.replace(old, new)
                     applied_count += 1
 
-            # Write back the patched source. Do not evict an already-imported
-            # module from sys.modules: some vLLM modules register torch custom
-            # ops at import time, and re-importing them would register the same
-            # schema twice in the current process.
-            with open(spec.origin, "w") as f:
-                f.write(patched_source)
+            # Write back the patched source ATOMICALLY via tempfile + rename.
+            # Rationale: vLLM's spawn-based multiproc executor starts N worker
+            # processes nearly simultaneously, each of which re-imports
+            # vllm_musa and therefore re-runs apply_patches(). If a worker
+            # holds the file open for read (e.g. during `import
+            # vllm.utils.deep_gemm`) while another process is mid-write, the
+            # worker can observe a truncated/partial file and raise an
+            # ImportError mid-startup (observed during MUSA-0046 MiniMax-M2.7
+            # smoke #4, 2026-05-14). Atomic rename guarantees readers see
+            # either the pre-patch or post-patch content, never partial.
+            #
+            # Do not evict an already-imported module from sys.modules: some
+            # vLLM modules register torch custom ops at import time, and
+            # re-importing them would register the same schema twice in the
+            # current process.
+            import tempfile  # noqa: I001 — local import keeps top-level imports stable
+
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                prefix=os.path.basename(spec.origin) + ".",
+                dir=os.path.dirname(spec.origin),
+            )
+            try:
+                with os.fdopen(tmp_fd, "w") as f:
+                    f.write(patched_source)
+                os.rename(tmp_path, spec.origin)
+            except Exception:
+                # Best-effort cleanup on error.
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
 
             logger.info(f"Applied {applied_count} patch(es) to {module_name}")
 
