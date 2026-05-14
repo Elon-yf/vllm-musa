@@ -141,6 +141,52 @@ class MUSAPlatformBase(Platform):
         return True
 
     @classmethod
+    def import_ir_kernels(cls) -> None:
+        """Import upstream and MUSA-OOT IR-op providers.
+
+        Order matters: upstream first (registers `native` / `vllm_c` /
+        `oink` / etc.), then OOT MUSA providers so they appear in the
+        registry alongside upstream impls. Used by
+        `vllm.config.kernel.KernelConfig.set_priority()` to ensure
+        every provider mentioned in `ir_op_priority` is registered
+        before the dispatcher needs it.
+        """
+        super().import_ir_kernels()
+        try:
+            import vllm_musa.kernels  # noqa: F401
+        except ImportError as exc:
+            from vllm.logger import init_logger
+            init_logger(__name__).info(
+                "vllm_musa.kernels unavailable (%s); MUSA IR providers "
+                "will not be registered. Upstream providers remain "
+                "available.",
+                exc,
+            )
+
+    @classmethod
+    def get_default_ir_op_priority(cls, vllm_config):
+        """Platform-default priority list for vllm.ir.ops on MUSA.
+
+        Place the `musa` provider ahead of `vllm_c` / `native` for ops
+        where vllm-musa has registered a kernel implementation. The IR
+        lowering pass replaces `torch.ops.vllm_ir.<op>` with the first
+        supported impl in this list during torch.compile.
+        """
+        from vllm.config.compilation import CompilationMode
+        from vllm.config.kernel import IrOpPriorityConfig
+
+        cc = vllm_config.compilation_config
+        using_inductor = (
+            cc.backend == "inductor" and cc.mode != CompilationMode.NONE
+        )
+        # Mirror cuda.py's pattern: when compiling, keep `native` first so
+        # Inductor sees the reference impl and the lowering pass swaps in
+        # the kernel; when not compiling, take the kernel path directly.
+        default = ["native"] if using_inductor else ["musa", "native"]
+        rms_norm = ["musa"] + default
+        return IrOpPriorityConfig.with_default(default, rms_norm=rms_norm)
+
+    @classmethod
     def support_deep_gemm(cls) -> bool:
         """
         Returns if DeepGEMM is supported by the current platform.
