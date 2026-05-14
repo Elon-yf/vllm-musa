@@ -183,7 +183,12 @@ class MUSAPlatformBase(Platform):
         # Inductor sees the reference impl and the lowering pass swaps in
         # the kernel; when not compiling, take the kernel path directly.
         default = ["native"] if using_inductor else ["musa", "native"]
-        rms_norm = ["musa"] + default
+        # rms_norm: `musa` first, `native` fallback. Build the list
+        # explicitly — do NOT do `["musa"] + default`, because in the
+        # non-inductor branch `default` already starts with "musa", which
+        # would yield ["musa", "musa", "native"] and trip the IR op
+        # priority validator / dispatcher.
+        rms_norm = ["musa", "native"]
         return IrOpPriorityConfig.with_default(default, rms_norm=rms_norm)
 
     @classmethod
