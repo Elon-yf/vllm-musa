@@ -350,26 +350,24 @@ class MUSAPlatformBase(Platform):
 
         compilation_config = vllm_config.compilation_config
         cudagraph_mode = getattr(compilation_config, "cudagraph_mode", None)
-        # MUSA-0061: the TP>2 cudagraph force-disable below exists because
-        # MCCL collectives are not safe during MUSA stream capture. That
-        # reasoning only holds when custom_all_reduce is disabled -- with
-        # custom_all_reduce enabled (MUSA-0062), the TP allreduce uses the
-        # cudagraph-capturable custom kernel instead of MCCL, so cudagraph
-        # capture is allowed. Gate the force-disable on
-        # disable_custom_all_reduce accordingly.
-        if (
-            parallel_config.tensor_parallel_size > 2
-            and parallel_config.disable_custom_all_reduce
-            and cudagraph_mode is not None
-        ):
+        # MUSA-0061 investigated lifting this TP>2 cudagraph force-disable
+        # once custom_all_reduce (MUSA-0062) replaced the MCCL TP allreduce
+        # with a cudagraph-capturable kernel. It does NOT help: at TP>2 the
+        # MCCL ProcessGroup itself is incompatible with MUSA stream capture
+        # -- vLLM's profile_cudagraph_memory() (the first stream-capture
+        # op) crashes with "operation not permitted when stream is
+        # capturing", in BOTH MCCL async-watchdog mode and
+        # TORCH_MCCL_BLOCKING_WAIT=1 mode, for PIECEWISE / FULL_DECODE_ONLY
+        # / FULL alike. The force-disable is therefore kept unconditional
+        # for TP>2. See generated/musa0061/ for the full sweep evidence.
+        if parallel_config.tensor_parallel_size > 2 and cudagraph_mode is not None:
             from vllm.config import CUDAGraphMode
 
             if cudagraph_mode != CUDAGraphMode.NONE:
                 logger.warning(
                     "Disabling MUSA cudagraph capture for tensor parallel "
                     "size %d because MCCL collectives are not safe during "
-                    "stream capture on this platform and custom_all_reduce "
-                    "is disabled.",
+                    "stream capture on this platform.",
                     parallel_config.tensor_parallel_size,
                 )
                 compilation_config.cudagraph_mode = CUDAGraphMode.NONE
