@@ -279,6 +279,22 @@ class MUSAPlatformBase(Platform):
             )
             scheduler_config.disable_chunked_mm_input = True
 
+        compilation_config = vllm_config.compilation_config
+        cudagraph_mode = getattr(compilation_config, "cudagraph_mode", None)
+        if parallel_config.tensor_parallel_size > 2 and cudagraph_mode is not None:
+            from vllm.config import CUDAGraphMode
+
+            if cudagraph_mode != CUDAGraphMode.NONE:
+                logger.warning(
+                    "Disabling MUSA cudagraph capture for tensor parallel "
+                    "size %d because MCCL collectives are not safe during "
+                    "stream capture on this platform.",
+                    parallel_config.tensor_parallel_size,
+                )
+                compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+                compilation_config.max_cudagraph_capture_size = 0
+                compilation_config.cudagraph_capture_sizes = []
+
     @classmethod
     def get_current_memory_usage(
         cls, device: torch.types.Device | None = None
