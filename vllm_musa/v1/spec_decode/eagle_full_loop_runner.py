@@ -353,7 +353,7 @@ class EagleFullLoopRunner:
             batch_size=batch_size,
         )
 
-    # ---- helpers (step-4 implementation targets) ----
+    # ---- helpers (step 4: real implementations) ----
 
     def _warmup_eager(
         self,
@@ -363,19 +363,17 @@ class EagleFullLoopRunner:
     ) -> None:
         """Run one eager pass through the N-step loop before graph capture.
 
-        STEP 4 TODO. Required by torch.cuda.graph to ensure all kernels are
-        compiled and allocator pages are warm. The eager pass writes to the
-        same buffers the captured graph will write to — i.e., it's the
-        functional equivalent of the captured loop but executed outside
-        any graph context.
-
-        Per Q1 smoke (generated/musa0090_impl/step1_5-q1-cudagraph-smoke-result.md):
-        run inside a side stream and join before the capture context opens.
+        Required by torch.cuda.graph: kernels must be compiled and allocator
+        pages warm before the capture context opens. Pattern from the Q1 smoke
+        (generated/musa0090_impl/step1_5-q1-cudagraph-smoke-result.md): run on
+        a side stream, join before capture.
         """
-        # STEP 4: implement using the same kernel calls that will be
-        # captured. Avoid any Python-level data-dependent control flow inside
-        # this method that wouldn't replay correctly later.
-        raise NotImplementedError("_warmup_eager: STEP 4 implementation pending")
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            self._run_n_step_inner(buffers, attn_metadata_array, batch_size)
+        torch.cuda.current_stream().wait_stream(s)
+        torch.cuda.synchronize()
 
     def _capture_n_step_loop(
         self,
@@ -387,19 +385,134 @@ class EagleFullLoopRunner:
         """Open the torch.cuda.graph context and drive the N-step loop with
         in-place tensor ops only. Returns the captured CUDAGraph object.
 
-        STEP 4 TODO. The pseudocode in _capture_one_batch_size's docstring
-        is the spec. Critical invariants enforced here:
+        Critical invariants enforced inside `_run_n_step_inner`:
           - No Python list growth (no .append, no torch.cat).
           - No new tensor allocations (everything writes into `buffers`).
-          - No set_forward_context / dispatcher calls (loop is inside graph).
           - No tensor.item() / .tolist() / .cpu() calls (would CUDA-sync).
+          - set_forward_context is allowed (pure Python state mutation; the
+            actual GPU work it wraps is captured by torch.cuda.graph).
         """
-        # STEP 4: torch.cuda.graph() + for loop. See pseudocode in
-        # _capture_one_batch_size() docstring.
-        raise NotImplementedError(
-            "_capture_n_step_loop: STEP 4 implementation pending. "
-            "Pseudocode in _capture_one_batch_size() docstring."
+        # torch.cuda.CUDAGraph is routed to torch_musa.musa_graph.MUSAGraph on
+        # MUSA via torchada — proven correctness-wise by the Q1 smoke.
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=pool):
+            self._run_n_step_inner(buffers, attn_metadata_array, batch_size)
+        return graph
+
+    def _run_n_step_inner(
+        self,
+        buffers: EagleDraftBuffers,
+        attn_metadata_array: list,
+        batch_size: int,
+    ) -> None:
+        """The N-step draft loop body. Called both by _warmup_eager (outside
+        graph) and _capture_n_step_loop (inside graph). MUST use only
+        in-place tensor ops + tensor-view assignments that the graph can
+        capture.
+
+        This mirrors vLLM's `EagleProposer.propose()` loop body
+        (vllm/v1/spec_decode/llm_base_proposer.py:554-651) but
+        statically-allocates everything ahead of time.
+        """
+        # Lazy imports to avoid pulling vLLM internals at module-load time.
+        from vllm.forward_context import set_forward_context
+        from vllm.config import CUDAGraphMode
+        from vllm.v1.spec_decode.utils import eagle_step_update_slot_mapping_and_metadata
+
+        proposer = self.proposer
+        # Step-0 seed: copy the input carry-over into the per-step buffers.
+        # bonus_token_ids_in is the bonus token from the previous verify pass
+        # (the target's accepted last token); it's the input to the first
+        # draft forward.
+        buffers.input_ids_per_step[0, :batch_size].copy_(
+            buffers.bonus_token_ids_in[:batch_size]
         )
+        buffers.hidden_states_per_step[0, :batch_size].copy_(
+            buffers.target_hidden_states_in[:batch_size]
+        )
+
+        # The N-step loop. Inside torch.cuda.graph(), every GPU op below is
+        # captured. The Python for-loop unrolls at trace time — N is a static
+        # int, not a tensor.
+        for step in range(self.num_steps):
+            # Views into this step's slice of the buffers. .narrow-style
+            # indexing on a contiguous tensor returns a view; the captured
+            # graph captures the kernel launches that consume these views.
+            input_ids_view = buffers.input_ids_per_step[step, :batch_size]
+            positions_view = buffers.positions_per_step[step, :batch_size]
+            hidden_view = buffers.hidden_states_per_step[step, :batch_size]
+            slot_mapping_view = buffers.slot_mapping_per_step[step, :batch_size]
+
+            # Build the model kwargs. vLLM's draft model signature:
+            #   model(input_ids=..., positions=..., inputs_embeds=None,
+            #         hidden_states=...)
+            # Returns either (last_hidden, hidden) tuple or just last_hidden.
+            model_kwargs = {
+                "input_ids": input_ids_view,
+                "positions": positions_view,
+                "inputs_embeds": None,
+            }
+            if getattr(proposer, "pass_hidden_states_to_model", True):
+                # Eagle3 always passes hidden states from the previous step.
+                model_kwargs["hidden_states"] = hidden_view
+
+            # set_forward_context sets vLLM's thread-local context (attn
+            # metadata, slot_mapping, num_tokens) for the model call.
+            # Critical: cudagraph_runtime_mode=NONE — we're capturing OUR
+            # OWN graph; vLLM's PIECEWISE shouldn't re-fire.
+            with set_forward_context(
+                attn_metadata_array[step],
+                proposer.vllm_config,
+                num_tokens=batch_size,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                slot_mapping=slot_mapping_view,
+            ):
+                ret_hidden_states = proposer.model(**model_kwargs)
+                if isinstance(ret_hidden_states, tuple):
+                    last_hidden_states, next_hidden = ret_hidden_states
+                else:
+                    last_hidden_states = ret_hidden_states
+                    next_hidden = ret_hidden_states
+
+            # Sample greedy via the proposer's helper (lm_head + argmax).
+            # Result dtype is int64 by default; vllm casts to int32 because
+            # "tensor.argmax() returns int64 by default" and Eagle compile
+            # requires int32 (per vllm comment line 556).
+            draft_token_ids = proposer._greedy_sample(
+                last_hidden_states[:batch_size]
+            ).to(torch.int32)
+
+            # Write the drafted token to the output tensor.
+            buffers.draft_token_ids_out[:batch_size, step].copy_(draft_token_ids)
+
+            # Update state for step+1 if not the last step.
+            if step + 1 < self.num_steps:
+                # Stage next step's input.
+                buffers.input_ids_per_step[step + 1, :batch_size].copy_(
+                    draft_token_ids
+                )
+                buffers.hidden_states_per_step[step + 1, :batch_size].copy_(
+                    next_hidden[:batch_size]
+                )
+
+                # Increment positions + recompute slot_mapping for step+1.
+                # The fused kernel writes positions, seq_lens, slot_mapping
+                # all in one launch — exactly what vLLM's iterative path
+                # does at line 569-578 of llm_base_proposer.py.
+                eagle_step_update_slot_mapping_and_metadata(
+                    positions_1d=positions_view,
+                    block_table_tensor=buffers.block_table_tensor,
+                    seq_lens=buffers.seq_lens_per_step[step + 1, :batch_size],
+                    block_size=getattr(proposer, "block_size", 16),
+                    max_model_len=getattr(proposer, "max_model_len", 196_608),
+                    out_clamped_positions=buffers.positions_per_step[
+                        step + 1, :batch_size
+                    ],
+                    out_slot_mapping=buffers.slot_mapping_per_step[
+                        step + 1, :batch_size
+                    ],
+                    input_batch_size=batch_size,
+                )
 
     # ---- memory accounting ----
 
