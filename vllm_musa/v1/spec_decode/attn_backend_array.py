@@ -26,6 +26,7 @@ def build_per_step_attn_metadata_array(
     base_metadata: Any,  # CommonAttentionMetadata; typed Any to avoid hard dep at module-load
     buffers: EagleDraftBuffers,
     batch_size: int,
+    proposer: Any = None,  # vllm.v1.spec_decode.eagle.EagleProposer (optional)
 ) -> list[Any]:
     """Pre-allocate N attn-metadata objects whose tensors point into `buffers`.
 
@@ -63,6 +64,42 @@ def build_per_step_attn_metadata_array(
     if buffers.num_steps <= 0:
         return []
 
+    # MUSA-0090 step 5e: when the proposer is provided, use its
+    # build_per_group_and_layer_attn_metadata() to produce per-layer
+    # backend-specific metadata (e.g., FlashAttentionMetadata with the
+    # use_cascade, common_prefix_len, etc. fields the compiled draft
+    # model's forward expects). The compiled forward reads
+    # get_forward_context().attn_metadata and accesses .use_cascade
+    # unconditionally; passing the raw CommonAttentionMetadata fails
+    # with AttributeError.
+    use_per_layer = proposer is not None and hasattr(
+        proposer, "build_per_group_and_layer_attn_metadata"
+    )
+    if use_per_layer:
+        metadata_array: list[Any] = []
+        for step_idx in range(buffers.num_steps):
+            # Mutate base_metadata in place to reflect the step's state
+            # (slot_mapping, seq_lens, max_seq_len), then build per-layer
+            # metadata. The per-layer call returns a dict-shaped object
+            # that the model reads via get_forward_context().
+            base_metadata.slot_mapping = buffers.slot_mapping_per_step[step_idx, :batch_size]
+            base_metadata.seq_lens = buffers.seq_lens_per_step[step_idx, :batch_size]
+            base_metadata.max_seq_len = int(getattr(base_metadata, "max_seq_len", 0)) + (1 if step_idx > 0 else 0)
+            try:
+                _, per_layer = proposer.build_per_group_and_layer_attn_metadata(
+                    base_metadata, draft_index=step_idx
+                )
+                metadata_array.append(per_layer)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"step {step_idx}: proposer.build_per_group_and_layer_attn_metadata "
+                    f"failed: {type(exc).__name__}: {exc}"
+                ) from exc
+        return metadata_array
+
+    # Fallback: dataclasses.replace on CommonAttentionMetadata. Works for
+    # tests + lightweight scenarios but the compiled draft model may
+    # need per-layer metadata (see comment block above).
     metadata_array: list[Any] = []
     base_max_seq_len = int(getattr(base_metadata, "max_seq_len", 0))
 

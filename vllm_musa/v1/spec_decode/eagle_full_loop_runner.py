@@ -209,10 +209,16 @@ class EagleFullLoopRunner:
         )
 
         # Phase 2: pre-build per-step metadata array (views into buffers).
+        # Pass `proposer` so the helper can call
+        # proposer.build_per_group_and_layer_attn_metadata() to produce
+        # per-layer backend-specific metadata that has the use_cascade /
+        # common_prefix_len / etc. fields the compiled draft model expects
+        # (see attn_backend_array.py docstring for the rationale).
         attn_metadata_array = build_per_step_attn_metadata_array(
             base_metadata=base_metadata,
             buffers=buffers,
             batch_size=batch_size,
+            proposer=self.proposer,
         )
         # Verify the indexing math before committing to graph capture.
         StepMetadataIndexing.inspect(attn_metadata_array).verify_strict()
