@@ -42,6 +42,19 @@ import logging
 
 _log = logging.getLogger(__name__)
 
+# CRITICAL ORDER: import vllm_musa.v1.spec_decode.utils BEFORE eagle.
+# vllm-musa's utils module installs a MUSA-Triton-adapted version of
+# `eagle_prepare_next_token_padded_kernel` on vllm.v1.spec_decode.utils.
+# If we import eagle here without first ensuring that monkey-patch has
+# fired, eagle.py's `from vllm.v1.spec_decode.utils import ...` will
+# bind to the UPSTREAM unpatched kernel, which then fails at MUSA
+# Triton compile time with 'mismatched type for valid_count' inside
+# eagle_prepare_next_token_padded_kernel. (Diagnosed via isolation test
+# 21:41 confirming: with this patch.py disabled, MUSA-0089 v7 config
+# boots fine + smoke PASSes; with this patch.py active but without the
+# prime import, smoke FAILS in the Triton kernel.)
+import vllm_musa.v1.spec_decode.utils  # noqa: F401 — prime the kernel monkey-patch
+
 try:
     from vllm.v1.spec_decode.eagle import EagleProposer
 except ImportError as exc:  # pragma: no cover
