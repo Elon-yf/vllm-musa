@@ -174,6 +174,11 @@ VLLM_MUSA_CSRC_SOURCES = [
     # and depends on two header file from PyTorch 2.11's torch/headeronly/core/ScalarType.h and
     # torch/headeronly/util/Exception.h, which is not supported by the current musa.
     "csrc/musa/quantization/per_token_group_quant.cu",
+    # MUSA-0088: SGLang quick_all_reduce HIP -> MUSA port (iter-2,
+    # in-progress; first-pass mechanical port + hipLaunchKernelGGL fix
+    # + musaMalloc swap. NOT YET COMPILE-TESTED — wired here to enable
+    # the next build attempt. Comment out if mcc errors.)
+    "csrc/quick_all_reduce.cu",
 ]
 
 VLLM_MOE_CSRC_SOURCES = [
