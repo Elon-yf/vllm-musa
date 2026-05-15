@@ -123,6 +123,17 @@ class QuickAllReduce:
             return False
         return True
 
+    # API-compat aliases matching vllm-upstream cuda_communicator.all_reduce naming.
+    def should_quick_allreduce(self, input_: torch.Tensor) -> bool:
+        return self.should_quick_ar(input_)
+
+    def quick_all_reduce(
+        self, input_: torch.Tensor, quant_level: int = 0, cast_bf2half: bool = False
+    ) -> Optional[torch.Tensor]:
+        """vllm-upstream API alias: returns the all-reduced output tensor
+        directly (in-place via a fresh output buffer)."""
+        return self.all_reduce(input_, output=None, quant_level=quant_level, cast_bf2half=cast_bf2half)
+
     def all_reduce(
         self,
         input_: torch.Tensor,
