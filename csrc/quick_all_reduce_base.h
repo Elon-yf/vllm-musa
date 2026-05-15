@@ -116,11 +116,15 @@ __quickreduce_device_inline__ void packed_assign_add<half>(int32x4_t* A, int32x4
   int32x4_t& tR_fragment = A[0];
   int32x4_t& tA_fragment = B[0];
 
-  // MUSA-0088: AMD GCN v_pk_add_f16 -> portable __hadd2.
+  // MUSA-0088: AMD GCN v_pk_add_f16 -> portable __hadd2. Use cast-and-offset
+  // because tR_fragment is a clang vector (__vector_size__ attribute) — taking
+  // address of [i] is rejected.
+  int32_t* rp = reinterpret_cast<int32_t*>(&tR_fragment);
+  int32_t* ap = reinterpret_cast<int32_t*>(&tA_fragment);
   for (int i = 0; i < 4; ++i) {
-    __half2 r = *reinterpret_cast<__half2*>(&tR_fragment[i]);
-    __half2 a = *reinterpret_cast<__half2*>(&tA_fragment[i]);
-    *reinterpret_cast<__half2*>(&tR_fragment[i]) = __hadd2(r, a);
+    __half2 r = *reinterpret_cast<__half2*>(&rp[i]);
+    __half2 a = *reinterpret_cast<__half2*>(&ap[i]);
+    *reinterpret_cast<__half2*>(&rp[i]) = __hadd2(r, a);
   }
 }
 
@@ -331,15 +335,15 @@ __quickreduce_device_inline__ int group_abs_max(int32x4_t atom) {
   // Note: This is basically 2 blocks of values setup as the
   // upper/lower halves of the f16x2_t
   for (int i = 1; i < kThreadGroupSize; i <<= 1) {
-    int x = __shfl_down(wmax, i);
+    int x = __shfl_down_sync(0xFFFFFFFF, wmax, i);
     wmax = packed_max<T>(wmax, x);
 
-    int y = __shfl_down(wmin, i);
+    int y = __shfl_down_sync(0xFFFFFFFF, wmin, i);
     wmin = packed_min<T>(wmin, y);
   }
   wblockmax = packed_abs_max<T>(wmax, wmin);
   // Share with the cohort
-  wblockmax = __shfl(wblockmax, group_leader);
+  wblockmax = __shfl_sync(0xFFFFFFFF, wblockmax, group_leader);
   return wblockmax;
 }
 

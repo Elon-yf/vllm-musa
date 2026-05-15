@@ -323,9 +323,10 @@ struct CodecQ6 : public CodecBase {
             int32_t q6 = q4 | (q2 << 4) | kHalf2_1024;
             // MUSA-0088: dead-code (if(0) above) AMD GCN asm replaced with __hadd2 equivalent.
             {
+              int32_t* wp = reinterpret_cast<int32_t*>(&w);
               __half2 q6_h2 = *reinterpret_cast<__half2*>(&q6);
               __half2 c_h2 = *reinterpret_cast<__half2 const*>(&kHalf2_1056);
-              *reinterpret_cast<__half2*>(&w[i]) = __hadd2(q6_h2, c_h2);
+              *reinterpret_cast<__half2*>(&wp[i]) = __hadd2(q6_h2, c_h2);
             }
           } else {
             int32_t int16_2 = q4 | (q2 << 4);
