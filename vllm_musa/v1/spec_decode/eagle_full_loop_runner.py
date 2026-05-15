@@ -462,12 +462,17 @@ class EagleFullLoopRunner:
             # metadata, slot_mapping, num_tokens) for the model call.
             # Critical: cudagraph_runtime_mode=NONE — we're capturing OUR
             # OWN graph; vLLM's PIECEWISE shouldn't re-fire.
+            # NOTE: do NOT pass slot_mapping=tensor here — vllm's forward_context
+            # internally does `slot_mapping or {}` which raises on multi-element
+            # Tensors (`Boolean value of Tensor with more than one value is
+            # ambiguous`). The slot_mapping_view is already carried by
+            # attn_metadata_array[step].slot_mapping; the kwarg is the per-attn-group
+            # dict that vllm uses for cross-group dispatch, NOT the single tensor.
             with set_forward_context(
                 attn_metadata_array[step],
                 proposer.vllm_config,
                 num_tokens=batch_size,
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
-                slot_mapping=slot_mapping_view,
             ):
                 ret_hidden_states = proposer.model(**model_kwargs)
                 if isinstance(ret_hidden_states, tuple):
