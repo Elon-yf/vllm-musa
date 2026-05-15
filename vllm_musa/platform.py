@@ -369,7 +369,19 @@ class MUSAPlatformBase(Platform):
         # upstream, cap max_cudagraph_capture_size to a safe value so
         # only the small (decode-relevant) graphs are captured. Single-
         # batch decode only needs size=1 anyway.
-        MUSA_SAFE_MAX_CUDAGRAPH_CAPTURE_SIZE = 8
+        # MUSA-0081: allow overriding the safe-cap via env var for
+        # spec-decode / Eagle3 perf experiments. Setting
+        # ``VLLM_MUSA_MAX_CUDAGRAPH_CAPTURE_SIZE`` overrides the default
+        # ``MUSA_SAFE_MAX_CUDAGRAPH_CAPTURE_SIZE=8``. Values up to 224
+        # have been observed working on torch_musa 2.9.0; values >= 232
+        # trigger MUSA-0082's illegal memory access at capture_end.
+        import os as _os
+        try:
+            MUSA_SAFE_MAX_CUDAGRAPH_CAPTURE_SIZE = int(
+                _os.getenv("VLLM_MUSA_MAX_CUDAGRAPH_CAPTURE_SIZE", "8")
+            )
+        except ValueError:
+            MUSA_SAFE_MAX_CUDAGRAPH_CAPTURE_SIZE = 8
         if cudagraph_mode is not None:
             from vllm.config import CUDAGraphMode
             if cudagraph_mode != CUDAGraphMode.NONE:
@@ -379,7 +391,8 @@ class MUSAPlatformBase(Platform):
                         "MUSA-0076: capping max_cudagraph_capture_size "
                         "from %d to %d (larger sizes trigger an illegal "
                         "memory access at musa_graph.capture_end on "
-                        "torch_musa 2.9.0; investigation pending).",
+                        "torch_musa 2.9.0; investigation pending). "
+                        "Override with VLLM_MUSA_MAX_CUDAGRAPH_CAPTURE_SIZE.",
                         max_size, MUSA_SAFE_MAX_CUDAGRAPH_CAPTURE_SIZE,
                     )
                     compilation_config.max_cudagraph_capture_size = (
