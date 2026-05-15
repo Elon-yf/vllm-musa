@@ -15,8 +15,8 @@
 
 namespace quickreduce {
 
-typedef __hip_bfloat16 nv_bfloat16;
-typedef __hip_bfloat162 nv_bfloat162;
+typedef __mt_bfloat16 nv_bfloat16;  // MUSA-0088: __hip_bfloat16 -> __mt_bfloat16
+typedef __mt_bfloat162 nv_bfloat162;  // MUSA-0088: __hip_bfloat162 -> __mt_bfloat162
 
 using int32x2_t = __attribute__((__vector_size__(2 * sizeof(int)))) int;
 using int32x4_t = __attribute__((__vector_size__(4 * sizeof(int)))) int;
