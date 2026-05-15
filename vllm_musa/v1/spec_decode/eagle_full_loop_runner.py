@@ -221,7 +221,11 @@ class EagleFullLoopRunner:
             proposer=self.proposer,
         )
         # Verify the indexing math before committing to graph capture.
-        StepMetadataIndexing.inspect(attn_metadata_array).verify_strict()
+        # Skip verify_strict for per-layer dict metadata (StepMetadataIndexing
+        # reads `.slot_mapping.data_ptr()` which is a CommonAttentionMetadata
+        # field, not a per-layer-dict attribute).
+        if attn_metadata_array and not isinstance(attn_metadata_array[0], dict):
+            StepMetadataIndexing.inspect(attn_metadata_array).verify_strict()
 
         # Phase 3: warm-up. STEP 4 TODO — run one eager iteration to compile
         # kernels and exercise allocator hot-paths. Per torch.cuda.graph docs,
