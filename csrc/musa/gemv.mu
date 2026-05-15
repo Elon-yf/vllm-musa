@@ -1,5 +1,7 @@
 #include <musa_runtime.h>
 #include <cassert>
+#include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <musa_bf16.h>
 #include <musa_fp16.h>
@@ -513,6 +515,81 @@ struct BlockConfig {
     bool valid;
 };
 
+constexpr const char* kGemvMoeBlockEnv = "VLLM_MUSA_GEMV_MOE_BLOCK";
+constexpr const char* kDeepSeekFp8W1BlockEnv =
+    "VLLM_MUSA_DEEPSEEK_FP8_W1_32X4";
+
+bool ParseForcedBlockConfig(BlockConfig* config) {
+    const char* value = std::getenv(kGemvMoeBlockEnv);
+    if (value == nullptr || value[0] == '\0') {
+        return false;
+    }
+
+    int block_n = 0;
+    int block_k = 0;
+    if (std::sscanf(value, "%dx%d", &block_n, &block_k) != 2) {
+        TORCH_CHECK(false, kGemvMoeBlockEnv, " must use '<block_n>x<block_k>', got ", value);
+    }
+    TORCH_CHECK(block_n > 0 && block_k > 0, kGemvMoeBlockEnv, " must use positive block sizes, got ", value);
+    TORCH_CHECK(block_n * block_k <= 512, kGemvMoeBlockEnv, " block_n * block_k must be <= 512, got ", value);
+
+    *config = BlockConfig{block_n, block_k, 0.f, true};
+    return true;
+}
+
+bool IsForcedBlockConfigValid(const BlockConfig& config, int nr_n, int hidden_size, int vlen) {
+    return (nr_n % config.block_n == 0) &&
+           (hidden_size % (config.block_k * vlen) == 0);
+}
+
+bool IsDeepSeekFp8W1BlockEnabled() {
+    const char* value = std::getenv(kDeepSeekFp8W1BlockEnv);
+    return value == nullptr || value[0] != '0';
+}
+
+bool ShouldUseQwenFp8Moe32x4(
+    int current_arch,
+    bool is_fp8,
+    bool use_swigelu,
+    int nr_n,
+    int hidden_size,
+    int scale_k_group_tile,
+    int vlen) {
+    if (current_arch < 300 || !is_fp8 || scale_k_group_tile != 128) {
+        return false;
+    }
+
+    const bool qwen_w1_swiglu = use_swigelu && hidden_size == 2048 && nr_n == 768;
+    const bool qwen_w2_project = !use_swigelu && hidden_size == 768 && nr_n == 2048;
+    const BlockConfig config{32, 4, 0.f, true};
+    return (qwen_w1_swiglu || qwen_w2_project) &&
+           IsForcedBlockConfigValid(config, nr_n, hidden_size, vlen);
+}
+
+bool ShouldUseDeepSeekFp8W1Moe32x4(
+    bool is_fp8,
+    bool use_swigelu,
+    bool use_int4_w4a16,
+    int64_t topk,
+    int hidden_size,
+    int reduce_size,
+    int num_experts,
+    int scale_k_group_tile,
+    int nr_n,
+    int vlen) {
+    const BlockConfig config{32, 4, 0.f, true};
+    return IsDeepSeekFp8W1BlockEnabled() &&
+           is_fp8 &&
+           use_swigelu &&
+           !use_int4_w4a16 &&
+           topk == 6 &&
+           hidden_size == 2048 &&
+           reduce_size == 2816 &&
+           num_experts == 64 &&
+           scale_k_group_tile == 128 &&
+           IsForcedBlockConfigValid(config, nr_n, hidden_size, vlen);
+}
+
 void musa_fused_gemv(
     torch::Tensor &A,
     torch::Tensor &B,
@@ -622,13 +699,24 @@ void musa_fused_gemv(
         }
     }
 
-    BlockConfig* best_config = new BlockConfig{32, 1, -1.0f, false};
+    BlockConfig fallback_config{32, 1, -1.0f, false};
     if (current_arch < 300) {
-        best_config = new BlockConfig{128, 1, -1.0f, false};
+        fallback_config = BlockConfig{128, 1, -1.0f, false};
     }
-    for (auto& config : configs) {
-        if (config.valid && config.score > best_config->score) {
-            best_config = &config;
+    BlockConfig forced_config{0, 0, 0.f, false};
+    BlockConfig* best_config = &fallback_config;
+    if (ParseForcedBlockConfig(&forced_config)) {
+        TORCH_CHECK(
+            IsForcedBlockConfigValid(forced_config, nr_n, hidden_size, vlen),
+            kGemvMoeBlockEnv, "=", forced_config.block_n, "x",
+            forced_config.block_k, " is invalid for nr_n=", nr_n,
+            ", hidden_size=", hidden_size, ", vlen=", vlen);
+        best_config = &forced_config;
+    } else {
+        for (auto& config : configs) {
+            if (config.valid && config.score > best_config->score) {
+                best_config = &config;
+            }
         }
     }
 
@@ -642,18 +730,21 @@ void musa_fused_gemv(
         case 8:
             switch (best_config->block_k) {
                 case 16: GEN_LAUNCH_KERN_GEMV(8, 16); break;
+                case 32: GEN_LAUNCH_KERN_GEMV(8, 32); break;
                 default: TORCH_CHECK(false, "Unsupported block_k for block_n=8");
             }
             break;
         case 16:
             switch (best_config->block_k) {
                 case 8: GEN_LAUNCH_KERN_GEMV(16, 8); break;
+                case 16: GEN_LAUNCH_KERN_GEMV(16, 16); break;
                 default: TORCH_CHECK(false, "Unsupported block_k for block_n=16");
             }
             break;
         case 32:
             switch (best_config->block_k) {
                 case 4: GEN_LAUNCH_KERN_GEMV(32, 4); break;
+                case 8: GEN_LAUNCH_KERN_GEMV(32, 8); break;
                 case 1: GEN_LAUNCH_KERN_GEMV(32, 1); break;
                 default: TORCH_CHECK(false, "Unsupported block_k for block_n=32");
             }
@@ -775,14 +866,47 @@ void musa_fused_gemv_moe(
         }
     }
 
-    BlockConfig* best_config = new BlockConfig{32, 1, -1.0f, false};
+    BlockConfig fallback_config{32, 1, -1.0f, false};
     if (current_arch < 300) {
-        best_config = new BlockConfig{128, 1, -1.0f, false};
+        fallback_config = BlockConfig{128, 1, -1.0f, false};
     }
-
-    for (auto& config : configs) {
-        if (config.valid && config.score > best_config->score) {
-            best_config = &config;
+    BlockConfig forced_config{0, 0, 0.f, false};
+    BlockConfig qwen_fp8_moe_config{32, 4, 0.f, true};
+    BlockConfig deepseek_fp8_w1_config{32, 4, 0.f, true};
+    BlockConfig* best_config = &fallback_config;
+    if (ParseForcedBlockConfig(&forced_config)) {
+        TORCH_CHECK(
+            IsForcedBlockConfigValid(forced_config, nr_n, hidden_size, vlen),
+            kGemvMoeBlockEnv, "=", forced_config.block_n, "x",
+            forced_config.block_k, " is invalid for nr_n=", nr_n,
+            ", hidden_size=", hidden_size, ", vlen=", vlen);
+        best_config = &forced_config;
+    } else if (ShouldUseQwenFp8Moe32x4(
+                   current_arch,
+                   is_fp8,
+                   use_swigelu,
+                   nr_n,
+                   hidden_size,
+                   scale_k_group_tile,
+                   vlen)) {
+        best_config = &qwen_fp8_moe_config;
+    } else if (ShouldUseDeepSeekFp8W1Moe32x4(
+                   is_fp8,
+                   use_swigelu,
+                   use_int4_w4a16,
+                   topk,
+                   hidden_size,
+                   reduce_size,
+                   num_experts,
+                   scale_k_group_tile,
+                   nr_n,
+                   vlen)) {
+        best_config = &deepseek_fp8_w1_config;
+    } else {
+        for (auto& config : configs) {
+            if (config.valid && config.score > best_config->score) {
+                best_config = &config;
+            }
         }
     }
 
@@ -796,18 +920,21 @@ void musa_fused_gemv_moe(
         case 8:
             switch (best_config->block_k) {
                 case 16: GEN_LAUNCH_KERN(8, 16); break;
+                case 32: GEN_LAUNCH_KERN(8, 32); break;
                 default: TORCH_CHECK(false, "Unsupported block_k for block_n=8");
             }
             break;
         case 16:
             switch (best_config->block_k) {
                 case 8: GEN_LAUNCH_KERN(16, 8); break;
+                case 16: GEN_LAUNCH_KERN(16, 16); break;
                 default: TORCH_CHECK(false, "Unsupported block_k for block_n=16");
             }
             break;
         case 32:
             switch (best_config->block_k) {
                 case 4: GEN_LAUNCH_KERN(32, 4); break;
+                case 8: GEN_LAUNCH_KERN(32, 8); break;
                 case 1: GEN_LAUNCH_KERN(32, 1); break;
                 default: TORCH_CHECK(false, "Unsupported block_k for block_n=32");
             }

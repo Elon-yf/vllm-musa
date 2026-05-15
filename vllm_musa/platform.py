@@ -7,7 +7,7 @@ pymtml. However, it should not initialize musa context.
 import os
 from collections.abc import Callable
 from functools import cache, wraps
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 # isort: off
 import torchada  # noqa: F401
@@ -33,6 +33,28 @@ logger = init_logger(__name__)
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
+_QWEN3_MOE_FP8_MAX_CUDAGRAPH_CAPTURE_SIZE = 64
+
+
+def _is_qwen3_moe_fp8_model(model_config: Any | None) -> bool:
+    if model_config is None:
+        return False
+
+    hf_config = getattr(model_config, "hf_config", None)
+    architectures = getattr(model_config, "architectures", None)
+    if architectures is None and hf_config is not None:
+        architectures = getattr(hf_config, "architectures", None)
+    if not any("Qwen3Moe" in str(arch) for arch in architectures or ()):
+        return False
+
+    if getattr(model_config, "quantization", None) == "fp8":
+        return True
+
+    quantization_config = getattr(hf_config, "quantization_config", None)
+    if isinstance(quantization_config, dict):
+        return quantization_config.get("quant_method") == "fp8"
+
+    return False
 
 
 @cache
@@ -171,6 +193,19 @@ class MUSAPlatformBase(Platform):
         if all(s not in compilation_config.custom_ops for s in ("all", "none")):
             compilation_config.custom_ops.append("all")
 
+        if (
+            compilation_config.max_cudagraph_capture_size is None
+            and compilation_config.cudagraph_capture_sizes is None
+            and _is_qwen3_moe_fp8_model(vllm_config.model_config)
+        ):
+            compilation_config.max_cudagraph_capture_size = (
+                _QWEN3_MOE_FP8_MAX_CUDAGRAPH_CAPTURE_SIZE
+            )
+            logger.info(
+                "Capping MUSA Qwen3 MoE FP8 cudagraph capture size to %d.",
+                compilation_config.max_cudagraph_capture_size,
+            )
+
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         parallel_config = vllm_config.parallel_config
@@ -243,6 +278,22 @@ class MUSAPlatformBase(Platform):
                 "with multimodal-bidirectional attention."
             )
             scheduler_config.disable_chunked_mm_input = True
+
+        compilation_config = vllm_config.compilation_config
+        cudagraph_mode = getattr(compilation_config, "cudagraph_mode", None)
+        if parallel_config.tensor_parallel_size > 2 and cudagraph_mode is not None:
+            from vllm.config import CUDAGraphMode
+
+            if cudagraph_mode != CUDAGraphMode.NONE:
+                logger.warning(
+                    "Disabling MUSA cudagraph capture for tensor parallel "
+                    "size %d because MCCL collectives are not safe during "
+                    "stream capture on this platform.",
+                    parallel_config.tensor_parallel_size,
+                )
+                compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+                compilation_config.max_cudagraph_capture_size = 0
+                compilation_config.cudagraph_capture_sizes = []
 
     @classmethod
     def get_current_memory_usage(
@@ -417,7 +468,7 @@ class MUSAPlatformBase(Platform):
 
     @classmethod
     def supports_fp8(cls) -> bool:
-        return cls.has_device_capability(89)
+        return cls.has_device_capability((3, 1))
 
     @classmethod
     def use_custom_allreduce(cls) -> bool:

@@ -3,6 +3,7 @@
 """Tests for the MUSA Platform implementation."""
 
 import sys
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -85,6 +86,30 @@ class TestMUSAPlatformBase:
         from vllm_musa.platform import MUSAPlatformBase
 
         assert MUSAPlatformBase.use_custom_allreduce() is True
+
+    def test_supports_fp8_for_musa_3_1(self):
+        """Test that FP8 is supported on MUSA capability 3.1."""
+        from vllm_musa.platform import MUSAPlatformBase
+        from vllm.platforms.interface import DeviceCapability
+
+        with patch.object(
+            MUSAPlatformBase,
+            "get_device_capability",
+            return_value=DeviceCapability(3, 1),
+        ):
+            assert MUSAPlatformBase.supports_fp8() is True
+
+    def test_supports_fp8_rejects_pre_3_1(self):
+        """Test that pre-3.1 MUSA capability does not support FP8."""
+        from vllm_musa.platform import MUSAPlatformBase
+        from vllm.platforms.interface import DeviceCapability
+
+        with patch.object(
+            MUSAPlatformBase,
+            "get_device_capability",
+            return_value=DeviceCapability(3, 0),
+        ):
+            assert MUSAPlatformBase.supports_fp8() is False
 
     def test_support_hybrid_kv_cache(self):
         """Test that support_hybrid_kv_cache returns True."""
@@ -173,6 +198,40 @@ class TestMUSAPlatformBase:
 
         assert reason is not None
         assert "Triton float8 conversions" in reason
+
+
+class TestNativeGemvSource:
+    """Source-level checks for native MUSA GEMV dispatch gates."""
+
+    def test_qwen_fp8_moe_uses_32x4_shape_gate(self):
+        source = Path("csrc/musa/gemv.mu").read_text()
+
+        assert "ShouldUseQwenFp8Moe32x4(" in source
+        assert "hidden_size == 2048 && nr_n == 768" in source
+        assert "hidden_size == 768 && nr_n == 2048" in source
+        assert "BlockConfig qwen_fp8_moe_config{32, 4" in source
+        assert "case 4: GEN_LAUNCH_KERN(32, 4)" in source
+
+    def test_deepseek_fp8_w1_uses_32x4_shape_gate(self):
+        source = Path("csrc/musa/gemv.mu").read_text()
+
+        assert "kDeepSeekFp8W1BlockEnv" in source
+        assert '"VLLM_MUSA_DEEPSEEK_FP8_W1_32X4"' in source
+        assert "ShouldUseDeepSeekFp8W1Moe32x4(" in source
+        assert "topk == 6" in source
+        assert "hidden_size == 2048" in source
+        assert "reduce_size == 2816" in source
+        assert "num_experts == 64" in source
+        assert "BlockConfig deepseek_fp8_w1_config{32, 4" in source
+        assert "best_config = &deepseek_fp8_w1_config" in source
+
+    def test_gemv_block_override_validates_env_config(self):
+        source = Path("csrc/musa/gemv.mu").read_text()
+
+        assert 'kGemvMoeBlockEnv = "VLLM_MUSA_GEMV_MOE_BLOCK"' in source
+        assert "std::getenv(kGemvMoeBlockEnv)" in source
+        assert "must use '<block_n>x<block_k>'" in source
+        assert "IsForcedBlockConfigValid(forced_config" in source
 
 
 class TestNonMtmlMUSAPlatform:
