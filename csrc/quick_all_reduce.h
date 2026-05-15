@@ -1,32 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 //
-// MUSA-0088 first-pass mechanical port of SGLang's quick_all_reduce.h.
-// Source: sglang/sgl-kernel/csrc/allreduce/quick_all_reduce.h
+// MUSA-0088 first-pass port of SGLang's quick_all_reduce.h.
 // Translation: mechanical sed-pass per MUSA-0080 iter-2 breakdown
-// (s/hip.../musa.../g). NOT YET COMPILED OR TESTED. Follow-up:
-//   - Fix any non-mechanical translation gaps (/* MUSA-0088 TODO: replace hipLaunchKernelGGL with direct <<<grid, block, sharedMem, stream>>> launch.
-   Original HIP form:
-   hipLaunchKernelGGL,
-//     stream-cast helpers, warp-size assumptions)
-//   - Wire into vllm-musa/setup.py kernel list
-//   - Build + correctness + perf A/B per MUSA-0088 acceptance criteria
+// + hipLaunchKernelGGL -> direct <<<grid, block, sharedMem, stream>>>.
 //
-#pragma once
-
-#include <musa_runtime.h>
-
-#include <vector>
-
-#include "quick_all_reduce.cuh"
-
-#define MUSA_CHECK(err)                                                                               \
-  do {                                                                                               \
-    musaError_t err_ = (err);
-*/ hipLaunchKernelGGL,
-//     stream-cast helpers, warp-size assumptions)
-//   - Wire into vllm-musa/setup.py kernel list
-//   - Build + correctness + perf A/B per MUSA-0088 acceptance criteria
+// NOT YET COMPILED. Follow-up:
+//   - Verify mcc accepts the <<<>>> launch syntax (vs hipLaunchKernelGGL)
+//   - Adapt warp-size assumptions (HIP wave 64 -> MUSA wave 32)
+//   - Wire csrc/quick_all_reduce.cu into setup.py kernel list
+//   - Confirm musaMallocWithFlags + musaIpcMemLazyEnablePeerAccess exist
+//     (renamed mechanically from hip equivalents; may need alternative)
+//   - Build + correctness + perf A/B per MUSA-0088 ACs
 //
 #pragma once
 
@@ -74,108 +59,15 @@ __global__ __quickreduce_launch_bounds_two_shot__ static void allreduce_prototyp
   if (world_size == 2) {                                                  \
     using LineCodec = __codec<T, 2>;                                      \
     using AllReduceKernel = AllReduceTwoshot<T, LineCodec, cast_bf2half>; \
-    /* MUSA-0088 TODO: replace hipLaunchKernelGGL with direct <<<grid, block, sharedMem, stream>>> launch.
-   Original HIP form:
-   hipLaunchKernelGGL(                                                   \
-        (allreduce_prototype_twoshot<AllReduceKernel, T>),                \
-        dim3(grid),                                                       \
-        dim3(kBlockTwoShot),                                              \
-        0,                                                                \
-        stream,                                                           \
-        A,                                                                \
-        B,                                                                \
-        N,                                                                \
-        num_blocks,                                                       \
-        rank,                                                             \
-        dbuffer_list,                                                     \
-        data_offset,                                                      \
-        flag_color,                                                       \
-        this->kMaxProblemSize);
-*/ hipLaunchKernelGGL(                                                   \
-        (allreduce_prototype_twoshot<AllReduceKernel, T>),                \
-        dim3(grid),                                                       \
-        dim3(kBlockTwoShot),                                              \
-        0,                                                                \
-        stream,                                                           \
-        A,                                                                \
-        B,                                                                \
-        N,                                                                \
-        num_blocks,                                                       \
-        rank,                                                             \
-        dbuffer_list,                                                     \
-        data_offset,                                                      \
-        flag_color,                                                       \
-        this->kMaxProblemSize);                                           \
+    allreduce_prototype_twoshot<AllReduceKernel, T><<<dim3(grid), dim3(kBlockTwoShot), 0, stream>>>(A, B, N, num_blocks, rank, dbuffer_list, data_offset, flag_color, this->kMaxProblemSize);                                           \
   } else if (world_size == 4) {                                           \
     using LineCodec = __codec<T, 4>;                                      \
     using AllReduceKernel = AllReduceTwoshot<T, LineCodec, cast_bf2half>; \
-    /* MUSA-0088 TODO: replace hipLaunchKernelGGL with direct <<<grid, block, sharedMem, stream>>> launch.
-   Original HIP form:
-   hipLaunchKernelGGL(                                                   \
-        (allreduce_prototype_twoshot<AllReduceKernel, T>),                \
-        dim3(grid),                                                       \
-        dim3(kBlockTwoShot),                                              \
-        0,                                                                \
-        stream,                                                           \
-        A,                                                                \
-        B,                                                                \
-        N,                                                                \
-        num_blocks,                                                       \
-        rank,                                                             \
-        dbuffer_list,                                                     \
-        data_offset,                                                      \
-        flag_color,                                                       \
-        this->kMaxProblemSize);
-*/ hipLaunchKernelGGL(                                                   \
-        (allreduce_prototype_twoshot<AllReduceKernel, T>),                \
-        dim3(grid),                                                       \
-        dim3(kBlockTwoShot),                                              \
-        0,                                                                \
-        stream,                                                           \
-        A,                                                                \
-        B,                                                                \
-        N,                                                                \
-        num_blocks,                                                       \
-        rank,                                                             \
-        dbuffer_list,                                                     \
-        data_offset,                                                      \
-        flag_color,                                                       \
-        this->kMaxProblemSize);                                           \
+    allreduce_prototype_twoshot<AllReduceKernel, T><<<dim3(grid), dim3(kBlockTwoShot), 0, stream>>>(A, B, N, num_blocks, rank, dbuffer_list, data_offset, flag_color, this->kMaxProblemSize);                                           \
   } else if (world_size == 8) {                                           \
     using LineCodec = __codec<T, 8>;                                      \
     using AllReduceKernel = AllReduceTwoshot<T, LineCodec, cast_bf2half>; \
-    /* MUSA-0088 TODO: replace hipLaunchKernelGGL with direct <<<grid, block, sharedMem, stream>>> launch.
-   Original HIP form:
-   hipLaunchKernelGGL(                                                   \
-        (allreduce_prototype_twoshot<AllReduceKernel, T>),                \
-        dim3(grid),                                                       \
-        dim3(kBlockTwoShot),                                              \
-        0,                                                                \
-        stream,                                                           \
-        A,                                                                \
-        B,                                                                \
-        N,                                                                \
-        num_blocks,                                                       \
-        rank,                                                             \
-        dbuffer_list,                                                     \
-        data_offset,                                                      \
-        flag_color,                                                       \
-        this->kMaxProblemSize);
-*/ hipLaunchKernelGGL(                                                   \
-        (allreduce_prototype_twoshot<AllReduceKernel, T>),                \
-        dim3(grid),                                                       \
-        dim3(kBlockTwoShot),                                              \
-        0,                                                                \
-        stream,                                                           \
-        A,                                                                \
-        B,                                                                \
-        N,                                                                \
-        num_blocks,                                                       \
-        rank,                                                             \
-        dbuffer_list,                                                     \
-        data_offset,                                                      \
-        flag_color,                                                       \
-        this->kMaxProblemSize);                                           \
+    allreduce_prototype_twoshot<AllReduceKernel, T><<<dim3(grid), dim3(kBlockTwoShot), 0, stream>>>(A, B, N, num_blocks, rank, dbuffer_list, data_offset, flag_color, this->kMaxProblemSize);                                           \
   }
 
 enum QuickReduceQuantLevel {
@@ -221,7 +113,7 @@ struct DeviceComms {
     static int64_t data_buffer_size = 2 * this->kMaxProblemSize;
     int64_t total_buffer_size = flags_buffer_size + data_buffer_size;
     data_offset = flags_buffer_size;
-    MUSA_CHECK(/* MUSA-0088 TODO: hip->musa equivalent for hipExtMallocWithFlags */ hipExtMallocWithFlags((void**)&dbuffer, total_buffer_size, /* MUSA-0088 TODO: hip->musa equivalent for hipDeviceMallocUncached */ hipDeviceMallocUncached));
+    MUSA_CHECK(musaMallocWithFlags((void**)&dbuffer, total_buffer_size, musaDeviceMallocUncached));
 
     // Clear the flags buffer.
     MUSA_CHECK(musaMemset(dbuffer, 0, flags_buffer_size));
@@ -275,7 +167,7 @@ struct DeviceComms {
     for (int i = 0; i < world_size; i++) {
       if (i != rank) {
         MUSA_CHECK(
-            musaIpcOpenMemHandle((void**)&buffer_list[i], all_buffer_ipc_handles[i], /* MUSA-0088 TODO: hip->musa equivalent for hipIpcMemLazyEnablePeerAccess */ hipIpcMemLazyEnablePeerAccess));
+            musaIpcOpenMemHandle((void**)&buffer_list[i], all_buffer_ipc_handles[i], musaIpcMemLazyEnablePeerAccess));
       } else {
         buffer_list[i] = dbuffer;
       }
