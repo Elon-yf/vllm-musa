@@ -107,18 +107,25 @@ int64_t qr_max_size() {
   template struct quickreduce::AllReduceTwoshot<T, Codec<T, 4>, cast_bf2half>; \
   template struct quickreduce::AllReduceTwoshot<T, Codec<T, 8>, cast_bf2half>;
 
+// MUSA-0088 iter-5: strip to M2.5 production shape only (bf16 CodecFP, no cast).
+// The full template surface (36 instantiations) triggers an mcc internal
+// segfault in CallGraph Pass Manager. Restricting to this single shape
+// keeps the kernel binary small and lets mcc complete. Other shapes
+// (CodecQ4/Q6/Q8 quantized, half dtype, cast_bf2half=true) can be
+// re-enabled when mate/mcc fixes the segfault.
 INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecFP, false)
-INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ4, false)
-INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ6, false)
-INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ8, false)
-INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecFP, true)
-INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ4, true)
-INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ6, true)
-INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ8, true)
+// INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ4, false)
+// INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ6, false)
+// INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ8, false)
+// INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecFP, true)
+// INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ4, true)
+// INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ6, true)
+// INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ8, true)
 
-INSTANTIATE_FOR_WORLDSIZE(half, quickreduce::CodecFP, false)
-INSTANTIATE_FOR_WORLDSIZE(half, quickreduce::CodecQ4, false)
-INSTANTIATE_FOR_WORLDSIZE(half, quickreduce::CodecQ6, false)
-INSTANTIATE_FOR_WORLDSIZE(half, quickreduce::CodecQ8, false)
+// MUSA-0088 iter-5: half-dtype variants stripped (only bf16 kept above).
+// INSTANTIATE_FOR_WORLDSIZE(half, quickreduce::CodecFP, false)
+// INSTANTIATE_FOR_WORLDSIZE(half, quickreduce::CodecQ4, false)
+// INSTANTIATE_FOR_WORLDSIZE(half, quickreduce::CodecQ6, false)
+// INSTANTIATE_FOR_WORLDSIZE(half, quickreduce::CodecQ8, false)
 
 #endif  // USE_MUSA
