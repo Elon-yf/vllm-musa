@@ -10,8 +10,8 @@
 #include <cstdint>
 
 #define __quickreduce_device_inline__ __device__ __forceinline__
-#define __quickreduce_launch_bounds_two_shot__ __launch_bounds__(256, 4)
-#define __quickreduce_launch_bounds_one_shot__ __launch_bounds__(512, 4)
+#define __quickreduce_launch_bounds_two_shot__ __launch_bounds__(128, 4)  // MUSA-0088: kBlockSize=128
+#define __quickreduce_launch_bounds_one_shot__ __launch_bounds__(256, 4)  // MUSA-0088: half of HIP
 
 namespace quickreduce {
 
@@ -38,22 +38,29 @@ static constexpr int kNegOne = 0xBC00BC00;  // {-1, -1}, fp16x2_t
 // Number of atoms (4xf16x2_t) processed by a single thread
 static constexpr int kAtoms = 8;
 
-// We use a workgroup of 256 threads
-static constexpr int kBlockSize = 256;
+// MUSA-0088: warp/block-size adaptation for MTT S5000.
+// HIP/AMD CDNA wavefront = 64; MUSA on S5000 = 32. To preserve the
+// "4 warps per block" ratio that the codec macros assume, drop block
+// size from 256 (= 4*64) to 128 (= 4*32). This is the conservative
+// choice; if mcc compiles cleanly, an A/B at block=256 (= 8 warps on
+// MUSA) is worth probing - more warps may yield better occupancy on
+// S5000's 96-CU silicon.
+static constexpr int kBlockSize = 128;
 static constexpr int kAtomStride = kBlockSize;
 
 // Size and atom stride of source/destination data that the block will
 // process.
-// Workgroup scope = Tile = (256 threads x 8 atoms x 16B)
+// Workgroup scope = Tile = (kBlockSize threads x 8 atoms x 16B)
 static constexpr int kTileSize = kBlockSize * kAtoms * sizeof(int32x4_t);
 
-// Max number of blocks. 304 CUs on MI300
-static constexpr int kMaxNumBlocks = 304 * 4;
+// Max number of blocks. MTT S5000 has 96 CUs (vs MI300's 304); keep the
+// 4x factor for occupancy headroom.
+static constexpr int kMaxNumBlocks = 96 * 4;
 
-// Standard CDNA wavefront size.
-static constexpr int kWavefront = 64;
+// MUSA wavefront size on MTT S5000.
+static constexpr int kWavefront = 32;
 
-// 256 thread, 4 wavefronts.
+// kBlockSize threads, 4 wavefronts (kBlockSize/kWavefront = 4).
 static dim3 constexpr kBlockTwoShot = {kWavefront, kBlockSize / kWavefront, 1};
 
 // Number of threads in a group for quantization
