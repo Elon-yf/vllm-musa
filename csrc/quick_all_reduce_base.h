@@ -116,10 +116,12 @@ __quickreduce_device_inline__ void packed_assign_add<half>(int32x4_t* A, int32x4
   int32x4_t& tR_fragment = A[0];
   int32x4_t& tA_fragment = B[0];
 
-  asm volatile("v_pk_add_f16 %0, %1, %2" : "=v"(tR_fragment[0]) : "v"(tR_fragment[0]), "v"(tA_fragment[0]));
-  asm volatile("v_pk_add_f16 %0, %1, %2" : "=v"(tR_fragment[1]) : "v"(tR_fragment[1]), "v"(tA_fragment[1]));
-  asm volatile("v_pk_add_f16 %0, %1, %2" : "=v"(tR_fragment[2]) : "v"(tR_fragment[2]), "v"(tA_fragment[2]));
-  asm volatile("v_pk_add_f16 %0, %1, %2" : "=v"(tR_fragment[3]) : "v"(tR_fragment[3]), "v"(tA_fragment[3]));
+  // MUSA-0088: AMD GCN v_pk_add_f16 -> portable __hadd2.
+  for (int i = 0; i < 4; ++i) {
+    __half2 r = *reinterpret_cast<__half2*>(&tR_fragment[i]);
+    __half2 a = *reinterpret_cast<__half2*>(&tA_fragment[i]);
+    *reinterpret_cast<__half2*>(&tR_fragment[i]) = __hadd2(r, a);
+  }
 }
 
 template <>
@@ -137,8 +139,12 @@ __quickreduce_device_inline__ int packed_max(int a, int b);
 
 template <>
 __quickreduce_device_inline__ int packed_max<half>(int a, int b) {
+  // MUSA-0088: AMD GCN v_pk_max_f16 -> portable __hmax2.
+  __half2 a2 = *reinterpret_cast<__half2*>(&a);
+  __half2 b2 = *reinterpret_cast<__half2*>(&b);
+  __half2 r2 = __hmax2(a2, b2);
   int result;
-  asm volatile("v_pk_max_f16 %0, %1, %2" : "=v"(result) : "v"(a), "v"(b));
+  *reinterpret_cast<__half2*>(&result) = r2;
   return result;
 }
 
@@ -156,8 +162,12 @@ __quickreduce_device_inline__ int packed_min(int a, int b);
 
 template <>
 __quickreduce_device_inline__ int packed_min<half>(int a, int b) {
+  // MUSA-0088: AMD GCN v_pk_min_f16 -> portable __hmin2.
+  __half2 a2 = *reinterpret_cast<__half2*>(&a);
+  __half2 b2 = *reinterpret_cast<__half2*>(&b);
+  __half2 r2 = __hmin2(a2, b2);
   int result;
-  asm volatile("v_pk_min_f16 %0, %1, %2" : "=v"(result) : "v"(a), "v"(b));
+  *reinterpret_cast<__half2*>(&result) = r2;
   return result;
 }
 
@@ -199,8 +209,12 @@ __quickreduce_device_inline__ int packed_add(int a, int b);
 
 template <>
 __quickreduce_device_inline__ int packed_add<half>(int a, int b) {
+  // MUSA-0088: AMD GCN v_pk_add_f16 -> portable __hadd2.
+  __half2 a2 = *reinterpret_cast<__half2*>(&a);
+  __half2 b2 = *reinterpret_cast<__half2*>(&b);
+  __half2 r2 = __hadd2(a2, b2);
   int result;
-  asm volatile("v_pk_add_f16 %0, %1, %2" : "=v"(result) : "v"(a), "v"(b));
+  *reinterpret_cast<__half2*>(&result) = r2;
   return result;
 }
 
@@ -215,8 +229,14 @@ __quickreduce_device_inline__ int packed_add<nv_bfloat16>(int a, int b) {
 
 template <>
 __quickreduce_device_inline__ int packed_add<int16_t>(int a, int b) {
-  int result;
-  asm volatile("v_pk_add_i16 %0, %1, %2" : "=v"(result) : "v"(a), "v"(b));
+  // MUSA-0088: AMD GCN v_pk_add_i16 -> scalar int16x2 add via bit-fiddle.
+  int16_t a_lo = static_cast<int16_t>(a & 0xFFFF);
+  int16_t a_hi = static_cast<int16_t>((a >> 16) & 0xFFFF);
+  int16_t b_lo = static_cast<int16_t>(b & 0xFFFF);
+  int16_t b_hi = static_cast<int16_t>((b >> 16) & 0xFFFF);
+  int16_t r_lo = static_cast<int16_t>(a_lo + b_lo);
+  int16_t r_hi = static_cast<int16_t>(a_hi + b_hi);
+  int result = (static_cast<int>(r_hi) << 16) | (static_cast<int>(static_cast<uint16_t>(r_lo)));
   return result;
 }
 
@@ -227,8 +247,11 @@ template <>
 __quickreduce_device_inline__ int packed_sub<half>(int a, int b) {
   int result;
 
-  // MI300 lacks packed fp16 sub instruction. So we do -1 * min + max
-  asm volatile("v_pk_fma_f16 %0, %1, %2 %3" : "=v"(result) : "v"(kNegOne), "v"(b), "v"(a));
+  // MUSA-0088: AMD GCN v_pk_fma_f16(-1, b, a) = a - b -> portable __hsub2.
+  __half2 a2 = *reinterpret_cast<__half2*>(&a);
+  __half2 b2 = *reinterpret_cast<__half2*>(&b);
+  __half2 r2 = __hsub2(a2, b2);
+  *reinterpret_cast<__half2*>(&result) = r2;
   return result;
 }
 
@@ -246,8 +269,12 @@ __quickreduce_device_inline__ int packed_mul(int a, int b);
 
 template <>
 __quickreduce_device_inline__ int packed_mul<half>(int a, int b) {
+  // MUSA-0088: AMD GCN v_pk_mul_f16 -> portable __hmul2.
+  __half2 a2 = *reinterpret_cast<__half2*>(&a);
+  __half2 b2 = *reinterpret_cast<__half2*>(&b);
+  __half2 r2 = __hmul2(a2, b2);
   int result;
-  asm volatile("v_pk_mul_f16 %0, %1, %2" : "=v"(result) : "v"(a), "v"(b));
+  *reinterpret_cast<__half2*>(&result) = r2;
   return result;
 }
 
