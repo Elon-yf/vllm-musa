@@ -72,27 +72,50 @@ __quickreduce_device_inline__ __host__ unsigned long divceil(unsigned long x, un
   return ((x + y - 1) / y);
 }
 
-union BufferResource {
-  __quickreduce_device_inline__ constexpr BufferResource() : config(0x00020000U) {}
+// MUSA-0091: BufferResource was originally a UNION holding an int32x4_t
+// descriptor that AMD GCN's vector buffer-fetch unit consumes (the
+// `buffer_load_dwordx4` / `buffer_store_dwordx4` AMD intrinsics). MUSA's
+// mp_31 backend does not have an equivalent buffer-fetch unit and cannot
+// lower `llvm.amdgcn.raw.buffer.{load,store}.v4i32` — observed as
+// `error in backend: lsu.st.2d requires constant blx, bly, stride` and
+// `v4i32,ch = llvm.amdgcn.raw.buffer.load` in MUSA-0088 iter-3
+// (`generated/musa0088/iter3-final-state-and-mcc-segfault.md`).
+//
+// Replacement: plain pointer wrapper + portable `int32x4_t*` vector
+// load/store. 16-byte alignment is preserved because the callers compute
+// `voffset` as multiples of `sizeof(int32x4_t)` (= 16 bytes).
+struct BufferResource {
+  __quickreduce_device_inline__ constexpr BufferResource() : address(nullptr), range(0) {}
 
   __quickreduce_device_inline__ constexpr BufferResource(void* buffer_address, uint32_t buffer_size)
-      : address(buffer_address), range(buffer_size), config(0x00020000U) {}
+      : address(buffer_address), range(buffer_size) {}
 
-  int32x4_t descriptor;
-  struct {
-    void* address;  // 8B, out of which first 48b is address, and 16b is stride
-    // (unused)
-    uint32_t range;   // Byte range for the buffer resource
-    uint32_t config;  // Constant, DFMT=32b
-  };
+  void* address;
+  uint32_t range;
 };
 
+// MUSA-0091: AMD `llvm.amdgcn.raw.buffer.load.v4i32` -> portable int4 load.
+// The original AMD signature took `(int32x4_t srsrc, int32_t voffset,
+// int32_t soffset, int32_t aux)` where srsrc was the buffer descriptor and
+// aux was AMD-specific. We take a `BufferResource const&` to keep the
+// portable address-bearing variant; soffset and aux are kept as ignored
+// parameters so the calling-side diff stays minimal (existing kernels pass
+// soffset=0, aux=0 — pure AMD-isms).
 __quickreduce_device_inline__ static int32x4_t buffer_load_dwordx4(
-    int32x4_t srsrc, int32_t voffset, int32_t soffset, int32_t aux) __asm("llvm.amdgcn.raw.buffer.load.v4i32");
+    BufferResource const& buf, int32_t voffset, int32_t soffset = 0, int32_t aux = 0) {
+  (void)soffset;
+  (void)aux;
+  const char* base = reinterpret_cast<const char*>(buf.address);
+  return *reinterpret_cast<const int32x4_t*>(base + voffset);
+}
 
-__quickreduce_device_inline__ static void
-buffer_store_dwordx4(int32x4_t data, int32x4_t srsrc, int32_t voffset, int32_t soffset, int32_t aux) __asm(
-    "llvm.amdgcn.raw.buffer.store.v4i32");
+__quickreduce_device_inline__ static void buffer_store_dwordx4(
+    int32x4_t data, BufferResource const& buf, int32_t voffset, int32_t soffset = 0, int32_t aux = 0) {
+  (void)soffset;
+  (void)aux;
+  char* base = reinterpret_cast<char*>(buf.address);
+  *reinterpret_cast<int32x4_t*>(base + voffset) = data;
+}
 
 __quickreduce_device_inline__ static void set_fp16_ovfl(bool const value) {
 #if defined(__gfx942__)

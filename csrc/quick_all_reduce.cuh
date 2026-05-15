@@ -527,7 +527,7 @@ struct AllReduceTwoshot {
     uint32_t src_offset = block * kTileSize + thread * sizeof(int32x4_t);
 
     for (int i = 0; i < kAtoms; i++) {
-      tA[i] = buffer_load_dwordx4(src_buffer.descriptor, src_offset, 0, 0);
+      tA[i] = buffer_load_dwordx4(src_buffer, src_offset, 0, 0);
       src_offset += kAtomStride * sizeof(int32x4_t);
       if constexpr (cast_bf2half) {
         const nv_bfloat162* bf_buf = reinterpret_cast<const nv_bfloat162*>(&tA[i]);
@@ -632,9 +632,9 @@ struct AllReduceTwoshot {
           float2 f = __half22float2(half_buf[j]);
           bf16_buf[j] = __float22bfloat162_rn(f);
         }
-        buffer_store_dwordx4(*reinterpret_cast<const int32x4_t*>(bf16_buf), dst_buffer.descriptor, dst_offset, 0, 0);
+        buffer_store_dwordx4(*reinterpret_cast<const int32x4_t*>(bf16_buf), dst_buffer, dst_offset, 0, 0);
       } else {
-        buffer_store_dwordx4(tA[i], dst_buffer.descriptor, dst_offset, 0, 0);
+        buffer_store_dwordx4(tA[i], dst_buffer, dst_offset, 0, 0);
       }
       dst_offset += kAtomStride * sizeof(int32x4_t);
     }
