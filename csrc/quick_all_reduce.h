@@ -9,8 +9,9 @@
 //   - Verify mcc accepts the <<<>>> launch syntax (vs hipLaunchKernelGGL)
 //   - Adapt warp-size assumptions (HIP wave 64 -> MUSA wave 32)
 //   - Wire csrc/quick_all_reduce.cu into setup.py kernel list
-//   - Confirm musaMallocWithFlags + musaIpcMemLazyEnablePeerAccess exist
-//     (renamed mechanically from hip equivalents; may need alternative)
+//   - DONE: musaIpcMemLazyEnablePeerAccess exists in driver_types.h.
+//   - musaMallocWithFlags / musaDeviceMallocUncached not in MUSA SDK;
+//     replaced with plain musaMalloc (microopt only, not correctness).
 //   - Build + correctness + perf A/B per MUSA-0088 ACs
 //
 #pragma once
@@ -113,7 +114,13 @@ struct DeviceComms {
     static int64_t data_buffer_size = 2 * this->kMaxProblemSize;
     int64_t total_buffer_size = flags_buffer_size + data_buffer_size;
     data_offset = flags_buffer_size;
-    MUSA_CHECK(musaMallocWithFlags((void**)&dbuffer, total_buffer_size, musaDeviceMallocUncached));
+    // MUSA-0088: hipExtMallocWithFlags(..., hipDeviceMallocUncached) has no
+    // direct MUSA equivalent. Use plain musaMalloc; the uncached flag on
+    // HIP was a microoptimisation for AMD's MI300 cache hierarchy and isn't
+    // strictly necessary for correctness on MTT S5000. If profiling shows
+    // this matters, replace with musaMallocManaged + musaMemAdvise to
+    // approximate uncached behaviour.
+    MUSA_CHECK(musaMalloc((void**)&dbuffer, total_buffer_size));
 
     // Clear the flags buffer.
     MUSA_CHECK(musaMemset(dbuffer, 0, flags_buffer_size));
