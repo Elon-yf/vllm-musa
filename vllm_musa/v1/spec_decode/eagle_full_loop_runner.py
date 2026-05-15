@@ -133,10 +133,12 @@ class EagleFullLoopRunner:
         """
         if self._captured:
             return
-        if not hasattr(self.proposer, "draft_model"):
+        if not hasattr(self.proposer, "model"):
             raise RuntimeError(
-                "EagleProposer does not expose draft_model; check vLLM version "
-                "compatibility (expected v0.20.1.dev0 shape)."
+                "EagleProposer does not expose `model` attribute; check vLLM "
+                "version compatibility (expected v0.20.1.dev0 shape — the "
+                "draft model is exposed as `proposer.model`, NOT "
+                "`proposer.draft_model`)."
             )
 
         # Acquire a shared graph memory pool. Step 4 should share with the
