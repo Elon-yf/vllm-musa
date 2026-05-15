@@ -72,9 +72,12 @@ def build_per_step_attn_metadata_array(
     # get_forward_context().attn_metadata and accesses .use_cascade
     # unconditionally; passing the raw CommonAttentionMetadata fails
     # with AttributeError.
-    use_per_layer = proposer is not None and hasattr(
-        proposer, "build_per_group_and_layer_attn_metadata"
-    )
+    # MUSA-0090 step 5g: disable the per-layer build path. Although it
+    # provides use_cascade etc., the resulting metadata's seq_lens has
+    # a shape that flash_attn rejects ('seqused_k must have shape
+    # (batch_size,)'). Instead, use the simpler dataclasses.replace path
+    # below and setattr() the flag-fields the compiled forward expects.
+    use_per_layer = False  # was: proposer is not None and hasattr(...)
     if use_per_layer:
         metadata_array: list[Any] = []
         for step_idx in range(buffers.num_steps):
@@ -131,6 +134,24 @@ def build_per_step_attn_metadata_array(
                 seq_lens=seq_lens_view,
                 max_seq_len=step_max_seq_len,
             )
+            # MUSA-0090 step 5g: the compiled draft model's forward accesses
+            # attn_metadata.use_cascade unconditionally (and likely other
+            # backend-specific flags). Set defaults via setattr so the
+            # compiled forward doesn't AttributeError on missing fields.
+            # These are read-only flag fields; we don't need real implementations.
+            for attr_name, default in [
+                ("use_cascade", False),
+                ("common_prefix_len", 0),
+                ("query_start_loc", None),
+                ("seqused_k", seq_lens_view),  # flash_attn expects this name
+                ("max_query_len", 1),  # spec_decode draft is always 1-token-per-step
+                ("max_seq_len_k", step_max_seq_len),
+            ]:
+                if not hasattr(step_metadata, attr_name) or getattr(step_metadata, attr_name, None) is None:
+                    try:
+                        object.__setattr__(step_metadata, attr_name, default)
+                    except (AttributeError, TypeError):
+                        pass  # frozen dataclass; can't setattr — accept and continue
         except TypeError:
             # If replace() fails (e.g., the type isn't a dataclass), construct
             # via direct copy. This is the fallback for vllm-musa builds where
