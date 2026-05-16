@@ -599,6 +599,17 @@ class EagleFullLoopRunner:
                     next_hidden[:batch_size]
                 )
 
+                # MUSA-0090 step 5k: propagate seq_lens forward before the
+                # kernel. The kernel does in-place +1 on its `seq_lens` arg
+                # (reads, adds 1, writes back). If we passed
+                # seq_lens_per_step[step+1] directly without seeding, the
+                # kernel reads 0 and writes 1 — instead of reading
+                # actual_seq_lens+step and writing actual_seq_lens+step+1.
+                # Copy step's seq_lens to step+1's, then the kernel's
+                # in-place +1 produces the correct step+1 value.
+                buffers.seq_lens_per_step[step + 1, :batch_size].copy_(
+                    buffers.seq_lens_per_step[step, :batch_size]
+                )
                 # Increment positions + recompute slot_mapping for step+1.
                 # The fused kernel writes positions, seq_lens, slot_mapping
                 # all in one launch — exactly what vLLM's iterative path
