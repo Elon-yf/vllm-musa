@@ -100,81 +100,132 @@ def build_per_step_attn_metadata_array(
                 ) from exc
         return metadata_array
 
-    # Fallback: dataclasses.replace on CommonAttentionMetadata. Works for
-    # tests + lightweight scenarios but the compiled draft model may
-    # need per-layer metadata (see comment block above).
+    # MUSA-0090 reopen (2026-05-16): port SGLang's pattern of pre-allocating
+    # backend-specific metadata at capture time, mutating in-place at replay
+    # time. Per `[[sglang-eagle3-musa-30pct-confirmed]]` memory + research
+    # in `sglang/python/sglang/srt/layers/attention/flashattention_backend.py`
+    # at `FlashAttentionMultiStepBackend.init_forward_metadata_capture_cuda_graph`
+    # (line 2653), SGLang builds N-1 fully-instantiated backend objects, one
+    # per draft step beyond step 0, each with its own pre-allocated metadata.
+    #
+    # vLLM's equivalent is to call `FlashAttentionMetadataBuilder.build(
+    # common_prefix_len=0, common_attn_metadata=<step-specific cam>,
+    # fast_build=True)` once per step. The `fast_build=True` flag disables
+    # AOT scheduling (the comment in vllm/v1/attention/backends/flash_attn.py
+    # line 388 says: "Disables AOT scheduling, used when there will be few
+    # iterations i.e. spec-decode"), which keeps the metadata cudagraph-safe
+    # by skipping the scheduler-metadata path that requires host-side
+    # reductions.
+    #
+    # The previous setattr+dataclasses.replace workaround (commit f1d09d7)
+    # is structurally wrong because `CommonAttentionMetadata` is missing the
+    # backend-specific fields (`block_table`, `seqused_k`, etc.) that the
+    # compiled draft forward unconditionally reads. The right answer is to
+    # produce real `FlashAttentionMetadata` via the builder.
     metadata_array: list[Any] = []
     base_max_seq_len = int(getattr(base_metadata, "max_seq_len", 0))
+    base_max_model_len = int(getattr(base_metadata, "max_model_len", base_max_seq_len + buffers.num_steps))
+
+    # Acquire the backend-specific metadata builder. Two paths:
+    # 1. From the proposer (preferred — proposer knows the kv-cache layout)
+    # 2. From `current_platform`'s attention backend registry (fallback)
+    builder = None
+    if proposer is not None:
+        # vLLM keeps the builder on the proposer's runner. Multiple candidate
+        # attribute paths because vllm refactors this surface periodically.
+        for attr_path in (
+            ("attn_metadata_builders",),  # dict: {kv_cache_group: builder}
+            ("attn_metadata_builder",),
+            ("runner", "attn_metadata_builders"),
+            ("runner", "attn_metadata_builder"),
+        ):
+            obj = proposer
+            for attr in attr_path:
+                obj = getattr(obj, attr, None)
+                if obj is None:
+                    break
+            if obj is not None:
+                # If it's a dict (per-group), grab the first builder
+                if isinstance(obj, dict):
+                    if obj:
+                        builder = next(iter(obj.values()))
+                else:
+                    builder = obj
+                if builder is not None:
+                    break
+
+    if builder is None:
+        raise RuntimeError(
+            "build_per_step_attn_metadata_array: could not locate "
+            "FlashAttentionMetadataBuilder on the proposer. Searched paths: "
+            "attn_metadata_builders, attn_metadata_builder, "
+            "runner.attn_metadata_builders, runner.attn_metadata_builder. "
+            "Check the vllm version compatibility (this code was written "
+            "against vllm v0.20.1.dev0+g88d34c640 / 2026-05-16)."
+        )
 
     for step_idx in range(buffers.num_steps):
-        # Per-step views into the pre-allocated buffers. .narrow() returns a
-        # contiguous view; the captured graph writes to these slices via the
-        # eagle_step_update_slot_mapping_and_metadata kernel and the view
-        # reflects the writes without rebuild.
+        # Per-step views into the pre-allocated buffers. The captured graph
+        # writes to these slices via the
+        # eagle_step_update_slot_mapping_and_metadata kernel; the view (a
+        # contiguous tensor) reflects the writes without rebuild because
+        # FlashAttentionMetadata stores tensor *references*, not copies.
         slot_mapping_view = buffers.slot_mapping_per_step[step_idx, :batch_size]
         seq_lens_view = buffers.seq_lens_per_step[step_idx, :batch_size]
-        positions_view = buffers.positions_per_step[step_idx, :batch_size]
 
         # max_seq_len is a static int (not a tensor); bump by step_idx so the
         # attention backend sizes its scratch correctly for each step. The
         # +1 between steps is the spec-decode invariant: each draft token
         # adds one position to the sequence.
-        step_max_seq_len = min(
-            base_max_seq_len + step_idx,
-            int(getattr(base_metadata, "max_model_len", base_max_seq_len + buffers.num_steps)),
+        step_max_seq_len = min(base_max_seq_len + step_idx, base_max_model_len)
+
+        # Construct a step-specific CommonAttentionMetadata that the builder
+        # will translate into a proper FlashAttentionMetadata.
+        # `dataclasses.replace` produces a new CommonAttentionMetadata with
+        # step-specific tensor views; `builder.build()` then produces the
+        # backend-specific metadata with all required fields (`block_table`,
+        # `use_cascade`, `seqused_k`, `scheduler_metadata`, etc.).
+        step_cam = replace(
+            base_metadata,
+            slot_mapping=slot_mapping_view,
+            seq_lens=seq_lens_view,
+            max_seq_len=step_max_seq_len,
         )
 
-        # Build the per-step metadata. We use dataclasses.replace if base is a
-        # dataclass; else fall back to a shallow copy + setattr. CommonAttentionMetadata
-        # is a frozen dataclass in upstream vLLM, so `replace()` is the supported path.
         try:
-            step_metadata = replace(
-                base_metadata,
-                slot_mapping=slot_mapping_view,
-                seq_lens=seq_lens_view,
-                max_seq_len=step_max_seq_len,
+            step_metadata = builder.build(
+                common_prefix_len=0,
+                common_attn_metadata=step_cam,
+                fast_build=True,  # disables AOT scheduling — required for spec-decode
             )
-            # MUSA-0090 step 5g: the compiled draft model's forward accesses
-            # attn_metadata.use_cascade unconditionally (and likely other
-            # backend-specific flags). Set defaults via setattr so the
-            # compiled forward doesn't AttributeError on missing fields.
-            # These are read-only flag fields; we don't need real implementations.
-            for attr_name, default in [
-                ("use_cascade", False),
-                ("common_prefix_len", 0),
-                ("query_start_loc", None),
-                ("seqused_k", seq_lens_view),  # flash_attn expects this name
-                ("max_query_len", 1),  # spec_decode draft is always 1-token-per-step
-                ("max_seq_len_k", step_max_seq_len),
-            ]:
-                if not hasattr(step_metadata, attr_name) or getattr(step_metadata, attr_name, None) is None:
-                    try:
-                        object.__setattr__(step_metadata, attr_name, default)
-                    except (AttributeError, TypeError):
-                        pass  # frozen dataclass; can't setattr — accept and continue
-        except TypeError:
-            # If replace() fails (e.g., the type isn't a dataclass), construct
-            # via direct copy. This is the fallback for vllm-musa builds where
-            # CommonAttentionMetadata has been monkey-patched to a different
-            # shape. Identified at runtime; raise an informative error.
-            raise NotImplementedError(
-                "build_per_step_attn_metadata_array requires CommonAttentionMetadata "
-                "to be a dataclass with `slot_mapping`, `seq_lens`, `max_seq_len` "
-                f"fields. Got type {type(base_metadata).__name__}; check that "
-                "the vllm version is compatible (this code was written against "
-                "vllm v0.20.1.dev0+g88d34c640)."
-            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"step {step_idx}: FlashAttentionMetadataBuilder.build() "
+                f"failed: {type(exc).__name__}: {exc}. This path was added "
+                "in MUSA-0090 reopen (2026-05-16) to replace the setattr "
+                "workaround. The builder must succeed on a CommonAttentionMetadata "
+                "with step-specific slot_mapping/seq_lens/max_seq_len views."
+            ) from exc
 
         metadata_array.append(step_metadata)
 
-        # Sanity check (cheap): each step's views should point at distinct
-        # memory regions. data_ptr() differs because of the step offset.
+        # Sanity check (cheap): each step's slot_mapping should be a distinct
+        # view (data_ptr offset by buffers.slot_mapping_per_step stride).
         if step_idx > 0:
             prev = metadata_array[step_idx - 1]
-            if getattr(prev, "slot_mapping").data_ptr() == slot_mapping_view.data_ptr():
+            prev_sm = getattr(prev, "slot_mapping", None)
+            curr_sm = getattr(step_metadata, "slot_mapping", None)
+            if (
+                prev_sm is not None
+                and curr_sm is not None
+                and prev_sm.data_ptr() == curr_sm.data_ptr()
+            ):
                 raise RuntimeError(
-                    f"step {step_idx} slot_mapping view aliases step {step_idx-1}; "
-                    "buffers.slot_mapping_per_step is not laid out as expected"
+                    f"step {step_idx} slot_mapping aliases step {step_idx-1}; "
+                    "the builder copied or normalized the view away. Per-step "
+                    "in-place mutation will not be visible to the captured graph. "
+                    "Check FlashAttentionMetadataBuilder.build() to ensure it "
+                    "passes slot_mapping through without copy."
                 )
 
     return metadata_array
