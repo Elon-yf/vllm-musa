@@ -157,9 +157,22 @@ def _maybe_init_runner(proposer, args, kwargs) -> None:
 
 
 def _make_dispatched_propose(_original_propose):
-    """Closure-build the patched propose() so the original is captured."""
+    """Closure-build the patched propose() so the original is captured.
+
+    MUSA-0090 step 5l.4 (2026-05-16): runner architecture works for
+    capture but has deeper replay-time correctness issues (KV cache
+    page state, MUSA 'unknown error' on graph replay). Pending a full
+    SGLang-style per-step-backend refactor, disable the runner
+    dispatcher and always fall through to vllm's iterative path.
+    Set VLLM_MUSA_EAGLE_RUNNER=1 to re-enable for development.
+    """
+
+    import os
+    _RUNNER_ENABLED = os.environ.get("VLLM_MUSA_EAGLE_RUNNER", "0") == "1"
 
     def _musa_dispatched_propose(self, *args, **kwargs):
+        if not _RUNNER_ENABLED:
+            return _original_propose(self, *args, **kwargs)
         # Only dispatch on MUSA. On CUDA, fall through to the original.
         try:
             from vllm.platforms import current_platform
