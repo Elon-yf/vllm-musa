@@ -64,6 +64,22 @@ class EagleDraftBuffers:
     # bfloat16 [max_bs, hidden_size]: target model's last hidden state, used as
     # input to step 0 of the draft loop
     target_hidden_states_in: torch.Tensor
+    # MUSA-0090 step 5k (2026-05-16): step-0 input metadata seeded from the
+    # caller's CommonAttentionMetadata. Without these, positions_per_step[0]
+    # is zero (allocation default), and the captured graph reads zeros at
+    # step 0 — RoPE applies at position 0 regardless of actual sequence
+    # position. Downstream steps' positions/slot_mapping are then off by an
+    # absolute offset (P-0), which is why MUSA-0090 step 5h showed
+    # acceptance positions 3-6 = 0.00 (drafts at wrong positions).
+    # int64 [max_bs]: actual position of the BONUS token (target's last
+    # accepted output). Step 0 of the draft loop runs at this position.
+    positions_in: torch.Tensor
+    # int64 [max_bs]: KV cache slot for the BONUS token. Step 0 writes its
+    # draft KV here.
+    slot_mapping_in: torch.Tensor
+    # int32 [max_bs]: current sequence length INCLUDING the bonus token.
+    # Attention at step 0 attends to seq_lens_in tokens of context.
+    seq_lens_in: torch.Tensor
 
     # --- Static / read-only references (allocated once, not per-step) ---
     # int32 [max_num_blocks, max_bs] (or however the block table is shaped):
@@ -117,6 +133,10 @@ class EagleDraftBuffers:
             draft_token_ids_out=torch.zeros((max_bs, num_steps), dtype=i32, device=device),
             bonus_token_ids_in=torch.zeros((max_bs,), dtype=i32, device=device),
             target_hidden_states_in=torch.zeros((max_bs, hidden_size), dtype=bf16, device=device),
+            # MUSA-0090 step 5k: step-0 input metadata buffers.
+            positions_in=torch.zeros((max_bs,), dtype=i64, device=device),
+            slot_mapping_in=torch.zeros((max_bs,), dtype=i64, device=device),
+            seq_lens_in=torch.zeros((max_bs,), dtype=i32, device=device),
             block_table_tensor=block_table_tensor,
             max_bs=max_bs,
             num_steps=num_steps,
@@ -155,6 +175,10 @@ class EagleDraftBuffers:
             self.draft_token_ids_out,
             self.bonus_token_ids_in,
             self.target_hidden_states_in,
+            # MUSA-0090 step 5k: step-0 input metadata buffers.
+            self.positions_in,
+            self.slot_mapping_in,
+            self.seq_lens_in,
         ]
         # Don't count block_table_tensor — we don't own it.
         return sum(t.numel() * t.element_size() for t in tensors)

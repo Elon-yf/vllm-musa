@@ -181,8 +181,14 @@ def _make_dispatched_propose(_original_propose):
         # Extract args. EagleProposer.propose signature (vllm v0.20.1.dev0):
         #   def propose(self, target_token_ids, target_positions,
         #               target_hidden_states, next_token_ids,
-        #               common_attn_metadata, sampling_metadata, ...)
+        #               token_indices_to_sample, common_attn_metadata,
+        #               sampling_metadata, ...)
         try:
+            target_positions = (
+                kwargs.get("target_positions")
+                if "target_positions" in kwargs
+                else args[1]
+            )
             target_hidden_states = (
                 kwargs.get("target_hidden_states")
                 if "target_hidden_states" in kwargs
@@ -193,10 +199,17 @@ def _make_dispatched_propose(_original_propose):
                 if "next_token_ids" in kwargs
                 else args[3]
             )
+            # token_indices_to_sample may be None (proposer computes from
+            # query_start_loc) — that's fine; runner.replay() handles it.
+            token_indices_to_sample = (
+                kwargs.get("token_indices_to_sample")
+                if "token_indices_to_sample" in kwargs
+                else (args[4] if len(args) > 4 else None)
+            )
             common_attn_metadata = (
                 kwargs.get("common_attn_metadata")
                 if "common_attn_metadata" in kwargs
-                else args[4]
+                else args[5]
             )
         except (IndexError, KeyError):
             _log.debug(
@@ -214,6 +227,8 @@ def _make_dispatched_propose(_original_propose):
                 next_token_ids=next_token_ids,
                 common_attn_metadata=common_attn_metadata,
                 batch_size=batch_size,
+                target_positions=target_positions,
+                token_indices_to_sample=token_indices_to_sample,
             )
             return result.draft_token_ids
         except Exception as exc:

@@ -314,26 +314,39 @@ class EagleFullLoopRunner:
 
     def replay(
         self,
-        target_hidden_states: torch.Tensor,  # bf16 [bs, hidden_size]
+        target_hidden_states: torch.Tensor,  # bf16 [bs, hidden_size] OR [num_tokens, hidden_size]
         next_token_ids: torch.Tensor,        # int32 [bs] (the bonus from verify)
-        common_attn_metadata: Any,            # for assertion only at replay time
+        common_attn_metadata: Any,            # for assertion + step-0 metadata seeding
         batch_size: int,
+        target_positions: torch.Tensor | None = None,  # int64 [num_tokens] (the verify pass's positions)
+        token_indices_to_sample: torch.Tensor | None = None,  # int [bs] (idx in num_tokens of last token per seq)
     ) -> EagleFullLoopReplayResult:
         """Replay the captured graph for this batch size.
 
-        Single .replay() call + 2 .copy_() for input carry-over. Versus
-        vLLM's iterative path which pays N × (set_forward_context + metadata
-        rebuild + dispatcher dispatch) per spec round.
+        Single .replay() call + N .copy_() for input carry-over (5 buffers:
+        hidden_states, bonus_token_ids, positions, slot_mapping, seq_lens).
+        Versus vLLM's iterative path which pays N × (set_forward_context +
+        metadata rebuild + dispatcher dispatch) per spec round.
 
         Args:
-            target_hidden_states: target model's last hidden state, shape
-                [batch_size, hidden_size]. Used as input to step 0 of the
-                draft loop.
+            target_hidden_states: target model's hidden states, shape
+                [num_tokens, hidden_size] OR [batch_size, hidden_size].
+                The runner selects the per-sequence-last-token slice via
+                token_indices_to_sample.
             next_token_ids: bonus token ids from the previous verify pass,
                 shape [batch_size]. The "free" token that target accepted.
-            common_attn_metadata: passed for assertion only (verifies the
-                caller's metadata is compatible with the captured shape).
+            common_attn_metadata: source of step-0 slot_mapping and seq_lens
+                seeding. The runner reads .slot_mapping[token_indices_to_sample]
+                and .seq_lens directly.
             batch_size: actual batch size; must match a captured size.
+            target_positions: optional [num_tokens] tensor of the verify pass's
+                positions. The runner reads target_positions[token_indices_to_sample]
+                to seed step-0 positions. If None, step-0 positions are left
+                at the buffer's current value (legacy behavior — wrong, but
+                preserved for backward compat during step 5k transition).
+            token_indices_to_sample: optional [bs] tensor naming the index
+                (within num_tokens) of the last token per sequence. If None,
+                computed from common_attn_metadata.query_start_loc[1:] - 1.
 
         Returns:
             EagleFullLoopReplayResult with .draft_token_ids of shape
@@ -349,10 +362,68 @@ class EagleFullLoopRunner:
 
         ctx = self.contexts[batch_size]
 
-        # Copy inputs into the runner's pre-allocated input buffers.
-        # These copies happen OUTSIDE the graph — they're regular eager ops.
-        ctx.buffers.target_hidden_states_in[:batch_size].copy_(target_hidden_states)
+        # MUSA-0090 step 5k: derive token_indices_to_sample if not provided.
+        # Pattern matches vllm/v1/spec_decode/llm_base_proposer.py:set_inputs_first_pass.
+        if token_indices_to_sample is None:
+            query_start_loc = getattr(common_attn_metadata, "query_start_loc", None)
+            if query_start_loc is not None:
+                token_indices_to_sample = query_start_loc[1:] - 1
+            else:
+                # Fall back to "[bs-1, ..., bs-1]" which is correct ONLY when
+                # num_tokens == batch_size (one-token-per-seq decode case).
+                # The runner's eager path produces this from the proposer.
+                token_indices_to_sample = torch.arange(
+                    batch_size, dtype=torch.int64, device=target_hidden_states.device
+                )
+
+        # Hidden state selection: pick the LAST token per sequence.
+        # Shape handling:
+        #   target_hidden_states is [num_tokens, h] in the general case.
+        #   For BS=1 prefill 4k, num_tokens=4096 and we need the [4095]-th row.
+        if target_hidden_states.dim() >= 1 and target_hidden_states.shape[0] != batch_size:
+            selected_hidden = target_hidden_states[token_indices_to_sample]
+        else:
+            selected_hidden = target_hidden_states[:batch_size]
+        ctx.buffers.target_hidden_states_in[:batch_size].copy_(selected_hidden)
         ctx.buffers.bonus_token_ids_in[:batch_size].copy_(next_token_ids)
+
+        # MUSA-0090 step 5k: seed step-0 positions, slot_mapping, seq_lens
+        # from the verify pass's metadata. Without these, the captured graph
+        # reads zeros at step 0 — RoPE wrong, KV writes to wrong slots,
+        # attention attends to wrong context length.
+        if target_positions is not None:
+            # The bonus token's position is the position AFTER the last verified
+            # position. The first draft (step 0) is run AS the bonus token (its
+            # input_ids = bonus_token_id, its hidden_states = target_hidden), so
+            # step-0 positions = target_positions[last_idx_per_seq].
+            # (Per vllm/v1/spec_decode/llm_base_proposer.py line 502:
+            #  `positions = self.positions[token_indices_to_sample]`)
+            if target_positions.dim() == 2:
+                # M-RoPE case: positions shape [3, num_tokens]; take dim 0.
+                step0_positions = target_positions[0][token_indices_to_sample]
+            else:
+                step0_positions = target_positions[token_indices_to_sample]
+            ctx.buffers.positions_in[:batch_size].copy_(step0_positions.to(torch.int64))
+
+        # slot_mapping for step 0: the slot of the bonus token. The verify
+        # pass's common_attn_metadata.slot_mapping has shape [num_tokens] and
+        # tells us where each input token's K/V is written. The bonus token
+        # corresponds to the last input position of each sequence.
+        cm_slot_mapping = getattr(common_attn_metadata, "slot_mapping", None)
+        if cm_slot_mapping is not None and cm_slot_mapping.numel() > 0:
+            if cm_slot_mapping.shape[0] != batch_size:
+                step0_slot = cm_slot_mapping[token_indices_to_sample]
+            else:
+                step0_slot = cm_slot_mapping[:batch_size]
+            ctx.buffers.slot_mapping_in[:batch_size].copy_(step0_slot.to(torch.int64))
+
+        # seq_lens for step 0: same as the verify pass's seq_lens (the
+        # context length BEFORE the draft adds a new token).
+        cm_seq_lens = getattr(common_attn_metadata, "seq_lens", None)
+        if cm_seq_lens is not None and cm_seq_lens.numel() > 0:
+            ctx.buffers.seq_lens_in[:batch_size].copy_(
+                cm_seq_lens[:batch_size].to(torch.int32)
+            )
 
         # Single graph replay. All N draft forwards + sampling + slot-mapping
         # updates happen inside this one call.
@@ -441,6 +512,22 @@ class EagleFullLoopRunner:
         )
         buffers.hidden_states_per_step[0, :batch_size].copy_(
             buffers.target_hidden_states_in[:batch_size]
+        )
+        # MUSA-0090 step 5k (2026-05-16): seed step-0 metadata from input
+        # buffers populated by replay(). Without these copies, the captured
+        # graph reads zeros at step 0 — wrong RoPE positions, wrong KV slot,
+        # wrong attention seq_len. The eagle_step kernel below propagates
+        # positions[step] -> positions[step+1] by adding 1; so position 0
+        # wrong cascades through all downstream steps. This was the root
+        # cause of acceptance=0.00 at positions 3-6 in step 5h bench.
+        buffers.positions_per_step[0, :batch_size].copy_(
+            buffers.positions_in[:batch_size]
+        )
+        buffers.slot_mapping_per_step[0, :batch_size].copy_(
+            buffers.slot_mapping_in[:batch_size]
+        )
+        buffers.seq_lens_per_step[0, :batch_size].copy_(
+            buffers.seq_lens_in[:batch_size]
         )
 
         # The N-step loop. Inside torch.cuda.graph(), every GPU op below is
