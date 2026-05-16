@@ -126,42 +126,27 @@ def build_per_step_attn_metadata_array(
     base_max_seq_len = int(getattr(base_metadata, "max_seq_len", 0))
     base_max_model_len = int(getattr(base_metadata, "max_model_len", base_max_seq_len + buffers.num_steps))
 
-    # Acquire the backend-specific metadata builder. Two paths:
-    # 1. From the proposer (preferred — proposer knows the kv-cache layout)
-    # 2. From `current_platform`'s attention backend registry (fallback)
-    builder = None
-    if proposer is not None:
-        # vLLM keeps the builder on the proposer's runner. Multiple candidate
-        # attribute paths because vllm refactors this surface periodically.
-        for attr_path in (
-            ("attn_metadata_builders",),  # dict: {kv_cache_group: builder}
-            ("attn_metadata_builder",),
-            ("runner", "attn_metadata_builders"),
-            ("runner", "attn_metadata_builder"),
-        ):
-            obj = proposer
-            for attr in attr_path:
-                obj = getattr(obj, attr, None)
-                if obj is None:
-                    break
-            if obj is not None:
-                # If it's a dict (per-group), grab the first builder
-                if isinstance(obj, dict):
-                    if obj:
-                        builder = next(iter(obj.values()))
-                else:
-                    builder = obj
-                if builder is not None:
-                    break
-
-    if builder is None:
+    # MUSA-0090 step 5l (2026-05-16): use vllm's first-party
+    # `proposer.build_per_group_and_layer_attn_metadata(common_attn_metadata,
+    # draft_index=step_idx)` API (vllm/v1/spec_decode/llm_base_proposer.py:822).
+    # This calls `attn_group.get_metadata_builder().build_for_drafting()` per
+    # draft_attn_group and produces a per-layer dict that the captured model
+    # forward reads via set_forward_context.
+    #
+    # The OLD step 5h path searched 4 candidate attribute paths
+    # (attn_metadata_builders, attn_metadata_builder,
+    # runner.attn_metadata_builders, runner.attn_metadata_builder) — NONE
+    # of these exist in vllm v0.20.1.dev0. The builder is at
+    # `proposer.draft_attn_groups[0].get_metadata_builder()`. The
+    # `build_per_group_and_layer_attn_metadata` helper exposes the
+    # right entry point.
+    if proposer is None or not hasattr(
+        proposer, "build_per_group_and_layer_attn_metadata"
+    ):
         raise RuntimeError(
-            "build_per_step_attn_metadata_array: could not locate "
-            "FlashAttentionMetadataBuilder on the proposer. Searched paths: "
-            "attn_metadata_builders, attn_metadata_builder, "
-            "runner.attn_metadata_builders, runner.attn_metadata_builder. "
-            "Check the vllm version compatibility (this code was written "
-            "against vllm v0.20.1.dev0+g88d34c640 / 2026-05-16)."
+            "build_per_step_attn_metadata_array: proposer is None or lacks "
+            "build_per_group_and_layer_attn_metadata. Expected vllm "
+            "v0.20.1.dev0 EagleProposer with draft_attn_groups initialized."
         )
 
     for step_idx in range(buffers.num_steps):
@@ -180,11 +165,11 @@ def build_per_step_attn_metadata_array(
         step_max_seq_len = min(base_max_seq_len + step_idx, base_max_model_len)
 
         # Construct a step-specific CommonAttentionMetadata that the builder
-        # will translate into a proper FlashAttentionMetadata.
+        # will translate into a per-layer attention metadata dict.
         # `dataclasses.replace` produces a new CommonAttentionMetadata with
-        # step-specific tensor views; `builder.build()` then produces the
-        # backend-specific metadata with all required fields (`block_table`,
-        # `use_cascade`, `seqused_k`, `scheduler_metadata`, etc.).
+        # step-specific tensor views; the per-group builder then produces
+        # the backend-specific metadata (FlashAttentionMetadata) with all
+        # required fields (block_table, use_cascade, seqused_k, etc.).
         step_cam = replace(
             base_metadata,
             slot_mapping=slot_mapping_view,
@@ -193,40 +178,24 @@ def build_per_step_attn_metadata_array(
         )
 
         try:
-            step_metadata = builder.build(
-                common_prefix_len=0,
-                common_attn_metadata=step_cam,
-                fast_build=True,  # disables AOT scheduling — required for spec-decode
+            _per_group, per_layer = proposer.build_per_group_and_layer_attn_metadata(
+                step_cam, draft_index=step_idx
             )
         except Exception as exc:
             raise RuntimeError(
-                f"step {step_idx}: FlashAttentionMetadataBuilder.build() "
-                f"failed: {type(exc).__name__}: {exc}. This path was added "
-                "in MUSA-0090 reopen (2026-05-16) to replace the setattr "
-                "workaround. The builder must succeed on a CommonAttentionMetadata "
+                f"step {step_idx}: proposer."
+                f"build_per_group_and_layer_attn_metadata() failed: "
+                f"{type(exc).__name__}: {exc}. This path was added in "
+                "MUSA-0090 step 5l (2026-05-16) to use vllm's first-party "
+                "API. The builder must succeed on a CommonAttentionMetadata "
                 "with step-specific slot_mapping/seq_lens/max_seq_len views."
             ) from exc
 
-        metadata_array.append(step_metadata)
-
-        # Sanity check (cheap): each step's slot_mapping should be a distinct
-        # view (data_ptr offset by buffers.slot_mapping_per_step stride).
-        if step_idx > 0:
-            prev = metadata_array[step_idx - 1]
-            prev_sm = getattr(prev, "slot_mapping", None)
-            curr_sm = getattr(step_metadata, "slot_mapping", None)
-            if (
-                prev_sm is not None
-                and curr_sm is not None
-                and prev_sm.data_ptr() == curr_sm.data_ptr()
-            ):
-                raise RuntimeError(
-                    f"step {step_idx} slot_mapping aliases step {step_idx-1}; "
-                    "the builder copied or normalized the view away. Per-step "
-                    "in-place mutation will not be visible to the captured graph. "
-                    "Check FlashAttentionMetadataBuilder.build() to ensure it "
-                    "passes slot_mapping through without copy."
-                )
+        # per_layer is the dict {layer_name: attn_metadata} that
+        # set_forward_context expects. Store the dict as the step's metadata
+        # entry — _run_n_step_inner passes attn_metadata_array[step] into
+        # set_forward_context which dispatches per layer.
+        metadata_array.append(per_layer)
 
     return metadata_array
 
