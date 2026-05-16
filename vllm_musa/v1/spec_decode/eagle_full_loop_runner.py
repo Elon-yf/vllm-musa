@@ -380,6 +380,21 @@ class EagleFullLoopRunner:
         # Shape handling:
         #   target_hidden_states is [num_tokens, h] in the general case.
         #   For BS=1 prefill 4k, num_tokens=4096 and we need the [4095]-th row.
+        # MUSA-0090 step 5l.2: Eagle3 uses aux hidden states from N layers
+        # (e.g., 3 layers for M2.5-Eagle3: ids 1, 30, 58), concatenated to
+        # shape [num_tokens, N * hidden_size] = [num_tokens, 9216] for the
+        # 3072-hidden M2.5 draft. vLLM's propose() calls
+        # self.model.combine_hidden_states(target_hidden_states) to reduce
+        # the concat to [num_tokens, hidden_size] before the draft forward.
+        # We replicate that here OUTSIDE the captured graph.
+        if (
+            self.proposer.method in ("eagle3", "dflash")
+            and target_hidden_states.shape[-1] != self.hidden_size
+            and hasattr(self.proposer.model, "combine_hidden_states")
+        ):
+            target_hidden_states = self.proposer.model.combine_hidden_states(
+                target_hidden_states
+            )
         if target_hidden_states.dim() >= 1 and target_hidden_states.shape[0] != batch_size:
             selected_hidden = target_hidden_states[token_indices_to_sample]
         else:
