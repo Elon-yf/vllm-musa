@@ -81,21 +81,27 @@ def _maybe_init_runner(proposer, args, kwargs) -> None:
             "spec-decode appears not properly configured."
         )
 
-    # Capture sizes: prefer the proposer's explicit list, else fall back to
-    # the cudagraph dispatcher's. Else default to [1] (BS=1 /goal shape).
-    cudagraph_capture_sizes = getattr(proposer, "cudagraph_capture_sizes", None)
-    if not cudagraph_capture_sizes:
-        dispatcher = getattr(proposer, "cudagraph_dispatcher", None)
-        if dispatcher is not None:
-            cudagraph_capture_sizes = getattr(
-                dispatcher.compilation_config, "cudagraph_capture_sizes", None
-            ) or [1]
-        else:
-            cudagraph_capture_sizes = [1]
-        _log.info(
-            "MUSA-0090: cudagraph_capture_sizes derived from dispatcher: %s",
-            cudagraph_capture_sizes,
-        )
+    # MUSA-0090 step 5l.1: capture ONLY for the actual batch_size of the
+    # current call. The base_metadata is for `num_reqs=batch_size`; trying
+    # to capture for a different size requires synthetic metadata
+    # (query_start_loc shape needs to match num_reqs+1, etc.). Capturing
+    # for the observed size guarantees the metadata is consistent.
+    # Later calls at different batch_sizes will fall back to vllm iterative
+    # (cheap — just one cudagraph dispatch overhead) until we re-capture
+    # for that size (future work).
+    next_token_ids_arg = (
+        kwargs.get("next_token_ids")
+        if "next_token_ids" in kwargs
+        else (args[3] if len(args) > 3 else None)
+    )
+    if next_token_ids_arg is not None:
+        cudagraph_capture_sizes = [int(next_token_ids_arg.shape[0])]
+    else:
+        cudagraph_capture_sizes = [1]
+    _log.info(
+        "MUSA-0090: capturing for observed batch_size: %s",
+        cudagraph_capture_sizes,
+    )
 
     # Hidden size: probe multiple paths since vllm config layouts vary.
     hidden_size = 0
