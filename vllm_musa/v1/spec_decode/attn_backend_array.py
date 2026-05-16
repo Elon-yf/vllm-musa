@@ -170,11 +170,19 @@ def build_per_step_attn_metadata_array(
         # step-specific tensor views; the per-group builder then produces
         # the backend-specific metadata (FlashAttentionMetadata) with all
         # required fields (block_table, use_cascade, seqused_k, etc.).
+        #
+        # MUSA-0090 step 5l.3: also point block_table_tensor at the
+        # runner-owned buffer (not the caller's transient one). The owned
+        # buffer's contents are updated by replay() before each graph
+        # invocation; the captured graph reads from a stable pointer.
+        # The owned tensor is sized [max_bs, max_blocks_per_req]; slice
+        # to [:batch_size, :] to match the request.
         step_cam = replace(
             base_metadata,
             slot_mapping=slot_mapping_view,
             seq_lens=seq_lens_view,
             max_seq_len=step_max_seq_len,
+            block_table_tensor=buffers.block_table_tensor[:batch_size],
         )
 
         try:

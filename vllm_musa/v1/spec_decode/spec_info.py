@@ -82,10 +82,14 @@ class EagleDraftBuffers:
     seq_lens_in: torch.Tensor
 
     # --- Static / read-only references (allocated once, not per-step) ---
-    # int32 [max_num_blocks, max_bs] (or however the block table is shaped):
-    # block table tensor reused across all steps. NOT mutated during the
-    # captured loop; held as a reference so the slot-mapping kernel can read
-    # it without rebuild.
+    # MUSA-0090 step 5l.3: block_table_tensor is OWNED by the buffer
+    # (allocated once, copied-into per replay). NOT a reference to the
+    # caller's block_table — that pointer becomes stale across spec rounds
+    # as vllm reuses tensors, causing 'MUSA error: unknown error' during
+    # captured graph replay.
+    # Shape: [max_bs, max_blocks_per_req]. The eagle_step kernel reads from
+    # this; the runner's replay() copies the current request's block_table
+    # into it.
     block_table_tensor: torch.Tensor
 
     # --- Bookkeeping ---
@@ -107,10 +111,12 @@ class EagleDraftBuffers:
     ) -> EagleDraftBuffers:
         """One-time allocation at runner setup (before any graph capture).
 
-        block_table_tensor is passed in (not allocated here) because it's
-        owned by vLLM's CommonAttentionMetadata; we hold a reference, not a
-        copy. The captured graph reads it via the slot-mapping kernel; we
-        don't mutate it during the loop.
+        MUSA-0090 step 5l.3: block_table_tensor is OWNED by the buffer
+        (allocated once at max shape, copied-into per replay). The caller's
+        reference is used only to derive the shape (max_blocks_per_req)
+        and dtype. The captured graph reads from the buffer's
+        block_table_tensor; the runner's replay() copies the current
+        request's block_table into it before graph.replay().
 
         Sizes are stored on the device. The (N, max_bs) leading dims allow
         per-step slicing as a contiguous view (no copy).
@@ -119,6 +125,19 @@ class EagleDraftBuffers:
         i32 = torch.int32
         i64 = torch.int64
         f32 = torch.float32
+
+        # Allocate a runner-owned block_table buffer at the SHAPE of the
+        # caller's template. The caller's block_table_tensor has shape
+        # [num_reqs, max_blocks_per_req] (typically int32 — page table
+        # entries). We allocate [max_bs, max_blocks_per_req].
+        max_blocks_per_req = (
+            block_table_tensor.shape[-1] if block_table_tensor.ndim >= 1 else 1
+        )
+        owned_block_table = torch.zeros(
+            (max_bs, max_blocks_per_req),
+            dtype=block_table_tensor.dtype,
+            device=device,
+        )
 
         return cls(
             input_ids_per_step=torch.zeros((num_steps, max_bs), dtype=i32, device=device),
@@ -137,7 +156,7 @@ class EagleDraftBuffers:
             positions_in=torch.zeros((max_bs,), dtype=i64, device=device),
             slot_mapping_in=torch.zeros((max_bs,), dtype=i64, device=device),
             seq_lens_in=torch.zeros((max_bs,), dtype=i32, device=device),
-            block_table_tensor=block_table_tensor,
+            block_table_tensor=owned_block_table,
             max_bs=max_bs,
             num_steps=num_steps,
             hidden_size=hidden_size,
@@ -179,8 +198,9 @@ class EagleDraftBuffers:
             self.positions_in,
             self.slot_mapping_in,
             self.seq_lens_in,
+            # MUSA-0090 step 5l.3: block_table_tensor is now owned.
+            self.block_table_tensor,
         ]
-        # Don't count block_table_tensor — we don't own it.
         return sum(t.numel() * t.element_size() for t in tensors)
 
 

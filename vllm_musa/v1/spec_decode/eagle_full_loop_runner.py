@@ -440,6 +440,22 @@ class EagleFullLoopRunner:
                 cm_seq_lens[:batch_size].to(torch.int32)
             )
 
+        # MUSA-0090 step 5l.3: copy the current request's block_table into
+        # the runner-owned buffer. The captured graph reads from
+        # buffers.block_table_tensor (a stable pointer), not from the
+        # caller's transient tensor (which may be freed/repurposed between
+        # spec rounds, causing 'MUSA error: unknown error').
+        cm_block_table = getattr(common_attn_metadata, "block_table_tensor", None)
+        if cm_block_table is not None and cm_block_table.numel() > 0:
+            # Slice to actual shape, pad with zeros if needed.
+            src_bs = min(cm_block_table.shape[0], batch_size)
+            src_n_blocks = min(
+                cm_block_table.shape[1], ctx.buffers.block_table_tensor.shape[1]
+            )
+            ctx.buffers.block_table_tensor[:src_bs, :src_n_blocks].copy_(
+                cm_block_table[:src_bs, :src_n_blocks]
+            )
+
         # Single graph replay. All N draft forwards + sampling + slot-mapping
         # updates happen inside this one call.
         ctx.graph.replay()
