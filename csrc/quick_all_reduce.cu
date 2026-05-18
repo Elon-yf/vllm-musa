@@ -68,7 +68,12 @@ void qr_all_reduce(
 
   TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
   TORCH_CHECK_EQ(inp.numel(), out.numel());
-  TORCH_CHECK_LE(out.numel(), fa->kMaxProblemSize);
+  // kMaxProblemSize is a byte budget (default int32_max+1 = 2 GiB),
+  // not an element count. Compare against numel * element_size to
+  // avoid letting fp16/bf16 buffers > 2 GiB bytes slip past the
+  // check and overflow the comm allocation. See PR #40 review
+  // comment.
+  TORCH_CHECK_LE(out.numel() * out.element_size(), fa->kMaxProblemSize);
   if (out.scalar_type() == at::ScalarType::Half) {
     fa->allreduce<half, false>(
         reinterpret_cast<half*>(inp.data_ptr()),

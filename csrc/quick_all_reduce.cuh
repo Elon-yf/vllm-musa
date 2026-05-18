@@ -517,7 +517,13 @@ struct AllReduceTwoshot {
     int thread = threadIdx.x + threadIdx.y * kWavefront;
     uint8_t* rank_buffer = buffer_list[rank];
     Codec codec(thread, rank);
-    int block_id = blockIdx.x;
+    // block_id must be the LOGICAL block index passed in via `block`
+    // (the wrapper's `while (block < num_blocks) { block += grid; }`
+    // loop in quick_all_reduce.h advances it past gridDim.x). Using
+    // blockIdx.x makes the comm_data*/comm_flags* offsets repeat
+    // every grid stride, so later logical blocks corrupt the
+    // earlier ones' results. See PR #40 review comment.
+    int block_id = block;
     int grid_size = gridDim.x;
     // --------------------------------------------------------
     // Read input into registers

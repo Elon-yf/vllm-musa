@@ -18,10 +18,16 @@ Disable with: ``VLLM_MUSA_DISABLE_INDUCTOR_HEURISTICS=1``
 
 from __future__ import annotations
 
-import logging
 import os
 
-logger = logging.getLogger(__name__)
+from vllm.logger import init_logger
+
+# vllm.logger.init_logger returns a Logger that supports info_once /
+# warning_once. The previous use of logging.getLogger here raised
+# AttributeError at call sites, which was caught by the broad except
+# in vllm_musa/__init__.py and silently disabled MUSA-0087 heuristic
+# registration — see PR #40 review comment.
+logger = init_logger(__name__)
 
 # Idempotency guard
 _REGISTERED = False

@@ -21,13 +21,18 @@ API mirrors `vllm/.../custom_all_reduce.py:CustomAllreduce`:
 
 from __future__ import annotations
 
-import logging
 from typing import Optional
 
 import torch
 import torch.distributed as dist
 
-logger = logging.getLogger(__name__)
+from vllm.logger import init_logger
+
+# vllm.logger.init_logger returns a Logger with info_once / warning_once
+# helpers; the previous plain logging.getLogger here would have raised
+# AttributeError on first miss (PR #40 review comment), turning the
+# graceful "ops not available" degrade path into an ImportError.
+logger = init_logger(__name__)
 
 
 # Probe for the compiled ops. If missing, the wrapper degrades gracefully.
@@ -100,10 +105,13 @@ class QuickAllReduce:
                 torch.empty_like(my_handle) for _ in range(world_size)
             ]
             dist.all_gather(all_handles, my_handle, group=group)
-            peer_handles = [
-                all_handles[i] for i in range(world_size) if i != rank
-            ]
-            torch.ops._C_quick_ar.open_handles(self.fptr, peer_handles)
+            # Pass the full handle list (length == world_size). The C++
+            # DeviceComms::open_ipc_handles asserts size() == world_size
+            # and indexes by rank; it already skips the self entry
+            # internally (i == rank branch). Filtering out self here
+            # would shift the indices and mis-map ranks — see PR #40
+            # review comment.
+            torch.ops._C_quick_ar.open_handles(self.fptr, all_handles)
         except Exception as exc:
             logger.warning(
                 "MUSA-0088: QuickAllReduce IPC handle exchange failed "
