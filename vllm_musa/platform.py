@@ -141,6 +141,75 @@ class MUSAPlatformBase(Platform):
         return True
 
     @classmethod
+    def import_ir_kernels(cls) -> None:
+        """Import upstream and MUSA-OOT IR-op providers.
+
+        Order matters: upstream first (registers `native` / `vllm_c` /
+        `oink` / etc.), then OOT MUSA providers so they appear in the
+        registry alongside upstream impls. Used by
+        `vllm.config.kernel.KernelConfig.set_priority()` to ensure
+        every provider mentioned in `ir_op_priority` is registered
+        before the dispatcher needs it.
+        """
+        super().import_ir_kernels()
+        try:
+            import vllm_musa.kernels  # noqa: F401
+        except ImportError as exc:
+            from vllm.logger import init_logger
+            init_logger(__name__).info(
+                "vllm_musa.kernels unavailable (%s); MUSA IR providers "
+                "will not be registered. Upstream providers remain "
+                "available.",
+                exc,
+            )
+
+    @classmethod
+    def get_default_ir_op_priority(cls, vllm_config):
+        """Platform-default priority list for vllm.ir.ops on MUSA.
+
+        When compiling with Inductor, prefer the `native` (pure-PyTorch)
+        IR impl; in the eager path, prefer the `musa` kernel provider.
+        This mirrors the upstream `cuda.py` pattern
+        (`default = ["native"] if using_inductor else ["vllm_c", "native"]`):
+        under Inductor the native rms_norm is a handful of
+        elementwise/reduction ops the compiler can fuse with its
+        neighbours, whereas a `torch.ops._C.*` custom op is an opaque
+        fusion barrier; in eager mode there is no fusion to lose so the
+        kernel provider is taken directly.
+
+        NOTE (MUSA-0057): this is a **correctness / upstream-consistency**
+        change, NOT a perf fix. MUSA-0057's controlled A/B/C bisect
+        proved there is no rms_norm-related perf regression on
+        MiniMax-M2.7 — `["native"]` and `["musa", "native"]` measure the
+        same batch1 throughput. An earlier revision of this docstring
+        claimed MUSA-0055 had measured a 20-56% regression caused by
+        this priority list; that delta was traced to a stale/anomalous
+        baseline measurement, not a real regression (see the MUSA-0057
+        ticket). The `musa` provider stays registered (see
+        `vllm_musa/kernels/musa_ops.py`) for the eager / explicit
+        opt-in path.
+        """
+        from vllm.config.compilation import CompilationMode
+        from vllm.config.kernel import IrOpPriorityConfig
+
+        cc = vllm_config.compilation_config
+        using_inductor = (
+            cc.backend == "inductor" and cc.mode != CompilationMode.NONE
+        )
+        if using_inductor:
+            # Let Inductor fuse the native reference impl. Keep the
+            # `musa` custom-op provider out of the priority here — it is
+            # a fusion barrier (no measurable batch1 effect per
+            # MUSA-0057, but native is the upstream-aligned default).
+            default = ["native"]
+            rms_norm = ["native"]
+        else:
+            # Eager path: no Inductor fusion to lose, so take the kernel.
+            default = ["musa", "native"]
+            rms_norm = ["musa", "native"]
+        return IrOpPriorityConfig.with_default(default, rms_norm=rms_norm)
+
+    @classmethod
     def support_deep_gemm(cls) -> bool:
         """
         Returns if DeepGEMM is supported by the current platform.
