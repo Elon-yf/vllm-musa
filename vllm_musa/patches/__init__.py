@@ -96,17 +96,30 @@ def apply_patches():
             if not patches:
                 continue
 
-            # Check if any patches are needed
-            needs_patch = any(old in source for old, new in patches)
+            # Check if any patches are needed.
+            # MUSA-0089/0096 fix: for INSERT-style patches (where `new` contains
+            # `old` plus extra inserted text), `old in source` remains True after
+            # first apply, causing accumulation across re-imports. Gate on
+            # `new not in source` to detect "patch already applied" state.
+            # Behaviour-preserving for REPLACEMENT-style patches where `new`
+            # differs entirely from `old`.
+            needs_patch = any(
+                old in source and new not in source for old, new in patches
+            )
             if not needs_patch:
                 logger.debug(f"No patches needed for {module_name}")
                 continue
 
-            # Apply patches
+            # Apply patches.
+            # MUSA-0089/0096 fix: same `new not in patched_source` gate as
+            # the outer needs_patch check. Without this, INSERT-style patches
+            # re-apply on every import and accumulate (e.g., MUSA-0088's
+            # cuda_communicator.py grew 10 duplicate `elif current_platform.is_musa()`
+            # blocks before MUSA-0089 caught it and manual sed -i restored).
             patched_source = source
             applied_count = 0
             for old, new in patches:
-                if old in patched_source:
+                if old in patched_source and new not in patched_source:
                     patched_source = patched_source.replace(old, new)
                     applied_count += 1
 
