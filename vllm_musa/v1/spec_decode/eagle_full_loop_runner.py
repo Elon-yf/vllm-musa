@@ -150,23 +150,35 @@ class EagleFullLoopRunner:
         # torch_musa 2.9.0 allocator bug (`MUSA error: unknown error`
         # at capture/replay). Reusing vllm's existing global pool avoids
         # cross-pool interactions during replay.
+        pool = None
         try:
             from vllm.platforms import current_platform
             pool = current_platform.get_global_graph_pool()
+        except Exception as exc:
+            logger.warning(
+                "MUSA-0109: failed to acquire vllm global graph pool (%s); "
+                "will fall back to a fresh per-runner pool.",
+                exc,
+            )
+        # Validate the returned handle BEFORE using it for capture/replay.
+        # A platform that doesn't actually implement get_global_graph_pool
+        # may return None (or an invalid sentinel). Passing None through to
+        # torch.cuda.graph(..., pool=...) means the capture allocates from
+        # the default pool — silently breaking the shared-pool guarantee
+        # that the cross-pool replay allocator bug (PR #41 review comment).
+        if pool is None:
+            pool = torch.cuda.graph_pool_handle()
+            logger.warning(
+                "MUSA-0109: get_global_graph_pool() returned None; "
+                "falling back to per-runner pool (may trigger torch_musa "
+                "allocator bug). pool=%s",
+                pool,
+            )
+        else:
             logger.info(
                 "MUSA-0109: EagleFullLoopRunner using vllm GLOBAL graph pool "
                 "(shared with target model captures); pool=%s",
                 pool,
-            )
-        except Exception as exc:
-            # Fallback to fresh pool if the platform API isn't available
-            # (e.g. very old vllm). Preserves prior behaviour.
-            pool = torch.cuda.graph_pool_handle()
-            logger.warning(
-                "MUSA-0109: failed to acquire vllm global graph pool (%s); "
-                "falling back to per-runner pool (may trigger torch_musa "
-                "allocator bug). pool=%s",
-                exc, pool,
             )
 
         for bs in self.capture_sizes:

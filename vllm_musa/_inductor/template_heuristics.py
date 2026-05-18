@@ -13,7 +13,9 @@ never attempts Triton autotune for `mm` on MUSA. With this
 registration MUSA inherits the CUDA tile-size configs as a safe
 starting point; per-shape MUSA tuning can be added incrementally.
 
-Disable with: ``VLLM_MUSA_DISABLE_INDUCTOR_HEURISTICS=1``
+Default-off (Eagle3 TP=8 crash, see commit log + the comment in
+``maybe_register_musa_template_heuristics`` below). Opt in with:
+``VLLM_MUSA_ENABLE_INDUCTOR_HEURISTICS=1`` for non-Eagle3 workloads.
 """
 
 from __future__ import annotations
@@ -37,7 +39,8 @@ def maybe_register_musa_template_heuristics() -> None:
     """Idempotent registration of MUSA Inductor template heuristics.
 
     Safe to call multiple times. Opportunistic — silently no-ops on old
-    torch versions or when the disable env var is set.
+    torch versions or when the opt-in env var is unset (the default).
+    Set ``VLLM_MUSA_ENABLE_INDUCTOR_HEURISTICS=1`` to enable.
     """
     global _REGISTERED
     if _REGISTERED:

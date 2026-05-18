@@ -47,8 +47,9 @@ _patches_applied = False
 # MUSA-0087: register Inductor template heuristics for device_type='musa'
 # so compiled mm/bmm/addmm/baddbmm/scaled_mm ops use Triton autotune
 # instead of falling through to the empty fallback heuristic.
-# Opportunistic; silently no-ops on old torch versions or when disabled
-# via VLLM_MUSA_DISABLE_INDUCTOR_HEURISTICS=1.
+# Default-OFF (Eagle3 TP=8 crash on M2.5); opt in for non-Eagle3 workloads
+# via VLLM_MUSA_ENABLE_INDUCTOR_HEURISTICS=1. Also silently no-ops on
+# old torch versions.
 try:
     from vllm_musa._inductor import maybe_register_musa_template_heuristics
 
