@@ -141,11 +141,45 @@ class EagleFullLoopRunner:
                 "`proposer.draft_model`)."
             )
 
-        # Acquire a shared graph memory pool. Step 4 should share with the
-        # target model's pool if vllm-musa exposes a hook; for now, create
-        # a fresh pool — slightly more memory but simpler.
-        # Note: torch.cuda.graph_pool_handle() works on MUSA via torchada.
-        pool = torch.cuda.graph_pool_handle()
+        # MUSA-0109 spike: use the platform's GLOBAL graph pool (lazily
+        # created, shared across target + draft + spec captures). This
+        # mirrors sglang's `device_module.graph_pool_handle()` shared-pool
+        # pattern, which is the working reference on MUSA. The prior
+        # per-runner `torch.cuda.graph_pool_handle()` created a SEPARATE
+        # pool, and replay across distinct pools triggered the
+        # torch_musa 2.9.0 allocator bug (`MUSA error: unknown error`
+        # at capture/replay). Reusing vllm's existing global pool avoids
+        # cross-pool interactions during replay.
+        pool = None
+        try:
+            from vllm.platforms import current_platform
+            pool = current_platform.get_global_graph_pool()
+        except Exception as exc:
+            logger.warning(
+                "MUSA-0109: failed to acquire vllm global graph pool (%s); "
+                "will fall back to a fresh per-runner pool.",
+                exc,
+            )
+        # Validate the returned handle BEFORE using it for capture/replay.
+        # A platform that doesn't actually implement get_global_graph_pool
+        # may return None (or an invalid sentinel). Passing None through to
+        # torch.cuda.graph(..., pool=...) means the capture allocates from
+        # the default pool — silently breaking the shared-pool guarantee
+        # that the cross-pool replay allocator bug (PR #41 review comment).
+        if pool is None:
+            pool = torch.cuda.graph_pool_handle()
+            logger.warning(
+                "MUSA-0109: get_global_graph_pool() returned None; "
+                "falling back to per-runner pool (may trigger torch_musa "
+                "allocator bug). pool=%s",
+                pool,
+            )
+        else:
+            logger.info(
+                "MUSA-0109: EagleFullLoopRunner using vllm GLOBAL graph pool "
+                "(shared with target model captures); pool=%s",
+                pool,
+            )
 
         for bs in self.capture_sizes:
             try:
