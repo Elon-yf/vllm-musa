@@ -350,19 +350,59 @@ class MUSAPlatformBase(Platform):
 
         compilation_config = vllm_config.compilation_config
         cudagraph_mode = getattr(compilation_config, "cudagraph_mode", None)
-        if parallel_config.tensor_parallel_size > 2 and cudagraph_mode is not None:
+        # MUSA-0076: the TP>2 cudagraph force-disable was added in
+        # MUSA-0061/0063 under the (incorrect) belief that "MCCL is
+        # incompatible with MUSA stream capture at the platform level".
+        # The actual root cause was that custom_all_reduce was disabled
+        # on torch >= 2.9 (MUSA-0069 gate), causing
+        # cuda_communicator.all_reduce to fall through to
+        # torch.distributed.all_reduce, whose MCCL ProcessGroup watchdog
+        # made CUDA API calls during the capture window. MUSA-0075 fixed
+        # the underlying CAR kernel-alignment issue and re-enabled CAR
+        # at TP>2 on torch 2.9; the dispatcher now hits ca_comm
+        # (captureable, stream-bound) instead of torch.distributed.
+        #
+        # However, on torch_musa 2.9.0, capturing graphs at LARGE shapes
+        # (>= ~232 tokens / 51-size default capture) triggers an
+        # `illegal memory access` at musa_graph.capture_end() — a
+        # separate torch_musa-side bug. Until that bug is fixed
+        # upstream, cap max_cudagraph_capture_size to a safe value so
+        # only the small (decode-relevant) graphs are captured. Single-
+        # batch decode only needs size=1 anyway.
+        # MUSA-0081: allow overriding the safe-cap via env var for
+        # spec-decode / Eagle3 perf experiments. Setting
+        # ``VLLM_MUSA_MAX_CUDAGRAPH_CAPTURE_SIZE`` overrides the default
+        # ``MUSA_SAFE_MAX_CUDAGRAPH_CAPTURE_SIZE=8``. Values up to 224
+        # have been observed working on torch_musa 2.9.0; values >= 232
+        # trigger MUSA-0082's illegal memory access at capture_end.
+        import os as _os
+        try:
+            MUSA_SAFE_MAX_CUDAGRAPH_CAPTURE_SIZE = int(
+                _os.getenv("VLLM_MUSA_MAX_CUDAGRAPH_CAPTURE_SIZE", "8")
+            )
+        except ValueError:
+            MUSA_SAFE_MAX_CUDAGRAPH_CAPTURE_SIZE = 8
+        if cudagraph_mode is not None:
             from vllm.config import CUDAGraphMode
-
             if cudagraph_mode != CUDAGraphMode.NONE:
-                logger.warning(
-                    "Disabling MUSA cudagraph capture for tensor parallel "
-                    "size %d because MCCL collectives are not safe during "
-                    "stream capture on this platform.",
-                    parallel_config.tensor_parallel_size,
-                )
-                compilation_config.cudagraph_mode = CUDAGraphMode.NONE
-                compilation_config.max_cudagraph_capture_size = 0
-                compilation_config.cudagraph_capture_sizes = []
+                max_size = compilation_config.max_cudagraph_capture_size or 0
+                if max_size > MUSA_SAFE_MAX_CUDAGRAPH_CAPTURE_SIZE:
+                    logger.warning(
+                        "MUSA-0076: capping max_cudagraph_capture_size "
+                        "from %d to %d (larger sizes trigger an illegal "
+                        "memory access at musa_graph.capture_end on "
+                        "torch_musa 2.9.0; investigation pending). "
+                        "Override with VLLM_MUSA_MAX_CUDAGRAPH_CAPTURE_SIZE.",
+                        max_size, MUSA_SAFE_MAX_CUDAGRAPH_CAPTURE_SIZE,
+                    )
+                    compilation_config.max_cudagraph_capture_size = (
+                        MUSA_SAFE_MAX_CUDAGRAPH_CAPTURE_SIZE
+                    )
+                    if compilation_config.cudagraph_capture_sizes:
+                        compilation_config.cudagraph_capture_sizes = [
+                            s for s in compilation_config.cudagraph_capture_sizes
+                            if s <= MUSA_SAFE_MAX_CUDAGRAPH_CAPTURE_SIZE
+                        ]
 
     @classmethod
     def get_current_memory_usage(
