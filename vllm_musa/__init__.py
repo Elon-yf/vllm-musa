@@ -44,6 +44,23 @@ except ImportError:
 _patches_applied = False
 
 
+# MUSA-0087: register Inductor template heuristics for device_type='musa'
+# so compiled mm/bmm/addmm/baddbmm/scaled_mm ops use Triton autotune
+# instead of falling through to the empty fallback heuristic.
+# Opportunistic; silently no-ops on old torch versions or when disabled
+# via VLLM_MUSA_DISABLE_INDUCTOR_HEURISTICS=1.
+try:
+    from vllm_musa._inductor import maybe_register_musa_template_heuristics
+
+    maybe_register_musa_template_heuristics()
+except Exception as _exc:  # pragma: no cover
+    logger.warning(
+        "MUSA-0087: failed to register Inductor template heuristics for "
+        "MUSA (%s); falling back to ATen path for compiled `mm` ops.",
+        _exc,
+    )
+
+
 ########### platform plugin ###########
 
 

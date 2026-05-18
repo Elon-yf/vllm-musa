@@ -70,37 +70,103 @@ void all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out,
   TORCH_CHECK(_is_weak_contiguous(out));
   TORCH_CHECK(_is_weak_contiguous(inp));
   auto input_size = inp.numel() * inp.element_size();
+
+  // MUSA-0075: handle non-vector-aligned numel by zero-padding the tail of
+  // the input AND using a scratch region in reg_buffer for the output, then
+  // memcpy back to the user's out. Background: torch_musa 2.9.0's Inductor
+  // compile-mode lowering can pass non-aligned numel to this op (e.g. fp32
+  // numel not a multiple of 4); since PyTorch's caching allocator does NOT
+  // guarantee storage slack on small tensors, we cannot over-write past
+  // orig_numel directly. The reg_buffer-scratch approach avoids that:
+  //
+  //   - reg_buffer[0..aligned_bytes)         = input (orig bytes + zero pad)
+  //   - reg_buffer[aligned_bytes..2*aligned_bytes) = output scratch
+  //   - after kernel:  cudaMemcpy(out, scratch, orig_bytes)
+  //
+  // Safe because (a) we own reg_buffer, (b) each rank pads its input
+  // identically, (c) the sum-of-zero peer tails is zero, (d) the output
+  // scratch is rank-local (peer kernels read peer input regions, not peer
+  // output scratches), (e) the final memcpy writes exactly orig_bytes to
+  // user's out -- no over-write.
+  int64_t d_T = 16 / inp.element_size();  // == packed_t<T>::P::size
+  int64_t orig_numel = out.numel();
+  int64_t aligned_numel = ((orig_numel + d_T - 1) / d_T) * d_T;
+  int64_t pad_count = aligned_numel - orig_numel;
+  int64_t aligned_bytes = aligned_numel * inp.element_size();
+
   auto reg_buffer = reinterpret_cast<void*>(_reg_buffer);
-  if (reg_buffer) {
-    TORCH_CHECK_LE(input_size, reg_buffer_sz_bytes);
-    AT_CUDA_CHECK(cudaMemcpyAsync(reg_buffer, inp.data_ptr(), input_size,
-                                  cudaMemcpyDeviceToDevice, stream));
+  void* kernel_in;
+  void* kernel_out;
+  int64_t kernel_size;
+
+  if (pad_count == 0) {
+    // Common (aligned) path -- unchanged behavior. Kernel writes directly
+    // into user's out.
+    if (reg_buffer) {
+      TORCH_CHECK_LE(input_size, reg_buffer_sz_bytes);
+      AT_CUDA_CHECK(cudaMemcpyAsync(reg_buffer, inp.data_ptr(), input_size,
+                                    cudaMemcpyDeviceToDevice, stream));
+      kernel_in = reg_buffer;
+    } else {
+      kernel_in = inp.data_ptr();
+    }
+    kernel_out = out.data_ptr();
+    kernel_size = orig_numel;
   } else {
-    reg_buffer = inp.data_ptr();
+    // Non-aligned path -- use reg_buffer as both input pad-zone and output
+    // scratch. Requires reg_buffer to hold 2 * aligned_bytes.
+    TORCH_CHECK(reg_buffer != nullptr,
+                "MUSA-0075: non-aligned custom_all_reduce numel requires a "
+                "non-null reg_buffer (compile-mode lowering bypass path)");
+    int64_t needed_bytes = 2 * aligned_bytes;
+    TORCH_CHECK(needed_bytes <= reg_buffer_sz_bytes,
+                "MUSA-0075: reg_buffer too small for tail-padded "
+                "custom_all_reduce (need ", needed_bytes,
+                " have ", reg_buffer_sz_bytes, ")");
+    void* in_buf = reg_buffer;
+    void* out_buf = static_cast<char*>(reg_buffer) + aligned_bytes;
+    AT_CUDA_CHECK(cudaMemcpyAsync(in_buf, inp.data_ptr(), input_size,
+                                  cudaMemcpyDeviceToDevice, stream));
+    AT_CUDA_CHECK(cudaMemsetAsync(
+        static_cast<char*>(in_buf) + input_size,
+        0,
+        pad_count * inp.element_size(),
+        stream));
+    kernel_in = in_buf;
+    kernel_out = out_buf;
+    kernel_size = aligned_numel;
   }
+
   switch (out.scalar_type()) {
     case at::ScalarType::Float: {
-      fa->allreduce<float>(stream, reinterpret_cast<float*>(reg_buffer),
-                           reinterpret_cast<float*>(out.data_ptr()),
-                           out.numel());
+      fa->allreduce<float>(stream, reinterpret_cast<float*>(kernel_in),
+                           reinterpret_cast<float*>(kernel_out), kernel_size);
       break;
     }
     case at::ScalarType::Half: {
-      fa->allreduce<half>(stream, reinterpret_cast<half*>(reg_buffer),
-                          reinterpret_cast<half*>(out.data_ptr()), out.numel());
+      fa->allreduce<half>(stream, reinterpret_cast<half*>(kernel_in),
+                          reinterpret_cast<half*>(kernel_out), kernel_size);
       break;
     }
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
     case at::ScalarType::BFloat16: {
       fa->allreduce<nv_bfloat16>(
-          stream, reinterpret_cast<nv_bfloat16*>(reg_buffer),
-          reinterpret_cast<nv_bfloat16*>(out.data_ptr()), out.numel());
+          stream, reinterpret_cast<nv_bfloat16*>(kernel_in),
+          reinterpret_cast<nv_bfloat16*>(kernel_out), kernel_size);
       break;
     }
 #endif
     default:
       throw std::runtime_error(
           "custom allreduce only supports float32, float16 and bfloat16");
+  }
+
+  // MUSA-0075: when we ran with non-aligned numel, kernel wrote to the
+  // reg_buffer-scratch. Memcpy only the first orig_bytes back to user's out.
+  if (pad_count > 0) {
+    int64_t orig_bytes = orig_numel * out.element_size();
+    AT_CUDA_CHECK(cudaMemcpyAsync(out.data_ptr(), kernel_out, orig_bytes,
+                                  cudaMemcpyDeviceToDevice, stream));
   }
 }
 

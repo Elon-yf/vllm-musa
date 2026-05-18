@@ -109,6 +109,15 @@ def register_attention_backends() -> None:
             "MUSATurboQuantAttentionBackend"
         ),
     )
+    # MUSA-0094: tree drafting via a MUSA-routed TreeAttention backend
+    # (Triton unified_attention is already MUSA-patched; reshape_and_cache_flash
+    # is wired through fa_utils.reshape_and_cache_flash).
+    register_backend(
+        AttentionBackendEnum.TREE_ATTN,
+        class_path=(
+            "vllm_musa.v1.attention.backends.tree_attn.MUSATreeAttentionBackend"
+        ),
+    )
 
 
 class MUSAPlatformBase(Platform):
@@ -139,6 +148,75 @@ class MUSAPlatformBase(Platform):
     def is_sleep_mode_available(self) -> bool:
         """MUSA supports sleep mode."""
         return True
+
+    @classmethod
+    def import_ir_kernels(cls) -> None:
+        """Import upstream and MUSA-OOT IR-op providers.
+
+        Order matters: upstream first (registers `native` / `vllm_c` /
+        `oink` / etc.), then OOT MUSA providers so they appear in the
+        registry alongside upstream impls. Used by
+        `vllm.config.kernel.KernelConfig.set_priority()` to ensure
+        every provider mentioned in `ir_op_priority` is registered
+        before the dispatcher needs it.
+        """
+        super().import_ir_kernels()
+        try:
+            import vllm_musa.kernels  # noqa: F401
+        except ImportError as exc:
+            from vllm.logger import init_logger
+            init_logger(__name__).info(
+                "vllm_musa.kernels unavailable (%s); MUSA IR providers "
+                "will not be registered. Upstream providers remain "
+                "available.",
+                exc,
+            )
+
+    @classmethod
+    def get_default_ir_op_priority(cls, vllm_config):
+        """Platform-default priority list for vllm.ir.ops on MUSA.
+
+        When compiling with Inductor, prefer the `native` (pure-PyTorch)
+        IR impl; in the eager path, prefer the `musa` kernel provider.
+        This mirrors the upstream `cuda.py` pattern
+        (`default = ["native"] if using_inductor else ["vllm_c", "native"]`):
+        under Inductor the native rms_norm is a handful of
+        elementwise/reduction ops the compiler can fuse with its
+        neighbours, whereas a `torch.ops._C.*` custom op is an opaque
+        fusion barrier; in eager mode there is no fusion to lose so the
+        kernel provider is taken directly.
+
+        NOTE (MUSA-0057): this is a **correctness / upstream-consistency**
+        change, NOT a perf fix. MUSA-0057's controlled A/B/C bisect
+        proved there is no rms_norm-related perf regression on
+        MiniMax-M2.7 — `["native"]` and `["musa", "native"]` measure the
+        same batch1 throughput. An earlier revision of this docstring
+        claimed MUSA-0055 had measured a 20-56% regression caused by
+        this priority list; that delta was traced to a stale/anomalous
+        baseline measurement, not a real regression (see the MUSA-0057
+        ticket). The `musa` provider stays registered (see
+        `vllm_musa/kernels/musa_ops.py`) for the eager / explicit
+        opt-in path.
+        """
+        from vllm.config.compilation import CompilationMode
+        from vllm.config.kernel import IrOpPriorityConfig
+
+        cc = vllm_config.compilation_config
+        using_inductor = (
+            cc.backend == "inductor" and cc.mode != CompilationMode.NONE
+        )
+        if using_inductor:
+            # Let Inductor fuse the native reference impl. Keep the
+            # `musa` custom-op provider out of the priority here — it is
+            # a fusion barrier (no measurable batch1 effect per
+            # MUSA-0057, but native is the upstream-aligned default).
+            default = ["native"]
+            rms_norm = ["native"]
+        else:
+            # Eager path: no Inductor fusion to lose, so take the kernel.
+            default = ["musa", "native"]
+            rms_norm = ["musa", "native"]
+        return IrOpPriorityConfig.with_default(default, rms_norm=rms_norm)
 
     @classmethod
     def support_deep_gemm(cls) -> bool:
@@ -281,19 +359,59 @@ class MUSAPlatformBase(Platform):
 
         compilation_config = vllm_config.compilation_config
         cudagraph_mode = getattr(compilation_config, "cudagraph_mode", None)
-        if parallel_config.tensor_parallel_size > 2 and cudagraph_mode is not None:
+        # MUSA-0076: the TP>2 cudagraph force-disable was added in
+        # MUSA-0061/0063 under the (incorrect) belief that "MCCL is
+        # incompatible with MUSA stream capture at the platform level".
+        # The actual root cause was that custom_all_reduce was disabled
+        # on torch >= 2.9 (MUSA-0069 gate), causing
+        # cuda_communicator.all_reduce to fall through to
+        # torch.distributed.all_reduce, whose MCCL ProcessGroup watchdog
+        # made CUDA API calls during the capture window. MUSA-0075 fixed
+        # the underlying CAR kernel-alignment issue and re-enabled CAR
+        # at TP>2 on torch 2.9; the dispatcher now hits ca_comm
+        # (captureable, stream-bound) instead of torch.distributed.
+        #
+        # However, on torch_musa 2.9.0, capturing graphs at LARGE shapes
+        # (>= ~232 tokens / 51-size default capture) triggers an
+        # `illegal memory access` at musa_graph.capture_end() — a
+        # separate torch_musa-side bug. Until that bug is fixed
+        # upstream, cap max_cudagraph_capture_size to a safe value so
+        # only the small (decode-relevant) graphs are captured. Single-
+        # batch decode only needs size=1 anyway.
+        # MUSA-0081: allow overriding the safe-cap via env var for
+        # spec-decode / Eagle3 perf experiments. Setting
+        # ``VLLM_MUSA_MAX_CUDAGRAPH_CAPTURE_SIZE`` overrides the default
+        # ``MUSA_SAFE_MAX_CUDAGRAPH_CAPTURE_SIZE=8``. Values up to 224
+        # have been observed working on torch_musa 2.9.0; values >= 232
+        # trigger MUSA-0082's illegal memory access at capture_end.
+        import os as _os
+        try:
+            MUSA_SAFE_MAX_CUDAGRAPH_CAPTURE_SIZE = int(
+                _os.getenv("VLLM_MUSA_MAX_CUDAGRAPH_CAPTURE_SIZE", "8")
+            )
+        except ValueError:
+            MUSA_SAFE_MAX_CUDAGRAPH_CAPTURE_SIZE = 8
+        if cudagraph_mode is not None:
             from vllm.config import CUDAGraphMode
-
             if cudagraph_mode != CUDAGraphMode.NONE:
-                logger.warning(
-                    "Disabling MUSA cudagraph capture for tensor parallel "
-                    "size %d because MCCL collectives are not safe during "
-                    "stream capture on this platform.",
-                    parallel_config.tensor_parallel_size,
-                )
-                compilation_config.cudagraph_mode = CUDAGraphMode.NONE
-                compilation_config.max_cudagraph_capture_size = 0
-                compilation_config.cudagraph_capture_sizes = []
+                max_size = compilation_config.max_cudagraph_capture_size or 0
+                if max_size > MUSA_SAFE_MAX_CUDAGRAPH_CAPTURE_SIZE:
+                    logger.warning(
+                        "MUSA-0076: capping max_cudagraph_capture_size "
+                        "from %d to %d (larger sizes trigger an illegal "
+                        "memory access at musa_graph.capture_end on "
+                        "torch_musa 2.9.0; investigation pending). "
+                        "Override with VLLM_MUSA_MAX_CUDAGRAPH_CAPTURE_SIZE.",
+                        max_size, MUSA_SAFE_MAX_CUDAGRAPH_CAPTURE_SIZE,
+                    )
+                    compilation_config.max_cudagraph_capture_size = (
+                        MUSA_SAFE_MAX_CUDAGRAPH_CAPTURE_SIZE
+                    )
+                    if compilation_config.cudagraph_capture_sizes:
+                        compilation_config.cudagraph_capture_sizes = [
+                            s for s in compilation_config.cudagraph_capture_sizes
+                            if s <= MUSA_SAFE_MAX_CUDAGRAPH_CAPTURE_SIZE
+                        ]
 
     @classmethod
     def get_current_memory_usage(
