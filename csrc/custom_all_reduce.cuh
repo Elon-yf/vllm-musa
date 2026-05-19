@@ -12,6 +12,12 @@
 #include <unordered_map>
 #include <vector>
 
+
+// MUSA-0117 forward decl: MT-Transformer custom AR shim (defined in
+// csrc/musa/mtt_ar/mtt_ar_shim.cpp, links libmtt.so).
+extern "C" void mtt_ar_bf16_tp8(cudaStream_t stream, void *d_ptrs, int bs,
+                                 int hidden, int rank, unsigned counter);
+
 namespace vllm {
 
 #define CHECK_CUDA_SUCCESS(cmd)                                     \
@@ -659,6 +665,28 @@ class CustomAllreduce {
       REDUCE_CASE(6)
       case 8:
         if constexpr (!std::is_same<T, float>::value) {
+          if constexpr (std::is_same<T, nv_bfloat16>::value) {
+            // MUSA-0117: MT-Transformer one-shot AR dispatch under env-var gate.
+            static const bool _mtt_ar_enabled =
+                std::getenv("VLLM_MUSA_USE_MTT_AR") != nullptr &&
+                std::getenv("VLLM_MUSA_USE_MTT_AR")[0] == '1';
+            if (_mtt_ar_enabled) {
+              const char *_h_env = std::getenv("VLLM_MUSA_MTT_AR_HIDDEN");
+              int _hidden = _h_env ? std::atoi(_h_env) : 6144;
+              int _total = size * (int)(packed_t<T>::P::size);
+              if (_total > 0 && _hidden > 0 && _total % _hidden == 0) {
+                int _bs = _total / _hidden;
+                mtt_ar_bf16_tp8(stream, (void *)ptrs, _bs, _hidden, rank_,
+                                ++round);
+                // MT-Transformer kernel writes result in-place at input.
+                // Copy to output. cudaMemcpyAsync on same stream serializes.
+                CHECK_CUDA_SUCCESS(cudaMemcpyAsync(
+                    output, input, _total * sizeof(T),
+                    cudaMemcpyDeviceToDevice, stream));
+                break;
+              }
+            }
+          }
           custom_all_reduce_2shot<T, 8><<<blocks, threads, 0, stream>>>(ptrs,
               sg_, self_sg_, output, rank_, size, ++round);
         } else {
