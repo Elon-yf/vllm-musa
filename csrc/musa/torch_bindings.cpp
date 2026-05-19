@@ -28,6 +28,14 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _musa_ops), musa_ops) {
   musa_ops.impl("musa_fused_add_rms_norm", torch::kMUSA,
                 &musa_fused_add_rms_norm);
 
+  // MUSA-0123: fused all-reduce + add + RMS norm (TP=8 BF16 only).
+  // `fa` is the CustomAllreduce instance fptr_t; `input` must be a
+  // peer-IPC-registered buffer of that instance.
+  musa_ops.def(
+      "musa_fused_ar_rmsnorm(int fa, Tensor! input, Tensor! residual, "
+      "Tensor weight, Tensor! output, float epsilon) -> ()");
+  musa_ops.impl("musa_fused_ar_rmsnorm", torch::kMUSA, &musa_fused_ar_rmsnorm);
+
   musa_ops.def(
       "musa_reshape_and_cache_flash_nhd(Tensor key, Tensor value, "
       "Tensor! key_cache, Tensor! value_cache, Tensor slot_mapping) -> ()");

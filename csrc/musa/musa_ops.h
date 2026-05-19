@@ -36,6 +36,17 @@ void musa_fused_add_rms_norm(
     torch::Tensor &weight,
     double eps);
 
+// MUSA-0123: fused (all-reduce + add-residual + RMS-norm) op. Requires
+// `input` to be a CustomAllreduce-registered peer-IPC buffer. The fa
+// handle is the same fptr_t used by the existing _C_custom_ar.all_reduce.
+void musa_fused_ar_rmsnorm(
+    int64_t fa,
+    torch::Tensor &input,
+    torch::Tensor &residual,
+    torch::Tensor &weight,
+    torch::Tensor &output,
+    double epsilon);
+
 void musa_reshape_and_cache_flash_nhd(
     torch::Tensor &key,
     torch::Tensor &value,
