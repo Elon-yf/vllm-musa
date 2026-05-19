@@ -35,12 +35,9 @@ def _ensure_torchada_installed():
         import torchada  # noqa: F401
 
 
-if os.environ.get("VLLM_MUSA_SKIP_PIP_GUARDS", "0") == "1":
-    print("Skipping setup.py pip dependency guards (VLLM_MUSA_SKIP_PIP_GUARDS=1)")
-else:
-    # Run dependency checks at setup start.
-    _ensure_numpy_compatible()
-    _ensure_torchada_installed()
+# Run dependency checks at setup start
+_ensure_numpy_compatible()
+_ensure_torchada_installed()
 
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
@@ -131,7 +128,6 @@ INCLUDE_DIRS = [
 # =============================================================================
 
 VLLM_CSRC_SOURCES = [
-    "csrc/musa/mtt_ar/mtt_ar_shim.cpp",  # MUSA-0117 shim (also linked into vllm._C)
     str(_VLLM_REPO.source_dir / "csrc/activation_kernels.cu"),
     str(_VLLM_REPO.source_dir / "csrc/cache_kernels.cu"),
     str(_VLLM_REPO.source_dir / "csrc/cuda_utils_kernels.cu"),
@@ -170,7 +166,6 @@ VLLM_CSRC_SOURCES = [
 
 VLLM_MUSA_CSRC_SOURCES = [
     "csrc/musa/torch_bindings.cpp",
-    "csrc/musa/mtt_ar/mtt_ar_shim.cpp",  # MUSA-0117 MT-Transformer AR shim
     "csrc/musa/gemv.mu",
     "csrc/musa/fused_add_rmsnorm.mu",
     "csrc/musa/cache_kernels.mu",
@@ -335,12 +330,6 @@ EXTRA_LINK_ARGS = [
     "-Wl,-rpath,$ORIGIN/../../torch/lib",
     f"-L/usr/lib/{arch}-linux-gnu",
     "-lmublasLt",
-    # MUSA-0117 MT-Transformer libs
-    "-L/home/dist/yeahdongcn/MT-Transformer/build/core",
-    "-L/home/dist/yeahdongcn/MT-Transformer/musa_asm/build/lib",
-    "-lmtt", "-lmusaasm",
-    "-Wl,-rpath,/home/dist/yeahdongcn/MT-Transformer/build/core",
-    "-Wl,-rpath,/home/dist/yeahdongcn/MT-Transformer/musa_asm/build/lib",
 ]
 
 # Detect MTGPU target architecture
@@ -574,16 +563,10 @@ class _CustomBuildExt(BuildExtension):
             )
             print("Third-party repositories ready.")
 
-        if os.environ.get("VLLM_MUSA_SKIP_VLLM_INSTALL", "0") == "1":
-            print(
-                "Skipping vLLM dependency installation "
-                "(VLLM_MUSA_SKIP_VLLM_INSTALL=1)"
-            )
-        else:
-            self._install_vllm(_VLLM_REPO.source_dir)
+        self._install_vllm(_VLLM_REPO.source_dir)
 
-            # Re-ensure numpy<2 after vllm installation (vllm may pull in numpy>=2)
-            _ensure_numpy_compatible()
+        # Re-ensure numpy<2 after vllm installation (vllm may pull in numpy>=2)
+        _ensure_numpy_compatible()
 
         self._apply_file_overrides(_VLLM_REPO.source_dir)
         self._apply_text_patches()
