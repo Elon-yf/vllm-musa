@@ -50,14 +50,18 @@ using fptr_t = int64_t;
 //   - hidden % 8 == 0
 //   - vec_hidden (hidden/8) must be <= 2048
 //
-// The op assumes `input.data_ptr()` is registered in the CustomAllreduce
-// instance's buffers_ map (or in graph-capture mode, that we're in the
-// active capture and graph_unreg_buffers_ tracks the slot).
+// API: matches the existing `_C_custom_ar.all_reduce` pattern of taking
+// (fa, input, output, reg_buffer, reg_buffer_sz). `input` is the local
+// rank's data tensor; the wrapper copies it into the IPC-registered
+// `reg_buffer` (pre-AR), then runs the fused kernel reading from peer
+// reg_buffers.
 void musa_fused_ar_rmsnorm(fptr_t _fa,
                            torch::Tensor& input,
                            torch::Tensor& residual,
                            torch::Tensor& weight,
                            torch::Tensor& output,
+                           fptr_t _reg_buffer,
+                           int64_t reg_buffer_sz_bytes,
                            double epsilon) {
   TORCH_CHECK(input.scalar_type() == at::ScalarType::BFloat16,
               "MUSA-0123 op requires BF16 (got ", input.scalar_type(), ")");
@@ -91,18 +95,31 @@ void musa_fused_ar_rmsnorm(fptr_t _fa,
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
   musaStream_t stream = c10::musa::getCurrentMUSAStream().stream();
 
-  // Look up RankData* for input. Mirror the logic in
-  // CustomAllreduce::allreduce<T>.
+  // Copy input → reg_buffer (the IPC-registered buffer). After this,
+  // each rank's reg_buffer contains its own pre-AR data; the fused
+  // kernel reads ALL 8 peers' reg_buffers via the RankData* pointers.
+  void* reg_buffer = reinterpret_cast<void*>(_reg_buffer);
+  const int64_t input_bytes =
+      static_cast<int64_t>(input.numel() * input.element_size());
+  TORCH_CHECK(reg_buffer != nullptr, "reg_buffer must be non-null");
+  TORCH_CHECK(input_bytes <= reg_buffer_sz_bytes,
+              "input (", input_bytes, "B) exceeds reg_buffer (",
+              reg_buffer_sz_bytes, "B)");
+  AT_CUDA_CHECK(cudaMemcpyAsync(reg_buffer, input.data_ptr(), input_bytes,
+                                cudaMemcpyDeviceToDevice, stream));
+
+  // Look up RankData* for reg_buffer. CustomAllreduce already
+  // registered this buffer at init time (its own buffer_ptrs[rank]).
   vllm::RankData* ptrs;
   cudaStreamCaptureStatus status;
   CHECK_CUDA_SUCCESS(cudaStreamIsCapturing(stream, &status));
   if (status == cudaStreamCaptureStatusActive) {
     ptrs = fa->d_rank_data_base_ + fa->graph_unreg_buffers_.size();
-    fa->graph_unreg_buffers_.push_back(input.data_ptr());
+    fa->graph_unreg_buffers_.push_back(reg_buffer);
   } else {
-    auto it = fa->buffers_.find(input.data_ptr());
+    auto it = fa->buffers_.find(reg_buffer);
     TORCH_CHECK(it != fa->buffers_.end(),
-                "MUSA-0123: input buffer not registered in CustomAllreduce");
+                "MUSA-0123: reg_buffer not registered in CustomAllreduce");
     ptrs = it->second;
   }
 

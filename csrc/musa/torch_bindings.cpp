@@ -33,7 +33,8 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _musa_ops), musa_ops) {
   // peer-IPC-registered buffer of that instance.
   musa_ops.def(
       "musa_fused_ar_rmsnorm(int fa, Tensor! input, Tensor! residual, "
-      "Tensor weight, Tensor! output, float epsilon) -> ()");
+      "Tensor weight, Tensor! output, int reg_buffer, "
+      "int reg_buffer_sz_bytes, float epsilon) -> ()");
   musa_ops.impl("musa_fused_ar_rmsnorm", torch::kMUSA, &musa_fused_ar_rmsnorm);
 
   musa_ops.def(
