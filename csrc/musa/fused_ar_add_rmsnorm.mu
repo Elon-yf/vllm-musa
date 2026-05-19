@@ -31,9 +31,53 @@
 
 #include <cstdlib>
 
-// Pull in vllm's RankData / RankSignals / Signal / multi_gpu_barrier_with_atomic
-// from custom_all_reduce.cuh. The .cuh defines them inside namespace vllm.
-#include "../custom_all_reduce.cuh"
+// MUSA-0123 build-validation note: we DELIBERATELY inline the minimal
+// types from vllm/csrc/custom_all_reduce.cuh here (rather than #include
+// the .cuh) because torchada's CUDA→MUSA porting doesn't process the
+// .cuh when it's included from a .mu file (cuda.h isn't on the .mu
+// include path). The structs MUST byte-match vllm's layout — verify
+// after any change in custom_all_reduce.cuh.
+//
+// Source of truth: vllm-musa/csrc/custom_all_reduce.cuh @ HEAD.
+
+namespace vllm {
+
+using FlagType = uint32_t;
+constexpr int kMaxBlocks_local = 60;  // matches USE_MUSA branch in .cuh
+
+struct Signal_layout {
+  alignas(128) FlagType self_counter[kMaxBlocks_local][8];
+  alignas(128) FlagType peer_counter[2][kMaxBlocks_local][8];
+};
+using Signal = Signal_layout;
+
+struct __align__(16) RankData {
+  const void* ptrs[8];
+};
+
+struct __align__(16) RankSignals {
+  Signal* signals[8];
+};
+
+// Mirror of multi_gpu_barrier_with_atomic from .cuh.
+template <int32_t ngpus>
+__device__ __forceinline__ void multi_gpu_barrier_with_atomic_local(
+    const RankSignals& sg, Signal* self_sg, int32_t rank) {
+  if (threadIdx.x < ngpus) {
+    auto val =
+        self_sg->self_counter[blockIdx.x][threadIdx.x] += 1;
+    auto peer_counter_ptr =
+        &sg.signals[threadIdx.x]->peer_counter[val % 2][blockIdx.x][rank];
+    auto self_counter_ptr =
+        &self_sg->peer_counter[val % 2][blockIdx.x][threadIdx.x];
+    atomicExch(peer_counter_ptr, val);
+    while (atomicAdd(self_counter_ptr, 0) != val) {
+    }
+  }
+  __syncthreads();
+}
+
+}  // namespace vllm
 
 namespace vllm_musa {
 
@@ -112,7 +156,7 @@ __global__ void __launch_bounds__(BLOCK_X, 1) fused_ar_add_rmsnorm_kernel(
   const int row_offset = row * vec_hidden_size;
 
   // Cross-rank barrier 1: all ranks visible.
-  vllm::multi_gpu_barrier_with_atomic<NRANKS>(sg, self_sg, rank);
+  vllm::multi_gpu_barrier_with_atomic_local<NRANKS>(sg, self_sg, rank);
 
   // Storage for post-AR values per thread — kept in registers/local.
   float acc_stash[ELEMS_PER_THREAD][8];
@@ -181,10 +225,15 @@ __global__ void __launch_bounds__(BLOCK_X, 1) fused_ar_add_rmsnorm_kernel(
   // No second barrier — output is local and not peer-readable.
 }
 
+}  // namespace vllm_musa
+
 // Host launcher: dispatches the right template instantiation based on
 // (hidden_size, BLOCK_X). For now only support bf16, TP=8, BLOCK_X=256.
 // The kernel needs CustomAllreduce state, which is the caller's job.
-void fused_ar_add_rmsnorm_bf16_tp8_launch(
+//
+// extern "C" so the symbol is preserved through linking and exposed
+// for a future torch_bindings.cpp wrapper (MUSA-0123 step 2).
+extern "C" void fused_ar_add_rmsnorm_bf16_tp8_launch(
     void* dp,           // device pointer to vllm::RankData
     void* sg_signals,   // device pointer array (8) of vllm::Signal*
     void* self_sg,      // device pointer to vllm::Signal
@@ -215,22 +264,20 @@ void fused_ar_add_rmsnorm_bf16_tp8_launch(
   // For M2.5 hidden=6144: vec_hidden=768, BLOCK_X=256 → ELEMS_PER_THREAD=3.
   // For hidden=2048: vec_hidden=256, BLOCK_X=256 → ELEMS_PER_THREAD=1.
   if (vec_hidden_size <= 256) {
-    fused_ar_add_rmsnorm_kernel<__mt_bfloat16, 8, BLOCK_X, 1>
+    vllm_musa::fused_ar_add_rmsnorm_kernel<__mt_bfloat16, 8, BLOCK_X, 1>
         <<<num_rows, BLOCK_X, 0, stream>>>(
             dp_ptr, rs, self_sg_ptr, residual, gamma, output, hidden_size,
             vec_hidden_size, epsilon, rank);
   } else if (vec_hidden_size <= 768) {
-    fused_ar_add_rmsnorm_kernel<__mt_bfloat16, 8, BLOCK_X, 3>
+    vllm_musa::fused_ar_add_rmsnorm_kernel<__mt_bfloat16, 8, BLOCK_X, 3>
         <<<num_rows, BLOCK_X, 0, stream>>>(
             dp_ptr, rs, self_sg_ptr, residual, gamma, output, hidden_size,
             vec_hidden_size, epsilon, rank);
   } else if (vec_hidden_size <= 2048) {
-    fused_ar_add_rmsnorm_kernel<__mt_bfloat16, 8, BLOCK_X, 8>
+    vllm_musa::fused_ar_add_rmsnorm_kernel<__mt_bfloat16, 8, BLOCK_X, 8>
         <<<num_rows, BLOCK_X, 0, stream>>>(
             dp_ptr, rs, self_sg_ptr, residual, gamma, output, hidden_size,
             vec_hidden_size, epsilon, rank);
   }
   // else: hidden too large for this scheme; would need bigger BLOCK_X.
 }
-
-}  // namespace vllm_musa
