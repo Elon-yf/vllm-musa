@@ -119,12 +119,20 @@ class EagleFullLoopRunner:
 
     # ---- one-time capture (called lazily on first propose()) ----
 
-    def capture(self, base_metadata: Any) -> None:
+    def capture(self, base_metadata: Any, in_graph_capture: bool = False) -> None:
         """Capture one cudagraph per entry in self.capture_sizes.
 
-        Called lazily on the first propose() call. `base_metadata` is the
-        CommonAttentionMetadata vLLM would otherwise pass to the iterative
-        propose loop; used as the template for per-step metadata.
+        `base_metadata` is the CommonAttentionMetadata used as the template
+        for per-step metadata.
+
+        `in_graph_capture`: True when the caller is ALREADY inside vllm's
+        `graph_capture(device)` context (the MUSA-0109 capture-at-boot path
+        — `capture_model()` holds `graph_capture()` open across the whole
+        boot capture phase). In that case `_capture_n_step_loop` must NOT
+        re-enter `graph_capture()` (nesting `ca_comm.capture()` would
+        assert); it captures with a plain `torch.cuda.graph(...)` on the
+        already-active capture stream. False = standalone (legacy lazy)
+        path: the runner opens its own `graph_capture()`.
 
         After this returns successfully, self._captured is True and
         self.contexts[bs] is populated for every bs in self.capture_sizes.
@@ -202,7 +210,9 @@ class EagleFullLoopRunner:
 
         for bs in self.capture_sizes:
             try:
-                ctx = self._capture_one_batch_size(bs, base_metadata, pool)
+                ctx = self._capture_one_batch_size(
+                    bs, base_metadata, pool, in_graph_capture=in_graph_capture
+                )
                 self.contexts[bs] = ctx
                 logger.info(
                     "MUSA-0090 captured Eagle3 full-loop graph for bs=%d "
@@ -225,6 +235,7 @@ class EagleFullLoopRunner:
         batch_size: int,
         base_metadata: Any,
         pool: Any,
+        in_graph_capture: bool = False,
     ) -> EagleFullLoopCaptureContext:
         """Capture the N-step draft loop for one batch size.
 
@@ -352,6 +363,7 @@ class EagleFullLoopRunner:
         #   # End of context manager = graph capture complete.
         graph = self._capture_n_step_loop(
             buffers, attn_metadata_array, batch_size, pool,
+            in_graph_capture=in_graph_capture,
         )
 
         # Phase 5: wrap up and return.
@@ -596,9 +608,15 @@ class EagleFullLoopRunner:
         attn_metadata_array: list,
         batch_size: int,
         pool: Any,
+        in_graph_capture: bool = False,
     ) -> Any:
         """Open the torch.cuda.graph context and drive the N-step loop with
         in-place tensor ops only. Returns the captured CUDAGraph object.
+
+        `in_graph_capture=True` means the caller is already inside vllm's
+        `graph_capture(device)` (the capture-at-boot path); we then capture
+        with a plain `torch.cuda.graph(...)` on the current (capture) stream
+        instead of opening a nested `graph_capture()`.
 
         Critical invariants enforced inside `_run_n_step_inner`:
           - No Python list growth (no .append, no torch.cat).
@@ -631,6 +649,22 @@ class EagleFullLoopRunner:
         # context vllm's own target-model capture uses, and the analogue of
         # SGLang's `GroupCoordinator.graph_capture()`. Capturing the draft
         # loop without it is what triggered the watchdog violation.
+        if in_graph_capture:
+            # MUSA-0109 capture-at-boot: vllm's `graph_capture()` is ALREADY
+            # open (capture_model() holds it across the whole boot capture
+            # phase, gpu_model_runner.py:6093). Re-entering it would nest
+            # `ca_comm.capture()` and assert. Issuing multiple
+            # `torch.cuda.graph(...)` captures inside one `graph_capture()`
+            # is vllm's normal pattern (the CUDAGraphWrapper does it per
+            # piecewise graph). Capture on the current stream — which, under
+            # the active `graph_capture()`, IS the dedicated capture stream.
+            with torch.cuda.graph(
+                graph, pool=pool, stream=torch.cuda.current_stream()
+            ):
+                self._run_n_step_inner(buffers, attn_metadata_array, batch_size)
+            return graph
+
+        # Standalone (legacy lazy) path: open our own graph_capture().
         from vllm.distributed.parallel_state import (
             graph_capture as _vllm_graph_capture,
         )
