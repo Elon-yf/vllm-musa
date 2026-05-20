@@ -129,19 +129,36 @@ __device__ __forceinline__ float block_reduce_sum_f(float value) {
   return shared[0];
 }
 
-// MUSA-0123 v2 kernel: 2shot-style internal structure.
+// MUSA-0123 v3 kernel: 2shot-style internal structure, NO cross-rank
+// variance reduce. Variance is computed during Stage 2's allgather pass
+// by accumulating sum-of-squares from the values each thread holds in
+// register before applying normalization.
 //
 // Grid: gridDim.x = num_rows (one block per row).
 // Block: BLOCK_X threads.
 //
 // vec_hidden_size = hidden_size / 8 (packed by 8 bf16 elements).
-// Requires: vec_hidden_size % NRANKS == 0 (each rank owns equal slice).
+// Requires: vec_hidden_size % NRANKS == 0.
+// Max supported per-thread elements: 8 packed values = 64 bf16 = 128B in
+// register. Caller must size BLOCK_X so vec_hidden_size <= BLOCK_X * 8.
 //
 // Storage layout in each rank's tmp_buf (peer-IPC region):
 //   [0 .. num_rows * vec_hidden_size) : packed bf16 (reduced+residual data)
-//   [num_rows * vec_hidden_size * sizeof(P) .. +num_rows*sizeof(float)) : float variance scratch
-template <typename T, int NRANKS, int BLOCK_X>
-__global__ void __launch_bounds__(BLOCK_X, 1) fused_ar_add_rmsnorm_kernel_v2(
+//
+// Algorithm:
+//   Barrier 1 (entry)
+//   Stage 1: rank R reduces its slice from 8 peers + adds residual,
+//            writes to own peer-visible tmp
+//   Barrier 2 (exit stage 1)
+//   Stage 2a: each thread reads its strided vec_idx values from the
+//             appropriate peer tmp, holds in register, accumulates x²
+//   Block-reduce x² → total_x2 (no cross-rank IPC needed: each rank
+//                                already has full row data after Stage 2a)
+//   rms = rsqrt(total_x2 / H + eps)
+//   Stage 2b: apply rms * gamma[vec_idx] to held register values, write
+//             to local output
+template <typename T, int NRANKS, int BLOCK_X, int MAX_ELEMS_PER_THREAD>
+__global__ void __launch_bounds__(BLOCK_X, 1) fused_ar_add_rmsnorm_kernel_v3(
     vllm::RankData* dp,
     vllm::RankSignals sg,
     vllm::Signal* self_sg,
@@ -158,26 +175,22 @@ __global__ void __launch_bounds__(BLOCK_X, 1) fused_ar_add_rmsnorm_kernel_v2(
   const int tid = threadIdx.x;
   const int row_offset = row * vec_hidden_size;
 
-  // Slice ownership: each rank handles vec_hidden_size/NRANKS packed-elements.
   const int part = vec_hidden_size / NRANKS;
   const int my_start = rank * part;
   const int my_end = (rank == NRANKS - 1) ? vec_hidden_size : my_start + part;
 
-  // Own tmp buffer (peer-readable scratch in self_sg).
   P* my_tmp = vllm::get_tmp_buf_local<P>(self_sg);
 
-  // ENTRY BARRIER: all peers have written their pre-AR inputs.
+  // ENTRY BARRIER.
   vllm::multi_gpu_barrier_with_atomic_local<NRANKS>(sg, self_sg, rank);
 
-  // ===== STAGE 1: REDUCE-SCATTER + ADD RESIDUAL + PARTIAL VARIANCE =====
-  float local_x2 = 0.0f;
+  // ===== STAGE 1: REDUCE-SCATTER + ADD RESIDUAL =====
   for (int vec_idx = my_start + tid; vec_idx < my_end; vec_idx += BLOCK_X) {
     const int g_idx = row_offset + vec_idx;
     float acc[8];
 #pragma unroll
     for (int v = 0; v < 8; v++) acc[v] = 0.0f;
 
-    // Sum across NRANKS peers, skewed access to spread bandwidth.
 #pragma unroll
     for (int p = 0; p < NRANKS; p++) {
       int target = (rank + p) % NRANKS;
@@ -188,20 +201,12 @@ __global__ void __launch_bounds__(BLOCK_X, 1) fused_ar_add_rmsnorm_kernel_v2(
       }
     }
 
-    // Add residual slice.
     const P res_p = ((const P*)residual)[g_idx];
 #pragma unroll
     for (int v = 0; v < 8; v++) {
       acc[v] += __bfloat162float(res_p.data[v]);
     }
 
-    // Sum-of-squares for variance.
-#pragma unroll
-    for (int v = 0; v < 8; v++) {
-      local_x2 += acc[v] * acc[v];
-    }
-
-    // Write reduced+residual to OWN tmp (peer-readable).
     P out_p;
 #pragma unroll
     for (int v = 0; v < 8; v++) {
@@ -210,69 +215,57 @@ __global__ void __launch_bounds__(BLOCK_X, 1) fused_ar_add_rmsnorm_kernel_v2(
     my_tmp[g_idx] = out_p;
   }
 
-  // Block-wide variance reduce (within rank).
-  local_x2 = block_reduce_sum_f<BLOCK_X>(local_x2);
-
-  // Store our partial variance in our tmp scratch tail.
-  // Layout: variance area immediately follows the packed data region.
-  float* my_var = reinterpret_cast<float*>(my_tmp + num_rows * vec_hidden_size);
-  if (tid == 0) {
-    my_var[row] = local_x2;
-  }
-
-  // BARRIER 2: stage 1 results visible to peers.
+  // BARRIER 2: stage 1 visible to peers.
   vllm::multi_gpu_barrier_with_atomic_local<NRANKS>(sg, self_sg, rank);
 
-  // ===== CROSS-RANK VARIANCE SUM =====
-  // Read peer partial variances, sum to get total_x2 for full row.
-  float total_x2;
-  if (tid < NRANKS) {
-    P* peer_tmp = vllm::get_tmp_buf_local<P>(sg.signals[tid]);
-    float* peer_var =
-        reinterpret_cast<float*>(peer_tmp + num_rows * vec_hidden_size);
-    total_x2 = peer_var[row];
-  } else {
-    total_x2 = 0.0f;
-  }
-  // Warp-reduce across first NRANKS lanes.
-#pragma unroll
-  for (int offset = NRANKS >> 1; offset > 0; offset >>= 1) {
-    total_x2 += __shfl_xor_sync(0xffffffff, total_x2, offset);
-  }
-  // Broadcast to whole block via shared memory.
-  __shared__ float s_total_x2;
-  if (tid == 0) s_total_x2 = total_x2;
-  __syncthreads();
-  total_x2 = s_total_x2;
+  // ===== STAGE 2a: ALLGATHER (HOLD IN REGISTER) + COMPUTE PARTIAL x² =====
+  // Each thread covers vec_idxs in [tid, vec_hidden_size) striding BLOCK_X.
+  // For each such vec_idx, determine which peer owns it (vec_idx / part)
+  // and read from that peer's tmp.
+  float stash[MAX_ELEMS_PER_THREAD][8];
+  float local_x2 = 0.0f;
 
-  const float rms =
-      rsqrtf(total_x2 / static_cast<float>(hidden_size) + epsilon);
-
-  // ===== STAGE 2: ALLGATHER + NORMALIZE + WRITE =====
-  // Read peer tmp slices in skewed order, apply rms*gamma, write to output.
 #pragma unroll
-  for (int p = 0; p < NRANKS; p++) {
-    int target = (rank + p) % NRANKS;
-    const int target_start = target * part;
-    const int target_part_size =
-        (target == NRANKS - 1) ? (vec_hidden_size - target_start) : part;
-    const P* peer_tmp = vllm::get_tmp_buf_local<P>(sg.signals[target]);
-
-    for (int local_idx = tid; local_idx < target_part_size;
-         local_idx += BLOCK_X) {
-      const int vec_idx = target_start + local_idx;
-      const int g_idx = row_offset + vec_idx;
-      const P tmp_p = peer_tmp[g_idx];
-      const P gamma_p = ((const P*)gamma)[vec_idx];
-      P out_p;
+  for (int e = 0; e < MAX_ELEMS_PER_THREAD; e++) {
+    const int vec_idx = tid + e * BLOCK_X;
+    if (vec_idx >= vec_hidden_size) {
 #pragma unroll
-      for (int v = 0; v < 8; v++) {
-        const float normed = __bfloat162float(tmp_p.data[v]) * rms *
-                             __bfloat162float(gamma_p.data[v]);
-        out_p.data[v] = __float2bfloat16(normed);
-      }
-      ((P*)output)[g_idx] = out_p;
+      for (int v = 0; v < 8; v++) stash[e][v] = 0.0f;
+      continue;
     }
+    // Which peer owns this vec_idx?
+    int target = vec_idx / part;
+    if (target >= NRANKS) target = NRANKS - 1;  // tail rank covers remainder
+    const int g_idx = row_offset + vec_idx;
+    const P* peer_tmp = vllm::get_tmp_buf_local<P>(sg.signals[target]);
+    const P p_val = peer_tmp[g_idx];
+#pragma unroll
+    for (int v = 0; v < 8; v++) {
+      float fv = __bfloat162float(p_val.data[v]);
+      stash[e][v] = fv;
+      local_x2 += fv * fv;
+    }
+  }
+
+  // Block-wide variance reduce (within rank — sees full row).
+  local_x2 = block_reduce_sum_f<BLOCK_X>(local_x2);
+  const float rms =
+      rsqrtf(local_x2 / static_cast<float>(hidden_size) + epsilon);
+
+  // ===== STAGE 2b: APPLY rms*gamma, WRITE OUTPUT =====
+#pragma unroll
+  for (int e = 0; e < MAX_ELEMS_PER_THREAD; e++) {
+    const int vec_idx = tid + e * BLOCK_X;
+    if (vec_idx >= vec_hidden_size) continue;
+    const int g_idx = row_offset + vec_idx;
+    const P gamma_p = ((const P*)gamma)[vec_idx];
+    P out_p;
+#pragma unroll
+    for (int v = 0; v < 8; v++) {
+      const float normed = stash[e][v] * rms * __bfloat162float(gamma_p.data[v]);
+      out_p.data[v] = __float2bfloat16(normed);
+    }
+    ((P*)output)[g_idx] = out_p;
   }
 }
 
@@ -290,7 +283,6 @@ extern "C" void fused_ar_add_rmsnorm_bf16_tp8_launch(
     float epsilon,
     int rank,
     musaStream_t stream) {
-  constexpr int BLOCK_X = 256;
   constexpr int VLEN = 8;
   const int vec_hidden_size = hidden_size / VLEN;
   if (hidden_size % VLEN != 0) return;
@@ -304,8 +296,26 @@ extern "C" void fused_ar_add_rmsnorm_bf16_tp8_launch(
   }
   vllm::Signal* self_sg_ptr = reinterpret_cast<vllm::Signal*>(self_sg);
 
-  vllm_musa::fused_ar_add_rmsnorm_kernel_v2<__mt_bfloat16, 8, BLOCK_X>
-      <<<num_rows, BLOCK_X, 0, stream>>>(
-          dp_ptr, rs, self_sg_ptr, residual, gamma, output, num_rows,
-          hidden_size, vec_hidden_size, epsilon, rank);
+  // v3 dispatch: BLOCK_X * MAX_ELEMS_PER_THREAD must cover vec_hidden_size.
+  // BLOCK_X=1024 (matches kDefaultThreads of standard 2stage AR).
+  //   vec_hidden <= 1024  → ELEMS=1
+  //   vec_hidden <= 2048  → ELEMS=2  (M2.5 vec_H=768 lands in the first bucket)
+  //   vec_hidden <= 8192  → ELEMS=8
+  constexpr int BLOCK_X = 1024;
+  if (vec_hidden_size <= 1024) {
+    vllm_musa::fused_ar_add_rmsnorm_kernel_v3<__mt_bfloat16, 8, BLOCK_X, 1>
+        <<<num_rows, BLOCK_X, 0, stream>>>(
+            dp_ptr, rs, self_sg_ptr, residual, gamma, output, num_rows,
+            hidden_size, vec_hidden_size, epsilon, rank);
+  } else if (vec_hidden_size <= 2048) {
+    vllm_musa::fused_ar_add_rmsnorm_kernel_v3<__mt_bfloat16, 8, BLOCK_X, 2>
+        <<<num_rows, BLOCK_X, 0, stream>>>(
+            dp_ptr, rs, self_sg_ptr, residual, gamma, output, num_rows,
+            hidden_size, vec_hidden_size, epsilon, rank);
+  } else if (vec_hidden_size <= 8192) {
+    vllm_musa::fused_ar_add_rmsnorm_kernel_v3<__mt_bfloat16, 8, BLOCK_X, 8>
+        <<<num_rows, BLOCK_X, 0, stream>>>(
+            dp_ptr, rs, self_sg_ptr, residual, gamma, output, num_rows,
+            hidden_size, vec_hidden_size, epsilon, rank);
+  }
 }
