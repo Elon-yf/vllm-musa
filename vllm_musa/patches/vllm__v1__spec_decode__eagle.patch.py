@@ -63,6 +63,9 @@ _CAPTURE_MAX_SEQ_LEN = int(
     os.environ.get("VLLM_MUSA_EAGLE_CAPTURE_SEQ_LEN", "8192")
 )
 
+# MUSA-0109 diagnostic call counter for VLLM_MUSA_EAGLE_DIFF.
+_DIFF_CALLS = 0
+
 # CRITICAL ORDER: import vllm_musa.v1.spec_decode.utils BEFORE eagle /
 # llm_base_proposer. vllm-musa's utils module installs a MUSA-Triton-adapted
 # `eagle_prepare_next_token_padded_kernel`. Importing the proposer modules
@@ -313,6 +316,48 @@ def _make_dispatched_propose(_original_propose):
         _req_max_seq_len = int(getattr(common_attn_metadata, "max_seq_len", 0) or 0)
         if not runner.can_run(batch_size, max_seq_len=_req_max_seq_len):
             return _original_propose(self, *args, **kwargs)
+
+        # MUSA-0109 (2026-05-20) diagnostic: VLLM_MUSA_EAGLE_DIFF=1 runs BOTH
+        # the iterative propose() and the runner, logs the draft tokens
+        # side-by-side plus step-0 input fingerprints, and returns the
+        # ITERATIVE result so generation stays correct. Reveals exactly where
+        # and how the runner's drafts diverge from the reference.
+        if os.environ.get("VLLM_MUSA_EAGLE_DIFF", "0") == "1":
+            global _DIFF_CALLS
+            try:
+                iter_drafts = _original_propose(self, *args, **kwargs)
+                rep = runner.replay(
+                    target_hidden_states=target_hidden_states,
+                    next_token_ids=next_token_ids,
+                    common_attn_metadata=common_attn_metadata,
+                    batch_size=batch_size,
+                    target_positions=target_positions,
+                    token_indices_to_sample=token_indices_to_sample,
+                )
+                if _DIFF_CALLS < 25:
+                    _DIFF_CALLS += 1
+                    _it = iter_drafts.reshape(batch_size, -1)[0].tolist()
+                    _rn = rep.draft_token_ids.reshape(batch_size, -1)[0].tolist()
+                    _ths = target_hidden_states
+                    _tp = target_positions.reshape(-1)
+                    _log.info(
+                        "MUSA-0109-DIFF#%d iter=%s runner=%s | next_tok=%s "
+                        "ths_shape=%s ths_sum=%.2f tpos0=%s tposN=%s "
+                        "tidx=%s max_seq=%d",
+                        _DIFF_CALLS, _it, _rn,
+                        next_token_ids.reshape(-1)[:batch_size].tolist(),
+                        tuple(_ths.shape), float(_ths.float().sum().item()),
+                        int(_tp[0].item()), int(_tp[-1].item()),
+                        (token_indices_to_sample.reshape(-1).tolist()
+                         if token_indices_to_sample is not None else None),
+                        _req_max_seq_len,
+                    )
+                return iter_drafts
+            except Exception as exc:
+                _log.warning(
+                    "MUSA-0109-DIFF failed (%s); using iterative path", exc
+                )
+                return _original_propose(self, *args, **kwargs)
 
         try:
             result = runner.replay(
