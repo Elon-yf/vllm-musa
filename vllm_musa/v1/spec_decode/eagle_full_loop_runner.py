@@ -91,8 +91,24 @@ class EagleFullLoopRunner:
         # / `child_drafts_per_level` (llm_base_proposer.py:280-300) and the
         # tree has depth > 1. In tree mode the runner captures the
         # `propose_tree` loop (`_run_tree_inner`); otherwise the chain loop.
+        #
+        # MUSA-0109 (2026-05-20): `propose_tree` only runs when the draft
+        # attention backend is TREE_ATTN. On the MUSA SOTA stack the draft
+        # always resolves to FLASH_ATTN (TREE_ATTN is registered but absent
+        # from `_get_backend_priorities`), so `propose_tree` is NEVER called
+        # and the draft is chain-style even with a `speculative_token_tree`
+        # configured — the tree only shapes verification. Confirmed by the
+        # MUSA-0109 POC probe and a live instrumented `propose()` probe
+        # (2026-05-20): the tree-branch return never fires. Capturing a tree
+        # draft loop here produces an N-node output the chain-oriented engine
+        # bookkeeping (`draft_token_ids_cpu` sized `num_spec_tokens`) cannot
+        # consume. Tree mode therefore stays opt-in behind
+        # `VLLM_MUSA_EAGLE_TREE=1`; it is only meaningful once
+        # `MUSATreeAttentionBackend` is actually selected for the draft.
+        import os as _os_tree
         cu = getattr(proposer, "cu_drafts_per_level", None)
-        self._tree_mode: bool = bool(cu) and len(cu) > 1
+        _tree_opt_in = _os_tree.environ.get("VLLM_MUSA_EAGLE_TREE", "0") == "1"
+        self._tree_mode: bool = _tree_opt_in and bool(cu) and len(cu) > 1
         if self._tree_mode:
             self._cu_drafts_per_level = [int(x) for x in cu]
             self._child_drafts_per_level = [
