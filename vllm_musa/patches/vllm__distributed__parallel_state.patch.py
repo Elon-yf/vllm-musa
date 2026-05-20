@@ -118,6 +118,18 @@ def _is_musa() -> bool:
 
 
 if _ENABLED:
+    # CRITICAL ORDER (same hazard as the MUSA-0090 eagle patch): importing
+    # `vllm.v1.spec_decode.eagle` / `llm_base_proposer` triggers their
+    # `from vllm.v1.spec_decode.utils import eagle_prepare_next_token_padded_kernel`.
+    # vllm-musa replaces that kernel with a MUSA-Triton-adapted version via
+    # `vllm_musa.v1.spec_decode.utils`. If we import the proposer modules
+    # before that monkey-patch has fired, they bind the UPSTREAM kernel,
+    # which fails at MUSA Triton compile time with
+    # "mismatched type for valid_count". This patch file sorts
+    # alphabetically before `vllm__v1__spec_decode__eagle.patch.py`, so we
+    # must prime the kernel patch ourselves before importing the proposers.
+    import vllm_musa.v1.spec_decode.utils  # noqa: F401 — prime the kernel monkey-patch
+
     try:
         from vllm.v1.spec_decode.eagle import EagleProposer
         from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
