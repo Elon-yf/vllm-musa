@@ -14,12 +14,101 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
 
-from .spec_info import EagleDraftBuffers
+from .spec_info import EagleDraftBuffers, EagleTreeDraftBuffers
+
+_log = logging.getLogger(__name__)
+
+
+def build_per_level_tree_attn_metadata(
+    base_metadata: Any,  # CommonAttentionMetadata
+    buffers: EagleTreeDraftBuffers,
+    batch_size: int,
+    proposer: Any,  # vllm.v1.spec_decode.eagle.EagleProposer
+) -> list[Any]:
+    """Pre-build one tree-attention metadata object per draft level.
+
+    MUSA-0109 A1 (tree-aware capture). Mirrors the per-level metadata build
+    inside vLLM's `propose_tree` (llm_base_proposer.py:990) — but done ONCE
+    at capture time, before `torch.cuda.graph`, since `build_for_drafting`
+    does host-side work that cannot run inside a captured graph.
+
+    For each of the `tree_depth - 1` draft levels L, vLLM does:
+
+        common_attn_metadata = replace(
+            common_attn_metadata,
+            query_start_loc = query_len * arange[:bs+1],
+            seq_lens        = base_seq_lens + level_num_drafts,
+            num_actual_tokens = bs * query_len,
+            max_query_len   = query_len,
+        )
+        attn_metadata = tree_attn_metadata_builder.build_for_drafting(
+            common_attn_metadata=common_attn_metadata, draft_index=L+1)
+
+    where `query_len = cu_drafts_per_level[L]` is the accumulated tree
+    prefix processed at level L (2, 4, 6, 7 for narrow-d5).
+
+    Returns a list of length `tree_depth - 1`; entry L is the per-layer
+    attn-metadata dict the captured draft forward consumes via
+    `set_forward_context` at level L.
+    """
+    tree_attn_metadata_builder = proposer.draft_attn_groups[0].get_metadata_builder()
+
+    cu = buffers.cu_drafts_per_level
+    tree_depth = buffers.tree_depth
+    device = buffers.device
+
+    # arange[:bs+1] = [0, 1, ..., bs]; query_start_loc for a uniform
+    # `query_len`-per-request batch is `query_len * arange`.
+    arange = torch.arange(batch_size + 1, dtype=torch.int32, device=device)
+
+    base_seq_lens = base_metadata.seq_lens[:batch_size]
+
+    metadata_array: list[Any] = []
+    for level in range(tree_depth - 1):
+        query_len = int(cu[level])  # accumulated tree prefix at this level
+        # level_num_drafts: count of nodes whose children we sample at this
+        # level = cu[level] - cu[level-1] (cu[0] for level 0).
+        level_num_drafts = query_len - (int(cu[level - 1]) if level > 0 else 0)
+
+        level_cam = replace(
+            base_metadata,
+            query_start_loc=query_len * arange,
+            query_start_loc_cpu=query_len
+            * torch.arange(batch_size + 1, dtype=torch.int32),
+            seq_lens=base_seq_lens + level_num_drafts,
+            num_actual_tokens=batch_size * query_len,
+            max_query_len=query_len,
+            block_table_tensor=buffers.block_table_tensor[:batch_size],
+            slot_mapping=buffers.tree_slot_mapping[:batch_size, :query_len].reshape(
+                -1
+            ),
+        )
+        try:
+            attn_metadata = tree_attn_metadata_builder.build_for_drafting(
+                common_attn_metadata=level_cam, draft_index=level + 1
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"MUSA-0109 tree level {level}: "
+                f"tree_attn_metadata_builder.build_for_drafting() failed: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+        # Per-layer dict for set_forward_context — same shape the chain path
+        # produces (one entry per draft attention layer).
+        per_layer: dict = {}
+        for attn_group in proposer.draft_attn_groups:
+            for layer_name in attn_group.layer_names:
+                per_layer[layer_name] = attn_metadata
+        metadata_array.append(per_layer)
+
+    return metadata_array
 
 
 def build_per_step_attn_metadata_array(
