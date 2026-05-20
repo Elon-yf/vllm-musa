@@ -714,9 +714,23 @@ class EagleFullLoopRunner:
                 cm_block_table[:src_bs, :src_n_blocks]
             )
 
-        # Single graph replay. All N draft forwards + sampling + slot-mapping
-        # updates happen inside this one call.
-        ctx.graph.replay()
+        # MUSA-0109 (2026-05-20) diagnostic: VLLM_MUSA_EAGLE_EAGER_REPLAY=1
+        # runs the N-step loop body EAGERLY instead of replaying the captured
+        # graph. This splits the acceptance-collapse bug definitively: if
+        # eager replay restores draft acceptance, the captured graph is at
+        # fault (e.g. a captured TP=8 all-reduce that does not reduce
+        # correctly across ranks at replay — consistent with a rank-by-rank
+        # GPU-util pattern); if eager replay is equally broken, the bug is in
+        # the runner's loop logic / buffer seeding, not the graph capture.
+        import os as _os_er
+        if _os_er.environ.get("VLLM_MUSA_EAGLE_EAGER_REPLAY", "0") == "1":
+            self._run_n_step_inner(
+                ctx.buffers, ctx.attn_metadata_array, batch_size
+            )
+        else:
+            # Single graph replay. All N draft forwards + sampling +
+            # slot-mapping updates happen inside this one call.
+            ctx.graph.replay()
 
         # MUSA-0090 layer-2 fix (2026-05-17): clone the output OUT of the
         # CUDAGraph memory pool. vllm's _copy_draft_token_ids_to_cpu does the
