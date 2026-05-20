@@ -591,8 +591,29 @@ class EagleFullLoopRunner:
         # torch.cuda.CUDAGraph is routed to torch_musa.musa_graph.MUSAGraph on
         # MUSA via torchada — proven correctness-wise by the Q1 smoke.
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool=pool):
+
+        # MUSA-0109 (2026-05-20): capture on a DEDICATED stream.
+        #
+        # SGLang's EAGLEDraftCudaGraphRunner — the working reference on this
+        # exact MUSA hardware — captures via `torch.cuda.graph(graph,
+        # pool=pool, stream=stream)` where `stream` is a fresh non-default
+        # stream from `GroupCoordinator.graph_capture()`, fenced with
+        # `stream.wait_stream(current)` before and `current.wait_stream(stream)`
+        # after. vllm's own target-model capture isolates the stream the same
+        # way (and works on MUSA — the M2.5 SOTA runs at cudagraph_mode=FULL).
+        #
+        # This runner previously captured with NO stream argument, i.e. on the
+        # default stream. On torch_musa that leaves the default-stream
+        # allocator in a state where the first post-capture allocation fails
+        # with `MUSA error: unknown error` (MUDNN err 999). The 4 earlier
+        # MUSA-0109 layer-fixes redirected *copy* streams and tuned warmup but
+        # never changed the capture stream itself — this is the untried lever
+        # the SGLang examination surfaced.
+        capture_stream = torch.cuda.Stream()
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.graph(graph, pool=pool, stream=capture_stream):
             self._run_n_step_inner(buffers, attn_metadata_array, batch_size)
+        torch.cuda.current_stream().wait_stream(capture_stream)
         return graph
 
     def _run_n_step_inner(
