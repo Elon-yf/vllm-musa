@@ -50,6 +50,14 @@ Patch style
 `PATCHES = []` — no file mutation; the monkey-patch is the import side
 effect (same mechanism as the MUSA-0090 eagle patch). Idempotent via
 the `_musa_draft_tp1_patched` class marker.
+
+Filename note: `patches/__init__.py` `apply_patches()` derives a module
+name from the filename (`__` -> `.`) and `find_spec()`s it; a patch file
+whose name maps to a non-existent module is skipped entirely. This file
+is therefore named after `vllm.distributed.parallel_state` — a real
+module, and the one that provides the `patch_tensor_parallel_group`
+context manager this patch wires. It does NOT mutate parallel_state.py
+(`PATCHES = []`); the monkey-patch targets the spec-decode proposers.
 """
 
 PATCHES: list = []  # No file mutation; the monkey-patch install is the side effect.
