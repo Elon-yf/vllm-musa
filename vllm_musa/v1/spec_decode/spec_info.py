@@ -205,6 +205,168 @@ class EagleDraftBuffers:
 
 
 @dataclass
+class EagleTreeDraftBuffers:
+    """Pre-allocated buffers for the TREE-aware Eagle3 full-loop runner
+    (MUSA-0109 A1).
+
+    Unlike `EagleDraftBuffers` (chain: per-step `[N, max_bs]`), the tree
+    runner accumulates a fixed-topology draft tree. For the narrow-d5 tree
+    `[(0,),(1,),(0,0),(1,1),(0,0,0),(1,1,0),(0,0,0,0),(0,0,0,0,0)]` there are
+    `total_drafts=8` nodes across `tree_depth=5` levels with per-level node
+    counts `[2,2,2,1,1]` (`cu_drafts_per_level=[2,4,6,7,8]`).
+
+    vLLM's `propose_tree` (llm_base_proposer.py:990) grows the tree with
+    `torch.cat` (dynamic shape — uncapturable). This buffer instead holds
+    the FULL tree pre-allocated `[max_bs, total_drafts, ...]`; the tree loop
+    writes each level's nodes into a fixed slice, so every op is in-place
+    and CUDAGraph-capturable.
+
+    Slot layout: a node at tree level L occupies a contiguous run in
+    `[cu_drafts_per_level[L-1] : cu_drafts_per_level[L]]` (level 0 is
+    `[0 : cu_drafts_per_level[0]]`). Level L's draft FORWARD consumes the
+    accumulated prefix `[0 : cu_drafts_per_level[L]]` (query_len grows
+    2,4,6,7 — A1 captures one graph per level at that fixed size).
+    """
+
+    # --- The accumulated draft tree (all levels, fixed total_drafts wide) ---
+    # int32 [max_bs, total_drafts]: every drafted token id, level-ordered.
+    tree_token_ids: torch.Tensor
+    # int64 [max_bs, total_drafts]: RoPE position of each draft node.
+    tree_positions: torch.Tensor
+    # bf16 [max_bs, total_drafts, hidden_size]: hidden state fed INTO the
+    # draft model for each node (carry from the parent node's forward).
+    tree_hidden_states: torch.Tensor
+    # int64 [max_bs, total_drafts]: KV cache slot for each draft node.
+    tree_slot_mapping: torch.Tensor
+
+    # --- Output ---
+    # int32 [max_bs, total_drafts]: the drafted tree, returned to the
+    # patched propose() and consumed by the tree-attention verify.
+    draft_token_ids_out: torch.Tensor
+
+    # --- Input carry-over from the previous spec round (verify output) ---
+    # int32 [max_bs]: bonus token id (target's accepted last token) — the
+    # root input of the draft tree.
+    bonus_token_ids_in: torch.Tensor
+    # bf16 [max_bs, hidden_size]: target's last hidden state — root hidden.
+    target_hidden_states_in: torch.Tensor
+    # int64 [max_bs]: position of the bonus token (tree root position base).
+    positions_in: torch.Tensor
+    # int64 [max_bs]: KV slot of the bonus token.
+    slot_mapping_in: torch.Tensor
+    # int32 [max_bs]: sequence length including the bonus token.
+    seq_lens_in: torch.Tensor
+
+    # --- Static / read-only ---
+    # int32 [max_bs, max_blocks_per_req]: runner-owned block table (copied
+    # into per replay — see EagleDraftBuffers note on stale pointers).
+    block_table_tensor: torch.Tensor
+
+    # --- Bookkeeping ---
+    max_bs: int
+    total_drafts: int
+    tree_depth: int
+    hidden_size: int
+    device: torch.device
+    # Tree topology, parsed from speculative_token_tree by the proposer.
+    cu_drafts_per_level: tuple[int, ...]
+    child_drafts_per_level: tuple[int, ...]
+
+    @classmethod
+    def allocate(
+        cls,
+        max_bs: int,
+        cu_drafts_per_level: list[int],
+        child_drafts_per_level: list[int],
+        hidden_size: int,
+        block_table_tensor: torch.Tensor,
+        device: torch.device,
+    ) -> EagleTreeDraftBuffers:
+        """One-time allocation at runner setup (before any graph capture).
+
+        `cu_drafts_per_level` / `child_drafts_per_level` come from the
+        proposer (parsed from `speculative_token_tree`). `total_drafts` is
+        `cu_drafts_per_level[-1]` (8 for narrow-d5).
+        """
+        bf16 = torch.bfloat16
+        i32 = torch.int32
+        i64 = torch.int64
+
+        total_drafts = int(cu_drafts_per_level[-1])
+        tree_depth = len(cu_drafts_per_level)
+
+        max_blocks_per_req = (
+            block_table_tensor.shape[-1] if block_table_tensor.ndim >= 1 else 1
+        )
+        owned_block_table = torch.zeros(
+            (max_bs, max_blocks_per_req),
+            dtype=block_table_tensor.dtype,
+            device=device,
+        )
+
+        return cls(
+            tree_token_ids=torch.zeros(
+                (max_bs, total_drafts), dtype=i32, device=device
+            ),
+            tree_positions=torch.zeros(
+                (max_bs, total_drafts), dtype=i64, device=device
+            ),
+            tree_hidden_states=torch.zeros(
+                (max_bs, total_drafts, hidden_size), dtype=bf16, device=device
+            ),
+            tree_slot_mapping=torch.zeros(
+                (max_bs, total_drafts), dtype=i64, device=device
+            ),
+            draft_token_ids_out=torch.zeros(
+                (max_bs, total_drafts), dtype=i32, device=device
+            ),
+            bonus_token_ids_in=torch.zeros((max_bs,), dtype=i32, device=device),
+            target_hidden_states_in=torch.zeros(
+                (max_bs, hidden_size), dtype=bf16, device=device
+            ),
+            positions_in=torch.zeros((max_bs,), dtype=i64, device=device),
+            slot_mapping_in=torch.zeros((max_bs,), dtype=i64, device=device),
+            seq_lens_in=torch.zeros((max_bs,), dtype=i32, device=device),
+            block_table_tensor=owned_block_table,
+            max_bs=max_bs,
+            total_drafts=total_drafts,
+            tree_depth=tree_depth,
+            hidden_size=hidden_size,
+            device=device,
+            cu_drafts_per_level=tuple(int(x) for x in cu_drafts_per_level),
+            child_drafts_per_level=tuple(int(x) for x in child_drafts_per_level),
+        )
+
+    def reset(self) -> None:
+        """Zero per-tree state before each capture/replay round.
+
+        Input carry-over buffers (bonus_token_ids_in, target_hidden_states_in,
+        positions_in, slot_mapping_in, seq_lens_in) are populated by the
+        caller via copy_() just before replay — not zeroed here.
+        """
+        self.tree_token_ids.zero_()
+        self.tree_positions.zero_()
+        self.tree_slot_mapping.zero_()
+        self.draft_token_ids_out.zero_()
+
+    def memory_footprint_bytes(self) -> int:
+        tensors = [
+            self.tree_token_ids,
+            self.tree_positions,
+            self.tree_hidden_states,
+            self.tree_slot_mapping,
+            self.draft_token_ids_out,
+            self.bonus_token_ids_in,
+            self.target_hidden_states_in,
+            self.positions_in,
+            self.slot_mapping_in,
+            self.seq_lens_in,
+            self.block_table_tensor,
+        ]
+        return sum(t.numel() * t.element_size() for t in tensors)
+
+
+@dataclass
 class EagleFullLoopCaptureContext:
     """Per-batch-size capture state. One per cudagraph_capture_size.
 
