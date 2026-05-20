@@ -611,28 +611,33 @@ class EagleFullLoopRunner:
         # MUSA via torchada — proven correctness-wise by the Q1 smoke.
         graph = torch.cuda.CUDAGraph()
 
-        # MUSA-0109 (2026-05-20): capture on a DEDICATED stream.
+        # MUSA-0109 (2026-05-20): capture inside vllm's `graph_capture()`
+        # context manager — NOT a bare `torch.cuda.graph(stream=...)`.
         #
-        # SGLang's EAGLEDraftCudaGraphRunner — the working reference on this
-        # exact MUSA hardware — captures via `torch.cuda.graph(graph,
-        # pool=pool, stream=stream)` where `stream` is a fresh non-default
-        # stream from `GroupCoordinator.graph_capture()`, fenced with
-        # `stream.wait_stream(current)` before and `current.wait_stream(stream)`
-        # after. vllm's own target-model capture isolates the stream the same
-        # way (and works on MUSA — the M2.5 SOTA runs at cudagraph_mode=FULL).
+        # History: an earlier fix gave the runner a dedicated capture stream
+        # (`torch.cuda.graph(graph, pool=pool, stream=<own Stream>)`). That
+        # cleared the capture-time `MUSA error: unknown error` — but the
+        # `--load-format dummy` fast-loop then surfaced the real next failure:
+        #   `MUSA error: operation not permitted when stream is capturing`
+        # raised from the process-group watchdog thread. The TP=8 draft loop
+        # contains custom all-reduces; capturing a collective is only valid
+        # while the custom-all-reduce communicator is in capture mode.
         #
-        # This runner previously captured with NO stream argument, i.e. on the
-        # default stream. On torch_musa that leaves the default-stream
-        # allocator in a state where the first post-capture allocation fails
-        # with `MUSA error: unknown error` (MUDNN err 999). The 4 earlier
-        # MUSA-0109 layer-fixes redirected *copy* streams and tuned warmup but
-        # never changed the capture stream itself — this is the untried lever
-        # the SGLang examination surfaced.
-        capture_stream = torch.cuda.Stream()
-        capture_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.graph(graph, pool=pool, stream=capture_stream):
-            self._run_n_step_inner(buffers, attn_metadata_array, batch_size)
-        torch.cuda.current_stream().wait_stream(capture_stream)
+        # vllm's `graph_capture(device)` is exactly that wrapper: it enters
+        # `GroupCoordinator.graph_capture()` -> `ca_comm.capture()`, which
+        # puts the custom all-reduce into graph-capture mode (registers the
+        # capture buffers, switches to the IPC-pointer path). It ALSO provides
+        # the dedicated capture stream + `wait_stream` fence. This is the same
+        # context vllm's own target-model capture uses, and the analogue of
+        # SGLang's `GroupCoordinator.graph_capture()`. Capturing the draft
+        # loop without it is what triggered the watchdog violation.
+        from vllm.distributed.parallel_state import (
+            graph_capture as _vllm_graph_capture,
+        )
+
+        with _vllm_graph_capture(self.device) as _gc_ctx:
+            with torch.cuda.graph(graph, pool=pool, stream=_gc_ctx.stream):
+                self._run_n_step_inner(buffers, attn_metadata_array, batch_size)
         return graph
 
     def _run_n_step_inner(
