@@ -47,6 +47,22 @@ _log = logging.getLogger(__name__)
 
 _RUNNER_ENABLED = os.environ.get("VLLM_MUSA_EAGLE_RUNNER", "0") == "1"
 
+# MUSA-0109 (2026-05-20): the boot capture bakes the draft attention's
+# `max_seq_len` (a host int -> grid size) into the CUDAGraph; per-request
+# `seq_lens`/`block_table`/`slot_mapping` are runner buffers and DO update
+# at replay, but `max_seq_len` cannot. The earlier synthesis used
+# `max_seq_len=1`, so the captured draft attention only ever iterated ~1
+# KV block -> the draft saw a 1-token context at replay -> near-0%
+# acceptance (measured 30.8 vs 86.9 tok/s). The capture must bake a
+# `max_seq_len` >= the longest context the runner will replay. It is set
+# generously here (covers the 4k-in/1k-out bench + margin); a request
+# whose context exceeds it falls back to the iterative path via
+# `can_run()`. Larger = correct for longer contexts but more wasted KV
+# iteration per draft step, so it is a tunable, not max_model_len.
+_CAPTURE_MAX_SEQ_LEN = int(
+    os.environ.get("VLLM_MUSA_EAGLE_CAPTURE_SEQ_LEN", "8192")
+)
+
 # CRITICAL ORDER: import vllm_musa.v1.spec_decode.utils BEFORE eagle /
 # llm_base_proposer. vllm-musa's utils module installs a MUSA-Triton-adapted
 # `eagle_prepare_next_token_padded_kernel`. Importing the proposer modules
@@ -154,9 +170,18 @@ def _synthesize_base_metadata(proposer, batch_size: int = 1):
             max_model_len = 8192
     max_blocks = (max_model_len + block_size - 1) // block_size
 
+    # MUSA-0109: capture with a realistic context length. `max_seq_len` is
+    # baked into the CUDAGraph as a host int (it sizes the draft attention
+    # grid); `seq_lens` here is what the per-step metadata builder derives
+    # `cu_seqlens_k` / scheduler metadata from. Both must reflect a real
+    # decode context, not 1, or the captured draft attention truncates to a
+    # ~1-token context at replay. Clamp to max_model_len.
+    capture_seq_len = min(_CAPTURE_MAX_SEQ_LEN, max_model_len)
     qsl = torch.arange(batch_size + 1, dtype=torch.int32, device=device)
     qsl_cpu = torch.arange(batch_size + 1, dtype=torch.int32)
-    seq_lens = torch.ones(batch_size, dtype=torch.int32, device=device)
+    seq_lens = torch.full(
+        (batch_size,), capture_seq_len, dtype=torch.int32, device=device
+    )
     block_table = torch.zeros(
         (batch_size, max_blocks), dtype=torch.int32, device=device
     )
@@ -169,7 +194,7 @@ def _synthesize_base_metadata(proposer, batch_size: int = 1):
         num_reqs=batch_size,
         num_actual_tokens=batch_size,
         max_query_len=1,
-        max_seq_len=1,
+        max_seq_len=capture_seq_len,
         block_table_tensor=block_table,
         slot_mapping=slot_mapping,
     )
@@ -282,7 +307,11 @@ def _make_dispatched_propose(_original_propose):
             return _original_propose(self, *args, **kwargs)
 
         batch_size = int(next_token_ids.shape[0])
-        if not runner.can_run(batch_size):
+        # MUSA-0109: `common_attn_metadata.max_seq_len` is a host int (the
+        # batch's longest context) — no GPU sync. A request longer than the
+        # captured context must use the iterative path.
+        _req_max_seq_len = int(getattr(common_attn_metadata, "max_seq_len", 0) or 0)
+        if not runner.can_run(batch_size, max_seq_len=_req_max_seq_len):
             return _original_propose(self, *args, **kwargs)
 
         try:

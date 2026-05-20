@@ -125,6 +125,13 @@ class EagleFullLoopRunner:
         # Per-batch-size capture state. Populated by capture(); read by replay().
         self.contexts: dict[int, EagleFullLoopCaptureContext] = {}
         self._captured: bool = False
+        # MUSA-0109: the context length baked into the captured draft
+        # attention (`max_seq_len` is a host int -> graph grid size, cannot
+        # change after capture). Set by capture(); `can_run()` rejects
+        # requests whose context exceeds it so they fall back to the
+        # iterative path instead of replaying a graph that would truncate
+        # the draft attention.
+        self._capture_seq_len: int = 0
 
         logger.info(
             "MUSA-0090/0109 EagleFullLoopRunner: configured for "
@@ -142,16 +149,31 @@ class EagleFullLoopRunner:
 
     # ---- dispatcher predicate ----
 
-    def can_run(self, batch_size: int) -> bool:
-        """Whether there's a captured graph compatible with this batch size.
+    def can_run(self, batch_size: int, max_seq_len: int | None = None) -> bool:
+        """Whether there's a captured graph compatible with this request.
 
-        Strict equality match for now (no padding to next capture size).
-        Step 4 may add padding logic if batch size variance is high; for
-        BS=1 4k/1k workloads (the /goal shape), exact match suffices.
+        Strict equality match on batch size (no padding to next capture
+        size); for BS=1 4k/1k workloads (the /goal shape), exact match
+        suffices.
+
+        `max_seq_len`: the request's current context length. The captured
+        draft attention bakes `max_seq_len` as a host int, so a request
+        whose context (plus the `num_steps` draft positions) exceeds the
+        captured length must fall back to the iterative path — replaying
+        the graph would truncate the draft attention and collapse
+        acceptance. When None the seq-len guard is skipped.
         """
         if not self._captured:
             return False
-        return batch_size in self.contexts
+        if batch_size not in self.contexts:
+            return False
+        if (
+            max_seq_len is not None
+            and self._capture_seq_len > 0
+            and max_seq_len + self.num_steps > self._capture_seq_len
+        ):
+            return False
+        return True
 
     # ---- one-time capture (called lazily on first propose()) ----
 
@@ -177,6 +199,9 @@ class EagleFullLoopRunner:
         """
         if self._captured:
             return
+        # MUSA-0109: record the context length baked into the capture so
+        # can_run() can reject longer-context requests.
+        self._capture_seq_len = int(getattr(base_metadata, "max_seq_len", 0) or 0)
         if not hasattr(self.proposer, "model"):
             raise RuntimeError(
                 "EagleProposer does not expose `model` attribute; check vLLM "
@@ -313,6 +338,18 @@ class EagleFullLoopRunner:
             block_table_tensor=block_table_tensor,
             device=self.device,
         )
+
+        # MUSA-0109 (2026-05-20): seed the seq_lens buffers to the capture
+        # context length BEFORE Phase 2 builds the per-step metadata. The
+        # FlashAttention builder derives `cu_seqlens_k` / scheduler metadata
+        # from `seq_lens` at build time and bakes them into the graph; if
+        # the buffers are still zero here those derived fields are baked for
+        # a 0-length context. `base_metadata.max_seq_len` carries the
+        # capture context length (set by the boot-capture patch). replay()
+        # overwrites these buffers with the real per-request seq_lens.
+        _cap_seq_len = int(getattr(base_metadata, "max_seq_len", 1) or 1)
+        buffers.seq_lens_per_step.fill_(_cap_seq_len)
+        buffers.seq_lens_in.fill_(_cap_seq_len)
 
         # Phase 2: pre-build per-step metadata array (views into buffers).
         # Pass `proposer` so the helper can call
