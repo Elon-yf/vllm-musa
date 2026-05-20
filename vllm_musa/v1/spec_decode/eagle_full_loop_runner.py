@@ -77,12 +77,6 @@ class EagleFullLoopRunner:
             )
         if not cudagraph_capture_sizes:
             raise ValueError("cudagraph_capture_sizes must not be empty")
-        if topk != 1:
-            # Tree drafting is a follow-up ticket (MUSA-0094); chain-only here.
-            raise NotImplementedError(
-                f"topk={topk} (tree drafting) is out of scope for MUSA-0090; "
-                "chain-only path (topk=1). Tree path is MUSA-0094."
-            )
 
         self.proposer = proposer
         self.num_steps = num_speculative_tokens
@@ -92,16 +86,42 @@ class EagleFullLoopRunner:
         self.topk = topk
         self.device = device
 
+        # MUSA-0109 A1: detect TREE mode. When the proposer was configured
+        # with a `speculative_token_tree`, it exposes `cu_drafts_per_level`
+        # / `child_drafts_per_level` (llm_base_proposer.py:280-300) and the
+        # tree has depth > 1. In tree mode the runner captures the
+        # `propose_tree` loop (`_run_tree_inner`); otherwise the chain loop.
+        cu = getattr(proposer, "cu_drafts_per_level", None)
+        self._tree_mode: bool = bool(cu) and len(cu) > 1
+        if self._tree_mode:
+            self._cu_drafts_per_level = [int(x) for x in cu]
+            self._child_drafts_per_level = [
+                int(x) for x in proposer.child_drafts_per_level
+            ]
+            self._total_drafts = self._cu_drafts_per_level[-1]
+            self._tree_depth = len(self._cu_drafts_per_level)
+        else:
+            self._cu_drafts_per_level = []
+            self._child_drafts_per_level = []
+            self._total_drafts = num_speculative_tokens
+            self._tree_depth = 0
+
         # Per-batch-size capture state. Populated by capture(); read by replay().
         self.contexts: dict[int, EagleFullLoopCaptureContext] = {}
         self._captured: bool = False
 
         logger.info(
-            "MUSA-0090 EagleFullLoopRunner: configured for "
+            "MUSA-0090/0109 EagleFullLoopRunner: configured for "
             "num_speculative_tokens=%d, capture_sizes=%s, max_bs=%d, "
-            "hidden_size=%d, topk=%d",
+            "hidden_size=%d, mode=%s%s",
             self.num_steps, self.capture_sizes, self.max_bs,
-            self.hidden_size, self.topk,
+            self.hidden_size,
+            "TREE" if self._tree_mode else "chain",
+            (
+                f" (cu_drafts={self._cu_drafts_per_level}, "
+                f"total_drafts={self._total_drafts})"
+                if self._tree_mode else ""
+            ),
         )
 
     # ---- dispatcher predicate ----
@@ -255,6 +275,12 @@ class EagleFullLoopRunner:
                 f"batch_size {batch_size} out of range [1, {self.max_bs}]"
             )
 
+        # MUSA-0109 A1: tree mode captures the propose_tree loop instead.
+        if self._tree_mode:
+            return self._capture_one_tree(
+                batch_size, base_metadata, pool, in_graph_capture
+            )
+
         # Phase 1: allocate buffers for this batch size.
         # block_table_tensor is held as a reference (not copied); we read it
         # via the slot-mapping kernel inside the captured graph.
@@ -374,6 +400,120 @@ class EagleFullLoopRunner:
             buffers=buffers,
             attn_metadata_array=attn_metadata_array,
         )
+
+    # ---- tree capture (MUSA-0109 A1 increment 4) ----
+
+    def _capture_one_tree(
+        self,
+        batch_size: int,
+        base_metadata: Any,
+        pool: Any,
+        in_graph_capture: bool,
+    ) -> EagleFullLoopCaptureContext:
+        """Capture the narrow-d5 tree draft loop for one batch size.
+
+        Mirrors `_capture_one_batch_size` but for the tree path: allocate
+        `EagleTreeDraftBuffers`, build the per-level tree-attention metadata
+        (plus the init-forward metadata as entry 0), warm up, capture one
+        graph wrapping `_run_tree_inner`.
+        """
+        from .attn_backend_array import build_per_level_tree_attn_metadata
+        from .spec_info import EagleTreeDraftBuffers
+
+        block_table_tensor = getattr(base_metadata, "block_table_tensor", None)
+        if block_table_tensor is None:
+            raise RuntimeError(
+                "base_metadata lacks block_table_tensor; cannot capture tree"
+            )
+
+        buffers = EagleTreeDraftBuffers.allocate(
+            max_bs=self.max_bs,
+            cu_drafts_per_level=self._cu_drafts_per_level,
+            child_drafts_per_level=self._child_drafts_per_level,
+            hidden_size=self.hidden_size,
+            block_table_tensor=block_table_tensor,
+            device=self.device,
+        )
+
+        # Metadata: entry 0 = the init forward (1 token/req) — vllm's
+        # `propose()` builds it via build_per_group_and_layer_attn_metadata;
+        # entries 1.. = the per-level accumulated-prefix forwards.
+        _per_group, init_per_layer = (
+            self.proposer.build_per_group_and_layer_attn_metadata(base_metadata)
+        )
+        level_metadata = build_per_level_tree_attn_metadata(
+            base_metadata, buffers, batch_size, self.proposer
+        )
+        metadata_per_level = [init_per_layer] + level_metadata
+
+        # Warm up the draft model on the tree shapes before capture.
+        self._warmup_tree(buffers, metadata_per_level, batch_size)
+
+        # Capture one graph wrapping the static-unrolled tree loop.
+        graph = self._capture_tree_loop(
+            buffers, metadata_per_level, batch_size, pool,
+            in_graph_capture=in_graph_capture,
+        )
+
+        return EagleFullLoopCaptureContext(
+            batch_size=batch_size,
+            graph=graph,
+            pool=pool,
+            buffers=buffers,
+            attn_metadata_array=metadata_per_level,
+        )
+
+    def _warmup_tree(
+        self, buffers: Any, metadata_per_level: list, batch_size: int
+    ) -> None:
+        """Two eager passes of `_run_tree_inner` with full sync between —
+        settles JIT/allocator state before capture (same rationale as
+        `_warmup_eager`)."""
+        from vllm.distributed import get_tp_group
+
+        try:
+            tp_barrier = get_tp_group().barrier
+        except Exception:
+            tp_barrier = lambda: None  # noqa: E731
+
+        s = torch.cuda.Stream()
+        for _ in range(2):
+            torch.cuda.synchronize()
+            tp_barrier()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                self._run_tree_inner(buffers, metadata_per_level, batch_size)
+            torch.cuda.current_stream().wait_stream(s)
+            torch.cuda.synchronize()
+        torch.cuda.synchronize()
+        tp_barrier()
+
+    def _capture_tree_loop(
+        self,
+        buffers: Any,
+        metadata_per_level: list,
+        batch_size: int,
+        pool: Any,
+        in_graph_capture: bool = False,
+    ) -> Any:
+        """Capture `_run_tree_inner` as one graph. Same capture discipline as
+        `_capture_n_step_loop` (the `in_graph_capture` distinction)."""
+        graph = torch.cuda.CUDAGraph()
+        if in_graph_capture:
+            with torch.cuda.graph(
+                graph, pool=pool, stream=torch.cuda.current_stream()
+            ):
+                self._run_tree_inner(buffers, metadata_per_level, batch_size)
+            return graph
+
+        from vllm.distributed.parallel_state import (
+            graph_capture as _vllm_graph_capture,
+        )
+
+        with _vllm_graph_capture(self.device) as _gc_ctx:
+            with torch.cuda.graph(graph, pool=pool, stream=_gc_ctx.stream):
+                self._run_tree_inner(buffers, metadata_per_level, batch_size)
+        return graph
 
     # ---- replay (hot path) ----
 
@@ -820,6 +960,132 @@ class EagleFullLoopRunner:
                     ],
                     input_batch_size=batch_size,
                 )
+
+    # ---- tree-aware loop body (MUSA-0109 A1 increment 2) ----
+
+    def _run_tree_inner(
+        self,
+        buffers: Any,  # EagleTreeDraftBuffers
+        metadata_per_level: list,
+        batch_size: int,
+    ) -> None:
+        """Tree draft-loop body — narrow-d5 (MUSA-0109 A1). GPU-only; the
+        `for level` loop is static so it unrolls at capture time, letting one
+        torch.cuda.graph capture all forwards at their fixed query_lens.
+
+        Faithful port of vLLM `propose()` initial-forward + `propose_tree()`
+        (llm_base_proposer.py:460-1160), restructured to write into fixed
+        pre-allocated tree buffers (no torch.cat).
+
+        `metadata_per_level`: length `tree_depth`. [0] = init forward
+        (1 token/req); [L+1] = the accumulated-prefix forward at level L
+        (query_len cu_drafts_per_level[L]).
+        """
+        from vllm.config import CUDAGraphMode
+        from vllm.forward_context import set_forward_context
+
+        proposer = self.proposer
+        cu = buffers.cu_drafts_per_level          # e.g. (2,4,6,7,8)
+        child = buffers.child_drafts_per_level    # e.g. (2,1,1,0,1)
+        tree_depth = buffers.tree_depth
+        total = buffers.total_drafts
+        bs = batch_size
+        h = buffers.hidden_size
+        pass_hidden = getattr(proposer, "pass_hidden_states_to_model", True)
+        block_size = int(getattr(proposer, "block_size", 64) or 64)
+
+        # --- precompute per-node RoPE positions + KV slot mappings ---
+        # Static given the base (bonus-token) position; all GPU ops, fully
+        # capturable. Node p at tree level L (cu[L-1] <= p < cu[L]) has RoPE
+        # position base+(L+1) — all nodes at a level share the depth.
+        base_pos = buffers.positions_in[:bs]  # int64 [bs]
+        for L in range(tree_depth):
+            lo = int(cu[L - 1]) if L > 0 else 0
+            hi = int(cu[L])
+            buffers.tree_positions[:bs, lo:hi].copy_(
+                (base_pos + (L + 1)).unsqueeze(1).expand(bs, hi - lo)
+            )
+        # KV slot per node: flattened offset 1..total gives each node a
+        # distinct cache slot (propose_tree's flattened_draft_positions).
+        offsets = torch.arange(
+            1, total + 1, device=base_pos.device, dtype=torch.int64
+        )
+        abs_pos = base_pos.unsqueeze(1) + offsets.unsqueeze(0)  # [bs, total]
+        block_num = abs_pos // block_size
+        block_ids = (
+            buffers.block_table_tensor[:bs].to(torch.int64).gather(1, block_num)
+        )
+        buffers.tree_slot_mapping[:bs, :].copy_(
+            block_ids * block_size + abs_pos % block_size
+        )
+
+        def _fwd(meta, ids, pos, hid):
+            kw = {"input_ids": ids, "positions": pos, "inputs_embeds": None}
+            if pass_hidden:
+                kw["hidden_states"] = hid
+            with set_forward_context(
+                meta,
+                proposer.vllm_config,
+                num_tokens=int(ids.shape[0]),
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            ):
+                r = proposer.model(**kw)
+            return (r[0], r[1]) if isinstance(r, tuple) else (r, r)
+
+        def _sample(last_hidden, n_children):
+            logits = proposer.model.compute_logits(last_hidden)
+            if n_children <= 1:
+                return logits.argmax(dim=-1).to(torch.int32)
+            return torch.topk(
+                logits, n_children, dim=-1
+            ).indices.to(torch.int32)
+
+        # --- initial forward: the bonus token -> root tokens ---
+        last_h, next_h = _fwd(
+            metadata_per_level[0],
+            buffers.bonus_token_ids_in[:bs],
+            base_pos,
+            buffers.target_hidden_states_in[:bs],
+        )
+        n_root = int(cu[0])
+        root = _sample(last_h[:bs], int(child[0])).view(bs, -1)[:, :n_root]
+        buffers.tree_token_ids[:bs, 0:n_root].copy_(root)
+        buffers.tree_hidden_states[:bs, 0:n_root].copy_(
+            next_h[:bs].unsqueeze(1).expand(bs, n_root, h)
+        )
+
+        # --- tree level loop (static — unrolls at capture) ---
+        level_num = n_root
+        for level in range(tree_depth - 1):
+            qlen = int(cu[level])
+            last_h, next_h = _fwd(
+                metadata_per_level[level + 1],
+                buffers.tree_token_ids[:bs, :qlen].reshape(-1),
+                buffers.tree_positions[:bs, :qlen].reshape(-1),
+                buffers.tree_hidden_states[:bs, :qlen].reshape(bs * qlen, h),
+            )
+            # The last `level_num` nodes of the prefix are this level's
+            # frontier — we sample their children.
+            front_last = last_h[: bs * qlen].view(bs, qlen, h)[:, -level_num:]
+            front_next = next_h[: bs * qlen].view(bs, qlen, h)[:, -level_num:]
+            lo, hi = int(cu[level]), int(cu[level + 1])
+            n_new = hi - lo
+            nch = int(child[level + 1])
+            toks = _sample(
+                front_last.reshape(bs * level_num, h), nch
+            ).view(bs, -1)[:, :n_new]
+            buffers.tree_token_ids[:bs, lo:hi].copy_(toks)
+            carry = (
+                front_next.repeat_interleave(nch, dim=1)
+                if nch > 1
+                else front_next
+            )
+            buffers.tree_hidden_states[:bs, lo:hi].copy_(carry[:, :n_new])
+            level_num = n_new
+
+        buffers.draft_token_ids_out[:bs, :].copy_(
+            buffers.tree_token_ids[:bs, :]
+        )
 
     # ---- memory accounting ----
 
