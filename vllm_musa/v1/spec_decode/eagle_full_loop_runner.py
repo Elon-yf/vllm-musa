@@ -739,6 +739,30 @@ class EagleFullLoopRunner:
                         for s in range(self.num_steps)
                     ],
                 )
+                # MUSA-0109 (2026-05-21) SLOTDBG: the chain reads context KV
+                # via buffers.block_table_tensor; _eager_first_forward writes
+                # the verified KV via cad.slot_mapping. If those disagree the
+                # chain reads context it cannot find. Dump both + block_size.
+                try:
+                    _bs_blk = int(
+                        getattr(self.proposer, "block_size", 0) or 0
+                    )
+                    _cad_sm = getattr(cad, "slot_mapping", None)
+                    _cad_bt = getattr(cad, "block_table_tensor", None)
+                    logger.info(
+                        "MUSA-0109-SLOTDBG#%d block_size=%s | "
+                        "cad.slot_mapping[-6:]=%s | cad.block_table[0,:8]=%s "
+                        "| buffers.block_table[0,:8]=%s",
+                        _c,
+                        _bs_blk,
+                        (_cad_sm.reshape(-1)[-6:].tolist()
+                         if _cad_sm is not None else None),
+                        (_cad_bt[0, :8].tolist()
+                         if _cad_bt is not None and _cad_bt.numel() else None),
+                        b.block_table_tensor[0, :8].tolist(),
+                    )
+                except Exception as _e:
+                    logger.info("MUSA-0109-SLOTDBG#%d failed: %s", _c, _e)
 
         # ---- PHASE 5: assemble [draft0] ++ chain -> [bs, num_spec_tokens].
         # Clone out of the CUDAGraph pool (MUSA-0090 layer-2: a cross-stream
