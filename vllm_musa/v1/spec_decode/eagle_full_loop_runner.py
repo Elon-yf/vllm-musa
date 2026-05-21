@@ -155,6 +155,8 @@ class EagleFullLoopRunner:
         self._fwdprobe_step: int = 0
         self._fwdprobe_active: bool = False
         self._fwdprobe_hooks_installed: bool = False
+        self._fa_probe_fires: int = 0
+        self._fa_probe_log_count: int = 0
         self._dbg: dict[str, torch.Tensor] = {}
         if self._fwdprobe and self.num_steps > 0:
             # last/next = model() return; embed/attn/mlp = submodule
@@ -924,20 +926,43 @@ class EagleFullLoopRunner:
                 def _fa_fwd_probe(impl_self, *a, **kw):
                     r = _orig_fa_fwd(impl_self, *a, **kw)
                     try:
-                        if _runner._fwdprobe_active:
-                            out = kw.get("output", None)
-                            if out is None and len(a) >= 7:
-                                out = a[6]
-                            buf = _runner._dbg.get("attn")
-                            if (
-                                isinstance(out, torch.Tensor)
-                                and buf is not None
-                                and out.dim() >= 2
-                                and out.shape[-1] == buf.shape[-1]
-                            ):
-                                n = min(out.shape[0], buf.shape[1])
+                        _runner._fa_probe_fires += 1
+                        out = kw.get("output", None)
+                        if out is None and len(a) >= 7:
+                            out = a[6]
+                        active = _runner._fwdprobe_active
+                        # Diagnostic: log the first 3 fires unconditionally
+                        # (proves the patch fires at all) + the first chain
+                        # fires (active) with full arg shapes.
+                        if (active or _runner._fa_probe_fires <= 3) and (
+                            _runner._fa_probe_log_count < 14
+                        ):
+                            _runner._fa_probe_log_count += 1
+                            shapes = [
+                                tuple(x.shape)
+                                if isinstance(x, torch.Tensor)
+                                else type(x).__name__
+                                for x in a
+                            ]
+                            logger.info(
+                                "MUSA-0109 FA-PROBE-FIRE#%d active=%s step=%s "
+                                "fires=%d argshapes=%s kw=%s",
+                                _runner._fa_probe_log_count, active,
+                                _runner._fwdprobe_step, _runner._fa_probe_fires,
+                                shapes, list(kw.keys()),
+                            )
+                        buf = _runner._dbg.get("attn")
+                        if (
+                            active
+                            and isinstance(out, torch.Tensor)
+                            and buf is not None
+                            and out.numel() > 0
+                        ):
+                            o2 = out.reshape(out.shape[0], -1)
+                            if o2.shape[-1] == buf.shape[-1]:
+                                n = min(o2.shape[0], buf.shape[1])
                                 buf[_runner._fwdprobe_step, :n].copy_(
-                                    out[:n].detach()
+                                    o2[:n].detach()
                                 )
                     except Exception:
                         pass
