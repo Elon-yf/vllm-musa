@@ -338,11 +338,18 @@ def _make_dispatched_propose(_original_propose):
         if os.environ.get("VLLM_MUSA_EAGLE_DIFF", "0") == "1":
             global _DIFF_CALLS
             try:
+                # CLEAN diff: deep-copy common_attn_metadata BEFORE
+                # _original_propose mutates it in place, so the runner
+                # replays on pristine metadata (the earlier DIFF was
+                # contaminated — _original_propose mutated cad/proposer
+                # state that replay() then read).
+                import copy as _copy
+                cad_copy = _copy.deepcopy(common_attn_metadata)
                 iter_drafts = _original_propose(self, *args, **kwargs)
                 rep = runner.replay(
                     target_hidden_states=target_hidden_states,
                     next_token_ids=next_token_ids,
-                    common_attn_metadata=common_attn_metadata,
+                    common_attn_metadata=cad_copy,
                     batch_size=batch_size,
                     target_positions=target_positions,
                     token_indices_to_sample=token_indices_to_sample,
