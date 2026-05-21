@@ -140,6 +140,28 @@ class EagleFullLoopRunner:
         # the draft attention.
         self._capture_seq_len: int = 0
 
+        # MUSA-0109 (2026-05-21) FWDPROBE: VLLM_MUSA_EAGLE_FWDPROBE=1 captures
+        # the draft model's per-step (last_hidden, next_hidden) into debug
+        # buffers, then replay() runs the graph AND an eager pass over the
+        # SAME seeded inputs and logs a direct graph-vs-eager comparison
+        # (norm + cosine similarity). cos≈1 on last_hidden ⇒ the captured
+        # model forward is correct and bug A is downstream (sampling/d2t);
+        # cos≪1 ⇒ the captured model forward itself is corrupted.
+        import os as _os_fp
+        self._fwdprobe: bool = (
+            _os_fp.environ.get("VLLM_MUSA_EAGLE_FWDPROBE", "0") == "1"
+        )
+        self._fwdprobe_count: int = 0
+        if self._fwdprobe and self.num_steps > 0:
+            self._dbg_last_hidden = torch.zeros(
+                self.num_steps, self.max_bs, hidden_size,
+                dtype=torch.bfloat16, device=device,
+            )
+            self._dbg_next_hidden = torch.zeros(
+                self.num_steps, self.max_bs, hidden_size,
+                dtype=torch.bfloat16, device=device,
+            )
+
         logger.info(
             "MUSA-0090/0109 EagleFullLoopRunner: configured for "
             "num_speculative_tokens=%d, capture_sizes=%s, max_bs=%d, "
@@ -692,11 +714,33 @@ class EagleFullLoopRunner:
 
         # ---- PHASE 4: replay the captured chain (num_spec_tokens - 1 steps).
         # VLLM_MUSA_EAGLE_EAGER_REPLAY=1 runs the chain eagerly (diagnostic —
-        # splits a captured-graph bug from a loop-logic bug). ----
+        # splits a captured-graph bug from a loop-logic bug).
+        # VLLM_MUSA_EAGLE_FWDPROBE=1 runs the graph THEN an eager pass over
+        # the same seeded inputs and logs a graph-vs-eager comparison of the
+        # draft model's per-step outputs (bug-A localisation). ----
         import os as _os_er
         if _os_er.environ.get("VLLM_MUSA_EAGLE_EAGER_REPLAY", "0") == "1":
             self._run_n_step_inner(
                 ctx.buffers, ctx.attn_metadata_array, batch_size
+            )
+        elif getattr(self, "_fwdprobe", False) and self.num_steps > 0:
+            # Graph replay -> snapshot the captured draft outputs; then an
+            # eager re-run of the IDENTICAL _run_n_step_inner (it re-seeds
+            # step-0 from the still-seeded *_in buffers) -> snapshot eager
+            # outputs. The eager pass also fills draft_token_ids_out last,
+            # so the probe run still serves correct tokens.
+            ctx.graph.replay()
+            g_last = self._dbg_last_hidden.clone()
+            g_next = self._dbg_next_hidden.clone()
+            g_out = ctx.buffers.draft_token_ids_out[:batch_size].clone()
+            self._run_n_step_inner(
+                ctx.buffers, ctx.attn_metadata_array, batch_size
+            )
+            e_last = self._dbg_last_hidden.clone()
+            e_next = self._dbg_next_hidden.clone()
+            e_out = ctx.buffers.draft_token_ids_out[:batch_size].clone()
+            self._fwdprobe_log(
+                g_last, g_next, g_out, e_last, e_next, e_out, batch_size
             )
         else:
             ctx.graph.replay()
@@ -776,6 +820,46 @@ class EagleFullLoopRunner:
         return EagleFullLoopReplayResult(
             draft_token_ids=out,
             batch_size=batch_size,
+        )
+
+    def _fwdprobe_log(
+        self,
+        g_last: torch.Tensor,
+        g_next: torch.Tensor,
+        g_out: torch.Tensor,
+        e_last: torch.Tensor,
+        e_next: torch.Tensor,
+        e_out: torch.Tensor,
+        batch_size: int,
+    ) -> None:
+        """Log a per-step graph-vs-eager comparison of the draft model's raw
+        outputs (MUSA-0109 bug-A localisation). `cos≈1` on `last_hidden`
+        means the captured forward is correct and bug A is downstream
+        (sampling/d2t); `cos≪1` means the captured forward itself diverges
+        under graph replay."""
+        c = self._fwdprobe_count
+        if c >= 6:
+            return
+        self._fwdprobe_count = c + 1
+        import torch.nn.functional as _F
+        for s in range(self.num_steps):
+            gl = g_last[s, 0].float()
+            el = e_last[s, 0].float()
+            gn = g_next[s, 0].float()
+            en = e_next[s, 0].float()
+            cos_l = float(_F.cosine_similarity(gl, el, dim=0))
+            cos_n = float(_F.cosine_similarity(gn, en, dim=0))
+            logger.info(
+                "MUSA-0109-FWDPROBE#%d step%d | last_hidden g_norm=%.2f "
+                "e_norm=%.2f cos=%.4f | next_hidden g_norm=%.2f e_norm=%.2f "
+                "cos=%.4f",
+                c, s,
+                float(gl.norm()), float(el.norm()), cos_l,
+                float(gn.norm()), float(en.norm()), cos_n,
+            )
+        logger.info(
+            "MUSA-0109-FWDPROBE#%d g_out=%s e_out=%s",
+            c, g_out.reshape(-1).tolist(), e_out.reshape(-1).tolist(),
         )
 
     def _eager_first_forward(
@@ -1096,6 +1180,16 @@ class EagleFullLoopRunner:
 
             # Write the drafted token to the output tensor.
             buffers.draft_token_ids_out[:batch_size, step].copy_(draft_token_ids)
+
+            # MUSA-0109 FWDPROBE: snapshot the draft model's raw outputs
+            # (capture-safe in-place copies into persistent debug buffers).
+            if getattr(self, "_fwdprobe", False):
+                self._dbg_last_hidden[step, :batch_size].copy_(
+                    last_hidden_states[:batch_size]
+                )
+                self._dbg_next_hidden[step, :batch_size].copy_(
+                    next_hidden[:batch_size]
+                )
 
             # Update state for step+1 if not the last step.
             if step + 1 < self.num_steps:
