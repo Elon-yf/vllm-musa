@@ -908,6 +908,52 @@ class EagleFullLoopRunner:
                 hooked.append((name, "mlp"))
         logger.info("MUSA-0109 FWDPROBE submodule hooks installed: %s", hooked)
 
+        # nn.Module forward hooks are bypassed when the draft is
+        # Inductor-compiled (the compiled artifact doesn't call submodule
+        # `forward`). FlashAttentionImpl.forward is a custom-op impl that
+        # runs EAGER even inside a compiled model — monkeypatch it so the
+        # `attn` probe still captures the attention output (pre-o_proj).
+        try:
+            from vllm_musa.v1.attention.backends.flash_attn import (
+                FlashAttentionImpl as _FAImpl,
+            )
+            if not getattr(_FAImpl, "_musa0109_fwdprobe_wrapped", False):
+                _orig_fa_fwd = _FAImpl.forward
+                _runner = self
+
+                def _fa_fwd_probe(impl_self, *a, **kw):
+                    r = _orig_fa_fwd(impl_self, *a, **kw)
+                    try:
+                        if _runner._fwdprobe_active:
+                            out = kw.get("output", None)
+                            if out is None and len(a) >= 7:
+                                out = a[6]
+                            buf = _runner._dbg.get("attn")
+                            if (
+                                isinstance(out, torch.Tensor)
+                                and buf is not None
+                                and out.dim() >= 2
+                                and out.shape[-1] == buf.shape[-1]
+                            ):
+                                n = min(out.shape[0], buf.shape[1])
+                                buf[_runner._fwdprobe_step, :n].copy_(
+                                    out[:n].detach()
+                                )
+                    except Exception:
+                        pass
+                    return r
+
+                _FAImpl.forward = _fa_fwd_probe
+                _FAImpl._musa0109_fwdprobe_wrapped = True
+                logger.info(
+                    "MUSA-0109 FWDPROBE: FlashAttentionImpl.forward "
+                    "monkeypatched for the attn snapshot"
+                )
+        except Exception as exc:
+            logger.warning(
+                "MUSA-0109 FWDPROBE: FA monkeypatch failed: %s", exc
+            )
+
     def _eager_first_forward(
         self,
         target_token_ids: torch.Tensor,
@@ -1280,6 +1326,11 @@ class EagleFullLoopRunner:
                     ],
                     input_batch_size=batch_size,
                 )
+
+        # MUSA-0109 FWDPROBE: leave the snapshot window so the monkeypatched
+        # FlashAttentionImpl.forward is inert during the target verify pass.
+        if getattr(self, "_fwdprobe", False):
+            self._fwdprobe_active = False
 
     # ---- tree-aware loop body (MUSA-0109 A1 increment 2) ----
 
