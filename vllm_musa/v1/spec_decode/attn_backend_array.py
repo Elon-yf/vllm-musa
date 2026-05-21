@@ -247,11 +247,17 @@ def build_per_step_attn_metadata_array(
         slot_mapping_view = buffers.slot_mapping_per_step[step_idx, :batch_size]
         seq_lens_view = buffers.seq_lens_per_step[step_idx, :batch_size]
 
-        # max_seq_len is a static int (not a tensor); bump by step_idx so the
-        # attention backend sizes its scratch correctly for each step. The
-        # +1 between steps is the spec-decode invariant: each draft token
-        # adds one position to the sequence.
-        step_max_seq_len = min(base_max_seq_len + step_idx, base_max_model_len)
+        # MUSA-0109 hybrid: the captured graph is the CHAIN tail — its
+        # step `step_idx` is vLLM's chain-loop iteration `step_idx`, which
+        # produces draft token `step_idx + 1` and uses
+        # `draft_index = step_idx + 1` (propose() line ~609). Draft token 0
+        # comes from the eager first forward (draft_index 0). So every
+        # per-step value here carries a `+ 1`: the seq-len bump and the
+        # draft_index passed to the builder.
+        chain_draft_index = step_idx + 1
+        step_max_seq_len = min(
+            base_max_seq_len + chain_draft_index, base_max_model_len
+        )
 
         # Construct a step-specific CommonAttentionMetadata that the builder
         # will translate into a per-layer attention metadata dict.
@@ -276,7 +282,7 @@ def build_per_step_attn_metadata_array(
 
         try:
             _per_group, per_layer = proposer.build_per_group_and_layer_attn_metadata(
-                step_cam, draft_index=step_idx
+                step_cam, draft_index=chain_draft_index
             )
         except Exception as exc:
             raise RuntimeError(
