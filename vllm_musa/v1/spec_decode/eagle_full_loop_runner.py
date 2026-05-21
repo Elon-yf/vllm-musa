@@ -701,6 +701,43 @@ class EagleFullLoopRunner:
         else:
             ctx.graph.replay()
 
+        # MUSA-0109 (2026-05-21) CHAINDBG: with EAGER_REPLAY the chain ran
+        # eagerly so the per-step buffers are populated and safe to read
+        # (GPU->CPU sync is fine here — replay() is plain Python). Dumps the
+        # full chain trajectory to pinpoint the positions 1..N-1 failure.
+        if _os_er.environ.get("VLLM_MUSA_EAGLE_EAGER_REPLAY", "0") == "1":
+            _c = getattr(self, "_replay_dbg_count", 0)
+            if _c < 12:
+                self._replay_dbg_count = _c + 1
+                b = ctx.buffers
+                logger.info(
+                    "MUSA-0109-CHAINDBG#%d draft0=%s carry_pos=%s | "
+                    "seeded(bonus=%s pos_in=%s seq_in=%s slot_in=%s) | "
+                    "in_ids=%s positions=%s seq_lens=%s slots=%s | out=%s | "
+                    "hid_norms=%s",
+                    _c,
+                    draft0.reshape(-1).tolist(),
+                    carry_positions.reshape(-1)[:batch_size].tolist(),
+                    b.bonus_token_ids_in[:batch_size].reshape(-1).tolist(),
+                    b.positions_in[:batch_size].reshape(-1).tolist(),
+                    b.seq_lens_in[:batch_size].reshape(-1).tolist(),
+                    b.slot_mapping_in[:batch_size].reshape(-1).tolist(),
+                    b.input_ids_per_step[:, :batch_size].reshape(-1).tolist(),
+                    b.positions_per_step[:, :batch_size].reshape(-1).tolist(),
+                    b.seq_lens_per_step[:, :batch_size].reshape(-1).tolist(),
+                    b.slot_mapping_per_step[:, :batch_size].reshape(-1).tolist(),
+                    b.draft_token_ids_out[:batch_size].reshape(-1).tolist(),
+                    [
+                        round(
+                            float(
+                                b.hidden_states_per_step[s, 0].float().norm().item()
+                            ),
+                            1,
+                        )
+                        for s in range(self.num_steps)
+                    ],
+                )
+
         # ---- PHASE 5: assemble [draft0] ++ chain -> [bs, num_spec_tokens].
         # Clone out of the CUDAGraph pool (MUSA-0090 layer-2: a cross-stream
         # copy from pool memory fails MUDNN err 999). ----
