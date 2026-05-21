@@ -958,12 +958,18 @@ class EagleFullLoopRunner:
                             and buf is not None
                             and out.numel() > 0
                         ):
+                            # `output` is the pre-o_proj attention result,
+                            # per-TP-rank [num_tokens, local_heads*head_dim]
+                            # (e.g. 384 = 3 heads x 128 at TP=8) — narrower
+                            # than hidden_size. Copy into the buffer's first
+                            # `w` columns; the zero tail leaves the cosine in
+                            # _fwdprobe_log unchanged.
                             o2 = out.reshape(out.shape[0], -1)
-                            if o2.shape[-1] == buf.shape[-1]:
-                                n = min(o2.shape[0], buf.shape[1])
-                                buf[_runner._fwdprobe_step, :n].copy_(
-                                    o2[:n].detach()
-                                )
+                            n = min(o2.shape[0], buf.shape[1])
+                            w = min(o2.shape[-1], buf.shape[-1])
+                            buf[_runner._fwdprobe_step, :n, :w].copy_(
+                                o2[:n, :w].detach()
+                            )
                     except Exception:
                         pass
                     return r
