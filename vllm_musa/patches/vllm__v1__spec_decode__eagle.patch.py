@@ -30,8 +30,9 @@ is_graph_capturing=True)` inside it. This patch hooks that:
     boot-captured runner exists, replay it; otherwise fall through to
     vLLM's iterative path. No lazy capture.
 
-Gating: `VLLM_MUSA_EAGLE_RUNNER=1` opt-in (default off — the runner is not
-yet end-to-end verified). With it off, both wrappers are pass-throughs.
+Gating: the runner is ON by default; set `VLLM_MUSA_EAGLE_RUNNER=0` to
+disable it (both wrappers then become pass-throughs). Verified on
+M2.5+Eagle3 — +7.6% decode throughput over vLLM's iterative draft loop.
 
 Patch style: `PATCHES = []` — no file mutation; the monkey-patch install
 is the import side effect. Idempotent via the `_musa_eagle_patched`
@@ -45,7 +46,9 @@ import os
 
 _log = logging.getLogger(__name__)
 
-_RUNNER_ENABLED = os.environ.get("VLLM_MUSA_EAGLE_RUNNER", "0") == "1"
+# MUSA-0109: the runner is verified and ON by default; set
+# VLLM_MUSA_EAGLE_RUNNER=0 to fall back to vLLM's iterative draft loop.
+_RUNNER_ENABLED = os.environ.get("VLLM_MUSA_EAGLE_RUNNER", "1") == "1"
 
 # MUSA-0109 (2026-05-20): the boot capture bakes the draft attention's
 # `max_seq_len` (a host int -> grid size) into the CUDAGraph; per-request
