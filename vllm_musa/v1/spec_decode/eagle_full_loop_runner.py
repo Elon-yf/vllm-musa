@@ -79,7 +79,14 @@ class EagleFullLoopRunner:
             raise ValueError("cudagraph_capture_sizes must not be empty")
 
         self.proposer = proposer
-        self.num_steps = num_speculative_tokens
+        # MUSA-0109 hybrid (2026-05-21): the runner's captured graph covers
+        # only the 1-token CHAIN tail. Draft token 0 comes from an eager
+        # first forward over the verified sequence (replay() / vLLM's
+        # propose() first-forward), which is variable-/multi-token and not
+        # capturable. So the captured loop is num_speculative_tokens - 1
+        # steps; replay() prepends draft-0 to reach num_speculative_tokens.
+        self.num_spec_tokens = num_speculative_tokens
+        self.num_steps = num_speculative_tokens - 1
         self.capture_sizes: list[int] = sorted(set(cudagraph_capture_sizes))
         self.max_bs: int = max(self.capture_sizes)
         self.hidden_size = hidden_size
@@ -137,7 +144,7 @@ class EagleFullLoopRunner:
             "MUSA-0090/0109 EagleFullLoopRunner: configured for "
             "num_speculative_tokens=%d, capture_sizes=%s, max_bs=%d, "
             "hidden_size=%d, mode=%s%s",
-            self.num_steps, self.capture_sizes, self.max_bs,
+            self.num_spec_tokens, self.capture_sizes, self.max_bs,
             self.hidden_size,
             "TREE" if self._tree_mode else "chain",
             (
@@ -170,7 +177,7 @@ class EagleFullLoopRunner:
         if (
             max_seq_len is not None
             and self._capture_seq_len > 0
-            and max_seq_len + self.num_steps > self._capture_seq_len
+            and max_seq_len + self.num_spec_tokens > self._capture_seq_len
         ):
             return False
         return True
@@ -578,6 +585,8 @@ class EagleFullLoopRunner:
         batch_size: int,
         target_positions: torch.Tensor | None = None,  # int64 [num_tokens] (the verify pass's positions)
         token_indices_to_sample: torch.Tensor | None = None,  # int [bs] (idx in num_tokens of last token per seq)
+        target_token_ids: torch.Tensor | None = None,  # int [num_tokens] verified token ids (first forward)
+        num_rejected_tokens_gpu: torch.Tensor | None = None,  # [bs] padded-drafter rejected count
     ) -> EagleFullLoopReplayResult:
         """Replay the captured graph for this batch size.
 
@@ -619,132 +628,161 @@ class EagleFullLoopRunner:
             )
 
         ctx = self.contexts[batch_size]
+        p = self.proposer
 
-        # MUSA-0090 step 5k: derive token_indices_to_sample if not provided.
-        # Pattern matches vllm/v1/spec_decode/llm_base_proposer.py:set_inputs_first_pass.
-        if token_indices_to_sample is None:
-            query_start_loc = getattr(common_attn_metadata, "query_start_loc", None)
-            if query_start_loc is not None:
-                token_indices_to_sample = query_start_loc[1:] - 1
-            else:
-                # Fall back to "[bs-1, ..., bs-1]" which is correct ONLY when
-                # num_tokens == batch_size (one-token-per-seq decode case).
-                # The runner's eager path produces this from the proposer.
-                token_indices_to_sample = torch.arange(
-                    batch_size, dtype=torch.int64, device=target_hidden_states.device
-                )
+        # ---- PHASE 1: eager first forward over the verified sequence ----
+        # Produces draft token 0 + the hidden/position state that seeds the
+        # captured chain. vLLM's Eagle propose() first-forward is variable-
+        # length (the K+1 verified tokens / the prompt on the first call) so
+        # it cannot be a fixed CUDAGraph — run it eagerly, by calling the
+        # proposer's own methods, so it is correct by construction.
+        draft0, carry_hidden, carry_positions, cad = self._eager_first_forward(
+            target_token_ids=target_token_ids,
+            target_positions=target_positions,
+            target_hidden_states=target_hidden_states,
+            next_token_ids=next_token_ids,
+            token_indices_to_sample=token_indices_to_sample,
+            common_attn_metadata=common_attn_metadata,
+            num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+            batch_size=batch_size,
+        )
 
-        # Hidden state selection: pick the LAST token per sequence.
-        # Shape handling:
-        #   target_hidden_states is [num_tokens, h] in the general case.
-        #   For BS=1 prefill 4k, num_tokens=4096 and we need the [4095]-th row.
-        # MUSA-0090 step 5l.2: Eagle3 uses aux hidden states from N layers
-        # (e.g., 3 layers for M2.5-Eagle3: ids 1, 30, 58), concatenated to
-        # shape [num_tokens, N * hidden_size] = [num_tokens, 9216] for the
-        # 3072-hidden M2.5 draft. vLLM's propose() calls
-        # self.model.combine_hidden_states(target_hidden_states) to reduce
-        # the concat to [num_tokens, hidden_size] before the draft forward.
-        # We replicate that here OUTSIDE the captured graph.
-        if (
-            self.proposer.method in ("eagle3", "dflash")
-            and target_hidden_states.shape[-1] != self.hidden_size
-            and hasattr(self.proposer.model, "combine_hidden_states")
-        ):
-            target_hidden_states = self.proposer.model.combine_hidden_states(
-                target_hidden_states
-            )
-        if target_hidden_states.dim() >= 1 and target_hidden_states.shape[0] != batch_size:
-            selected_hidden = target_hidden_states[token_indices_to_sample]
-        else:
-            selected_hidden = target_hidden_states[:batch_size]
-        ctx.buffers.target_hidden_states_in[:batch_size].copy_(selected_hidden)
-        ctx.buffers.bonus_token_ids_in[:batch_size].copy_(next_token_ids)
+        # ---- PHASE 2: bridge — first-forward state -> captured-chain step-0
+        # metadata. Mirrors propose() lines 528-580: the padded-drafter
+        # seq-len adjustment, then ONE eagle_step_update advancing the carry
+        # position/seq_len/slot_mapping by one (the chain's first forward is
+        # at carry_position + 1, exactly as propose()'s chain iter 0).
+        from vllm.v1.spec_decode.utils import (
+            eagle_step_update_slot_mapping_and_metadata,
+        )
+        seq_lens = cad.seq_lens
+        if self.num_spec_tokens > 1 and num_rejected_tokens_gpu is not None:
+            seq_lens = seq_lens - num_rejected_tokens_gpu
+        chain_seq = seq_lens[:batch_size].to(torch.int32).clone()
 
-        # MUSA-0090 step 5k: seed step-0 positions, slot_mapping, seq_lens
-        # from the verify pass's metadata. Without these, the captured graph
-        # reads zeros at step 0 — RoPE wrong, KV writes to wrong slots,
-        # attention attends to wrong context length.
-        if target_positions is not None:
-            # The bonus token's position is the position AFTER the last verified
-            # position. The first draft (step 0) is run AS the bonus token (its
-            # input_ids = bonus_token_id, its hidden_states = target_hidden), so
-            # step-0 positions = target_positions[last_idx_per_seq].
-            # (Per vllm/v1/spec_decode/llm_base_proposer.py line 502:
-            #  `positions = self.positions[token_indices_to_sample]`)
-            if target_positions.dim() == 2:
-                # M-RoPE case: positions shape [3, num_tokens]; take dim 0.
-                step0_positions = target_positions[0][token_indices_to_sample]
-            else:
-                step0_positions = target_positions[token_indices_to_sample]
-            ctx.buffers.positions_in[:batch_size].copy_(step0_positions.to(torch.int64))
-
-        # slot_mapping for step 0: the slot of the bonus token. The verify
-        # pass's common_attn_metadata.slot_mapping has shape [num_tokens] and
-        # tells us where each input token's K/V is written. The bonus token
-        # corresponds to the last input position of each sequence.
-        cm_slot_mapping = getattr(common_attn_metadata, "slot_mapping", None)
-        if cm_slot_mapping is not None and cm_slot_mapping.numel() > 0:
-            if cm_slot_mapping.shape[0] != batch_size:
-                step0_slot = cm_slot_mapping[token_indices_to_sample]
-            else:
-                step0_slot = cm_slot_mapping[:batch_size]
-            ctx.buffers.slot_mapping_in[:batch_size].copy_(step0_slot.to(torch.int64))
-
-        # seq_lens for step 0: same as the verify pass's seq_lens (the
-        # context length BEFORE the draft adds a new token).
-        cm_seq_lens = getattr(common_attn_metadata, "seq_lens", None)
-        if cm_seq_lens is not None and cm_seq_lens.numel() > 0:
-            ctx.buffers.seq_lens_in[:batch_size].copy_(
-                cm_seq_lens[:batch_size].to(torch.int32)
-            )
-
-        # MUSA-0090 step 5l.3: copy the current request's block_table into
-        # the runner-owned buffer. The captured graph reads from
-        # buffers.block_table_tensor (a stable pointer), not from the
-        # caller's transient tensor (which may be freed/repurposed between
-        # spec rounds, causing 'MUSA error: unknown error').
-        cm_block_table = getattr(common_attn_metadata, "block_table_tensor", None)
+        cm_block_table = getattr(cad, "block_table_tensor", None)
         if cm_block_table is not None and cm_block_table.numel() > 0:
-            # Slice to actual shape, pad with zeros if needed.
             src_bs = min(cm_block_table.shape[0], batch_size)
-            src_n_blocks = min(
+            src_nb = min(
                 cm_block_table.shape[1], ctx.buffers.block_table_tensor.shape[1]
             )
-            ctx.buffers.block_table_tensor[:src_bs, :src_n_blocks].copy_(
-                cm_block_table[:src_bs, :src_n_blocks]
+            ctx.buffers.block_table_tensor[:src_bs, :src_nb].copy_(
+                cm_block_table[:src_bs, :src_nb]
             )
 
-        # MUSA-0109 (2026-05-20) diagnostic: VLLM_MUSA_EAGLE_EAGER_REPLAY=1
-        # runs the N-step loop body EAGERLY instead of replaying the captured
-        # graph. This splits the acceptance-collapse bug definitively: if
-        # eager replay restores draft acceptance, the captured graph is at
-        # fault (e.g. a captured TP=8 all-reduce that does not reduce
-        # correctly across ranks at replay — consistent with a rank-by-rank
-        # GPU-util pattern); if eager replay is equally broken, the bug is in
-        # the runner's loop logic / buffer seeding, not the graph capture.
+        # eagle_step_update does seq_lens += 1 in place and writes the
+        # advanced positions / slot_mapping into the runner buffers.
+        eagle_step_update_slot_mapping_and_metadata(
+            positions_1d=carry_positions[:batch_size],
+            block_table_tensor=ctx.buffers.block_table_tensor,
+            seq_lens=chain_seq,
+            block_size=int(getattr(p, "block_size", 64) or 64),
+            max_model_len=int(getattr(p, "max_model_len", 196_608) or 196_608),
+            out_clamped_positions=ctx.buffers.positions_in[:batch_size],
+            out_slot_mapping=ctx.buffers.slot_mapping_in[:batch_size],
+            input_batch_size=batch_size,
+        )
+        ctx.buffers.seq_lens_in[:batch_size].copy_(chain_seq)
+
+        # ---- PHASE 3: seed the captured chain's step-0 input ----
+        ctx.buffers.bonus_token_ids_in[:batch_size].copy_(
+            draft0.to(ctx.buffers.bonus_token_ids_in.dtype)
+        )
+        ctx.buffers.target_hidden_states_in[:batch_size].copy_(carry_hidden)
+
+        # ---- PHASE 4: replay the captured chain (num_spec_tokens - 1 steps).
+        # VLLM_MUSA_EAGLE_EAGER_REPLAY=1 runs the chain eagerly (diagnostic —
+        # splits a captured-graph bug from a loop-logic bug). ----
         import os as _os_er
         if _os_er.environ.get("VLLM_MUSA_EAGLE_EAGER_REPLAY", "0") == "1":
             self._run_n_step_inner(
                 ctx.buffers, ctx.attn_metadata_array, batch_size
             )
         else:
-            # Single graph replay. All N draft forwards + sampling +
-            # slot-mapping updates happen inside this one call.
             ctx.graph.replay()
 
-        # MUSA-0090 layer-2 fix (2026-05-17): clone the output OUT of the
-        # CUDAGraph memory pool. vllm's _copy_draft_token_ids_to_cpu does the
-        # H2D copy on a dedicated `draft_token_ids_copy_stream` (not the default
-        # stream), and MUSA's MUDNN fails ("err 999 = unknown error") when
-        # copying from pool memory across streams. Cloning into a fresh
-        # allocation outside the pool fixes this. The clone is small
-        # (`[bs, num_steps]` int32 = ~12 bytes for bs=1) and runs on the
-        # default stream so subsequent cross-stream sync works.
-        out = ctx.buffers.draft_token_ids_out[:batch_size].clone()
+        # ---- PHASE 5: assemble [draft0] ++ chain -> [bs, num_spec_tokens].
+        # Clone out of the CUDAGraph pool (MUSA-0090 layer-2: a cross-stream
+        # copy from pool memory fails MUDNN err 999). ----
+        draft0_col = draft0.view(batch_size, 1)
+        if self.num_steps > 0:
+            chain = ctx.buffers.draft_token_ids_out[:batch_size]
+            out = torch.cat([draft0_col.to(chain.dtype), chain], dim=1).clone()
+        else:
+            out = draft0_col.clone()
         return EagleFullLoopReplayResult(
             draft_token_ids=out,
             batch_size=batch_size,
         )
+
+    def _eager_first_forward(
+        self,
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        token_indices_to_sample: torch.Tensor | None,
+        common_attn_metadata: Any,
+        num_rejected_tokens_gpu: torch.Tensor | None,
+        batch_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Any]:
+        """Run vLLM's Eagle `propose()` first-forward EAGERLY (not captured).
+
+        Mirrors `EagleProposer.propose()` lines 433-516 by calling the
+        proposer's own methods — the first forward is variable-length (the
+        verified sequence / prompt) so it cannot be a fixed CUDAGraph;
+        running it eagerly here is correct by construction. Returns
+        `(draft_token_0 [bs], carry_hidden [bs, h], carry_positions [bs],
+        cad)` — the seed for the captured chain.
+        """
+        from vllm.forward_context import set_forward_context
+
+        p = self.proposer
+        th = target_hidden_states
+        if p.method in ("eagle3", "dflash") and hasattr(
+            p.model, "combine_hidden_states"
+        ):
+            th = p.model.combine_hidden_states(th)
+
+        num_tokens, tidx, cad = p.set_inputs_first_pass(
+            target_token_ids=target_token_ids,
+            next_token_ids=next_token_ids,
+            target_positions=target_positions,
+            target_hidden_states=th,
+            token_indices_to_sample=token_indices_to_sample,
+            cad=common_attn_metadata,
+            num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+        )
+        _per_group, per_layer = p.build_per_group_and_layer_attn_metadata(cad)
+        cg_mode, num_input_tokens, dp = p._determine_batch_execution_and_padding(
+            num_tokens
+        )
+        model_kwargs, slot_sz = p.build_model_inputs_first_pass(
+            num_tokens, num_input_tokens, None
+        )
+        with set_forward_context(
+            per_layer,
+            p.vllm_config,
+            num_tokens=num_input_tokens,
+            num_tokens_across_dp=dp,
+            cudagraph_runtime_mode=cg_mode,
+            slot_mapping=p._get_slot_mapping(slot_sz, cad.slot_mapping),
+        ):
+            ret = p.model(**model_kwargs)
+        if isinstance(ret, tuple):
+            last_hidden, hidden = ret
+        else:
+            last_hidden, hidden = ret, ret
+
+        draft0 = (
+            p._greedy_sample(last_hidden[tidx]).to(torch.int32).view(batch_size)
+        )
+        carry_hidden = hidden[tidx]
+        if target_positions.dim() == 2:
+            carry_positions = target_positions[0][tidx]
+        else:
+            carry_positions = target_positions[tidx]
+        return draft0, carry_hidden, carry_positions.to(torch.int64), cad
 
     # ---- helpers (step 4: real implementations) ----
 

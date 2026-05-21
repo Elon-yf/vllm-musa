@@ -303,6 +303,19 @@ def _make_dispatched_propose(_original_propose):
                 if "common_attn_metadata" in kwargs
                 else args[5]
             )
+            # MUSA-0109 hybrid: the eager first forward needs the verified
+            # token ids (args[0]) and, for the padded-drafter seq-len
+            # adjustment, num_rejected_tokens_gpu (args[8], optional).
+            target_token_ids = (
+                kwargs.get("target_token_ids")
+                if "target_token_ids" in kwargs
+                else args[0]
+            )
+            num_rejected_tokens_gpu = (
+                kwargs.get("num_rejected_tokens_gpu")
+                if "num_rejected_tokens_gpu" in kwargs
+                else (args[8] if len(args) > 8 else None)
+            )
         except (IndexError, KeyError):
             _log.debug(
                 "MUSA-0090: propose() signature mismatch; fallback to original"
@@ -333,6 +346,8 @@ def _make_dispatched_propose(_original_propose):
                     batch_size=batch_size,
                     target_positions=target_positions,
                     token_indices_to_sample=token_indices_to_sample,
+                    target_token_ids=target_token_ids,
+                    num_rejected_tokens_gpu=num_rejected_tokens_gpu,
                 )
                 if _DIFF_CALLS < 25:
                     _DIFF_CALLS += 1
@@ -367,6 +382,8 @@ def _make_dispatched_propose(_original_propose):
                 batch_size=batch_size,
                 target_positions=target_positions,
                 token_indices_to_sample=token_indices_to_sample,
+                target_token_ids=target_token_ids,
+                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
             )
             return result.draft_token_ids
         except Exception as exc:
