@@ -1059,17 +1059,25 @@ class EagleFullLoopRunner:
             # metadata, slot_mapping, num_tokens) for the model call.
             # Critical: cudagraph_runtime_mode=NONE — we're capturing OUR
             # OWN graph; vLLM's PIECEWISE shouldn't re-fire.
-            # NOTE: do NOT pass slot_mapping=tensor here — vllm's forward_context
-            # internally does `slot_mapping or {}` which raises on multi-element
-            # Tensors (`Boolean value of Tensor with more than one value is
-            # ambiguous`). The slot_mapping_view is already carried by
-            # attn_metadata_array[step].slot_mapping; the kwarg is the per-attn-group
-            # dict that vllm uses for cross-group dispatch, NOT the single tensor.
+            #
+            # MUSA-0109 (2026-05-21) FIX: `slot_mapping` MUST be passed — and
+            # it must be the per-LAYER DICT, not a raw tensor. vLLM's KV-cache
+            # write (`get_attention_context` -> `do_kv_cache_update`,
+            # attention.py:703) reads the write slots from
+            # `forward_context.slot_mapping[layer_name]` and SKIPS the write
+            # entirely when that is None. Without this kwarg the chain's draft
+            # model never writes its KV, so chain step s+1 reads stale KV for
+            # step s's position -> draft acceptance collapses after position 0.
+            # `proposer._get_slot_mapping(n, tensor)` builds the dict (and
+            # copies the tensor into the proposer's stable `_slot_mapping_
+            # buffer`, which the captured graph then reads — capture-safe).
+            sm_dict = proposer._get_slot_mapping(batch_size, slot_mapping_view)
             with set_forward_context(
                 attn_metadata_array[step],
                 proposer.vllm_config,
                 num_tokens=batch_size,
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                slot_mapping=sm_dict,
             ):
                 ret_hidden_states = proposer.model(**model_kwargs)
                 if isinstance(ret_hidden_states, tuple):
