@@ -701,11 +701,13 @@ class EagleFullLoopRunner:
         else:
             ctx.graph.replay()
 
-        # MUSA-0109 (2026-05-21) CHAINDBG: with EAGER_REPLAY the chain ran
-        # eagerly so the per-step buffers are populated and safe to read
-        # (GPU->CPU sync is fine here — replay() is plain Python). Dumps the
-        # full chain trajectory to pinpoint the positions 1..N-1 failure.
-        if _os_er.environ.get("VLLM_MUSA_EAGLE_EAGER_REPLAY", "0") == "1":
+        # MUSA-0109 (2026-05-21) CHAINDBG: dumps the full chain trajectory.
+        # Fires after PHASE 4 in EITHER mode (graph or eager) — the per-step
+        # buffers are populated by both, and the GPU->CPU sync here is safe
+        # (replay() is plain Python, never captured). Comparing the graph
+        # dump vs the eager dump pinpoints whether the captured graph
+        # diverges in bookkeeping (positions/slots) or the model forward.
+        if _os_er.environ.get("VLLM_MUSA_EAGLE_CHAINDBG", "0") == "1":
             _c = getattr(self, "_replay_dbg_count", 0)
             if _c < 12:
                 self._replay_dbg_count = _c + 1
