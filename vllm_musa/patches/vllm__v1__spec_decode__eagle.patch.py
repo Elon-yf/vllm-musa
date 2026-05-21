@@ -382,10 +382,21 @@ def _make_dispatched_propose(_original_propose):
                 return _original_propose(self, *args, **kwargs)
 
         try:
+            # MUSA-0109 (2026-05-21) test: VLLM_MUSA_EAGLE_COPY_CAD=1 passes a
+            # deep copy of common_attn_metadata to replay(), so the runner's
+            # _eager_first_forward -> set_inputs_first_pass mutations cannot
+            # touch the real metadata (whose tensors may alias gpu_model_runner
+            # persistent buffers the verify pass depends on). The clean DIFF
+            # had this property; this isolates whether it — not co-running
+            # _original_propose — is what makes replay() correct.
+            _cad = common_attn_metadata
+            if os.environ.get("VLLM_MUSA_EAGLE_COPY_CAD", "0") == "1":
+                import copy as _copy_cad
+                _cad = _copy_cad.deepcopy(common_attn_metadata)
             result = runner.replay(
                 target_hidden_states=target_hidden_states,
                 next_token_ids=next_token_ids,
-                common_attn_metadata=common_attn_metadata,
+                common_attn_metadata=_cad,
                 batch_size=batch_size,
                 target_positions=target_positions,
                 token_indices_to_sample=token_indices_to_sample,
