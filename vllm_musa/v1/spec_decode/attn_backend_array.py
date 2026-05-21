@@ -294,6 +294,29 @@ def build_per_step_attn_metadata_array(
                 "with step-specific slot_mapping/seq_lens/max_seq_len views."
             ) from exc
 
+        # MUSA-0109 (2026-05-21): the FA backend bakes a FA3 tile-scheduler
+        # plan (`scheduler_metadata`, from get_scheduler_metadata) computed
+        # from the capture-time seq_lens. The captured chain reads it every
+        # replay, but it is NEVER refreshed — so at replay it is a stale
+        # plan for the wrong context length, which corrupts the chain's
+        # attention output (the eager first forward is unaffected: it
+        # rebuilds metadata fresh each call). Force the captured chain onto
+        # the non-AOT-scheduled path: scheduler_metadata=None +
+        # max_num_splits=1 -> a plain fixed-split decode that is both
+        # CUDAGraph-capturable AND correct for any seq_lens (the per-request
+        # `seq_lens`/`seqused_k` tensor still masks the KV correctly).
+        for _m in per_layer.values():
+            if hasattr(_m, "scheduler_metadata"):
+                try:
+                    _m.scheduler_metadata = None
+                except Exception:
+                    pass
+            if hasattr(_m, "max_num_splits"):
+                try:
+                    _m.max_num_splits = 1
+                except Exception:
+                    pass
+
         # per_layer is the dict {layer_name: attn_metadata} that
         # set_forward_context expects. Store the dict as the step's metadata
         # entry — _run_n_step_inner passes attn_metadata_array[step] into
