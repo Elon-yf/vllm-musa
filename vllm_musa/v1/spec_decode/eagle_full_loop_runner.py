@@ -152,15 +152,18 @@ class EagleFullLoopRunner:
             _os_fp.environ.get("VLLM_MUSA_EAGLE_FWDPROBE", "0") == "1"
         )
         self._fwdprobe_count: int = 0
+        self._fwdprobe_step: int = 0
+        self._fwdprobe_active: bool = False
+        self._fwdprobe_hooks_installed: bool = False
+        self._dbg: dict[str, torch.Tensor] = {}
         if self._fwdprobe and self.num_steps > 0:
-            self._dbg_last_hidden = torch.zeros(
-                self.num_steps, self.max_bs, hidden_size,
-                dtype=torch.bfloat16, device=device,
-            )
-            self._dbg_next_hidden = torch.zeros(
-                self.num_steps, self.max_bs, hidden_size,
-                dtype=torch.bfloat16, device=device,
-            )
+            # last/next = model() return; embed/attn/mlp = submodule
+            # forward-hook outputs (filled by _install_fwdprobe_hooks).
+            for _k in ("embed", "attn", "mlp", "last", "next"):
+                self._dbg[_k] = torch.zeros(
+                    self.num_steps, self.max_bs, hidden_size,
+                    dtype=torch.bfloat16, device=device,
+                )
 
         logger.info(
             "MUSA-0090/0109 EagleFullLoopRunner: configured for "
@@ -238,6 +241,11 @@ class EagleFullLoopRunner:
                 "draft model is exposed as `proposer.model`, NOT "
                 "`proposer.draft_model`)."
             )
+
+        # MUSA-0109 FWDPROBE: install submodule hooks BEFORE warmup/capture so
+        # the captured graph includes the per-submodule snapshot copies.
+        if self._fwdprobe:
+            self._install_fwdprobe_hooks()
 
         # MUSA-0109 spike: use the platform's GLOBAL graph pool (lazily
         # created, shared across target + draft + spec captures). This
@@ -730,18 +738,14 @@ class EagleFullLoopRunner:
             # outputs. The eager pass also fills draft_token_ids_out last,
             # so the probe run still serves correct tokens.
             ctx.graph.replay()
-            g_last = self._dbg_last_hidden.clone()
-            g_next = self._dbg_next_hidden.clone()
+            g = {k: v.clone() for k, v in self._dbg.items()}
             g_out = ctx.buffers.draft_token_ids_out[:batch_size].clone()
             self._run_n_step_inner(
                 ctx.buffers, ctx.attn_metadata_array, batch_size
             )
-            e_last = self._dbg_last_hidden.clone()
-            e_next = self._dbg_next_hidden.clone()
+            e = {k: v.clone() for k, v in self._dbg.items()}
             e_out = ctx.buffers.draft_token_ids_out[:batch_size].clone()
-            self._fwdprobe_log(
-                g_last, g_next, g_out, e_last, e_next, e_out, batch_size
-            )
+            self._fwdprobe_log(g, e, g_out, e_out)
         else:
             ctx.graph.replay()
 
@@ -824,43 +828,85 @@ class EagleFullLoopRunner:
 
     def _fwdprobe_log(
         self,
-        g_last: torch.Tensor,
-        g_next: torch.Tensor,
+        g: dict[str, torch.Tensor],
+        e: dict[str, torch.Tensor],
         g_out: torch.Tensor,
-        e_last: torch.Tensor,
-        e_next: torch.Tensor,
         e_out: torch.Tensor,
-        batch_size: int,
     ) -> None:
-        """Log a per-step graph-vs-eager comparison of the draft model's raw
-        outputs (MUSA-0109 bug-A localisation). `cos≈1` on `last_hidden`
-        means the captured forward is correct and bug A is downstream
-        (sampling/d2t); `cos≪1` means the captured forward itself diverges
-        under graph replay."""
+        """Log a per-step, per-submodule graph-vs-eager comparison (MUSA-0109
+        bug-A localisation). For each probe point (embed/attn/mlp/last/next)
+        logs cosine similarity + norms. The FIRST probe point whose cosine
+        drops is the op that does not replay correctly under capture."""
         c = self._fwdprobe_count
         if c >= 6:
             return
         self._fwdprobe_count = c + 1
         import torch.nn.functional as _F
+
+        def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
+            return float(
+                _F.cosine_similarity(
+                    a.float().reshape(-1), b.float().reshape(-1), dim=0
+                )
+            )
+
         for s in range(self.num_steps):
-            gl = g_last[s, 0].float()
-            el = e_last[s, 0].float()
-            gn = g_next[s, 0].float()
-            en = e_next[s, 0].float()
-            cos_l = float(_F.cosine_similarity(gl, el, dim=0))
-            cos_n = float(_F.cosine_similarity(gn, en, dim=0))
+            parts = []
+            for k in ("embed", "attn", "mlp", "last", "next"):
+                gk = g[k][s, 0]
+                ek = e[k][s, 0]
+                parts.append(
+                    "%s[cos=%.4f gN=%.1f eN=%.1f]"
+                    % (k, _cos(gk, ek), float(gk.float().norm()),
+                       float(ek.float().norm()))
+                )
             logger.info(
-                "MUSA-0109-FWDPROBE#%d step%d | last_hidden g_norm=%.2f "
-                "e_norm=%.2f cos=%.4f | next_hidden g_norm=%.2f e_norm=%.2f "
-                "cos=%.4f",
-                c, s,
-                float(gl.norm()), float(el.norm()), cos_l,
-                float(gn.norm()), float(en.norm()), cos_n,
+                "MUSA-0109-FWDPROBE#%d step%d | %s", c, s, " ".join(parts)
             )
         logger.info(
             "MUSA-0109-FWDPROBE#%d g_out=%s e_out=%s",
             c, g_out.reshape(-1).tolist(), e_out.reshape(-1).tolist(),
         )
+
+    def _install_fwdprobe_hooks(self) -> None:
+        """Register forward hooks on the draft model's embed/attn/mlp so the
+        captured graph snapshots each submodule's per-step output (MUSA-0109
+        bug-A localisation). Hooks are inert unless `self._fwdprobe_active`
+        (set only around the chain's `_run_n_step_inner`, NOT the eager
+        first forward). The snapshot `.copy_()` is capture-safe."""
+        if self._fwdprobe_hooks_installed:
+            return
+        self._fwdprobe_hooks_installed = True
+        model = self.proposer.model
+
+        def _make_hook(label: str):
+            buf = self._dbg[label]
+
+            def _hook(_m: Any, _inp: Any, out: Any) -> None:
+                if not self._fwdprobe_active:
+                    return
+                t = out[0] if isinstance(out, tuple) else out
+                if not isinstance(t, torch.Tensor) or t.dim() < 2:
+                    return
+                if t.shape[-1] != buf.shape[-1]:
+                    return
+                n = min(t.shape[0], buf.shape[1])
+                buf[self._fwdprobe_step, :n].copy_(t[:n].detach())
+
+            return _hook
+
+        hooked = []
+        for name, mod in model.named_modules():
+            if name.endswith("embed_tokens"):
+                mod.register_forward_hook(_make_hook("embed"))
+                hooked.append((name, "embed"))
+            elif name.endswith("layers.0.self_attn"):
+                mod.register_forward_hook(_make_hook("attn"))
+                hooked.append((name, "attn"))
+            elif name.endswith("layers.0.mlp"):
+                mod.register_forward_hook(_make_hook("mlp"))
+                hooked.append((name, "mlp"))
+        logger.info("MUSA-0109 FWDPROBE submodule hooks installed: %s", hooked)
 
     def _eager_first_forward(
         self,
@@ -1087,6 +1133,8 @@ class EagleFullLoopRunner:
         from vllm.v1.spec_decode.utils import eagle_step_update_slot_mapping_and_metadata
 
         proposer = self.proposer
+        if getattr(self, "_fwdprobe", False):
+            self._fwdprobe_active = True
         # Step-0 seed: copy the input carry-over into the per-step buffers.
         # bonus_token_ids_in is the bonus token from the previous verify pass
         # (the target's accepted last token); it's the input to the first
@@ -1118,6 +1166,8 @@ class EagleFullLoopRunner:
         # captured. The Python for-loop unrolls at trace time — N is a static
         # int, not a tensor.
         for step in range(self.num_steps):
+            if getattr(self, "_fwdprobe", False):
+                self._fwdprobe_step = step
             # Views into this step's slice of the buffers. .narrow-style
             # indexing on a contiguous tensor returns a view; the captured
             # graph captures the kernel launches that consume these views.
@@ -1184,10 +1234,10 @@ class EagleFullLoopRunner:
             # MUSA-0109 FWDPROBE: snapshot the draft model's raw outputs
             # (capture-safe in-place copies into persistent debug buffers).
             if getattr(self, "_fwdprobe", False):
-                self._dbg_last_hidden[step, :batch_size].copy_(
+                self._dbg["last"][step, :batch_size].copy_(
                     last_hidden_states[:batch_size]
                 )
-                self._dbg_next_hidden[step, :batch_size].copy_(
+                self._dbg["next"][step, :batch_size].copy_(
                     next_hidden[:batch_size]
                 )
 
