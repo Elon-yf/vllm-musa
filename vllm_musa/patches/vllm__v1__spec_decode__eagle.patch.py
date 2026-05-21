@@ -203,6 +203,42 @@ def _synthesize_base_metadata(proposer, batch_size: int = 1):
     )
 
 
+def _draft_attn_kv_cache_blocks(proposer) -> int:
+    """Largest `num_blocks` across the draft model's attention kv_cache
+    tensors (0 if none bound yet).
+
+    MUSA-0109 bug A: a captured CUDAGraph bakes the kv_cache DEVICE POINTER
+    into the draft attention kernel. At boot, vLLM's capture phase runs the
+    draft against a small dummy kv_cache (~8 blocks); the real per-engine
+    cache (tens of thousands of blocks) is a DIFFERENT tensor. Capturing
+    against the dummy makes the replayed draft attention read stale memory
+    -> garbage attention output (cos~=0 vs eager). Boot capture must be
+    deferred until this returns a real (large) block count.
+    """
+    import torch
+
+    model = getattr(proposer, "model", None)
+    if model is None:
+        return 0
+    best = 0
+    for _name, mod in model.named_modules():
+        kvc = getattr(mod, "kv_cache", None)
+        if kvc is None:
+            continue
+        if isinstance(kvc, (list, tuple)):
+            tensors = [t for t in kvc if isinstance(t, torch.Tensor)]
+        elif isinstance(kvc, torch.Tensor):
+            tensors = [kvc]
+        else:
+            tensors = []
+        for t in tensors:
+            if t.dim() >= 3:
+                best = max(best, int(t.shape[1]))
+            elif t.numel() > 0:
+                best = max(best, int(t.numel()))
+    return best
+
+
 def _boot_capture_runner(proposer) -> None:
     """Build + capture the EagleFullLoopRunner at boot.
 
@@ -239,6 +275,21 @@ def _make_boot_capture_dummy_run(_original_dummy_run):
             return result
         if getattr(self, "_musa_full_loop_runner", None) is not None:
             return result  # already captured
+
+        # MUSA-0109 bug A: the captured draft attention bakes the kv_cache
+        # device pointer. Defer capture until the REAL kv_cache is bound —
+        # capturing against the boot dummy (~8 blocks) makes the replayed
+        # draft attention read stale memory. Probe each is_graph_capturing
+        # dummy_run; capture on the first one where the cache looks real.
+        blocks = _draft_attn_kv_cache_blocks(self)
+        n = getattr(self, "_musa_boot_capture_probe_n", 0) + 1
+        self._musa_boot_capture_probe_n = n
+        _log.info(
+            "MUSA-0109 boot-capture probe #%d: draft attn kv_cache "
+            "num_blocks=%d (need >=64 for the real cache)", n, blocks,
+        )
+        if blocks < 64:
+            return result  # still the boot dummy cache — wait
         if getattr(self, "_musa_boot_capture_attempted", False):
             return result  # one-shot — do not retry
         self._musa_boot_capture_attempted = True
