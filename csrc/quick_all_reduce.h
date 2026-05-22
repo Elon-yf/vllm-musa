@@ -214,8 +214,13 @@ struct DeviceComms {
     // MUSA-0116: only the full-precision CodecFP path is enabled on MUSA.
     // The Int4/6/8 quant codecs pull in group_abs_max warp shuffles + extra
     // surface not needed for the M2.5 all-reduce; keep the build minimal.
-    (void)quant_level;
-    TWOSHOT_DISPATCH(CodecFP)
+    // MUSA-0091: dispatch the quantized codec on quant_level. INT4 moves
+    // less cross-rank data; CodecFP is the lossless fallback.
+    if (quant_level == INT4) {
+      TWOSHOT_DISPATCH(CodecQ4)
+    } else {
+      TWOSHOT_DISPATCH(CodecFP)
+    }
     MUSA_CHECK(cudaGetLastError());
     // Rotate the flag color.
     flag_color += divceil(N, grid);

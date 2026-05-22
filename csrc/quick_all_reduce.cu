@@ -120,6 +120,12 @@ int64_t qr_max_size() {
 // instantiation is dropped - mcc cannot compile its musa_bf16.h asm.
 INSTANTIATE_FOR_WORLDSIZE(half, quickreduce::CodecFP, false)
 INSTANTIATE_FOR_WORLDSIZE(half, quickreduce::CodecFP, true)
+// MUSA-0091: enable the INT4 quantized codec (half path; bf16 routed via the
+// cast_bf2half=true path, same as CodecFP). The quant codecs are what give
+// QAR its data-movement advantage. bf16-native instantiations stay disabled
+// (mcc bf16 asm); CodecQ4's bf16 branch is if-constexpr'd out for T=half.
+INSTANTIATE_FOR_WORLDSIZE(half, quickreduce::CodecQ4, false)
+INSTANTIATE_FOR_WORLDSIZE(half, quickreduce::CodecQ4, true)
 // INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ4, false)
 // INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ6, false)
 // INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ8, false)
