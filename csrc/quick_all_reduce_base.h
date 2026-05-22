@@ -118,6 +118,16 @@ __quickreduce_device_inline__ static int32x4_t buffer_load_dwordx4(
     BufferResource const& buf, int32_t voffset, int32_t soffset = 0, int32_t aux = 0) {
   (void)soffset;
   (void)aux;
+  // MUSA-0116: AMD's raw.buffer.load hardware-bounds-checks against the
+  // descriptor range (OOB lanes read 0). The MUSA port replaced it with a
+  // plain pointer load, which reads out of bounds on the partial last tile
+  // when the message is not a kTileSize multiple (e.g. BS=1 decode, <16 KiB)
+  // -> a rank faults and its peers hang on its sync flag. Restore the bounds
+  // check: a voffset past the range reads as zero.
+  if (static_cast<uint32_t>(voffset) >= buf.range) {
+    int32x4_t zero = {};
+    return zero;
+  }
   const char* base = reinterpret_cast<const char*>(buf.address);
   return *reinterpret_cast<const int32x4_t*>(base + voffset);
 }
@@ -126,6 +136,11 @@ __quickreduce_device_inline__ static void buffer_store_dwordx4(
     int32x4_t data, BufferResource const& buf, int32_t voffset, int32_t soffset = 0, int32_t aux = 0) {
   (void)soffset;
   (void)aux;
+  // MUSA-0116: bounds-check like AMD's raw.buffer.store — drop OOB lanes so
+  // the partial last tile does not write past the output tensor.
+  if (static_cast<uint32_t>(voffset) >= buf.range) {
+    return;
+  }
   char* base = reinterpret_cast<char*>(buf.address);
   *reinterpret_cast<int32x4_t*>(base + voffset) = data;
 }
