@@ -20,6 +20,7 @@
 
 #include "quick_all_reduce.h"
 #include "core/registration.h"
+#include "torch_musa/csrc/aten/musa/MUSAContext.h"
 
 quickreduce::fptr_t init_custom_qr(int64_t rank, int64_t world_size, std::optional<int64_t> qr_max_size) {
   if (world_size > 8) throw std::invalid_argument("world size > 8 is not supported");
@@ -144,8 +145,8 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _quick_ar), quick_ar) {
   quick_ar.def("open_handles(int fa, Tensor[] handles) -> ()", &qr_open_handles);
   quick_ar.def(
       "all_reduce(int fa, Tensor inp, Tensor! out, int quant_level, "
-      "bool cast_bf2half) -> ()",
-      &qr_all_reduce);
+      "bool cast_bf2half) -> ()");
+  quick_ar.impl("all_reduce", torch::kMUSA, &qr_all_reduce);
   quick_ar.def("max_size() -> int", &qr_max_size);
 }
 
