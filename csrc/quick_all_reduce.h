@@ -61,15 +61,15 @@ __global__ __quickreduce_launch_bounds_two_shot__ static void allreduce_prototyp
   if (world_size == 2) {                                                  \
     using LineCodec = __codec<T, 2>;                                      \
     using AllReduceKernel = AllReduceTwoshot<T, LineCodec, cast_bf2half>; \
-    allreduce_prototype_twoshot<AllReduceKernel, T><<<dim3(grid), dim3(kBlockTwoShot), 0, stream>>>(A, B, N, num_blocks, rank, dbuffer_list, data_offset, flag_color, this->kMaxProblemSize);                                           \
+    allreduce_prototype_twoshot<AllReduceKernel, T><<<dim3(grid), dim3(kBlockTwoShot), 0, stream>>>(A, B, N, num_blocks, rank, dbuffer_list, data_offset, flag_color, data_size_per_phase);                                           \
   } else if (world_size == 4) {                                           \
     using LineCodec = __codec<T, 4>;                                      \
     using AllReduceKernel = AllReduceTwoshot<T, LineCodec, cast_bf2half>; \
-    allreduce_prototype_twoshot<AllReduceKernel, T><<<dim3(grid), dim3(kBlockTwoShot), 0, stream>>>(A, B, N, num_blocks, rank, dbuffer_list, data_offset, flag_color, this->kMaxProblemSize);                                           \
+    allreduce_prototype_twoshot<AllReduceKernel, T><<<dim3(grid), dim3(kBlockTwoShot), 0, stream>>>(A, B, N, num_blocks, rank, dbuffer_list, data_offset, flag_color, data_size_per_phase);                                           \
   } else if (world_size == 8) {                                           \
     using LineCodec = __codec<T, 8>;                                      \
     using AllReduceKernel = AllReduceTwoshot<T, LineCodec, cast_bf2half>; \
-    allreduce_prototype_twoshot<AllReduceKernel, T><<<dim3(grid), dim3(kBlockTwoShot), 0, stream>>>(A, B, N, num_blocks, rank, dbuffer_list, data_offset, flag_color, this->kMaxProblemSize);                                           \
+    allreduce_prototype_twoshot<AllReduceKernel, T><<<dim3(grid), dim3(kBlockTwoShot), 0, stream>>>(A, B, N, num_blocks, rank, dbuffer_list, data_offset, flag_color, data_size_per_phase);                                           \
   }
 
 enum QuickReduceQuantLevel {
@@ -205,6 +205,13 @@ struct DeviceComms {
     uint32_t msg_size = N * sizeof(T);
     uint32_t num_blocks = divceil(msg_size, kTileSize);
     uint32_t grid = min(kMaxNumBlocks, num_blocks);
+    // MUSA-0116: place Phase-2 data immediately after Phase-1, with
+    // stride = the actual aligned message size (num_blocks*kTileSize),
+    // NOT +kMaxProblemSize (2 GiB). A cross-rank IPC store at a ~2 GiB
+    // offset faults on S5000 (IMA localized to Phase-2A). The 2 GiB
+    // stride was only a worst-case buffer-layout constant, never the
+    // per-call data size; the comm buffer stays large enough either way.
+    int64_t data_size_per_phase = static_cast<int64_t>(num_blocks) * kTileSize;
     // MUSA-0116: only the full-precision CodecFP path is enabled on MUSA.
     // The Int4/6/8 quant codecs pull in group_abs_max warp shuffles + extra
     // surface not needed for the M2.5 all-reduce; keep the build minimal.
