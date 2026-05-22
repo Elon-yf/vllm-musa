@@ -109,6 +109,11 @@ class QuickAllReduce:
             # would shift the indices and mis-map ranks — see PR #40
             # review comment.
             torch.ops._C_quick_ar.open_handles(self.fptr, all_handles)
+            logger.info(
+                "MUSA-0116: QuickAllReduce ACTIVE - rank=%d world_size=%d.",
+                rank,
+                world_size,
+            )
         except Exception as exc:
             logger.warning(
                 "MUSA-0088: QuickAllReduce IPC handle exchange failed "
@@ -157,6 +162,10 @@ class QuickAllReduce:
             return None
         if output is None:
             output = torch.empty_like(input_)
+        logger.info_once(
+            "MUSA-0116: QuickAllReduce serving all-reduce (dtype=%s).",
+            input_.dtype,
+        )
         torch.ops._C_quick_ar.all_reduce(
             self.fptr, input_, output, quant_level, cast_bf2half
         )
