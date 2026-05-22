@@ -346,7 +346,14 @@ __quickreduce_device_inline__ int packed_rcp(int a);
 
 template <>
 __quickreduce_device_inline__ int packed_rcp<half>(int a) {
-  return __builtin_bit_cast(int, h2rcp(__builtin_bit_cast(half2, a)));
+  // MUSA-0091: h2rcp(__half2) is declared but unimplemented on MUSA (lld
+  // undefined symbol). Compute the packed reciprocal in float instead --
+  // mcc-safe (uses the same __half22float2 / __float22half2_rn as CodecFP)
+  // and more accurate than the fp16 h2rcp approximation.
+  float2 f = __half22float2(__builtin_bit_cast(half2, a));
+  f.x = 1.0f / f.x;
+  f.y = 1.0f / f.y;
+  return __builtin_bit_cast(int, __float22half2_rn(f));
 }
 
 template <>
