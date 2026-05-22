@@ -578,13 +578,17 @@ struct AllReduceTwoshot {
       int32x4_t* recv_buffer = reinterpret_cast<int32x4_t*>(rank_buffer + comm_data0_offset);
       uint32_t* flag_ptr = reinterpret_cast<uint32_t*>(rank_buffer + comm_flags0_offset);
 
-      for (int r = 0; r < kWorldSize; r++) {
-        // Wait for the flags to be set.
-        if (thread == 0) {
-          wait_sync_flag(&flag_ptr[r], flag_color);
-        }
-        __syncthreads();
+      // MUSA-0116 perf: wait on all peer flags in PARALLEL (thread t waits
+      // flag t), not thread 0 serially over kWorldSize -- removes 7/8 of the
+      // serial atomic round-trip latency. custom_all_reduce's barrier is
+      // parallel. All flags set before any recv => every recv reads valid
+      // data (equivalent to the per-r wait, just hoisted + parallelized).
+      if (thread < kWorldSize) {
+        wait_sync_flag(&flag_ptr[thread], flag_color);
+      }
+      __syncthreads();
 
+      for (int r = 0; r < kWorldSize; r++) {
         // note: we reuse tA as temp buffer here
         codec.recv(&recv_buffer, tA);
 
@@ -614,13 +618,13 @@ struct AllReduceTwoshot {
       int32x4_t* recv_buffer = reinterpret_cast<int32x4_t*>(rank_buffer + comm_data1_offset);
       uint32_t* flag_ptr = reinterpret_cast<uint32_t*>(rank_buffer + comm_flags1_offset);
 
-      for (int r = 0; r < kWorldSize; r++) {
-        // Wait for the flags to be set.
-        if (thread == 0) {
-          wait_sync_flag(&flag_ptr[r], flag_color);
-        }
-        __syncthreads();
+      // MUSA-0116 perf: parallel wait on all peer flags (see Phase-1B).
+      if (thread < kWorldSize) {
+        wait_sync_flag(&flag_ptr[thread], flag_color);
+      }
+      __syncthreads();
 
+      for (int r = 0; r < kWorldSize; r++) {
         // Gather all reduced and final rank segments into tA.
         codec.recv(&recv_buffer, &tA[r * Codec::kRankAtoms]);
       }
