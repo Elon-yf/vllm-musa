@@ -48,6 +48,26 @@ except (AttributeError, RuntimeError) as exc:
     _QUICK_AR_AVAILABLE = False
 
 
+# torch.compile / Dynamo traces the model with fake tensors. The
+# _C_quick_ar.all_reduce op is an in-place collective (mutates `out`,
+# returns ()); without a fake impl Dynamo runs the real C++, which calls
+# .numel() - invalid on symbolic-shape fake tensors. Register a no-op
+# fake impl so shape-prop skips the real kernel.
+if _QUICK_AR_AVAILABLE:
+    try:
+
+        @torch.library.register_fake("_C_quick_ar::all_reduce")
+        def _qr_all_reduce_fake(fa, inp, out, quant_level, cast_bf2half):
+            return None
+
+    except Exception as exc:
+        logger.warning(
+            "MUSA-0116: register_fake for _C_quick_ar.all_reduce failed "
+            "(%s); QuickAllReduce may not be torch.compile-safe.",
+            exc,
+        )
+
+
 class QuickAllReduce:
     """One-shot two-shot P2P all-reduce wrapper for MUSA TP>2.
 
