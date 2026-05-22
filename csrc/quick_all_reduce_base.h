@@ -407,14 +407,21 @@ __quickreduce_device_inline__ int group_abs_max(int32x4_t atom) {
 // cross_device_reduce barriers) -- routes every barrier flag through atomic
 // RMW ops, which ARE coherent at the LLC home. Match that golden path:
 // atomicExch is the cross-rank flag store, atomicAdd(ptr,0) the coherent load.
+// MUSA-0116 perf: __threadfence_system_noflush (not __threadfence_system).
+// The data path is __builtin_nontemporal (cache-bypassing) stores/loads, so
+// there is nothing cached to flush -- the full L1+L2 CFI flush-invalidate of
+// __threadfence_system only serialized phases and destroyed memory pipelining
+// (~32 flushes/all-reduce, cost growing with resident data). The noflush
+// fence still drains the NT stores to the coherence point and orders them
+// around the flag. custom_all_reduce uses the same noflush fence.
 __quickreduce_device_inline__ void set_sync_flag(uint32_t* flag_ptr, uint32_t flag) {
-  __threadfence_system();       // prior segment-data writes -> globally visible
-  atomicExch(flag_ptr, flag);   // cross-rank flag store (custom_all_reduce idiom)
+  __threadfence_system_noflush();  // drain+order segment-data NT stores
+  atomicExch(flag_ptr, flag);      // cross-rank flag store (LLC-coherent)
 }
 
 __quickreduce_device_inline__ void wait_sync_flag(uint32_t* flag_ptr, uint32_t flag) {
   while (atomicAdd(flag_ptr, 0u) != flag) {}  // LLC-coherent spin-load
-  __threadfence_system();       // peer segment-data reads after the flag are fresh
+  __threadfence_system_noflush();  // order peer-data NT reads after the flag
 }
 
 }  // namespace quickreduce
