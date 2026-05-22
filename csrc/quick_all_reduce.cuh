@@ -10,11 +10,6 @@
 
 namespace quickreduce {
 
-// MUSA-0116 DEBUG (env QR_DBG_STOP): phase-stop for IMA localization.
-// Defined in quick_all_reduce.cu, set per-call via musaMemcpyToSymbol.
-// 99 (default) = full run, inert. 1/2/3/4 = early-return after phase N.
-extern __device__ int qr_dbg_stop;
-
 struct CodecBase {
   const int thread;
   const int rank;
@@ -575,7 +570,6 @@ struct AllReduceTwoshot {
       uint32_t* flag_ptr = reinterpret_cast<uint32_t*>(buffer_list[r] + comm_flags0_offset + rank * sizeof(uint32_t));
       set_sync_flag(flag_ptr, flag_color);
     }
-    if (qr_dbg_stop <= 1) return;  // MUSA-0116 DEBUG: stop after Phase-1A
     // --------------------------------------------------------
     // Phase-1B: Reduce the segment data from the communication buffers.
     int32x4_t tR[Codec::kRankAtoms] = {};
@@ -599,7 +593,6 @@ struct AllReduceTwoshot {
         }
       }
     }
-    if (qr_dbg_stop <= 2) return;  // MUSA-0116 DEBUG: stop after Phase-1B
 
     // Phase-2: Write the reduced segment to every other rank
     for (int r = 0; r < kWorldSize; r++) {
@@ -614,7 +607,6 @@ struct AllReduceTwoshot {
       uint32_t* flag_ptr = reinterpret_cast<uint32_t*>(buffer_list[r] + comm_flags1_offset + rank * sizeof(uint32_t));
       set_sync_flag(flag_ptr, flag_color);
     }
-    if (qr_dbg_stop <= 3) return;  // MUSA-0116 DEBUG: stop after Phase-2A
 
     // Phase-2: Read the gather segments from the rank's communication buffer.
     {
@@ -633,7 +625,6 @@ struct AllReduceTwoshot {
         codec.recv(&recv_buffer, &tA[r * Codec::kRankAtoms]);
       }
     }
-    if (qr_dbg_stop <= 4) return;  // MUSA-0116 DEBUG: stop after Phase-2B
 
     // --------------------------------------------------------
     // Write the result to output.
