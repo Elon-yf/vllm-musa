@@ -384,23 +384,22 @@ __quickreduce_device_inline__ int group_abs_max(int32x4_t atom) {
 }
 
 // MUSA-0116: cross-rank sync over IPC peer memory. On PH1/S5000 a plain
-// __atomic load/store is served from L1, so a spinning rank never observes
-// a peer's flag write -> deadlock. Per the PH1 memory model (sphere-kb
-// 224266333-196756093-atomic-order-c11), __threadfence_system lowers to a
-// CFI flush-invalidate of L1+L2 to LLC at system scope -- the only way to
-// get cross-GPU flag visibility on this P2P fabric.
+// load/store (incl. __atomic_*_n RELAXED) is held in L1, so a spinning rank
+// never observes a peer's flag write -> deadlock. __threadfence_system was
+// tried and did NOT clear it: PH1 does not honor a system-scope fence for
+// the P2P fabric. custom_all_reduce.cuh -- the proven-working all-reduce on
+// this exact 8x S5000 fabric (multi_gpu_barrier_with_atomic / the
+// cross_device_reduce barriers) -- routes every barrier flag through atomic
+// RMW ops, which ARE coherent at the LLC home. Match that golden path:
+// atomicExch is the cross-rank flag store, atomicAdd(ptr,0) the coherent load.
 __quickreduce_device_inline__ void set_sync_flag(uint32_t* flag_ptr, uint32_t flag) {
-  __threadfence_system();  // prior segment-data writes -> globally visible
-  __atomic_store_n(flag_ptr, flag, __ATOMIC_RELAXED);
-  __threadfence_system();  // push the flag write across the P2P fabric
+  __threadfence_system();       // prior segment-data writes -> globally visible
+  atomicExch(flag_ptr, flag);   // cross-rank flag store (custom_all_reduce idiom)
 }
 
 __quickreduce_device_inline__ void wait_sync_flag(uint32_t* flag_ptr, uint32_t flag) {
-  while (true) {
-    __threadfence_system();  // FLUSHINV L1/L2 -> next load reads fresh from LLC
-    if (__atomic_load_n(flag_ptr, __ATOMIC_RELAXED) == flag) break;
-  }
-  __threadfence_system();    // subsequent peer-data reads must be fresh
+  while (atomicAdd(flag_ptr, 0u) != flag) {}  // LLC-coherent spin-load
+  __threadfence_system();       // peer segment-data reads after the flag are fresh
 }
 
 }  // namespace quickreduce
