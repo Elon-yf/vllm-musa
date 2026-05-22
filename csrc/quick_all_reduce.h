@@ -18,6 +18,7 @@
 
 #include <musa_runtime.h>
 
+#include <cstdlib>
 #include <vector>
 
 #include "quick_all_reduce.cuh"
@@ -208,6 +209,13 @@ struct DeviceComms {
     // The Int4/6/8 quant codecs pull in group_abs_max warp shuffles + extra
     // surface not needed for the M2.5 all-reduce; keep the build minimal.
     (void)quant_level;
+    // MUSA-0116 DEBUG: push the phase-stop value (env QR_DBG_STOP,
+    // default 99 = full run) to the device symbol before kernel launch.
+    {
+      const char* e = std::getenv("QR_DBG_STOP");
+      int dbg = e ? std::atoi(e) : 99;
+      MUSA_CHECK(musaMemcpyToSymbol(qr_dbg_stop, &dbg, sizeof(int)));
+    }
     TWOSHOT_DISPATCH(CodecFP)
     MUSA_CHECK(cudaGetLastError());
     // Rotate the flag color.

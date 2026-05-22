@@ -22,6 +22,10 @@
 #include "core/registration.h"
 #include "torch_musa/csrc/aten/musa/MUSAContext.h"
 
+// MUSA-0116 DEBUG: definition of the phase-stop symbol declared extern in
+// quick_all_reduce.cuh. 99 = full run (inert unless env QR_DBG_STOP set).
+namespace quickreduce { __device__ int qr_dbg_stop = 99; }
+
 quickreduce::fptr_t init_custom_qr(int64_t rank, int64_t world_size, std::optional<int64_t> qr_max_size) {
   if (world_size > 8) throw std::invalid_argument("world size > 8 is not supported");
   if (world_size == 6) throw std::invalid_argument("world size == 6 is not supported");
