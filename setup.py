@@ -166,6 +166,9 @@ VLLM_CSRC_SOURCES = [
 
 VLLM_MUSA_CSRC_SOURCES = [
     "csrc/musa/torch_bindings.cpp",
+    "csrc/quick_all_reduce.cu",
+    "csrc/fused_ar_rmsnorm_wrapper.cu",
+    "csrc/musa/fused_ar_add_rmsnorm.mu",
     "csrc/musa/gemv.mu",
     "csrc/musa/fused_add_rmsnorm.mu",
     "csrc/musa/cache_kernels.mu",

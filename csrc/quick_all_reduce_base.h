@@ -21,6 +21,19 @@ typedef __mt_bfloat162 nv_bfloat162;  // MUSA-0088: __hip_bfloat162 -> __mt_bflo
 using int32x2_t = __attribute__((__vector_size__(2 * sizeof(int)))) int;
 using int32x4_t = __attribute__((__vector_size__(4 * sizeof(int)))) int;
 
+// MUSA-0116: mcc-safe bf16<->fp32 helpers. mcc 4.3.4 rejects the "h"
+// (16-bit) register constraint that musa_bf16.h intrinsics emit (sphere-kb
+// claim mcc.inline_asm_constraints_are_generic_R_only). bf16 is the top 16
+// bits of fp32, so convert with pure integer + fp32 ops only.
+__quickreduce_device_inline__ float qr_bf16_to_f32(uint16_t b) {
+  return __builtin_bit_cast(float, static_cast<uint32_t>(b) << 16);
+}
+__quickreduce_device_inline__ uint16_t qr_f32_to_bf16(float f) {
+  uint32_t u = __builtin_bit_cast(uint32_t, f);
+  u += 0x7FFFu + ((u >> 16) & 1u);  // round-to-nearest-even
+  return static_cast<uint16_t>(u >> 16);
+}
+
 // Setup acquire-release semantics for vector memory reads (mubuf instruction)
 // as per architecture.
 #if defined(__gfx942__)

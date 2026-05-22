@@ -19,6 +19,7 @@
 #ifdef USE_MUSA
 
 #include "quick_all_reduce.h"
+#include "core/registration.h"
 
 quickreduce::fptr_t init_custom_qr(int64_t rank, int64_t world_size, std::optional<int64_t> qr_max_size) {
   if (world_size > 8) throw std::invalid_argument("world size > 8 is not supported");
@@ -82,21 +83,16 @@ void qr_all_reduce(
         quant_level,
         stream);
   } else if (out.scalar_type() == at::ScalarType::BFloat16) {
-    if (cast_bf2half) {
-      fa->allreduce<half, true>(
-          reinterpret_cast<half*>(inp.data_ptr()),
-          reinterpret_cast<half*>(out.data_ptr()),
-          out.numel(),
-          quant_level,
-          stream);
-    } else {
-      fa->allreduce<quickreduce::nv_bfloat16, false>(
-          reinterpret_cast<quickreduce::nv_bfloat16*>(inp.data_ptr()),
-          reinterpret_cast<quickreduce::nv_bfloat16*>(out.data_ptr()),
-          out.numel(),
-          quant_level,
-          stream);
-    }
+    // MUSA-0116: bf16 always routes through the fp16 cast path. mcc 4.3.4
+    // cannot compile the native nv_bfloat16 kernel (musa_bf16.h "h"
+    // register-constraint asm). cast_bf2half is forced true here.
+    (void)cast_bf2half;
+    fa->allreduce<half, true>(
+        reinterpret_cast<half*>(inp.data_ptr()),
+        reinterpret_cast<half*>(out.data_ptr()),
+        out.numel(),
+        quant_level,
+        stream);
   } else {
     throw std::runtime_error("quick allreduce only supports float16 and bfloat16");
   }
@@ -118,7 +114,11 @@ int64_t qr_max_size() {
 // keeps the kernel binary small and lets mcc complete. Other shapes
 // (CodecQ4/Q6/Q8 quantized, half dtype, cast_bf2half=true) can be
 // re-enabled when mate/mcc fixes the segfault.
-INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecFP, false)
+// MUSA-0116: instantiate only the fp16 CodecFP path (cast=false for fp16
+// inputs, cast=true for bf16 routed through fp16). The native nv_bfloat16
+// instantiation is dropped - mcc cannot compile its musa_bf16.h asm.
+INSTANTIATE_FOR_WORLDSIZE(half, quickreduce::CodecFP, false)
+INSTANTIATE_FOR_WORLDSIZE(half, quickreduce::CodecFP, true)
 // INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ4, false)
 // INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ6, false)
 // INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ8, false)
@@ -132,5 +132,21 @@ INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecFP, false)
 // INSTANTIATE_FOR_WORLDSIZE(half, quickreduce::CodecQ4, false)
 // INSTANTIATE_FOR_WORLDSIZE(half, quickreduce::CodecQ6, false)
 // INSTANTIATE_FOR_WORLDSIZE(half, quickreduce::CodecQ8, false)
+
+// MUSA-0116: register the quick_all_reduce ops under torch.ops._C_quick_ar.*
+// (the namespace the Python wrapper quick_all_reduce.py probes). Compiled
+// into the vllm_musa._C extension; registers when that .so is imported.
+TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _quick_ar), quick_ar) {
+  quick_ar.def("init(int rank, int world_size, int? qr_max_size) -> int",
+               &init_custom_qr);
+  quick_ar.def("destroy(int fa) -> ()", &qr_destroy);
+  quick_ar.def("get_handle(int fa) -> Tensor", &qr_get_handle);
+  quick_ar.def("open_handles(int fa, Tensor[] handles) -> ()", &qr_open_handles);
+  quick_ar.def(
+      "all_reduce(int fa, Tensor inp, Tensor! out, int quant_level, "
+      "bool cast_bf2half) -> ()",
+      &qr_all_reduce);
+  quick_ar.def("max_size() -> int", &qr_max_size);
+}
 
 #endif  // USE_MUSA

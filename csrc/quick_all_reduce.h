@@ -204,21 +204,11 @@ struct DeviceComms {
     uint32_t msg_size = N * sizeof(T);
     uint32_t num_blocks = divceil(msg_size, kTileSize);
     uint32_t grid = min(kMaxNumBlocks, num_blocks);
-    auto quant_level_ = static_cast<QuickReduceQuantLevel>(quant_level);
-    switch (quant_level_) {
-      case QuickReduceQuantLevel::INT8:
-        TWOSHOT_DISPATCH(CodecQ8)
-        break;
-      case QuickReduceQuantLevel::INT6:
-        TWOSHOT_DISPATCH(CodecQ6)
-        break;
-      case QuickReduceQuantLevel::INT4:
-        TWOSHOT_DISPATCH(CodecQ4)
-        break;
-      default:
-        TWOSHOT_DISPATCH(CodecFP)
-        break;
-    }
+    // MUSA-0116: only the full-precision CodecFP path is enabled on MUSA.
+    // The Int4/6/8 quant codecs pull in group_abs_max warp shuffles + extra
+    // surface not needed for the M2.5 all-reduce; keep the build minimal.
+    (void)quant_level;
+    TWOSHOT_DISPATCH(CodecFP)
     MUSA_CHECK(cudaGetLastError());
     // Rotate the flag color.
     flag_color += divceil(N, grid);

@@ -536,11 +536,13 @@ struct AllReduceTwoshot {
       tA[i] = buffer_load_dwordx4(src_buffer, src_offset, 0, 0);
       src_offset += kAtomStride * sizeof(int32x4_t);
       if constexpr (cast_bf2half) {
-        const nv_bfloat162* bf_buf = reinterpret_cast<const nv_bfloat162*>(&tA[i]);
+        const uint16_t* bf_raw = reinterpret_cast<const uint16_t*>(&tA[i]);
         half2 half_buf[4];
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-          float2 f = __bfloat1622float2(bf_buf[j]);
+          float2 f;
+          f.x = qr_bf16_to_f32(bf_raw[2 * j]);
+          f.y = qr_bf16_to_f32(bf_raw[2 * j + 1]);
           half_buf[j] = __float22half2_rn(f);
         }
         tA[i] = *reinterpret_cast<const int32x4_t*>(half_buf);
@@ -632,13 +634,14 @@ struct AllReduceTwoshot {
     for (int i = 0; i < kAtoms; i++) {
       if constexpr (cast_bf2half) {
         const half2* half_buf = reinterpret_cast<const half2*>(&tA[i]);
-        nv_bfloat162 bf16_buf[4];
+        uint16_t bf16_raw[8];
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
           float2 f = __half22float2(half_buf[j]);
-          bf16_buf[j] = __float22bfloat162_rn(f);
+          bf16_raw[2 * j] = qr_f32_to_bf16(f.x);
+          bf16_raw[2 * j + 1] = qr_f32_to_bf16(f.y);
         }
-        buffer_store_dwordx4(*reinterpret_cast<const int32x4_t*>(bf16_buf), dst_buffer, dst_offset, 0, 0);
+        buffer_store_dwordx4(*reinterpret_cast<const int32x4_t*>(bf16_raw), dst_buffer, dst_offset, 0, 0);
       } else {
         buffer_store_dwordx4(tA[i], dst_buffer, dst_offset, 0, 0);
       }
