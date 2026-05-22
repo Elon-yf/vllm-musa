@@ -162,10 +162,8 @@ class QuickAllReduce:
             return None
         if output is None:
             output = torch.empty_like(input_)
-        logger.info_once(
-            "MUSA-0116: QuickAllReduce serving all-reduce (dtype=%s).",
-            input_.dtype,
-        )
+        # NOTE: no logging here - all_reduce runs inside the
+        # torch.compile-traced TP region; a logger call graph-breaks.
         torch.ops._C_quick_ar.all_reduce(
             self.fptr, input_, output, quant_level, cast_bf2half
         )
