@@ -39,6 +39,9 @@ for _so in (
         torch.ops.load_library(_so)
 del _os
 
+# Cold-cache timing harness (mandatory per .claude/rules/musa-kernel-bench.md)
+from mate.testing.utils import bench_kineto  # noqa: E402
+
 _DEVICE = "musa"
 
 
@@ -60,25 +63,42 @@ def _peak_gbps():
     return float(os.environ.get("OP_PERF_PEAK_GDDR6_GBPS", "1200")) * 1e9
 
 
-def _run_bench(name, shape, build_inputs, run_op, n_warmup=20, n_iters=100):
+def _run_bench(name, shape, build_inputs, run_op, num_tests=30,
+               kernel_substr="sphere_rope_kernel_v2"):
+    """Cold-cache timing via mate.bench_kineto + flush_l2=True.
+
+    Replaces the previous time.perf_counter_ns + n_warmup=20 + n_iters=100
+    warm-cache pattern. Each iteration sees an 8 GB L2 flush.
+    """
     inputs = build_inputs(shape)
-    for _ in range(n_warmup):
+
+    def _runner():
         run_op(inputs)
+
+    # Warmup outside profile (bench_kineto also schedules its own warmup pass).
+    for _ in range(3):
+        _runner()
     _device_sync()
-    durs_us = []
-    for _ in range(n_iters):
-        _device_sync()
-        t0 = time.perf_counter_ns()
-        run_op(inputs)
-        _device_sync()
-        t1 = time.perf_counter_ns()
-        durs_us.append((t1 - t0) / 1e3)
-    median_us = statistics.median(durs_us)
+
+    seconds = bench_kineto(
+        _runner,
+        kernel_names=kernel_substr,
+        num_tests=num_tests,
+        suppress_kineto_output=True,
+        flush_l2=True,
+    )
+    if seconds <= 0:
+        raise RuntimeError(
+            f"bench_kineto returned 0 for kernel substring {kernel_substr!r}; "
+            "check it matches the actual dispatched kernel name."
+        )
+    median_us = seconds * 1e6
     io = _io_bytes(shape)
     gbps = (io / 1e9) / (median_us * 1e-6) if median_us > 0 else 0
     bw_pct = gbps * 1e9 / _peak_gbps() * 100
-    print(f"{name:<40s} median_us={median_us:>8.2f}  GB/s={gbps:>7.1f}  roofline_pct={bw_pct:>6.2f}%")
-    return {"name": name, "shape": shape, "median_us": median_us,
+    print(f"{name:<40s} kernel_us={median_us:>8.3f}  GB/s={gbps:>7.1f}  "
+          f"roofline_pct={bw_pct:>6.2f}%")
+    return {"name": name, "shape": shape, "kernel_us": median_us,
             "achieved_gbps": gbps, "roofline_pct": bw_pct}
 
 
