@@ -14,10 +14,15 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, replace
 from typing import Any
 
+import torch
+
 from .spec_info import EagleDraftBuffers
+
+_log = logging.getLogger(__name__)
 
 
 def build_per_step_attn_metadata_array(
@@ -62,46 +67,6 @@ def build_per_step_attn_metadata_array(
     if buffers.num_steps <= 0:
         return []
 
-    # MUSA-0090 step 5e: when the proposer is provided, use its
-    # build_per_group_and_layer_attn_metadata() to produce per-layer
-    # backend-specific metadata (e.g., FlashAttentionMetadata with the
-    # use_cascade, common_prefix_len, etc. fields the compiled draft
-    # model's forward expects). The compiled forward reads
-    # get_forward_context().attn_metadata and accesses .use_cascade
-    # unconditionally; passing the raw CommonAttentionMetadata fails
-    # with AttributeError.
-    # MUSA-0090 step 5g: disable the per-layer build path. Although it
-    # provides use_cascade etc., the resulting metadata's seq_lens has
-    # a shape that flash_attn rejects ('seqused_k must have shape
-    # (batch_size,)'). Instead, use the simpler dataclasses.replace path
-    # below and setattr() the flag-fields the compiled forward expects.
-    use_per_layer = False  # was: proposer is not None and hasattr(...)
-    if use_per_layer:
-        metadata_array: list[Any] = []
-        for step_idx in range(buffers.num_steps):
-            # Mutate base_metadata in place to reflect the step's state
-            # (slot_mapping, seq_lens, max_seq_len), then build per-layer
-            # metadata. The per-layer call returns a dict-shaped object
-            # that the model reads via get_forward_context().
-            base_metadata.slot_mapping = buffers.slot_mapping_per_step[
-                step_idx, :batch_size
-            ]
-            base_metadata.seq_lens = buffers.seq_lens_per_step[step_idx, :batch_size]
-            base_metadata.max_seq_len = int(
-                getattr(base_metadata, "max_seq_len", 0)
-            ) + (1 if step_idx > 0 else 0)
-            try:
-                _, per_layer = proposer.build_per_group_and_layer_attn_metadata(
-                    base_metadata, draft_index=step_idx
-                )
-                metadata_array.append(per_layer)
-            except Exception as exc:
-                raise RuntimeError(
-                    f"step {step_idx}: proposer.build_per_group_and_layer_attn_metadata "
-                    f"failed: {type(exc).__name__}: {exc}"
-                ) from exc
-        return metadata_array
-
     # MUSA-0090 reopen (2026-05-16): port SGLang's pattern of pre-allocating
     # backend-specific metadata at capture time, mutating in-place at replay
     # time. Per `[[sglang-eagle3-musa-30pct-confirmed]]` memory + research
@@ -126,9 +91,7 @@ def build_per_step_attn_metadata_array(
     # produce real `FlashAttentionMetadata` via the builder.
     metadata_array: list[Any] = []
     base_max_seq_len = int(getattr(base_metadata, "max_seq_len", 0))
-    base_max_model_len = int(
-        getattr(base_metadata, "max_model_len", base_max_seq_len + buffers.num_steps)
-    )
+    base_max_model_len = int(getattr(base_metadata, "max_model_len", base_max_seq_len + buffers.num_steps))
 
     # MUSA-0090 step 5l (2026-05-16): use vllm's first-party
     # `proposer.build_per_group_and_layer_attn_metadata(common_attn_metadata,
@@ -162,11 +125,17 @@ def build_per_step_attn_metadata_array(
         slot_mapping_view = buffers.slot_mapping_per_step[step_idx, :batch_size]
         seq_lens_view = buffers.seq_lens_per_step[step_idx, :batch_size]
 
-        # max_seq_len is a static int (not a tensor); bump by step_idx so the
-        # attention backend sizes its scratch correctly for each step. The
-        # +1 between steps is the spec-decode invariant: each draft token
-        # adds one position to the sequence.
-        step_max_seq_len = min(base_max_seq_len + step_idx, base_max_model_len)
+        # MUSA-0109 hybrid: the captured graph is the CHAIN tail — its
+        # step `step_idx` is vLLM's chain-loop iteration `step_idx`, which
+        # produces draft token `step_idx + 1` and uses
+        # `draft_index = step_idx + 1` (propose() line ~609). Draft token 0
+        # comes from the eager first forward (draft_index 0). So every
+        # per-step value here carries a `+ 1`: the seq-len bump and the
+        # draft_index passed to the builder.
+        chain_draft_index = step_idx + 1
+        step_max_seq_len = min(
+            base_max_seq_len + chain_draft_index, base_max_model_len
+        )
 
         # Construct a step-specific CommonAttentionMetadata that the builder
         # will translate into a per-layer attention metadata dict.
@@ -191,7 +160,7 @@ def build_per_step_attn_metadata_array(
 
         try:
             _per_group, per_layer = proposer.build_per_group_and_layer_attn_metadata(
-                step_cam, draft_index=step_idx
+                step_cam, draft_index=chain_draft_index
             )
         except Exception as exc:
             raise RuntimeError(
@@ -202,6 +171,29 @@ def build_per_step_attn_metadata_array(
                 "API. The builder must succeed on a CommonAttentionMetadata "
                 "with step-specific slot_mapping/seq_lens/max_seq_len views."
             ) from exc
+
+        # MUSA-0109 (2026-05-21): the FA backend bakes a FA3 tile-scheduler
+        # plan (`scheduler_metadata`, from get_scheduler_metadata) computed
+        # from the capture-time seq_lens. The captured chain reads it every
+        # replay, but it is NEVER refreshed — so at replay it is a stale
+        # plan for the wrong context length, which corrupts the chain's
+        # attention output (the eager first forward is unaffected: it
+        # rebuilds metadata fresh each call). Force the captured chain onto
+        # the non-AOT-scheduled path: scheduler_metadata=None +
+        # max_num_splits=1 -> a plain fixed-split decode that is both
+        # CUDAGraph-capturable AND correct for any seq_lens (the per-request
+        # `seq_lens`/`seqused_k` tensor still masks the KV correctly).
+        # Set, do not swallow: if the FA backend ever changes one of
+        # these fields to read-only or removes it under us, we WANT to
+        # know — the captured chain's correctness depends on the AOT
+        # scheduler being neutralized, so a silent set-failure would
+        # corrupt outputs without any signal. `hasattr` already gates
+        # the optional fields.
+        for _m in per_layer.values():
+            if hasattr(_m, "scheduler_metadata"):
+                _m.scheduler_metadata = None
+            if hasattr(_m, "max_num_splits"):
+                _m.max_num_splits = 1
 
         # per_layer is the dict {layer_name: attn_metadata} that
         # set_forward_context expects. Store the dict as the step's metadata
@@ -244,12 +236,8 @@ class StepMetadataIndexing:
         return cls(
             num_steps=len(metadata_array),
             base_max_seq_len=int(getattr(metadata_array[0], "max_seq_len", 0)),
-            per_step_max_seq_lens=[
-                int(getattr(m, "max_seq_len", 0)) for m in metadata_array
-            ],
-            slot_mapping_data_ptrs=[
-                int(m.slot_mapping.data_ptr()) for m in metadata_array
-            ],
+            per_step_max_seq_lens=[int(getattr(m, "max_seq_len", 0)) for m in metadata_array],
+            slot_mapping_data_ptrs=[int(m.slot_mapping.data_ptr()) for m in metadata_array],
             seq_lens_data_ptrs=[int(m.seq_lens.data_ptr()) for m in metadata_array],
         )
 
@@ -265,7 +253,8 @@ class StepMetadataIndexing:
             )
         if len(set(self.seq_lens_data_ptrs)) != self.num_steps:
             raise RuntimeError(
-                f"seq_lens views are not all distinct: " f"{self.seq_lens_data_ptrs}"
+                f"seq_lens views are not all distinct: "
+                f"{self.seq_lens_data_ptrs}"
             )
         # max_seq_lens should be monotonically non-decreasing across steps
         for i in range(1, self.num_steps):

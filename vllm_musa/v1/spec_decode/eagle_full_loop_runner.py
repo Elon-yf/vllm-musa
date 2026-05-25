@@ -6,10 +6,9 @@
 # Q1 cudagraph smoke (proved correctness): ../../../../generated/musa0090_impl/
 #     step1_5-q1-cudagraph-smoke-result.md
 #
-# This file is the skeleton. The hot-path inner loop (_capture_one_batch_size)
-# has fully-typed signatures + explicit step-by-step pseudocode for the
-# step-4 implementation to fill in. Step 3's deliverable is the structural
-# scaffolding so the patch can hook in.
+# Hybrid design: replay() runs the variable-length Eagle first forward
+# eagerly (not capturable), then a captured graph drives the fixed
+# 1-token chain tail. Gated by VLLM_MUSA_EAGLE_RUNNER.
 
 from __future__ import annotations
 
@@ -69,7 +68,7 @@ class EagleFullLoopRunner:
         cudagraph_capture_sizes: list[int],
         hidden_size: int,
         device: torch.device,
-        topk: int = 1,  # chain drafting; tree path is MUSA-0094's scope
+        topk: int = 1,  # chain drafting
     ):
         if num_speculative_tokens < 1:
             raise ValueError(
@@ -77,15 +76,16 @@ class EagleFullLoopRunner:
             )
         if not cudagraph_capture_sizes:
             raise ValueError("cudagraph_capture_sizes must not be empty")
-        if topk != 1:
-            # Tree drafting is a follow-up ticket (MUSA-0094); chain-only here.
-            raise NotImplementedError(
-                f"topk={topk} (tree drafting) is out of scope for MUSA-0090; "
-                "chain-only path (topk=1). Tree path is MUSA-0094."
-            )
 
         self.proposer = proposer
-        self.num_steps = num_speculative_tokens
+        # MUSA-0109 hybrid (2026-05-21): the runner's captured graph covers
+        # only the 1-token CHAIN tail. Draft token 0 comes from an eager
+        # first forward over the verified sequence (replay() / vLLM's
+        # propose() first-forward), which is variable-/multi-token and not
+        # capturable. So the captured loop is num_speculative_tokens - 1
+        # steps; replay() prepends draft-0 to reach num_speculative_tokens.
+        self.num_spec_tokens = num_speculative_tokens
+        self.num_steps = num_speculative_tokens - 1
         self.capture_sizes: list[int] = sorted(set(cudagraph_capture_sizes))
         self.max_bs: int = max(self.capture_sizes)
         self.hidden_size = hidden_size
@@ -95,39 +95,66 @@ class EagleFullLoopRunner:
         # Per-batch-size capture state. Populated by capture(); read by replay().
         self.contexts: dict[int, EagleFullLoopCaptureContext] = {}
         self._captured: bool = False
+        # MUSA-0109: the context length baked into the captured draft
+        # attention (`max_seq_len` is a host int -> graph grid size, cannot
+        # change after capture). Set by capture(); `can_run()` rejects
+        # requests whose context exceeds it so they fall back to the
+        # iterative path instead of replaying a graph that would truncate
+        # the draft attention.
+        self._capture_seq_len: int = 0
 
         logger.info(
-            "MUSA-0090 EagleFullLoopRunner: configured for "
+            "MUSA-0090/0109 EagleFullLoopRunner: configured for "
             "num_speculative_tokens=%d, capture_sizes=%s, max_bs=%d, "
-            "hidden_size=%d, topk=%d",
-            self.num_steps,
-            self.capture_sizes,
-            self.max_bs,
+            "hidden_size=%d",
+            self.num_spec_tokens, self.capture_sizes, self.max_bs,
             self.hidden_size,
-            self.topk,
         )
 
     # ---- dispatcher predicate ----
 
-    def can_run(self, batch_size: int) -> bool:
-        """Whether there's a captured graph compatible with this batch size.
+    def can_run(self, batch_size: int, max_seq_len: int | None = None) -> bool:
+        """Whether there's a captured graph compatible with this request.
 
-        Strict equality match for now (no padding to next capture size).
-        Step 4 may add padding logic if batch size variance is high; for
-        BS=1 4k/1k workloads (the /goal shape), exact match suffices.
+        Strict equality match on batch size (no padding to next capture
+        size); for BS=1 4k/1k workloads (the /goal shape), exact match
+        suffices.
+
+        `max_seq_len`: the request's current context length. The captured
+        draft attention bakes `max_seq_len` as a host int, so a request
+        whose context (plus the `num_steps` draft positions) exceeds the
+        captured length must fall back to the iterative path — replaying
+        the graph would truncate the draft attention and collapse
+        acceptance. When None the seq-len guard is skipped.
         """
         if not self._captured:
             return False
-        return batch_size in self.contexts
+        if batch_size not in self.contexts:
+            return False
+        if (
+            max_seq_len is not None
+            and self._capture_seq_len > 0
+            and max_seq_len + self.num_spec_tokens > self._capture_seq_len
+        ):
+            return False
+        return True
 
     # ---- one-time capture (called lazily on first propose()) ----
 
-    def capture(self, base_metadata: Any) -> None:
+    def capture(self, base_metadata: Any, in_graph_capture: bool = False) -> None:
         """Capture one cudagraph per entry in self.capture_sizes.
 
-        Called lazily on the first propose() call. `base_metadata` is the
-        CommonAttentionMetadata vLLM would otherwise pass to the iterative
-        propose loop; used as the template for per-step metadata.
+        `base_metadata` is the CommonAttentionMetadata used as the template
+        for per-step metadata.
+
+        `in_graph_capture`: True when the caller is ALREADY inside vllm's
+        `graph_capture(device)` context (the MUSA-0109 capture-at-boot path
+        — `capture_model()` holds `graph_capture()` open across the whole
+        boot capture phase). In that case `_capture_n_step_loop` must NOT
+        re-enter `graph_capture()` (nesting `ca_comm.capture()` would
+        assert); it captures with a plain `torch.cuda.graph(...)` on the
+        already-active capture stream. False = standalone (legacy lazy)
+        path: the runner opens its own `graph_capture()`.
 
         After this returns successfully, self._captured is True and
         self.contexts[bs] is populated for every bs in self.capture_sizes.
@@ -136,6 +163,9 @@ class EagleFullLoopRunner:
         """
         if self._captured:
             return
+        # MUSA-0109: record the context length baked into the capture so
+        # can_run() can reject longer-context requests.
+        self._capture_seq_len = int(getattr(base_metadata, "max_seq_len", 0) or 0)
         if not hasattr(self.proposer, "model"):
             raise RuntimeError(
                 "EagleProposer does not expose `model` attribute; check vLLM "
@@ -156,51 +186,47 @@ class EagleFullLoopRunner:
         pool = None
         try:
             from vllm.platforms import current_platform
-
             pool = current_platform.get_global_graph_pool()
         except Exception as exc:
             logger.warning(
-                "MUSA-0109: failed to acquire vllm global graph pool (%s); "
-                "will fall back to a fresh per-runner pool.",
+                "MUSA-0109: failed to acquire vllm global graph pool "
+                "(%s); will fall back to a fresh per-runner pool.",
                 exc,
             )
-        # Validate the returned handle BEFORE using it for capture/replay.
-        # A platform that doesn't actually implement get_global_graph_pool
-        # may return None (or an invalid sentinel). Passing None through to
-        # torch.cuda.graph(..., pool=...) means the capture allocates from
-        # the default pool — silently breaking the shared-pool guarantee
-        # that the cross-pool replay allocator bug (PR #41 review comment).
+        # Validate the returned handle BEFORE using it. A platform that
+        # doesn't implement get_global_graph_pool may return None;
+        # passing None to torch.cuda.graph(..., pool=...) silently
+        # allocates from the default pool.
         if pool is None:
             pool = torch.cuda.graph_pool_handle()
             logger.warning(
                 "MUSA-0109: get_global_graph_pool() returned None; "
-                "falling back to per-runner pool (may trigger torch_musa "
-                "allocator bug). pool=%s",
+                "falling back to per-runner pool. pool=%s",
                 pool,
             )
         else:
             logger.info(
-                "MUSA-0109: EagleFullLoopRunner using vllm GLOBAL graph pool "
-                "(shared with target model captures); pool=%s",
+                "MUSA-0109: EagleFullLoopRunner using vllm GLOBAL graph "
+                "pool (shared with target captures); pool=%s",
                 pool,
             )
 
         for bs in self.capture_sizes:
             try:
-                ctx = self._capture_one_batch_size(bs, base_metadata, pool)
+                ctx = self._capture_one_batch_size(
+                    bs, base_metadata, pool, in_graph_capture=in_graph_capture
+                )
                 self.contexts[bs] = ctx
                 logger.info(
                     "MUSA-0090 captured Eagle3 full-loop graph for bs=%d "
                     "(buffer footprint %.2f MiB)",
-                    bs,
-                    ctx.memory_footprint_bytes() / 1024 / 1024,
+                    bs, ctx.memory_footprint_bytes() / 1024 / 1024,
                 )
             except Exception as exc:
                 logger.exception(
                     "MUSA-0090 graph capture FAILED at bs=%d: %s. "
                     "Falling back to iterative path for this size.",
-                    bs,
-                    exc,
+                    bs, exc,
                 )
                 # Don't propagate — the patch will fall back to vLLM's
                 # iterative path when can_run(bs) returns False for this size.
@@ -212,6 +238,7 @@ class EagleFullLoopRunner:
         batch_size: int,
         base_metadata: Any,
         pool: Any,
+        in_graph_capture: bool = False,
     ) -> EagleFullLoopCaptureContext:
         """Capture the N-step draft loop for one batch size.
 
@@ -227,7 +254,9 @@ class EagleFullLoopRunner:
         Phase 5: wrap and return context
         """
         if batch_size <= 0 or batch_size > self.max_bs:
-            raise ValueError(f"batch_size {batch_size} out of range [1, {self.max_bs}]")
+            raise ValueError(
+                f"batch_size {batch_size} out of range [1, {self.max_bs}]"
+            )
 
         # Phase 1: allocate buffers for this batch size.
         # block_table_tensor is held as a reference (not copied); we read it
@@ -245,6 +274,18 @@ class EagleFullLoopRunner:
             block_table_tensor=block_table_tensor,
             device=self.device,
         )
+
+        # MUSA-0109 (2026-05-20): seed the seq_lens buffers to the capture
+        # context length BEFORE Phase 2 builds the per-step metadata. The
+        # FlashAttention builder derives `cu_seqlens_k` / scheduler metadata
+        # from `seq_lens` at build time and bakes them into the graph; if
+        # the buffers are still zero here those derived fields are baked for
+        # a 0-length context. `base_metadata.max_seq_len` carries the
+        # capture context length (set by the boot-capture patch). replay()
+        # overwrites these buffers with the real per-request seq_lens.
+        _cap_seq_len = int(getattr(base_metadata, "max_seq_len", 1) or 1)
+        buffers.seq_lens_per_step.fill_(_cap_seq_len)
+        buffers.seq_lens_in.fill_(_cap_seq_len)
 
         # Phase 2: pre-build per-step metadata array (views into buffers).
         # Pass `proposer` so the helper can call
@@ -336,10 +377,8 @@ class EagleFullLoopRunner:
         #
         #   # End of context manager = graph capture complete.
         graph = self._capture_n_step_loop(
-            buffers,
-            attn_metadata_array,
-            batch_size,
-            pool,
+            buffers, attn_metadata_array, batch_size, pool,
+            in_graph_capture=in_graph_capture,
         )
 
         # Phase 5: wrap up and return.
@@ -356,15 +395,13 @@ class EagleFullLoopRunner:
     def replay(
         self,
         target_hidden_states: torch.Tensor,  # bf16 [bs, hidden_size] OR [num_tokens, hidden_size]
-        next_token_ids: torch.Tensor,  # int32 [bs] (the bonus from verify)
-        common_attn_metadata: Any,  # for assertion + step-0 metadata seeding
+        next_token_ids: torch.Tensor,        # int32 [bs] (the bonus from verify)
+        common_attn_metadata: Any,            # for assertion + step-0 metadata seeding
         batch_size: int,
-        target_positions: (
-            torch.Tensor | None
-        ) = None,  # int64 [num_tokens] (the verify pass's positions)
-        token_indices_to_sample: (
-            torch.Tensor | None
-        ) = None,  # int [bs] (idx in num_tokens of last token per seq)
+        target_positions: torch.Tensor | None = None,  # int64 [num_tokens] (the verify pass's positions)
+        token_indices_to_sample: torch.Tensor | None = None,  # int [bs] (idx in num_tokens of last token per seq)
+        target_token_ids: torch.Tensor | None = None,  # int [num_tokens] verified token ids (first forward)
+        num_rejected_tokens_gpu: torch.Tensor | None = None,  # [bs] padded-drafter rejected count
     ) -> EagleFullLoopReplayResult:
         """Replay the captured graph for this batch size.
 
@@ -406,121 +443,157 @@ class EagleFullLoopRunner:
             )
 
         ctx = self.contexts[batch_size]
+        p = self.proposer
 
-        # MUSA-0090 step 5k: derive token_indices_to_sample if not provided.
-        # Pattern matches vllm/v1/spec_decode/llm_base_proposer.py:set_inputs_first_pass.
-        if token_indices_to_sample is None:
-            query_start_loc = getattr(common_attn_metadata, "query_start_loc", None)
-            if query_start_loc is not None:
-                token_indices_to_sample = query_start_loc[1:] - 1
-            else:
-                # Fall back to "[bs-1, ..., bs-1]" which is correct ONLY when
-                # num_tokens == batch_size (one-token-per-seq decode case).
-                # The runner's eager path produces this from the proposer.
-                token_indices_to_sample = torch.arange(
-                    batch_size, dtype=torch.int64, device=target_hidden_states.device
-                )
+        # ---- PHASE 1: eager first forward over the verified sequence ----
+        # Produces draft token 0 + the hidden/position state that seeds the
+        # captured chain. vLLM's Eagle propose() first-forward is variable-
+        # length (the K+1 verified tokens / the prompt on the first call) so
+        # it cannot be a fixed CUDAGraph — run it eagerly, by calling the
+        # proposer's own methods, so it is correct by construction.
+        draft0, carry_hidden, carry_positions, cad = self._eager_first_forward(
+            target_token_ids=target_token_ids,
+            target_positions=target_positions,
+            target_hidden_states=target_hidden_states,
+            next_token_ids=next_token_ids,
+            token_indices_to_sample=token_indices_to_sample,
+            common_attn_metadata=common_attn_metadata,
+            num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+            batch_size=batch_size,
+        )
 
-        # Hidden state selection: pick the LAST token per sequence.
-        # Shape handling:
-        #   target_hidden_states is [num_tokens, h] in the general case.
-        #   For BS=1 prefill 4k, num_tokens=4096 and we need the [4095]-th row.
-        # MUSA-0090 step 5l.2: Eagle3 uses aux hidden states from N layers
-        # (e.g., 3 layers for M2.5-Eagle3: ids 1, 30, 58), concatenated to
-        # shape [num_tokens, N * hidden_size] = [num_tokens, 9216] for the
-        # 3072-hidden M2.5 draft. vLLM's propose() calls
-        # self.model.combine_hidden_states(target_hidden_states) to reduce
-        # the concat to [num_tokens, hidden_size] before the draft forward.
-        # We replicate that here OUTSIDE the captured graph.
-        if (
-            self.proposer.method in ("eagle3", "dflash")
-            and target_hidden_states.shape[-1] != self.hidden_size
-            and hasattr(self.proposer.model, "combine_hidden_states")
-        ):
-            target_hidden_states = self.proposer.model.combine_hidden_states(
-                target_hidden_states
-            )
-        if (
-            target_hidden_states.dim() >= 1
-            and target_hidden_states.shape[0] != batch_size
-        ):
-            selected_hidden = target_hidden_states[token_indices_to_sample]
-        else:
-            selected_hidden = target_hidden_states[:batch_size]
-        ctx.buffers.target_hidden_states_in[:batch_size].copy_(selected_hidden)
-        ctx.buffers.bonus_token_ids_in[:batch_size].copy_(next_token_ids)
+        # ---- PHASE 2: bridge — first-forward state -> captured-chain step-0
+        # metadata. Mirrors propose() lines 528-580: the padded-drafter
+        # seq-len adjustment, then ONE eagle_step_update advancing the carry
+        # position/seq_len/slot_mapping by one (the chain's first forward is
+        # at carry_position + 1, exactly as propose()'s chain iter 0).
+        from vllm.v1.spec_decode.utils import (
+            eagle_step_update_slot_mapping_and_metadata,
+        )
+        seq_lens = cad.seq_lens
+        if self.num_spec_tokens > 1 and num_rejected_tokens_gpu is not None:
+            seq_lens = seq_lens - num_rejected_tokens_gpu
+        chain_seq = seq_lens[:batch_size].to(torch.int32).clone()
 
-        # MUSA-0090 step 5k: seed step-0 positions, slot_mapping, seq_lens
-        # from the verify pass's metadata. Without these, the captured graph
-        # reads zeros at step 0 — RoPE wrong, KV writes to wrong slots,
-        # attention attends to wrong context length.
-        if target_positions is not None:
-            # The bonus token's position is the position AFTER the last verified
-            # position. The first draft (step 0) is run AS the bonus token (its
-            # input_ids = bonus_token_id, its hidden_states = target_hidden), so
-            # step-0 positions = target_positions[last_idx_per_seq].
-            # (Per vllm/v1/spec_decode/llm_base_proposer.py line 502:
-            #  `positions = self.positions[token_indices_to_sample]`)
-            if target_positions.dim() == 2:
-                # M-RoPE case: positions shape [3, num_tokens]; take dim 0.
-                step0_positions = target_positions[0][token_indices_to_sample]
-            else:
-                step0_positions = target_positions[token_indices_to_sample]
-            ctx.buffers.positions_in[:batch_size].copy_(step0_positions.to(torch.int64))
-
-        # slot_mapping for step 0: the slot of the bonus token. The verify
-        # pass's common_attn_metadata.slot_mapping has shape [num_tokens] and
-        # tells us where each input token's K/V is written. The bonus token
-        # corresponds to the last input position of each sequence.
-        cm_slot_mapping = getattr(common_attn_metadata, "slot_mapping", None)
-        if cm_slot_mapping is not None and cm_slot_mapping.numel() > 0:
-            if cm_slot_mapping.shape[0] != batch_size:
-                step0_slot = cm_slot_mapping[token_indices_to_sample]
-            else:
-                step0_slot = cm_slot_mapping[:batch_size]
-            ctx.buffers.slot_mapping_in[:batch_size].copy_(step0_slot.to(torch.int64))
-
-        # seq_lens for step 0: same as the verify pass's seq_lens (the
-        # context length BEFORE the draft adds a new token).
-        cm_seq_lens = getattr(common_attn_metadata, "seq_lens", None)
-        if cm_seq_lens is not None and cm_seq_lens.numel() > 0:
-            ctx.buffers.seq_lens_in[:batch_size].copy_(
-                cm_seq_lens[:batch_size].to(torch.int32)
-            )
-
-        # MUSA-0090 step 5l.3: copy the current request's block_table into
-        # the runner-owned buffer. The captured graph reads from
-        # buffers.block_table_tensor (a stable pointer), not from the
-        # caller's transient tensor (which may be freed/repurposed between
-        # spec rounds, causing 'MUSA error: unknown error').
-        cm_block_table = getattr(common_attn_metadata, "block_table_tensor", None)
+        cm_block_table = getattr(cad, "block_table_tensor", None)
         if cm_block_table is not None and cm_block_table.numel() > 0:
-            # Slice to actual shape, pad with zeros if needed.
             src_bs = min(cm_block_table.shape[0], batch_size)
-            src_n_blocks = min(
+            src_nb = min(
                 cm_block_table.shape[1], ctx.buffers.block_table_tensor.shape[1]
             )
-            ctx.buffers.block_table_tensor[:src_bs, :src_n_blocks].copy_(
-                cm_block_table[:src_bs, :src_n_blocks]
+            ctx.buffers.block_table_tensor[:src_bs, :src_nb].copy_(
+                cm_block_table[:src_bs, :src_nb]
             )
 
-        # Single graph replay. All N draft forwards + sampling + slot-mapping
-        # updates happen inside this one call.
+        # eagle_step_update does seq_lens += 1 in place and writes the
+        # advanced positions / slot_mapping into the runner buffers.
+        eagle_step_update_slot_mapping_and_metadata(
+            positions_1d=carry_positions[:batch_size],
+            block_table_tensor=ctx.buffers.block_table_tensor,
+            seq_lens=chain_seq,
+            # block_size / max_model_len: align with the captured-chain
+            # site (see the in-graph call below) — same fallbacks, same
+            # `int(... or default)` falsy-guard so a None / missing attr
+            # cannot diverge between bridge and replay slot mappings.
+            block_size=int(getattr(p, "block_size", 16) or 16),
+            max_model_len=int(getattr(p, "max_model_len", 196_608) or 196_608),
+            out_clamped_positions=ctx.buffers.positions_in[:batch_size],
+            out_slot_mapping=ctx.buffers.slot_mapping_in[:batch_size],
+            input_batch_size=batch_size,
+        )
+        ctx.buffers.seq_lens_in[:batch_size].copy_(chain_seq)
+
+        # ---- PHASE 3: seed the captured chain's step-0 input ----
+        ctx.buffers.bonus_token_ids_in[:batch_size].copy_(
+            draft0.to(ctx.buffers.bonus_token_ids_in.dtype)
+        )
+        ctx.buffers.target_hidden_states_in[:batch_size].copy_(carry_hidden)
+
+        # ---- PHASE 4: replay the captured chain (num_spec_tokens - 1 steps).
         ctx.graph.replay()
 
-        # MUSA-0090 layer-2 fix (2026-05-17): clone the output OUT of the
-        # CUDAGraph memory pool. vllm's _copy_draft_token_ids_to_cpu does the
-        # H2D copy on a dedicated `draft_token_ids_copy_stream` (not the default
-        # stream), and MUSA's MUDNN fails ("err 999 = unknown error") when
-        # copying from pool memory across streams. Cloning into a fresh
-        # allocation outside the pool fixes this. The clone is small
-        # (`[bs, num_steps]` int32 = ~12 bytes for bs=1) and runs on the
-        # default stream so subsequent cross-stream sync works.
-        out = ctx.buffers.draft_token_ids_out[:batch_size].clone()
+        # ---- PHASE 5: assemble [draft0] ++ chain -> [bs, num_spec_tokens].
+        # Clone out of the CUDAGraph pool (MUSA-0090 layer-2: a cross-stream
+        # copy from pool memory fails MUDNN err 999). ----
+        draft0_col = draft0.view(batch_size, 1)
+        if self.num_steps > 0:
+            chain = ctx.buffers.draft_token_ids_out[:batch_size]
+            out = torch.cat([draft0_col.to(chain.dtype), chain], dim=1).clone()
+        else:
+            out = draft0_col.clone()
         return EagleFullLoopReplayResult(
             draft_token_ids=out,
             batch_size=batch_size,
         )
+
+    def _eager_first_forward(
+        self,
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        token_indices_to_sample: torch.Tensor | None,
+        common_attn_metadata: Any,
+        num_rejected_tokens_gpu: torch.Tensor | None,
+        batch_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Any]:
+        """Run vLLM's Eagle `propose()` first-forward EAGERLY (not captured).
+
+        Mirrors `EagleProposer.propose()` lines 433-516 by calling the
+        proposer's own methods — the first forward is variable-length (the
+        verified sequence / prompt) so it cannot be a fixed CUDAGraph;
+        running it eagerly here is correct by construction. Returns
+        `(draft_token_0 [bs], carry_hidden [bs, h], carry_positions [bs],
+        cad)` — the seed for the captured chain.
+        """
+        from vllm.forward_context import set_forward_context
+
+        p = self.proposer
+        th = target_hidden_states
+        if p.method in ("eagle3", "dflash") and hasattr(
+            p.model, "combine_hidden_states"
+        ):
+            th = p.model.combine_hidden_states(th)
+
+        num_tokens, tidx, cad = p.set_inputs_first_pass(
+            target_token_ids=target_token_ids,
+            next_token_ids=next_token_ids,
+            target_positions=target_positions,
+            target_hidden_states=th,
+            token_indices_to_sample=token_indices_to_sample,
+            cad=common_attn_metadata,
+            num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+        )
+        _per_group, per_layer = p.build_per_group_and_layer_attn_metadata(cad)
+        cg_mode, num_input_tokens, dp = p._determine_batch_execution_and_padding(
+            num_tokens
+        )
+        model_kwargs, slot_sz = p.build_model_inputs_first_pass(
+            num_tokens, num_input_tokens, None
+        )
+        with set_forward_context(
+            per_layer,
+            p.vllm_config,
+            num_tokens=num_input_tokens,
+            num_tokens_across_dp=dp,
+            cudagraph_runtime_mode=cg_mode,
+            slot_mapping=p._get_slot_mapping(slot_sz, cad.slot_mapping),
+        ):
+            ret = p.model(**model_kwargs)
+        if isinstance(ret, tuple):
+            last_hidden, hidden = ret
+        else:
+            last_hidden, hidden = ret, ret
+
+        draft0 = (
+            p._greedy_sample(last_hidden[tidx]).to(torch.int32).view(batch_size)
+        )
+        carry_hidden = hidden[tidx]
+        if target_positions.dim() == 2:
+            carry_positions = target_positions[0][tidx]
+        else:
+            carry_positions = target_positions[tidx]
+        return draft0, carry_hidden, carry_positions.to(torch.int64), cad
 
     # ---- helpers (step 4: real implementations) ----
 
@@ -591,9 +664,15 @@ class EagleFullLoopRunner:
         attn_metadata_array: list,
         batch_size: int,
         pool: Any,
+        in_graph_capture: bool = False,
     ) -> Any:
         """Open the torch.cuda.graph context and drive the N-step loop with
         in-place tensor ops only. Returns the captured CUDAGraph object.
+
+        `in_graph_capture=True` means the caller is already inside vllm's
+        `graph_capture(device)` (the capture-at-boot path); we then capture
+        with a plain `torch.cuda.graph(...)` on the current (capture) stream
+        instead of opening a nested `graph_capture()`.
 
         Critical invariants enforced inside `_run_n_step_inner`:
           - No Python list growth (no .append, no torch.cat).
@@ -605,8 +684,50 @@ class EagleFullLoopRunner:
         # torch.cuda.CUDAGraph is routed to torch_musa.musa_graph.MUSAGraph on
         # MUSA via torchada — proven correctness-wise by the Q1 smoke.
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool=pool):
-            self._run_n_step_inner(buffers, attn_metadata_array, batch_size)
+
+        # MUSA-0109 (2026-05-20): capture inside vllm's `graph_capture()`
+        # context manager — NOT a bare `torch.cuda.graph(stream=...)`.
+        #
+        # History: an earlier fix gave the runner a dedicated capture stream
+        # (`torch.cuda.graph(graph, pool=pool, stream=<own Stream>)`). That
+        # cleared the capture-time `MUSA error: unknown error` — but the
+        # `--load-format dummy` fast-loop then surfaced the real next failure:
+        #   `MUSA error: operation not permitted when stream is capturing`
+        # raised from the process-group watchdog thread. The TP=8 draft loop
+        # contains custom all-reduces; capturing a collective is only valid
+        # while the custom-all-reduce communicator is in capture mode.
+        #
+        # vllm's `graph_capture(device)` is exactly that wrapper: it enters
+        # `GroupCoordinator.graph_capture()` -> `ca_comm.capture()`, which
+        # puts the custom all-reduce into graph-capture mode (registers the
+        # capture buffers, switches to the IPC-pointer path). It ALSO provides
+        # the dedicated capture stream + `wait_stream` fence. This is the same
+        # context vllm's own target-model capture uses, and the analogue of
+        # SGLang's `GroupCoordinator.graph_capture()`. Capturing the draft
+        # loop without it is what triggered the watchdog violation.
+        if in_graph_capture:
+            # MUSA-0109 capture-at-boot: vllm's `graph_capture()` is ALREADY
+            # open (capture_model() holds it across the whole boot capture
+            # phase, gpu_model_runner.py:6093). Re-entering it would nest
+            # `ca_comm.capture()` and assert. Issuing multiple
+            # `torch.cuda.graph(...)` captures inside one `graph_capture()`
+            # is vllm's normal pattern (the CUDAGraphWrapper does it per
+            # piecewise graph). Capture on the current stream — which, under
+            # the active `graph_capture()`, IS the dedicated capture stream.
+            with torch.cuda.graph(
+                graph, pool=pool, stream=torch.cuda.current_stream()
+            ):
+                self._run_n_step_inner(buffers, attn_metadata_array, batch_size)
+            return graph
+
+        # Standalone (legacy lazy) path: open our own graph_capture().
+        from vllm.distributed.parallel_state import (
+            graph_capture as _vllm_graph_capture,
+        )
+
+        with _vllm_graph_capture(self.device) as _gc_ctx:
+            with torch.cuda.graph(graph, pool=pool, stream=_gc_ctx.stream):
+                self._run_n_step_inner(buffers, attn_metadata_array, batch_size)
         return graph
 
     def _run_n_step_inner(
@@ -625,11 +746,9 @@ class EagleFullLoopRunner:
         statically-allocates everything ahead of time.
         """
         # Lazy imports to avoid pulling vLLM internals at module-load time.
-        from vllm.config import CUDAGraphMode
         from vllm.forward_context import set_forward_context
-        from vllm.v1.spec_decode.utils import (
-            eagle_step_update_slot_mapping_and_metadata,
-        )
+        from vllm.config import CUDAGraphMode
+        from vllm.v1.spec_decode.utils import eagle_step_update_slot_mapping_and_metadata
 
         proposer = self.proposer
         # Step-0 seed: copy the input carry-over into the per-step buffers.
@@ -688,17 +807,25 @@ class EagleFullLoopRunner:
             # metadata, slot_mapping, num_tokens) for the model call.
             # Critical: cudagraph_runtime_mode=NONE — we're capturing OUR
             # OWN graph; vLLM's PIECEWISE shouldn't re-fire.
-            # NOTE: do NOT pass slot_mapping=tensor here — vllm's forward_context
-            # internally does `slot_mapping or {}` which raises on multi-element
-            # Tensors (`Boolean value of Tensor with more than one value is
-            # ambiguous`). The slot_mapping_view is already carried by
-            # attn_metadata_array[step].slot_mapping; the kwarg is the per-attn-group
-            # dict that vllm uses for cross-group dispatch, NOT the single tensor.
+            #
+            # MUSA-0109 (2026-05-21) FIX: `slot_mapping` MUST be passed — and
+            # it must be the per-LAYER DICT, not a raw tensor. vLLM's KV-cache
+            # write (`get_attention_context` -> `do_kv_cache_update`,
+            # attention.py:703) reads the write slots from
+            # `forward_context.slot_mapping[layer_name]` and SKIPS the write
+            # entirely when that is None. Without this kwarg the chain's draft
+            # model never writes its KV, so chain step s+1 reads stale KV for
+            # step s's position -> draft acceptance collapses after position 0.
+            # `proposer._get_slot_mapping(n, tensor)` builds the dict (and
+            # copies the tensor into the proposer's stable `_slot_mapping_
+            # buffer`, which the captured graph then reads — capture-safe).
+            sm_dict = proposer._get_slot_mapping(batch_size, slot_mapping_view)
             with set_forward_context(
                 attn_metadata_array[step],
                 proposer.vllm_config,
                 num_tokens=batch_size,
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                slot_mapping=sm_dict,
             ):
                 ret_hidden_states = proposer.model(**model_kwargs)
                 if isinstance(ret_hidden_states, tuple):
@@ -721,7 +848,9 @@ class EagleFullLoopRunner:
             # Update state for step+1 if not the last step.
             if step + 1 < self.num_steps:
                 # Stage next step's input.
-                buffers.input_ids_per_step[step + 1, :batch_size].copy_(draft_token_ids)
+                buffers.input_ids_per_step[step + 1, :batch_size].copy_(
+                    draft_token_ids
+                )
                 buffers.hidden_states_per_step[step + 1, :batch_size].copy_(
                     next_hidden[:batch_size]
                 )
@@ -745,8 +874,14 @@ class EagleFullLoopRunner:
                     positions_1d=positions_view,
                     block_table_tensor=buffers.block_table_tensor,
                     seq_lens=buffers.seq_lens_per_step[step + 1, :batch_size],
-                    block_size=getattr(proposer, "block_size", 16),
-                    max_model_len=getattr(proposer, "max_model_len", 196_608),
+                    # block_size / max_model_len: see the matching
+                    # comment at the bridge site above — keep these
+                    # identical (same fallback, same falsy-guard) so
+                    # bridge and captured replay agree on slot mappings.
+                    block_size=int(getattr(proposer, "block_size", 16) or 16),
+                    max_model_len=int(
+                        getattr(proposer, "max_model_len", 196_608) or 196_608
+                    ),
                     out_clamped_positions=buffers.positions_per_step[
                         step + 1, :batch_size
                     ],
