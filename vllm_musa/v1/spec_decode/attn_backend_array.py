@@ -183,17 +183,17 @@ def build_per_step_attn_metadata_array(
         # max_num_splits=1 -> a plain fixed-split decode that is both
         # CUDAGraph-capturable AND correct for any seq_lens (the per-request
         # `seq_lens`/`seqused_k` tensor still masks the KV correctly).
+        # Set, do not swallow: if the FA backend ever changes one of
+        # these fields to read-only or removes it under us, we WANT to
+        # know — the captured chain's correctness depends on the AOT
+        # scheduler being neutralized, so a silent set-failure would
+        # corrupt outputs without any signal. `hasattr` already gates
+        # the optional fields.
         for _m in per_layer.values():
             if hasattr(_m, "scheduler_metadata"):
-                try:
-                    _m.scheduler_metadata = None
-                except Exception:
-                    pass
+                _m.scheduler_metadata = None
             if hasattr(_m, "max_num_splits"):
-                try:
-                    _m.max_num_splits = 1
-                except Exception:
-                    pass
+                _m.max_num_splits = 1
 
         # per_layer is the dict {layer_name: attn_metadata} that
         # set_forward_context expects. Store the dict as the step's metadata

@@ -491,7 +491,11 @@ class EagleFullLoopRunner:
             positions_1d=carry_positions[:batch_size],
             block_table_tensor=ctx.buffers.block_table_tensor,
             seq_lens=chain_seq,
-            block_size=int(getattr(p, "block_size", 64) or 64),
+            # block_size / max_model_len: align with the captured-chain
+            # site (see the in-graph call below) — same fallbacks, same
+            # `int(... or default)` falsy-guard so a None / missing attr
+            # cannot diverge between bridge and replay slot mappings.
+            block_size=int(getattr(p, "block_size", 16) or 16),
             max_model_len=int(getattr(p, "max_model_len", 196_608) or 196_608),
             out_clamped_positions=ctx.buffers.positions_in[:batch_size],
             out_slot_mapping=ctx.buffers.slot_mapping_in[:batch_size],
@@ -870,8 +874,14 @@ class EagleFullLoopRunner:
                     positions_1d=positions_view,
                     block_table_tensor=buffers.block_table_tensor,
                     seq_lens=buffers.seq_lens_per_step[step + 1, :batch_size],
-                    block_size=getattr(proposer, "block_size", 16),
-                    max_model_len=getattr(proposer, "max_model_len", 196_608),
+                    # block_size / max_model_len: see the matching
+                    # comment at the bridge site above — keep these
+                    # identical (same fallback, same falsy-guard) so
+                    # bridge and captured replay agree on slot mappings.
+                    block_size=int(getattr(proposer, "block_size", 16) or 16),
+                    max_model_len=int(
+                        getattr(proposer, "max_model_len", 196_608) or 196_608
+                    ),
                     out_clamped_positions=buffers.positions_per_step[
                         step + 1, :batch_size
                     ],

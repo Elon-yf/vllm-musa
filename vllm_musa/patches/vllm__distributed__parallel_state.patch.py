@@ -94,6 +94,21 @@ def _get_draft_tp1_group():
     world_size = torch.distributed.get_world_size()
     backend = torch.distributed.get_backend(get_world_group().device_group)
     group_ranks = [[r] for r in range(world_size)]
+    # `init_model_parallel_group(group_ranks, local_rank, ...)` — the
+    # second arg is the **device-local rank** used by GroupCoordinator to
+    # assign the device (e.g. `cuda:{local_rank}`). It is NOT used to
+    # select which entry of `group_ranks` this process belongs to —
+    # GroupCoordinator does that internally via
+    # `torch.distributed.get_rank()` (the global rank).
+    #
+    # On a multi-node job (e.g. 2 nodes × 8 GPUs = 16 ranks),
+    # `local_rank=0` is passed from both node 0 rank 0 and node 1 rank 8;
+    # each picks its own singleton group (`[0]` and `[8]` respectively)
+    # via global-rank lookup and assigns device 0 on its own node. See
+    # `vllm/distributed/parallel_state.py::GroupCoordinator` docstring
+    # for the `local_rank` vs `rank_in_group` distinction. vLLM's own
+    # `initialize_model_parallel` uses the same `get_world_group().local_rank`
+    # idiom here.
     _DRAFT_TP1_GROUP = init_model_parallel_group(
         group_ranks,
         get_world_group().local_rank,
