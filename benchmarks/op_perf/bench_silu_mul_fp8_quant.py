@@ -24,29 +24,46 @@ for _so in (
         torch.ops.load_library(_so)
 del _os
 
+# Cold-cache timing harness (mandatory per .claude/rules/musa-kernel-bench.md).
+from mate.testing.utils import bench_kineto
+
+
 def _sync(): torch.musa.synchronize()
 
 
-def bench(name, shape, n_warmup=20, n_iters=100):
+def bench(name, shape, num_tests=30,
+          kernel_substr="silu_and_mul_per_token_group_fp8_quant"):
     M, N = shape["M"], shape["N"]
     x = torch.randn(M, 2 * N, device="musa", dtype=torch.bfloat16) * 0.1
+    # FP8 Fill op unsupported on MUSA — use empty() instead of zeros().
     out_q = torch.empty(M, N, device="musa", dtype=torch.float8_e4m3fn)
-    out_s = torch.zeros(M, N // 128, device="musa", dtype=torch.float32)
+    out_s = torch.empty(M, N // 128, device="musa", dtype=torch.float32)
     op = getattr(torch.ops._C_musa_ops, "silu_and_mul_per_token_group_fp8_quant", None)
     if op is None:
         print(f"{name}: SKIP (binding not found)")
         return None
-    for _ in range(n_warmup):
+
+    def runner():
         op(x, out_q, out_s, 128, 1e-10, -448.0, 448.0)
+
+    for _ in range(3):
+        runner()
     _sync()
-    durs = []
-    for _ in range(n_iters):
-        _sync()
-        t0 = time.perf_counter_ns()
-        op(x, out_q, out_s, 128, 1e-10, -448.0, 448.0)
-        _sync()
-        durs.append((time.perf_counter_ns() - t0) / 1e3)
-    med = statistics.median(durs)
+    try:
+        seconds = bench_kineto(
+            runner,
+            kernel_names=kernel_substr,
+            num_tests=num_tests,
+            suppress_kineto_output=True,
+            flush_l2=True,
+        )
+    except Exception as exc:
+        print(f"{name}: ERROR {exc}")
+        return None
+    if seconds <= 0:
+        print(f"{name}: SKIP (kernel substr {kernel_substr!r} not matched)")
+        return None
+    med = seconds * 1e6
     # io: read bf16 x (2*N), write fp8 (N), write fp32 scale (N/128)
     io_bytes = M * 2 * N * 2 + M * N * 1 + M * (N // 128) * 4
     peak_gbps = float(os.environ.get("OP_PERF_PEAK_GDDR6_GBPS", "1200")) * 1e9
