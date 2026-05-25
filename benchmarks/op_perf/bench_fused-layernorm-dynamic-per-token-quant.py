@@ -17,6 +17,11 @@ for _so in ("/ws/vllm_musa/_C.cpython-310-x86_64-linux-gnu.so",
         torch.ops.load_library(_so)
 del _os
 
+# Cold-cache timing harness (mandatory per .claude/rules/musa-kernel-bench.md).
+from mate.testing.utils import bench_kineto
+
+DEFAULT_KERNEL_SUBSTR = "rms_norm_dynamic_per_token_quant"
+
 _DEVICE = "musa"
 
 
@@ -67,15 +72,17 @@ def _torch_native_op(t):
     return out_local, scale_local.flatten()
 
 
-def _bench(name, s, op, nw=20, ni=100):
+def _bench(name, s, op, num_tests=30, kernel_substr=DEFAULT_KERNEL_SUBSTR):
     t = _build(s)
-    for _ in range(nw): op(t)
+    def runner(): op(t)
+    for _ in range(3): runner()
     _sync()
-    durs = []
-    for _ in range(ni):
-        _sync(); t0 = time.perf_counter_ns(); op(t); _sync()
-        durs.append((time.perf_counter_ns() - t0) / 1e3)
-    med = statistics.median(durs)
+    seconds = bench_kineto(runner, kernel_names=kernel_substr,
+                           num_tests=num_tests, suppress_kineto_output=True,
+                           flush_l2=True)
+    if seconds <= 0:
+        print(f"{name}: SKIP (kernel substr not matched)"); return None
+    med = seconds * 1e6
     io = _io_bytes(s)
     bps = io / (med * 1e-6) if med > 0 else 0
     pct = bps / _peak() * 100
