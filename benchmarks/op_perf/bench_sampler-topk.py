@@ -17,6 +17,9 @@ for _so in ("/ws/vllm_musa/_C.cpython-310-x86_64-linux-gnu.so",
         torch.ops.load_library(_so)
 del _os
 
+# Cold-cache timing harness (mandatory per .claude/rules/musa-kernel-bench.md).
+from mate.testing.utils import bench_kineto
+
 _DEVICE = "musa"
 
 
@@ -30,25 +33,33 @@ def _io_bytes_topk(s):
     return B * V * 4 + B * K * 4 + B * K * 4
 
 
-def _bench_topk(name, s, nw=20, ni=100):
+def _bench_topk(name, s, num_tests=30):
     B, V, K = s["B"], s["V"], s["K"]
     logits = torch.randn(B, V, device=_DEVICE, dtype=torch.float32)
-    # top_k_per_row_decode signature: (logits, next_n, ...) — try the simpler form first
-    # Fallback to torch.topk if binding signature differs
     try:
         op = torch.ops._C.top_k_per_row_decode
-        # Probe signature with a smoke call
-        out = op(logits, 1, K)
+        op(logits, 1, K)
         def call(): return op(logits, 1, K)
+        kernel_substr = "top_k_per_row_decode"
     except Exception:
         def call(): return torch.topk(logits, K, dim=-1)
-    for _ in range(nw): call()
+        # On MUSA, torch.topk goes through mudnn:
+        # GatherTopKSBColKernel (dominant, 69 % of self time) +
+        # RadixFindKthValuesKernel + bitonic_sort_kernel. Match the
+        # dominant kernel for the cold-cache number.
+        kernel_substr = "GatherTopKSBColKernel"
+    for _ in range(3): call()
     _sync()
-    durs = []
-    for _ in range(ni):
-        _sync(); t0 = time.perf_counter_ns(); call(); _sync()
-        durs.append((time.perf_counter_ns() - t0) / 1e3)
-    med = statistics.median(durs)
+    try:
+        seconds = bench_kineto(call, kernel_names=kernel_substr,
+                               num_tests=num_tests, suppress_kineto_output=True,
+                               flush_l2=True)
+    except Exception as exc:
+        print(f"{name}: SKIP ({exc})"); return None
+    if seconds <= 0:
+        print(f"{name}: SKIP (kernel substr {kernel_substr!r} not matched)")
+        return None
+    med = seconds * 1e6
     io = _io_bytes_topk(s)
     bps = io / (med * 1e-6) if med > 0 else 0
     pct = bps / _peak() * 100
