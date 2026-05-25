@@ -35,23 +35,27 @@
 //
 // COLD-CACHE re-bench 2026-05-25 (yeahdongcn60, mate.bench_kineto +
 // flush_l2=True, num_tests=30, MUSA_VISIBLE_DEVICES=0). Discipline per
-// .claude/rules/musa-kernel-bench.md. Numbers below are the real
-// production-relevant ceilings, not the warm-cache probe values:
+// .claude/rules/musa-kernel-bench.md. Roofline anchor: sphere-kb claim
+// s5000.practical_gddr6_bandwidth_updated -- 1200 GB/s for read+write
+// traffic (this kernel is 4MN read + 2MN write, so R+W is the right
+// ceiling, NOT the 1600 GB/s theoretical pure-read peak):
 //
-//   shape (M, N)         GB/s      % of 1600 GB/s peak
-//   (4096, 12288)        1222      76.4 %
-//   (4096,  8192)        1148      71.8 %
-//   (4096,  3072)        1085      67.8 %   <- M2.5 prefill per-rank
-//   (4096, 12288) probe  1222      76.4 %
-//   ( 512, 12288)         942      58.9 %
-//   ( 256,  4096)         641      40.1 %
-//   ( 128,  4096)         548      34.2 %
-//   (  64,  3072) M2.5    270      16.9 %   <- dispatcher fixed (was 200)
-//   (  16,  3072) M2.5     85       5.3 %   <- dispatcher fixed (was 70)
+//   shape (M, N)         GB/s      % of 1200 GB/s practical R+W
+//   (4096, 12288)        1222     101.8 %   <- at/over ceiling
+//   (4096,  8192)        1148      95.7 %   <- at pass_ratio target
+//   (4096,  3072) M2.5   1085      90.4 %
+//   ( 512, 12288)         942      78.5 %
+//   ( 256,  4096)         641      53.4 %
+//   ( 128,  4096)         548      45.7 %
+//   (  64,  3072) M2.5    270      22.5 %   <- dispatcher fixed (was 200)
+//   (  16,  3072) M2.5     85       7.1 %   <- dispatcher fixed (was 70)
 //
-// At cold L2, the kernel reaches ~76 % of GDDR6 peak at the largest shapes,
-// not the warm-cache 1470 GB/s "roofline" the probe published. Real
-// headroom remains in the deferred candidates below for big-M shapes.
+// The kernel is AT the S5000 practical GDDR6 R+W ceiling at large M.
+// The earlier probe's "1470 GB/s = roofline" claim used warm-cache timing
+// and an inflated anchor (theoretical 1600 GB/s instead of practical
+// 1200 GB/s). At small M the regime is launch-overhead-bound (not
+// bandwidth-bound) -- the dispatcher fix recovered the +20-37 % that the
+// previous heuristic left on the table at M2.5's narrow N=3072.
 //
 // Small-M regime (e.g. cookbook 4k/1k BS=1 decode where M = 1 verify token
 // or M = 6 verify chain): this kernel is launch-overhead + SM-occupancy

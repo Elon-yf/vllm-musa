@@ -60,10 +60,12 @@ for _so in (
 from mate.testing.utils import bench_kineto  # noqa: E402
 
 _DEVICE = "musa"
-# S5000 GDDR6 peak (mtforge/docs/HARDWARE.md). Practical effective bandwidth
-# at large shapes is ~1400-1470 GB/s read-dominated, ~1200 GB/s read+write
-# heavy. The fused_add_rmsnorm is read+write heavy (8MN bytes of MN traffic).
-_ROOFLINE_GBPS = float(os.environ.get("OP_PERF_PEAK_GDDR6_GBPS", "1600"))
+# S5000 GDDR6 bandwidth anchor. The kernel is read+write heavy (4MN read +
+# 2MN write per call), so the right ceiling is sphere-kb's authoritative
+# claim s5000.practical_gddr6_bandwidth_updated: 1200 GB/s for read+write
+# traffic (not the 1600 GB/s theoretical peak from mtforge/docs/HARDWARE.md
+# — that's pure-read marketing). pass_ratio 0.95 → target 1140 GB/s.
+_ROOFLINE_GBPS = float(os.environ.get("OP_PERF_PEAK_GDDR6_GBPS", "1200"))
 
 
 @dataclass(frozen=True)
