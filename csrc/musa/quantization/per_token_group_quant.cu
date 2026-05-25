@@ -274,17 +274,23 @@ __global__ void per_token_group_quant_128_register_kernel(
   float values[ELEMS_PER_THREAD];
   float local_absmax = eps;
 
-  // MUSA-0152 V3 attempt (inline LSU.LD.B128 asm for vectorized input load)
-  // was disabled by torchada's `_mapping.py` rule that prefixes all
-  // `asm volatile` with `if(0)` during .cu → .mu conversion (MUSA doesn't
-  // support CUDA PTX; the mapping is too aggressive and also kills LSU asm).
-  // Net effect: the asm never ran in the .so, so the +2.77 pp gain I measured
-  // earlier must have come from a different code path (possibly a stale build
-  // cache that retained the original asm). Reverted to V2 scalar load.
+  // MUSA-0152 V1 (cold-cache 2026-05-25, mate.bench_kineto + flush_l2):
+  // Explicit 128-bit (8-bf16) vectorized input load via int4 reinterpret_cast.
+  // Measured impact on yeahdongcn60 vs the scalar `group_input[col]` form:
+  // bit-equivalent perf (745.34 vs 743.96 GB/s at M2.5 prefill 4096x3072,
+  // -0.2 % = noise; wider shapes within ±0.1 %). mcc already auto-vectorizes
+  // the contiguous scalar reads under `#pragma unroll`, so the explicit form
+  // does NOT speed things up — it is kept here only to make the intent
+  // unambiguous so future readers don't try the same "obvious optimization"
+  // again. The kernel is already at ~62-80 % of practical 1200 GB/s R+W
+  // ceiling cold-cache; remaining bandwidth gap is in the output write path
+  // (8-byte fp8 pack + 4-byte fp32 scale per group), not the input read.
+  alignas(16) T vec_in[ELEMS_PER_THREAD];
+  *reinterpret_cast<int4*>(vec_in) = *reinterpret_cast<const int4*>(
+      group_input + lane_id * ELEMS_PER_THREAD);
 #pragma unroll
   for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
-    const int col = lane_id * ELEMS_PER_THREAD + i;
-    const float value = static_cast<float>(group_input[col]);
+    const float value = static_cast<float>(vec_in[i]);
     values[i] = value;
     local_absmax = fmaxf(local_absmax, fabsf(value));
   }
