@@ -1,180 +1,353 @@
 #!/usr/bin/env python3
-"""MUSA-0150 regression bench for csrc/musa/fused_add_rmsnorm.mu (V14).
+"""MUSA-0150 v2 cold-cache bench for csrc/musa/fused_add_rmsnorm.mu.
 
-Per-shape lockstep timing + achieved-vs-GDDR6-roofline ratio. Captures the
-kernel's current performance band; future kernel edits should not regress
-this band by more than 10 %.
+Replaces benchmarks/op_perf/bench_fused_add_rmsnorm.py — that script used
+`time.perf_counter_ns` + no L2 flush + 20 warmup + 100 iters, which is the
+warm-cache/host-timer pattern .claude/rules/musa-kernel-bench.md forbids. The
+85.9 % "SOTA" claimed by the V14 probe was measured under that regime.
 
-Reference (silicon-validated 2026-04-28..29 on MTT-S5000 worker33017):
-  sphere-kb/probes/sgl_kernel_ports_20260428/01-fused_add_rmsnorm/RESULTS.md
+This bench uses mate.testing.utils.bench_kineto with flush_l2=True, the same
+harness MR 238 uses on the MUSA-native JIT kernels. Each iteration sees a
+cold L2 (8 GB int32 .zero_() between fn() calls) so the reported GB/s is
+the kernel's true effective bandwidth, not the warm-L2 artifact.
 
-  Frozen bands at large M (representative):
-    M=128  N=4096  → ~+62 % over sgl-kernel  (sphere V8 vs sgl)
-    M=512  N=12288 → ~1000 GB/s (≈75 % of GDDR6 ceiling)
-    M=4096 N=12288 → ~1470 GB/s (≈ GDDR6 roofline)
+Production shapes for M2.5 decode (per-rank, TP=8, no-EP):
+  - hidden=3072 (per-rank shard of full hidden=24576)
+  - rows ∈ {1, 6, 16, 64, 4096} (decode-single, narrow-d5 verify, BS sweep, prefill)
 
-  Small-M (cookbook decode), launch-overhead bound:
-    M=1    N=6144  → ~6 µs/call (≈2.8 % SM utilization, NOT bandwidth bound)
-    M=6    N=6144  → similar
+Also includes the V14 probe's headline shape M=4096 N=8192 for direct
+comparison to the documented "1470 GB/s warm-cache" claim.
 
-Usage (inside authorized MUSA container, with vllm-musa editable-installed):
+Usage (inside authorized MUSA container, /ws editable-installed):
 
-  python3 benchmarks/op_perf/bench_fused_add_rmsnorm.py
+  python3 benchmarks/op_perf/bench_fused_add_rmsnorm_v2.py
+  python3 benchmarks/op_perf/bench_fused_add_rmsnorm_v2.py \\
+      --shapes M2.5_decode probe_v14
 
-Roofline ratios require the GDDR6 bandwidth anchor exported via:
+  # Force a single block_x for debugging:
+  VLLM_MUSA_FUSED_ADD_RMSNORM_BLOCK_X=1024 \\
+      python3 benchmarks/op_perf/bench_fused_add_rmsnorm_v2.py
 
-  export OP_PERF_PEAK_GDDR6_GBPS=1200   # read+write practical
-  # or 1400 for read-dominated patterns; see sphere-kb claim
-  # s5000.practical_gddr6_bandwidth_updated.
+Roofline = S5000 GDDR6 peak = 1600 GB/s; pass_ratio = 0.95 → target 1520 GB/s
+for memory-bound large-M shapes. Small-M (M≤16) is launch-overhead-bound,
+not bandwidth-bound — see PERF NOTE in csrc/musa/fused_add_rmsnorm.mu.
 """
 from __future__ import annotations
+
+import argparse
 import json
 import os
-import statistics
 import sys
-import time
+from dataclasses import dataclass
 
 import torch
 
 # Prime MUSA patches before any torch.cuda symbols are captured.
 import torchada  # noqa: F401
-import torch_musa  # noqa: F401  -- registers MUSA backend so torch.ops.load_library can resolve MUSA symbols
-# Load torch.ops directly from the .so files. Avoids the
-# vllm-plugin circular-import error that fires when `import vllm`
-# triggers `vllm.plugins.load_plugins_by_group()` against a
-# partially-initialized vllm_musa module.
-import os as _os
+import torch_musa  # noqa: F401
+
+# Load torch.ops directly from the .so files to avoid the vllm-plugin
+# circular-import error that fires when `import vllm` triggers
+# `vllm.plugins.load_plugins_by_group()` against a partially-initialized
+# vllm_musa module.
 for _so in (
     "/ws/vllm_musa/_C.cpython-310-x86_64-linux-gnu.so",
     "/ws/vllm/_C.cpython-310-x86_64-linux-gnu.so",
 ):
-    if _os.path.exists(_so):
+    if os.path.exists(_so):
         torch.ops.load_library(_so)
-del _os
+
+from mate.testing.utils import bench_kineto  # noqa: E402
 
 _DEVICE = "musa"
+# S5000 GDDR6 peak (mtforge/docs/HARDWARE.md). Practical effective bandwidth
+# at large shapes is ~1400-1470 GB/s read-dominated, ~1200 GB/s read+write
+# heavy. The fused_add_rmsnorm is read+write heavy (8MN bytes of MN traffic).
+_ROOFLINE_GBPS = float(os.environ.get("OP_PERF_PEAK_GDDR6_GBPS", "1600"))
 
 
-# --- bench primitives (self-contained — does not depend on the workspace
-# harness path, so the bench works regardless of where vllm-musa is built) ---
+@dataclass(frozen=True)
+class Shape:
+    name: str
+    rows: int
+    hidden: int
 
 
-def _device_sync() -> None:
+# M2.5 per-rank decode (TP=8 no-EP): hidden=3072 (per-rank shard of 24576)
+# Common rows in the workload:
+#   1   = greedy decode single token
+#   6   = narrow-d5 chain verify (1 + 5 spec tokens)
+#   16  = small concurrency
+#   64  = larger concurrency
+#   4096 = prefill at 4k input
+SHAPE_SETS: dict[str, tuple[Shape, ...]] = {
+    "M2.5_decode_per_rank": (
+        Shape("decode_single", 1, 3072),
+        Shape("verify_d5_chain", 6, 3072),
+        Shape("bs16_decode", 16, 3072),
+        Shape("bs64_decode", 64, 3072),
+        Shape("bs256_decode", 256, 3072),
+        Shape("prefill_4k", 4096, 3072),
+    ),
+    "M2.5_decode_full_hidden": (
+        Shape("decode_single_h24576", 1, 24576),
+        Shape("verify_d5_chain_h24576", 6, 24576),
+        Shape("bs16_h24576", 16, 24576),
+        Shape("bs256_h24576", 256, 24576),
+    ),
+    "probe_v14_headline": (
+        # Shapes the V14 probe published in sphere-kb/probes/.../RESULTS.md
+        Shape("v14_M256_N4096", 256, 4096),
+        Shape("v14_M128_N4096", 128, 4096),
+        Shape("v14_M512_N12288", 512, 12288),
+        Shape("v14_M4096_N12288", 4096, 12288),
+        Shape("v14_M4096_N8192", 4096, 8192),
+    ),
+    "mr238_layernorm_gated_reference": (
+        # MR 238's published `rms_norm_gated M4096 N8192` row = 1017 GB/s TileLang
+        # (not directly comparable — different op — but anchors the shape).
+        Shape("mr238_M4096_N8192", 4096, 8192),
+    ),
+}
+
+
+def _bytes_moved(rows: int, hidden: int, dtype: torch.dtype) -> int:
+    """Bytes read + written by one fused_add_rmsnorm call.
+
+    Read: input[M, N], residual[M, N], weight[N]
+    Write: residual[M, N] (sum), input[M, N] (normed)
+    Total = 4 * M * N + N (all dtype-sized).
+    """
+    elem = torch.empty((), dtype=dtype).element_size()
+    return (4 * rows * hidden + hidden) * elem
+
+
+def _flops(rows: int, hidden: int) -> int:
+    """FLOPs per fused_add_rmsnorm call.
+
+    Per element (M*N total):
+      add: 1 FLOP
+      sq:  1 FLOP
+      mul (output): 2 FLOPs (inv_rms * weight * fused)
+    Per row:
+      rsqrt: ~2 FLOPs
+    Total = 4 * M * N + 2 * M  ≈ 4 M N.
+    """
+    return 4 * rows * hidden + 2 * rows
+
+
+def _make_inputs(rows: int, hidden: int, dtype: torch.dtype):
+    g = torch.Generator(device=_DEVICE).manual_seed(0)
+    inp = torch.randn((rows, hidden), dtype=dtype, device=_DEVICE, generator=g) * 0.1
+    res = torch.randn((rows, hidden), dtype=dtype, device=_DEVICE, generator=g) * 0.1
+    w = torch.randn((hidden,), dtype=dtype, device=_DEVICE, generator=g) * 0.5 + 1.0
+    return inp.contiguous(), res.contiguous(), w.contiguous()
+
+
+def _resolve_op(prefer: str):
+    """Return the torch op pointer for the requested fused_add_rmsnorm variant.
+
+    `prefer` is one of:
+      "v14"      — vllm-musa native MUSA-0150 V14 kernel
+                   (torch.ops._C_musa_ops.musa_fused_add_rms_norm).
+      "upstream" — upstream vllm kernel
+                   (torch.ops._C.fused_add_rms_norm in vllm/_C.so).
+    """
+    if prefer == "v14":
+        op = getattr(torch.ops, "_C_musa_ops", None)
+        if op is not None and hasattr(op, "musa_fused_add_rms_norm"):
+            return op.musa_fused_add_rms_norm, "_C_musa_ops::musa_fused_add_rms_norm"
+        raise RuntimeError(
+            "V14 op torch.ops._C_musa_ops.musa_fused_add_rms_norm is not loaded. "
+            "Confirm /ws/vllm_musa/_C.cpython-*.so is loaded via torch.ops.load_library."
+        )
+    if prefer == "upstream":
+        op = getattr(torch.ops, "_C", None)
+        if op is not None and hasattr(op, "fused_add_rms_norm"):
+            return op.fused_add_rms_norm, "_C::fused_add_rms_norm"
+        raise RuntimeError(
+            "Upstream op torch.ops._C.fused_add_rms_norm is not loaded. "
+            "Confirm /ws/vllm/_C.cpython-*.so is loaded via torch.ops.load_library."
+        )
+    raise ValueError(f"prefer must be 'v14' or 'upstream', got {prefer!r}")
+
+
+def _bench_shape(shape: Shape, dtype: torch.dtype, kernel_substr: str,
+                 prefer: str, num_tests: int = 30) -> dict:
+    inp, res, w = _make_inputs(shape.rows, shape.hidden, dtype)
+    op_fn, op_name = _resolve_op(prefer)
+    eps = 1e-5
+
+    def _runner():
+        # in-place: residual ← input + residual, input ← rmsnorm(residual)
+        op_fn(inp, res, w, eps)
+
+    # Warmup outside the measurement (mate.bench_kineto already does an extra
+    # warmup pass inside the profiler schedule).
+    for _ in range(3):
+        _runner()
     torch.musa.synchronize()
 
-
-def _peak_gbps() -> float:
-    return float(os.environ.get("OP_PERF_PEAK_GDDR6_GBPS", "1200")) * 1e9
-
-
-def _run_bench(name, shape, build_inputs, run_op, io_bytes_fn,
-               n_warmup=20, n_iters=100):
-    inputs = build_inputs(shape)
-    for _ in range(n_warmup):
-        run_op(inputs)
-    _device_sync()
-
-    durs_us = []
-    for _ in range(n_iters):
-        _device_sync()
-        t0 = time.perf_counter_ns()
-        run_op(inputs)
-        _device_sync()
-        t1 = time.perf_counter_ns()
-        durs_us.append((t1 - t0) / 1e3)
-
-    median_us = statistics.median(durs_us)
-    min_us = min(durs_us)
-    p95_us = statistics.quantiles(durs_us, n=20)[18]
-    io_bytes = io_bytes_fn(shape)
-    achieved_bps = io_bytes / (median_us * 1e-6) if median_us > 0 else 0.0
-    bw_ratio = achieved_bps / _peak_gbps() if _peak_gbps() > 0 else None
-
-    print(
-        f"{name:<40s} median_us={median_us:>8.2f} "
-        f"min={min_us:>7.2f} p95={p95_us:>7.2f} "
-        f"GB/s={achieved_bps/1e9:>7.1f} "
-        f"roofline_pct={(bw_ratio or 0)*100:>6.2f}%"
+    seconds = bench_kineto(
+        _runner,
+        kernel_names=kernel_substr,
+        num_tests=num_tests,
+        suppress_kineto_output=True,
+        flush_l2=True,                 # MANDATORY (see musa-kernel-bench.md)
     )
+    if seconds <= 0:
+        raise RuntimeError(
+            f"bench_kineto returned 0 for {kernel_substr!r}; check substring match"
+        )
+    bytes_moved = _bytes_moved(shape.rows, shape.hidden, dtype)
+    flops = _flops(shape.rows, shape.hidden)
+    gbps = bytes_moved / seconds / 1e9
+    tflops = flops / seconds / 1e12
     return {
-        "name": name,
-        "shape": shape,
-        "median_us": median_us,
-        "min_us": min_us,
-        "p95_us": p95_us,
-        "io_bytes": io_bytes,
-        "achieved_gbps": achieved_bps / 1e9,
-        "roofline_pct": (bw_ratio or 0) * 100,
+        "shape": shape.name,
+        "rows": shape.rows,
+        "hidden": shape.hidden,
+        "dtype": str(dtype).removeprefix("torch."),
+        "bytes": bytes_moved,
+        "flops": flops,
+        "latency_us": seconds * 1e6,
+        "GB_s": gbps,
+        "TFLOPS": tflops,
+        "pct_peak_bw": gbps / _ROOFLINE_GBPS * 100,
+        "kernel": op_name,
     }
 
 
-# --- fused_add_rmsnorm specifics -------------------------------------------
-
-
-def _build_inputs(shape):
-    M, N = shape["M"], shape["N"]
-    dtype = shape.get("dtype", torch.bfloat16)
-    inp = torch.randn(M, N, device=_DEVICE, dtype=dtype) * 0.1
-    res = torch.randn(M, N, device=_DEVICE, dtype=dtype) * 0.1
-    w = torch.randn(N, device=_DEVICE, dtype=dtype) * 0.1 + 1.0
-    return inp, res, w
-
-
-def _run_op(inputs):
-    inp, res, w = inputs
-    # In-place fused add + rms norm: input -> normed; residual -> sum.
-    torch.ops._C_musa_ops.musa_fused_add_rms_norm(inp, res, w, 1e-5)
-
-
-def _io_bytes(shape):
-    M, N = shape["M"], shape["N"]
-    elem = 2  # bf16
-    # input load + residual load + residual store + weight load + output store
-    # weight load is amortized over M, but we count it conservatively once.
-    return M * N * elem * 4 + N * elem
-
-
-# Representative shapes for the M2.5 cookbook (hidden ≈ 6144) + the
-# probe's published shapes (so this bench rerun matches the silicon
-# RESULTS.md numbers within timing noise).
-SHAPES = [
-    # cookbook decode regime (launch-overhead bound)
-    {"M": 1,    "N": 6144},
-    {"M": 6,    "N": 6144},   # Eagle3 5-deep verify (1 base + 5 chain)
-    # mid-batch
-    {"M": 32,   "N": 6144},
-    {"M": 128,  "N": 6144},
-    # probe-aligned shapes (for cross-check vs RESULTS.md)
-    {"M": 256,  "N": 4096},
-    {"M": 512,  "N": 8192},
-    # cookbook prefill regime (bandwidth bound, expected near roofline)
-    {"M": 4096, "N": 6144},
-]
+def _print_table(rows: list[dict]) -> None:
+    hdr = (
+        f"{'shape':<28s} {'rows':>6s} {'hidden':>7s} {'dtype':>6s} "
+        f"{'latency_us':>12s} {'GB/s':>10s} {'%peak':>7s} {'TFLOPS':>9s}"
+    )
+    print()
+    print(hdr)
+    print("-" * len(hdr))
+    for r in rows:
+        print(
+            f"{r['shape']:<28s} {r['rows']:>6d} {r['hidden']:>7d} {r['dtype']:>6s} "
+            f"{r['latency_us']:>12.3f} {r['GB_s']:>10.2f} {r['pct_peak_bw']:>6.1f}% "
+            f"{r['TFLOPS']:>9.4f}"
+        )
 
 
 def main():
-    results = []
-    print("fused_add_rmsnorm.mu (V14) regression bench")
-    print(f"peak GDDR6: {_peak_gbps()/1e9:.0f} GB/s "
-          f"(override via OP_PERF_PEAK_GDDR6_GBPS)")
-    print()
-    for shape in SHAPES:
-        name = f"M{shape['M']:>4d}_N{shape['N']:>5d}"
-        results.append(_run_bench(
-            name, shape, _build_inputs, _run_op, _io_bytes
-        ))
-
-    out_path = os.environ.get(
-        "MUSA_0150_BENCH_OUT", "/tmp/musa_0150_fused_add_rmsnorm.json"
+    parser = argparse.ArgumentParser(__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument(
+        "--shapes",
+        nargs="+",
+        default=["M2.5_decode_per_rank", "probe_v14_headline"],
+        choices=list(SHAPE_SETS.keys()),
+        help="Which shape set(s) to bench.",
     )
-    with open(out_path, "w") as fh:
-        json.dump(results, fh, indent=2, default=str)
-    print()
-    print(f"Results JSON: {out_path}")
-    print()
-    print("Regression check: if any large-M (M >= 256) shape drops below "
-          "the historical band (~1000 GB/s at M=512, ~1470 GB/s at M >= 1024) "
-          "by more than 10 %, the kernel has regressed.")
+    parser.add_argument(
+        "--dtype",
+        choices=["bf16", "fp16"],
+        default="bf16",
+        help="Tensor dtype (fused_add_rmsnorm runs on bf16/fp16).",
+    )
+    parser.add_argument(
+        "--variant",
+        choices=["v14", "upstream", "both"],
+        default="both",
+        help="Which fused_add_rmsnorm impl to bench. 'both' runs V14 and "
+        "upstream side-by-side for the same shapes.",
+    )
+    parser.add_argument(
+        "--kernel-substr-v14",
+        default="vllm_musa::fused_add_rmsnorm_kernel",
+        help="Substring matched in profiler table for the V14 kernel.",
+    )
+    parser.add_argument(
+        "--kernel-substr-upstream",
+        default="vllm::fused_add_rms_norm_kernel",
+        help="Substring matched in profiler table for the upstream kernel.",
+    )
+    parser.add_argument("--num-tests", type=int, default=30)
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit JSON instead of human table.",
+    )
+    args = parser.parse_args()
+
+    if not (hasattr(torch, "musa") and torch.musa.is_available()):
+        print("ERROR: MUSA device not available", file=sys.stderr)
+        sys.exit(2)
+
+    dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}[args.dtype]
+    forced = os.environ.get("VLLM_MUSA_FUSED_ADD_RMSNORM_BLOCK_X", "auto")
+
+    print(f"# MUSA-0150 cold-cache bench (mate.bench_kineto + flush_l2=True)")
+    print(f"# device: {torch.musa.get_device_name(0)}")
+    print(f"# dtype:  {args.dtype}")
+    print(f"# block_x dispatch: {'forced=' + forced if forced != 'auto' else 'adaptive (V14)'}")
+    print(f"# roofline: {_ROOFLINE_GBPS:.0f} GB/s (S5000 GDDR6 peak)")
+    print(f"# pass_ratio 0.95 → target {_ROOFLINE_GBPS*0.95:.0f} GB/s")
+    print(f"# num_tests: {args.num_tests}")
+
+    variants = ["v14", "upstream"] if args.variant == "both" else [args.variant]
+    substrs = {
+        "v14": args.kernel_substr_v14,
+        "upstream": args.kernel_substr_upstream,
+    }
+
+    all_rows: list[dict] = []
+    for shape_set in args.shapes:
+        print(f"\n## {shape_set}")
+        rows_by_variant: dict[str, list[dict]] = {}
+        for variant in variants:
+            rows = []
+            for shape in SHAPE_SETS[shape_set]:
+                try:
+                    r = _bench_shape(shape, dtype, substrs[variant], variant,
+                                     args.num_tests)
+                    r["variant"] = variant
+                    rows.append(r)
+                except Exception as exc:
+                    rows.append({
+                        "shape": shape.name, "rows": shape.rows,
+                        "hidden": shape.hidden, "variant": variant,
+                        "dtype": str(dtype).removeprefix("torch."),
+                        "error": str(exc)[:200],
+                    })
+            rows_by_variant[variant] = rows
+            if args.json:
+                continue
+            print(f"\n### variant = {variant}")
+            _print_table([r for r in rows if "error" not in r])
+            for r in rows:
+                if "error" in r:
+                    print(f"  ERROR {r['shape']:<28s}: {r['error']}")
+
+        # Side-by-side speedup table when both variants ran
+        if len(variants) == 2 and not args.json:
+            print(f"\n### V14 vs upstream speedup")
+            print(f"{'shape':<28s} {'rows':>6s} {'hidden':>7s} "
+                  f"{'v14_us':>10s} {'up_us':>10s} {'speedup':>9s} "
+                  f"{'v14 GB/s':>10s} {'up GB/s':>10s}")
+            print("-" * 95)
+            v14_by_shape = {r['shape']: r for r in rows_by_variant.get('v14', [])
+                            if 'error' not in r}
+            up_by_shape = {r['shape']: r for r in rows_by_variant.get('upstream', [])
+                           if 'error' not in r}
+            for sname in [s.name for s in SHAPE_SETS[shape_set]]:
+                v = v14_by_shape.get(sname)
+                u = up_by_shape.get(sname)
+                if v and u:
+                    sp = u['latency_us'] / v['latency_us']
+                    print(f"{sname:<28s} {v['rows']:>6d} {v['hidden']:>7d} "
+                          f"{v['latency_us']:>10.3f} {u['latency_us']:>10.3f} "
+                          f"{sp:>8.2f}x {v['GB_s']:>10.2f} {u['GB_s']:>10.2f}")
+
+        all_rows.extend([r for variant in variants for r in rows_by_variant[variant]])
+        torch.musa.empty_cache()
+
+    if args.json:
+        print(json.dumps({"all": all_rows}, sort_keys=True))
 
 
 if __name__ == "__main__":

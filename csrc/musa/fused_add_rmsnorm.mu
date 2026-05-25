@@ -27,13 +27,31 @@
 //                              bypass loads, same adaptive block_x heuristic
 //                              frozen 2026-04-29)
 //
-// Verified achievement (silicon, worker33017, 1000 iters/trial, 5-trial median):
+// Verified achievement (silicon, worker33017, 1000 iters/trial, 5-trial median,
+// WARM-cache torch.musa.Event timer — superseded as primary perf reference):
 //   - geomean +31 % over sgl-kernel `LayerNormGlobalKernelVlen<T,float,1024,1,8>`
 //   - max +93 % at M=256, N=4096
-//   - effective bandwidth ~1470 GB/s at large shapes -- at S5000's practical
-//     GDDR6 roofline (sphere-kb claim s5000.practical_gddr6_bandwidth_updated:
-//     ~1200 GB/s read+write, ~1400 GB/s read-only)
-//   - no kernel-level headroom remaining at large shapes
+//   - effective bandwidth ~1470 GB/s at large shapes (warm-L2 artifact)
+//
+// COLD-CACHE re-bench 2026-05-25 (yeahdongcn60, mate.bench_kineto +
+// flush_l2=True, num_tests=30, MUSA_VISIBLE_DEVICES=0). Discipline per
+// .claude/rules/musa-kernel-bench.md. Numbers below are the real
+// production-relevant ceilings, not the warm-cache probe values:
+//
+//   shape (M, N)         GB/s      % of 1600 GB/s peak
+//   (4096, 12288)        1222      76.4 %
+//   (4096,  8192)        1148      71.8 %
+//   (4096,  3072)        1085      67.8 %   <- M2.5 prefill per-rank
+//   (4096, 12288) probe  1222      76.4 %
+//   ( 512, 12288)         942      58.9 %
+//   ( 256,  4096)         641      40.1 %
+//   ( 128,  4096)         548      34.2 %
+//   (  64,  3072) M2.5    270      16.9 %   <- dispatcher fixed (was 200)
+//   (  16,  3072) M2.5     85       5.3 %   <- dispatcher fixed (was 70)
+//
+// At cold L2, the kernel reaches ~76 % of GDDR6 peak at the largest shapes,
+// not the warm-cache 1470 GB/s "roofline" the probe published. Real
+// headroom remains in the deferred candidates below for big-M shapes.
 //
 // Small-M regime (e.g. cookbook 4k/1k BS=1 decode where M = 1 verify token
 // or M = 6 verify chain): this kernel is launch-overhead + SM-occupancy
@@ -52,8 +70,12 @@
 //   - Pipeline pass-1 chunks with async copy on x/r as well as w (only
 //     profitable at CHUNK >= 2, e.g. N=12288)
 //
-// Reference regression benchmark:
+// Reference cold-cache benchmark:
 //   benchmarks/op_perf/bench_fused_add_rmsnorm.py
+//     -- uses mate.testing.utils.bench_kineto with flush_l2=True per the
+//     .claude/rules/musa-kernel-bench.md discipline. The previous bench
+//     (time.perf_counter_ns + no L2 flush) produced warm-cache artifacts
+//     and is replaced by this script.
 //
 // =============================================================================
 
@@ -189,12 +211,35 @@ void dispatch_fused_add_rmsnorm(T* input, T* residual, const T* weight,
     block_x = forced_block;
   } else if (rows >= 512 && vec_hidden_size <= 640) {
     block_x = 128;
+  } else if (vec_hidden_size <= 480 && rows >= 256) {
+    // MUSA-0150 (re-bench 2026-05-25, mate.bench_kineto cold-cache): for
+    // narrow hidden (vec_hidden_size <= 480, i.e. hidden <= 3840 — covers
+    // M2.5 per-rank N=3072) with rows >= 256, block_x=128 wins cold-cache:
+    //   rows=256 hidden=3072: 600.3 -> 630.6 GB/s (+5 %)
+    //   rows=4096 hidden=3072: 1030.9 -> 1085.9 GB/s (+5 %)
+    // Rule is tightened from vec<=512 to vec<=480 to avoid the N=4096
+    // (vec=512) regression: at vec=512 M=128, BLOCK=128 needs CHUNK=4 and
+    // loses to BLOCK=256 CHUNK=2 by ~17 %. The probe's wider-hidden
+    // benches over-credited 256-thread blocks because their warm-cache
+    // numbers couldn't expose the cross-warp reduce overhead.
+    block_x = 128;
   } else if (rows >= 256) {
     block_x = 256;
   } else if (rows >= 128 && vec_hidden_size >= 896) {
     block_x = 512;
   } else if (rows >= 128) {
     block_x = 256;
+  } else if (vec_hidden_size <= 480) {
+    // MUSA-0150 (re-bench 2026-05-25): for narrow hidden and small M
+    // (rows < 128, vec_hidden <= 480), block_x=512 wins decisively over the
+    // previous default 1024. Cold-cache deltas at hidden=3072:
+    //   rows=6:  27.4 -> 33.0 GB/s  (+20 %)
+    //   rows=16: 69.3 -> 84.2 GB/s  (+21 %)
+    //   rows=64: 200.5 -> 275.6 GB/s (+37 %)
+    // The probe's else-branch=1024 assumed small M needs to saturate all
+    // 1024 lanes; cold-cache the cross-warp shared-mem reduce dominates,
+    // and a 2-warp block (512) is the right amortization point.
+    block_x = 512;
   } else if (rows >= 8 && vec_hidden_size >= 1280) {
     block_x = 512;
   } else {
