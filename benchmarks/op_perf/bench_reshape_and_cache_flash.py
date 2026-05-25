@@ -1,174 +1,207 @@
 #!/usr/bin/env python3
-"""MUSA-0151 regression bench for csrc/musa/cache_kernels.mu.
+"""MUSA-0151 cold-cache bench for csrc/musa/cache_kernels.mu.
 
-`reshape_and_cache_flash_nhd_kernel<T, BLOCK_X=512, TOKENS_PER_BLOCK>` is a
-pure bandwidth-bound gather/scatter from (key, value) to the paged
-kv-cache. Per-shape lockstep timing + achieved-vs-GDDR6 ratio. Captures
-the kernel's current band; future kernel edits should not regress > 10 %.
+Replaces the previous bench (time.perf_counter_ns + no L2 flush + warm
+iters). Uses mate.testing.utils.bench_kineto with flush_l2=True per
+.claude/rules/musa-kernel-bench.md.
 
-Note: this kernel has no sphere-kb probe yet. The 'baseline' here is the
-kernel's own first measurement; the V2 adaptive-BLOCK_X candidate (see
-PERF NOTE in cache_kernels.mu) would re-establish the band when shipped.
+Op: reshape_and_cache_flash_nhd_kernel<T, BLOCK_X=512, TOKENS_PER_BLOCK>.
+Pure bandwidth-bound gather (key, value) -> scatter (kv-cache), 4 * T *
+num_heads_kv * head_size * sizeof(dtype) bytes per call.
 
-Usage (inside authorized MUSA container with vllm-musa editable-installed):
+Production M2.5 shapes (per-rank, TP=8 no-EP):
+  num_heads_kv=1 (full kv_heads=8 sharded TP=8), head_size=128.
+  vecs_per_token = num_heads_kv * head_size / 8 = 16  -> TPB=8 default.
+  num_tokens ∈ {1, 6, 16, 64, 256, 4096}.
+
+Roofline anchor: sphere-kb claim s5000.practical_gddr6_bandwidth_updated
+= 1200 GB/s for read+write traffic (this kernel is 2T*H*D read +
+2T*H*D write = 4T*H*D total, all GDDR6 traffic).
+
+Usage:
 
   python3 benchmarks/op_perf/bench_reshape_and_cache_flash.py
+  VLLM_MUSA_RESHAPE_CACHE_TOKENS_PER_BLOCK=4 python3 benchmarks/...
 
-Roofline ratio requires the GDDR6 anchor:
-
-  export OP_PERF_PEAK_GDDR6_GBPS=1200   # read+write practical (sphere-kb
-                                        # s5000.practical_gddr6_bandwidth_updated)
 """
 from __future__ import annotations
+
+import argparse
 import json
 import os
-import statistics
-import time
+import sys
+from dataclasses import dataclass
 
 import torch
 import torchada  # noqa: F401
-import torch_musa  # noqa: F401  -- registers MUSA backend so torch.ops.load_library can resolve MUSA symbols
-# Load torch.ops directly from the .so files. Avoids the
-# vllm-plugin circular-import error that fires when `import vllm`
-# triggers `vllm.plugins.load_plugins_by_group()` against a
-# partially-initialized vllm_musa module.
-import os as _os
+import torch_musa  # noqa: F401
+
 for _so in (
     "/ws/vllm_musa/_C.cpython-310-x86_64-linux-gnu.so",
     "/ws/vllm/_C.cpython-310-x86_64-linux-gnu.so",
 ):
-    if _os.path.exists(_so):
+    if os.path.exists(_so):
         torch.ops.load_library(_so)
-del _os
+
+from mate.testing.utils import bench_kineto  # noqa: E402
 
 _DEVICE = "musa"
+_ROOFLINE_GBPS = float(os.environ.get("OP_PERF_PEAK_GDDR6_GBPS", "1200"))
 
 
-def _device_sync() -> None:
+@dataclass(frozen=True)
+class Shape:
+    name: str
+    num_tokens: int
+    num_heads: int
+    head_size: int
+    block_size: int = 16
+    num_blocks: int = 16384  # enough for max_model_len = 196608
+
+
+SHAPE_SETS: dict[str, tuple[Shape, ...]] = {
+    "M2.5_decode_per_rank": (
+        Shape("decode_single", 1, 1, 128),
+        Shape("verify_d5_chain", 6, 1, 128),
+        Shape("bs16_decode", 16, 1, 128),
+        Shape("bs64_decode", 64, 1, 128),
+        Shape("bs256_decode", 256, 1, 128),
+        Shape("prefill_4k", 4096, 1, 128),
+    ),
+    # Wider configs (full kv_heads on rank, non-TP) for diversity
+    "wide_heads": (
+        Shape("T256_H4_D128", 256, 4, 128),
+        Shape("T256_H8_D128", 256, 8, 128),
+        Shape("T4096_H4_D128", 4096, 4, 128),
+        Shape("T4096_H8_D128", 4096, 8, 128),
+    ),
+}
+
+
+def _bytes_moved(shape: Shape, dtype: torch.dtype) -> int:
+    """Read key + value, write key_cache + value_cache. 4 * T * H * D * dt."""
+    elem = torch.empty((), dtype=dtype).element_size()
+    return 4 * shape.num_tokens * shape.num_heads * shape.head_size * elem
+
+
+def _make_inputs(shape: Shape, dtype: torch.dtype):
+    g = torch.Generator(device=_DEVICE).manual_seed(0)
+    key = torch.randn((shape.num_tokens, shape.num_heads, shape.head_size),
+                      dtype=dtype, device=_DEVICE, generator=g).contiguous()
+    value = torch.randn_like(key)
+    kc = torch.zeros((shape.num_blocks, shape.block_size, shape.num_heads,
+                      shape.head_size), dtype=dtype, device=_DEVICE)
+    vc = torch.zeros_like(kc)
+    # Slot mapping: each token writes to a unique slot
+    max_slot = shape.num_blocks * shape.block_size
+    slots = torch.arange(shape.num_tokens, dtype=torch.int64, device=_DEVICE)
+    slots = (slots * 17) % max_slot  # pseudo-random but deterministic spread
+    return key, value, kc, vc, slots
+
+
+def _resolve_op():
+    op = torch.ops._C_musa_ops
+    for name in ("musa_reshape_and_cache_flash_nhd", "reshape_and_cache_flash"):
+        if hasattr(op, name):
+            return getattr(op, name), f"_C_musa_ops::{name}"
+    raise RuntimeError(
+        "Could not find reshape_and_cache_flash op. Available: "
+        + ", ".join(n for n in dir(op) if "cache" in n.lower())
+    )
+
+
+def _bench_shape(shape: Shape, dtype: torch.dtype, num_tests: int = 30) -> dict:
+    key, value, kc, vc, slots = _make_inputs(shape, dtype)
+    op_fn, op_name = _resolve_op()
+
+    def _runner():
+        op_fn(key, value, kc, vc, slots)
+
+    for _ in range(3):
+        _runner()
     torch.musa.synchronize()
 
-
-def _peak_gbps() -> float:
-    return float(os.environ.get("OP_PERF_PEAK_GDDR6_GBPS", "1200")) * 1e9
-
-
-def _run_bench(name, shape, build_inputs, run_op, io_bytes_fn,
-               n_warmup=20, n_iters=100):
-    inputs = build_inputs(shape)
-    for _ in range(n_warmup):
-        run_op(inputs)
-    _device_sync()
-
-    durs_us = []
-    for _ in range(n_iters):
-        _device_sync()
-        t0 = time.perf_counter_ns()
-        run_op(inputs)
-        _device_sync()
-        t1 = time.perf_counter_ns()
-        durs_us.append((t1 - t0) / 1e3)
-
-    median_us = statistics.median(durs_us)
-    min_us = min(durs_us)
-    p95_us = statistics.quantiles(durs_us, n=20)[18]
-    io_bytes = io_bytes_fn(shape)
-    bps = io_bytes / (median_us * 1e-6) if median_us > 0 else 0.0
-    bw_ratio = bps / _peak_gbps() if _peak_gbps() > 0 else None
-
-    print(
-        f"{name:<50s} median_us={median_us:>8.2f} "
-        f"min={min_us:>7.2f} p95={p95_us:>7.2f} "
-        f"GB/s={bps/1e9:>7.1f} "
-        f"roofline_pct={(bw_ratio or 0)*100:>6.2f}%"
+    seconds = bench_kineto(
+        _runner,
+        kernel_names="reshape_and_cache_flash_nhd_kernel",
+        num_tests=num_tests,
+        suppress_kineto_output=True,
+        flush_l2=True,
     )
+    if seconds <= 0:
+        raise RuntimeError(
+            "bench_kineto returned 0; check kernel name substring match"
+        )
+    bytes_moved = _bytes_moved(shape, dtype)
+    gbps = bytes_moved / seconds / 1e9
     return {
-        "name": name,
-        "shape": shape,
-        "median_us": median_us,
-        "io_bytes": io_bytes,
-        "achieved_gbps": bps / 1e9,
-        "roofline_pct": (bw_ratio or 0) * 100,
+        "shape": shape.name,
+        "num_tokens": shape.num_tokens,
+        "num_heads": shape.num_heads,
+        "head_size": shape.head_size,
+        "dtype": str(dtype).removeprefix("torch."),
+        "bytes": bytes_moved,
+        "latency_us": seconds * 1e6,
+        "GB_s": gbps,
+        "pct_peak_bw": gbps / _ROOFLINE_GBPS * 100,
+        "kernel": op_name,
     }
 
 
-def _build_inputs(shape):
-    T = shape["num_tokens"]
-    H = shape["num_heads"]
-    D = shape["head_size"]
-    B = shape["block_size"]
-    NB = shape["num_blocks"]
-    dtype = shape.get("dtype", torch.bfloat16)
-    key = torch.randn(T, H, D, device=_DEVICE, dtype=dtype)
-    value = torch.randn(T, H, D, device=_DEVICE, dtype=dtype)
-    key_cache = torch.zeros(NB, B, H, D, device=_DEVICE, dtype=dtype)
-    value_cache = torch.zeros(NB, B, H, D, device=_DEVICE, dtype=dtype)
-    # Slot mapping: simple sequential assignment, with some -1 padding sometimes.
-    slot_mapping = torch.arange(T, device=_DEVICE, dtype=torch.int64)
-    return key, value, key_cache, value_cache, slot_mapping
-
-
-def _run_op(inputs):
-    key, value, key_cache, value_cache, slot_mapping = inputs
-    torch.ops._C_musa_ops.musa_reshape_and_cache_flash_nhd(
-        key, value, key_cache, value_cache, slot_mapping
+def _print_table(rows: list[dict]) -> None:
+    hdr = (
+        f"{'shape':<22s} {'T':>6s} {'H':>3s} {'D':>4s} {'dtype':>8s} "
+        f"{'latency_us':>12s} {'GB/s':>10s} {'%peak':>7s}"
     )
-
-
-def _io_bytes(shape):
-    T = shape["num_tokens"]
-    H = shape["num_heads"]
-    D = shape["head_size"]
-    elem = 2  # bf16
-    # Read key + value, write key_cache + value_cache. 4 × T × H × D × 2 B.
-    return 4 * T * H * D * elem
-
-
-# Representative shapes:
-#   - cookbook M2.5 decode: num_kv_heads=8, head_size=128, block_size=16,
-#     T = 1 (1-token decode) to T = 6 (verify chain pass)
-#   - prefill / chunked: T = 4096 (cookbook 4k prefill)
-#   - typical config: block_size 16 or 32; num_blocks set so the cache fits.
-SHAPES = [
-    # cookbook decode (small T)
-    {"num_tokens": 1,    "num_heads": 8, "head_size": 128, "block_size": 16,
-     "num_blocks": 4096},
-    {"num_tokens": 6,    "num_heads": 8, "head_size": 128, "block_size": 16,
-     "num_blocks": 4096},
-    # mid
-    {"num_tokens": 64,   "num_heads": 8, "head_size": 128, "block_size": 16,
-     "num_blocks": 4096},
-    {"num_tokens": 256,  "num_heads": 8, "head_size": 128, "block_size": 16,
-     "num_blocks": 4096},
-    # cookbook prefill (large T)
-    {"num_tokens": 4096, "num_heads": 8, "head_size": 128, "block_size": 16,
-     "num_blocks": 4096},
-    # alt config: larger num_heads (sanity)
-    {"num_tokens": 256,  "num_heads": 32, "head_size": 128, "block_size": 16,
-     "num_blocks": 2048},
-]
+    print(hdr)
+    print("-" * len(hdr))
+    for r in rows:
+        print(
+            f"{r['shape']:<22s} {r['num_tokens']:>6d} {r['num_heads']:>3d} "
+            f"{r['head_size']:>4d} {r['dtype']:>8s} "
+            f"{r['latency_us']:>12.3f} {r['GB_s']:>10.2f} "
+            f"{r['pct_peak_bw']:>6.1f}%"
+        )
 
 
 def main():
-    print("reshape_and_cache_flash_nhd_kernel regression bench")
-    print(f"peak GDDR6: {_peak_gbps()/1e9:.0f} GB/s")
-    print()
-    results = []
-    for shape in SHAPES:
-        name = (
-            f"T{shape['num_tokens']:>4d}_H{shape['num_heads']:>2d}_"
-            f"D{shape['head_size']:>3d}_B{shape['block_size']:>2d}"
-        )
-        results.append(_run_bench(
-            name, shape, _build_inputs, _run_op, _io_bytes
-        ))
+    parser = argparse.ArgumentParser(__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--shapes", nargs="+",
+                        default=["M2.5_decode_per_rank", "wide_heads"],
+                        choices=list(SHAPE_SETS.keys()))
+    parser.add_argument("--dtype", choices=["bf16", "fp16"], default="bf16")
+    parser.add_argument("--num-tests", type=int, default=30)
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
 
-    out_path = os.environ.get(
-        "MUSA_0151_BENCH_OUT", "/tmp/musa_0151_reshape_and_cache_flash.json"
-    )
-    with open(out_path, "w") as fh:
-        json.dump(results, fh, indent=2, default=str)
-    print()
-    print(f"Results JSON: {out_path}")
+    if not (hasattr(torch, "musa") and torch.musa.is_available()):
+        print("ERROR: MUSA not available", file=sys.stderr)
+        sys.exit(2)
+
+    dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}[args.dtype]
+    forced_tpb = os.environ.get("VLLM_MUSA_RESHAPE_CACHE_TOKENS_PER_BLOCK", "auto")
+
+    print("# MUSA-0151 cold-cache bench (mate.bench_kineto + flush_l2=True)")
+    print(f"# device: {torch.musa.get_device_name(0)}")
+    print(f"# dtype:  {args.dtype}")
+    print(f"# tokens_per_block: {'forced=' + forced_tpb if forced_tpb != 'auto' else 'adaptive'}")
+    print(f"# roofline: {_ROOFLINE_GBPS:.0f} GB/s (S5000 GDDR6 R+W practical)")
+
+    all_rows: list[dict] = []
+    for shape_set in args.shapes:
+        print(f"\n## {shape_set}")
+        rows = [_bench_shape(shape, dtype, args.num_tests)
+                for shape in SHAPE_SETS[shape_set]]
+        if args.json:
+            print(json.dumps(rows, indent=2, sort_keys=True))
+        else:
+            _print_table(rows)
+        all_rows.extend(rows)
+        torch.musa.empty_cache()
+
+    if args.json:
+        print(json.dumps({"all": all_rows}, sort_keys=True))
 
 
 if __name__ == "__main__":

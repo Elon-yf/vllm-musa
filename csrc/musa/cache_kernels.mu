@@ -19,13 +19,17 @@
 // 4 × num_tokens × num_heads × head_size × sizeof(T) bytes per call,
 // no compute beyond index arithmetic.
 //
-// Current design layers:
+// Current design layers (V2, 2026-05-25):
 //   1. LSU cache-bypass loads (`vload16_byp_slc`) — the V3 floor from the
 //      sphere-kb arc (without LSU bypass plain loads are 2-5× slower).
 //   2. Vec16<T> (128-bit) vectorized loads + stores.
 //   3. Shape-adaptive dispatcher: TOKENS_PER_BLOCK ∈ {1,2,4,8} chosen by
 //      vecs_per_token band; env override
 //      VLLM_MUSA_RESHAPE_CACHE_TOKENS_PER_BLOCK.
+//   4. Adaptive BLOCK_X (V2, 2026-05-25): BLOCK_X = next pow2 >=
+//      TOKENS_PER_BLOCK * vecs_per_token, clamped to [32, 512]. Recovers
+//      the 75 % idle-thread overhead at narrow-KV shapes (vec_token=16
+//      drops BLOCK_X 512 -> 128 and quadruples concurrent CTAs/MP).
 //
 // sphere-kb status: no probe exists yet for this kernel (closest is
 // `probes/sgl_kernel_ports_20260428/03-apply_rope_pos_ids/` which fuses
@@ -33,20 +37,38 @@
 // recorded by the regression bench
 // `benchmarks/op_perf/bench_reshape_and_cache_flash.py`.
 //
-// Deferred optimization candidates (V2+):
-//   - Adaptive BLOCK_X: with current BLOCK_X=512 fixed, vecs_per_token=128
-//     (typical M2.5: num_kv_heads=8, head_size=128) under TOKENS_PER_BLOCK=1
-//     leaves 75 % of threads idle (128/512). Switching to BLOCK_X = next
-//     power-of-2 above vecs_per_token would zero idle and quadruple
-//     concurrent CTAs/SM, potentially +5..15 %. Mirrors the V13 'Layer 4
-//     adaptive BLOCK_X' rule that transferred from RoPE to RMSNorm in the
-//     sphere-kb arc. Easy to land; needs a bench cycle to verify.
+// Cold-cache bench (mate.bench_kineto + flush_l2=True, yeahdongcn60,
+// 2026-05-25). Roofline anchor: sphere-kb claim
+// s5000.practical_gddr6_bandwidth_updated = 1200 GB/s read+write.
+//
+//   shape (T, H, D)     V1 GB/s   V2 GB/s   % of 1200 R+W  Δ
+//   ----------------------------------------------------------
+//   M2.5 narrow-KV (num_heads_kv=1, head_size=128):
+//     T=1     H=1 D=128     0.28      0.33      0.0 %   +18 %
+//     T=6     H=1 D=128     1.48      1.60      0.1 %   +8 %
+//     T=16    H=1 D=128     3.78      3.91      0.3 %   +3 %
+//     T=64    H=1 D=128    13.49     13.64      1.1 %   +1 %
+//     T=256   H=1 D=128    48.54     47.82      4.0 %   -1.5 %
+//     T=4096  H=1 D=128   348.28    413.11     34.4 %   +19 %  ←
+//   Wider configs (already BLOCK_X=512 in both V1 and V2):
+//     T=4096  H=4 D=128   623.62    612.69     51.1 %   noise
+//     T=4096  H=8 D=128   599.33    599.56     50.0 %   0 %
+//
+// At narrow KV (M2.5 prefill T=4096) V2 lifts +19 % by trimming
+// BLOCK_X 512 -> 128 (4 x more concurrent CTAs/MP, zero idle threads).
+// At wider H V1==V2 (identical template params); the small T=256 H=4
+// regression is GPU-to-GPU variance, not algorithmic.
+//
+// Deferred optimization candidates:
 //   - Non-temporal store hint for kv-cache writes (kv-cache is rarely
 //     re-read until attention; NT store may bypass an L2 fill that's
 //     immediately discarded). Needs a probe-style mu-asm 'slc=nt' load
 //     equivalent for store; speculative until measured.
 //   - TME tile-stride load to overlap key + value streams. Gated behind
 //     MUTE_ARCH_TME_MP31_ACTIVATED. Speculative.
+//   - Batch decode-step writes across multiple iterations to amortize
+//     launch overhead at small T (currently 4 µs/launch + 0.1 µs/MB of
+//     traffic; at small-T the launch overhead dominates).
 //
 // =============================================================================
 
@@ -101,7 +123,6 @@ void dispatch_reshape_and_cache_flash_nhd(
     const int64_t* slot_mapping, int num_tokens, int num_heads, int head_size,
     int block_size, int64_t key_stride, int64_t value_stride,
     int64_t block_stride, int64_t page_stride, musaStream_t stream) {
-  constexpr int BLOCK_X = 512;
   const int vecs_per_token = (num_heads * head_size) / 8;
 
   static const int forced_tokens_per_block = []() {
@@ -109,29 +130,69 @@ void dispatch_reshape_and_cache_flash_nhd(
     return env == nullptr ? 0 : std::atoi(env);
   }();
 
-#define LAUNCH(TPB)                                                        \
-  reshape_and_cache_flash_nhd_kernel<T, BLOCK_X, TPB>                      \
-      <<<(num_tokens + TPB - 1) / TPB, BLOCK_X, 0, stream>>>(              \
+  // MUSA-0151 (cold-cache re-bench 2026-05-25, mate.bench_kineto +
+  // flush_l2=True): V1 fixed BLOCK_X=512 leaves up to 75 % of threads idle
+  // at narrow-KV shapes. M2.5 per-rank has num_heads_kv=1 head_size=128 ->
+  // vecs_per_token=16 -> TPB*vecs = 128, leaving 384/512 threads idle in
+  // each block (the for-loop's `linear < total_vecs` condition exits
+  // immediately for them). V2 adapts BLOCK_X to the actual work
+  // (TPB * vecs_per_token rounded up to next power of 2, floored at 32 to
+  // avoid sub-warp blocks, capped at 512 to keep cross-warp shared-mem
+  // reduce dormant). Smaller BLOCK_X recovers 4 x more concurrent CTAs
+  // per MP at narrow shapes; wider shapes (vecs >= 128) are unaffected
+  // because they already saturate BLOCK_X=512.
+
+#define LAUNCH(BX, TPB)                                                    \
+  reshape_and_cache_flash_nhd_kernel<T, BX, TPB>                           \
+      <<<(num_tokens + (TPB) - 1) / (TPB), BX, 0, stream>>>(               \
           key, value, key_cache, value_cache, slot_mapping, num_tokens,    \
           vecs_per_token, block_size, key_stride, value_stride,            \
           block_stride, page_stride)
 
-  if (forced_tokens_per_block == 1) {
-    LAUNCH(1);
-  } else if (forced_tokens_per_block == 2) {
-    LAUNCH(2);
-  } else if (forced_tokens_per_block == 4) {
-    LAUNCH(4);
-  } else if (forced_tokens_per_block == 8) {
-    LAUNCH(8);
+  // Pick TOKENS_PER_BLOCK first (same heuristic as V1).
+  int tpb;
+  if (forced_tokens_per_block == 1 || forced_tokens_per_block == 2 ||
+      forced_tokens_per_block == 4 || forced_tokens_per_block == 8) {
+    tpb = forced_tokens_per_block;
   } else if (vecs_per_token <= 64) {
-    LAUNCH(8);
+    tpb = 8;
   } else if (vecs_per_token <= 128) {
-    LAUNCH(4);
+    tpb = 4;
   } else if (vecs_per_token <= 256) {
-    LAUNCH(2);
+    tpb = 2;
   } else {
-    LAUNCH(1);
+    tpb = 1;
+  }
+
+  // Then pick the smallest BLOCK_X >= TPB * vecs_per_token (pow2, in
+  // [32, 512]). At narrow shapes this trims to 32/64/128 and quadruples
+  // concurrent CTAs per MP. At wider shapes BLOCK_X stays 512.
+  const int total = tpb * vecs_per_token;
+  if (total <= 32) {
+    if (tpb == 1) { LAUNCH(32, 1); }
+    else if (tpb == 2) { LAUNCH(32, 2); }
+    else if (tpb == 4) { LAUNCH(32, 4); }
+    else { LAUNCH(32, 8); }
+  } else if (total <= 64) {
+    if (tpb == 1) { LAUNCH(64, 1); }
+    else if (tpb == 2) { LAUNCH(64, 2); }
+    else if (tpb == 4) { LAUNCH(64, 4); }
+    else { LAUNCH(64, 8); }
+  } else if (total <= 128) {
+    if (tpb == 1) { LAUNCH(128, 1); }
+    else if (tpb == 2) { LAUNCH(128, 2); }
+    else if (tpb == 4) { LAUNCH(128, 4); }
+    else { LAUNCH(128, 8); }
+  } else if (total <= 256) {
+    if (tpb == 1) { LAUNCH(256, 1); }
+    else if (tpb == 2) { LAUNCH(256, 2); }
+    else if (tpb == 4) { LAUNCH(256, 4); }
+    else { LAUNCH(256, 8); }
+  } else {
+    if (tpb == 1) { LAUNCH(512, 1); }
+    else if (tpb == 2) { LAUNCH(512, 2); }
+    else if (tpb == 4) { LAUNCH(512, 4); }
+    else { LAUNCH(512, 8); }
   }
 
 #undef LAUNCH
