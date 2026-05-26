@@ -265,32 +265,64 @@ def fused_experts_impl(
         curr_topk_ids = topk_ids[begin_chunk_idx:end_chunk_idx]
         curr_topk_weights = topk_weights[begin_chunk_idx:end_chunk_idx]
 
-        musa_ops.musa_fused_gemv_moe(
-            curr_hidden_states,
-            w1,
-            curr_intermediate_cache2,
-            None,
-            w1_scale,
-            curr_topk_weights,
-            curr_topk_ids,
-            apply_router_weight_on_input,
-            topk_ids.shape[1],
-            use_int4_w4a16,
-            use_swigelu=True,
+        # MUSA-0200: TileLang V5 path gated by VLLM_MUSA_MOE_TILELANG=1.
+        # When the gate is set, both W1 (up+SwiGLU) and W2 (down) go
+        # through the TileLang grouped MoE kernel (T.gemm with block_m=64,
+        # fused SwiGLU + routed-weight). Otherwise the native scalar
+        # musa_fused_gemv_moe path runs (V0). The gate is checked per
+        # call so a process can flip behavior with the env var alone.
+        from vllm_musa.jit_kernel.tilelang.moe_fp8_v5 import (
+            tilelang_enabled,
+            tilelang_moe_w1_swiglu_fp8,
+            tilelang_moe_w2_fp8,
         )
-        musa_ops.musa_fused_gemv_moe(
-            curr_intermediate_cache2,
-            w2,
-            curr_intermediate_cache3,
-            None,
-            w2_scale,
-            curr_topk_weights,
-            curr_topk_ids,
-            not apply_router_weight_on_input,
-            1,
-            use_int4_w4a16,
-            use_swigelu=False,
-        )
+
+        if tilelang_enabled() and not use_int4_w4a16:
+            tilelang_moe_w1_swiglu_fp8(
+                curr_hidden_states,
+                w1,
+                w1_scale,
+                curr_topk_weights,
+                curr_topk_ids,
+                curr_intermediate_cache2,
+                mul_routed_weight=apply_router_weight_on_input,
+            )
+            tilelang_moe_w2_fp8(
+                curr_intermediate_cache2,
+                w2,
+                w2_scale,
+                curr_topk_weights,
+                curr_topk_ids,
+                curr_intermediate_cache3,
+                mul_routed_weight=not apply_router_weight_on_input,
+            )
+        else:
+            musa_ops.musa_fused_gemv_moe(
+                curr_hidden_states,
+                w1,
+                curr_intermediate_cache2,
+                None,
+                w1_scale,
+                curr_topk_weights,
+                curr_topk_ids,
+                apply_router_weight_on_input,
+                topk_ids.shape[1],
+                use_int4_w4a16,
+                use_swigelu=True,
+            )
+            musa_ops.musa_fused_gemv_moe(
+                curr_intermediate_cache2,
+                w2,
+                curr_intermediate_cache3,
+                None,
+                w2_scale,
+                curr_topk_weights,
+                curr_topk_ids,
+                not apply_router_weight_on_input,
+                1,
+                use_int4_w4a16,
+                use_swigelu=False,
+            )
         # ========================== END ====================
         ops.moe_sum(
             curr_intermediate_cache3.view(*curr_intermediate_cache3.size()),
