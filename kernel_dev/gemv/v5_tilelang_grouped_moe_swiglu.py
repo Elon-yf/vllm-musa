@@ -101,7 +101,7 @@ def _v5_grouped_moe_gemm_swiglu_kernel(
     return v5_grouped_moe_gemm_swiglu
 
 
-def bench_v5(bs, num_tests=20, block_m=128, block_n=64, block_k=64, topk=8,
+def bench_v5(bs, num_tests=20, block_m=64, block_n=64, block_k=64, topk=8,
              hidden=3072, intermediate=192, num_experts=256):
     n_total = bs * topk
     M_padded = ((n_total + block_m - 1) // block_m) * block_m
@@ -121,14 +121,27 @@ def bench_v5(bs, num_tests=20, block_m=128, block_n=64, block_k=64, topk=8,
         (1, quant_tile, quant_tile),
         torch.float8_e4m3fn, "K"
     )
-    # m_indices and routed weights per row
-    m_indices = torch.full((M_padded,), -1, device="musa", dtype=torch.int32)
-    rw = torch.zeros((M_padded,), device="musa", dtype=torch.float32)
-    n_used = (n_total // block_m) * block_m
-    for i in range(n_used):
-        m_indices[i] = (i // block_m) % num_experts
-        rw[i] = 1.0
+    # V5 uses its own block_m. Each active expert pads to block_m rows.
+    n_active_experts = min(n_total, num_experts)
+    M_padded_v5 = max(n_active_experts * block_m, block_m)
+    m_indices = torch.full((M_padded_v5,), -1, device="musa", dtype=torch.int32)
+    rw = torch.zeros((M_padded_v5,), device="musa", dtype=torch.float32)
+    rows_per_expert_full = n_total // max(n_active_experts, 1)
+    remainder = n_total - rows_per_expert_full * n_active_experts
+    a_raw = torch.rand((M_padded_v5, K), device="musa", dtype=torch.float32) * 0.1
+    Aq, A_scale = group_quantize_fp8(
+        a_raw, (M_padded_v5, K // quant_tile), (1, quant_tile),
+        torch.float8_e4m3fn, "K"
+    )
+    for e in range(n_active_experts):
+        rows_here = rows_per_expert_full + (1 if e < remainder else 0)
+        for r in range(rows_here):
+            row = e * block_m + r
+            m_indices[row] = e
+            rw[row] = 1.0
+    M_padded = M_padded_v5
     D = torch.empty((M_padded, intermediate), device="musa", dtype=torch.bfloat16)
+    D_mate_size = M_padded
 
     kernel = _v5_grouped_moe_gemm_swiglu_kernel(
         num_experts=int(num_experts),
@@ -147,13 +160,28 @@ def bench_v5(bs, num_tests=20, block_m=128, block_n=64, block_k=64, topk=8,
                        num_tests=num_tests, suppress_kineto_output=True,
                        flush_l2=True, with_multiple_kernels=True)
 
-    # Mate baseline (GEMM only — full op needs separate silu/scatter)
-    D_mate = torch.empty((M_padded, n_full), device="musa", dtype=torch.bfloat16)
+    # Mate baseline: requires alignment_m in {128, 256}. Use 128.
+    mate_align = 128
+    M_padded_mate = max(n_active_experts * mate_align, mate_align)
+    m_indices_mate = torch.full((M_padded_mate,), -1, device="musa", dtype=torch.int32)
+    rw_mate = torch.zeros((M_padded_mate,), device="musa", dtype=torch.float32)
+    for e in range(n_active_experts):
+        rows_here = rows_per_expert_full + (1 if e < remainder else 0)
+        for r in range(rows_here):
+            row = e * mate_align + r
+            m_indices_mate[row] = e
+            rw_mate[row] = 1.0
+    a_raw_mate = torch.rand((M_padded_mate, K), device="musa", dtype=torch.float32) * 0.1
+    Aq_mate, A_scale_mate = group_quantize_fp8(
+        a_raw_mate, (M_padded_mate, K // quant_tile), (1, quant_tile),
+        torch.float8_e4m3fn, "K"
+    )
+    D_mate = torch.empty((M_padded_mate, n_full), device="musa", dtype=torch.bfloat16)
 
     def run_mate():
         m_grouped_fp8_gemm_nt_contiguous(
-            (Aq, A_scale), (Wq, W_scale), D_mate, m_indices,
-            recipe=(1, quant_tile, quant_tile), alignment_m=block_m,
+            (Aq_mate, A_scale_mate), (Wq, W_scale), D_mate, m_indices_mate,
+            recipe=(1, quant_tile, quant_tile), alignment_m=mate_align,
         )
     for _ in range(3):
         run_mate()
@@ -167,12 +195,12 @@ def bench_v5(bs, num_tests=20, block_m=128, block_n=64, block_k=64, topk=8,
     # Mate full op approximation: GEMM + separate SwiGLU + scale (PyTorch native)
     def run_mate_full():
         m_grouped_fp8_gemm_nt_contiguous(
-            (Aq, A_scale), (Wq, W_scale), D_mate, m_indices,
-            recipe=(1, quant_tile, quant_tile), alignment_m=block_m,
+            (Aq_mate, A_scale_mate), (Wq, W_scale), D_mate, m_indices_mate,
+            recipe=(1, quant_tile, quant_tile), alignment_m=mate_align,
         )
         gate, up = D_mate.chunk(2, dim=-1)
         D2 = torch.nn.functional.silu(gate) * up
-        D2.mul_(rw.unsqueeze(-1).to(D2.dtype))
+        D2.mul_(rw_mate.unsqueeze(-1).to(D2.dtype))
     for _ in range(3):
         run_mate_full()
     torch.musa.synchronize()
@@ -202,8 +230,9 @@ def main():
             verdict = "WIN" if ratio < 0.95 else ("TIE" if ratio < 1.05 else "LOSE")
             n_total = bs * 8
             block_m = 128
-            M_padded = ((n_total + block_m - 1) // block_m) * block_m
-            print(f"{bs:>4d} {M_padded:>10d}  {sec*1e6:>9.2f}"
+            n_active = min(n_total, 256)
+            M_padded_real = n_active * block_m
+            print(f"{bs:>4d} {M_padded_real:>10d}  {sec*1e6:>9.2f}"
                   f"  {sec_mate_gemm*1e6:>10.2f}  {sec_mate_full*1e6:>10.2f}"
                   f"  {ratio:>7.2f}x  {verdict}")
             torch.musa.empty_cache()
