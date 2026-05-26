@@ -130,7 +130,7 @@ def _v5_grouped_moe_gemm_swiglu_kernel(
             T.clear(Acc_up)
 
             if expert >= 0:
-                for k in T.Pipelined(T.ceildiv(K, block_k), num_stages=4):
+                for k in T.Pipelined(T.ceildiv(K, block_k), num_stages=2):
                     T.copy(Aq[m_blk * block_m, k * block_k], A_s)
                     T.copy(W[expert, n_offset, k * block_k], B_gate_s)
                     T.copy(W[expert, n_offset_up, k * block_k], B_up_s)
@@ -198,7 +198,7 @@ def _v5_grouped_moe_gemm_kernel(
             T.clear(Acc)
 
             if expert >= 0:
-                for k in T.Pipelined(T.ceildiv(K, block_k), num_stages=4):
+                for k in T.Pipelined(T.ceildiv(K, block_k), num_stages=2):
                     T.copy(Aq[m_blk * block_m, k * block_k], A_s)
                     T.copy(W[expert, n_offset, k * block_k], B_s)
                     T.gemm(A_s, B_s, Acc, transpose_B=True)
@@ -434,3 +434,52 @@ def tilelang_moe_w2_fp8(
 
 def tilelang_enabled() -> bool:
     return os.environ.get("VLLM_MUSA_MOE_TILELANG", "0") == "1"
+
+
+# Module-load pre-compile for M2.5 K1 production shape. Triggers
+# TileLang's JIT outside the CUDA-graph-capture context so the first
+# captured forward doesn't pay the compile cost (and avoids the hang
+# observed when first-call JIT runs from inside a worker process that
+# has already started CUDAGraph capture). M2.5 K1:
+#   hidden=3072, intermediate=192, num_experts=256, topk=8.
+# Gated on the env var so workers that won't enable V5 skip the cost.
+def _prewarm_v5_for_m25_k1() -> None:
+    if not tilelang_enabled():
+        return
+    import logging
+    log = logging.getLogger(__name__)
+    # M2.5 K1: intermediate is partitioned across TP=8 and padded up to
+    # the FP8 quant block_shape=128 → vllm uses intermediate=256 in
+    # production (192 logical + 64 padding). Prewarm both common values
+    # so a cache miss at first-call doesn't trigger JIT inside a
+    # CUDAGraph-captured forward (which deadlocks the worker).
+    shapes = [
+        # (num_experts, intermediate, hidden)
+        (256, 256, 3072),  # M2.5 K1 with padded intermediate
+        (256, 192, 3072),  # M2.5 K1 raw
+    ]
+    for num_experts, intermediate, hidden in shapes:
+        try:
+            _v5_grouped_moe_gemm_swiglu_kernel(
+                num_experts=num_experts, intermediate=intermediate, K=hidden,
+                block_m=_BLOCK_M, block_n=_BLOCK_N, block_k=_BLOCK_K,
+                quant_tile=_QUANT_TILE, threads=_THREADS,
+            )
+            _v5_grouped_moe_gemm_kernel(
+                num_experts=num_experts, N=hidden, K=intermediate,
+                block_m=_BLOCK_M, block_n=_BLOCK_N, block_k=_BLOCK_K,
+                quant_tile=_QUANT_TILE, threads=_THREADS,
+            )
+            log.info(
+                "MUSA-0200 V5 prewarm OK: num_experts=%d intermediate=%d "
+                "hidden=%d", num_experts, intermediate, hidden,
+            )
+        except Exception as exc:  # pragma: no cover
+            log.warning(
+                "MUSA-0200 V5 prewarm failed for (E=%d,inter=%d,K=%d): "
+                "%s — first-call JIT may hang under CUDAGraph capture.",
+                num_experts, intermediate, hidden, exc,
+            )
+
+
+_prewarm_v5_for_m25_k1()

@@ -21,6 +21,14 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl
 
 from vllm_musa import _custom_ops as musa_ops
+# Import the TileLang V5 module at fused_moe load time (early in
+# vllm-musa init, before any worker starts CUDAGraph capture). The
+# module's _prewarm_v5_for_m25_k1() runs at load and pre-compiles the
+# V5 kernels for the M2.5 K1 production shape iff
+# VLLM_MUSA_MOE_TILELANG=1. This pre-compile happens in a non-captured
+# context, avoiding the hang observed when first-call JIT runs inside
+# a worker process that has already begun graph capture.
+from vllm_musa.jit_kernel.tilelang import moe_fp8_v5 as _v5_moe  # noqa: F401
 
 logger = init_logger(__name__)
 
@@ -271,11 +279,9 @@ def fused_experts_impl(
         # fused SwiGLU + routed-weight). Otherwise the native scalar
         # musa_fused_gemv_moe path runs (V0). The gate is checked per
         # call so a process can flip behavior with the env var alone.
-        from vllm_musa.jit_kernel.tilelang.moe_fp8_v5 import (
-            tilelang_enabled,
-            tilelang_moe_w1_swiglu_fp8,
-            tilelang_moe_w2_fp8,
-        )
+        tilelang_enabled = _v5_moe.tilelang_enabled
+        tilelang_moe_w1_swiglu_fp8 = _v5_moe.tilelang_moe_w1_swiglu_fp8
+        tilelang_moe_w2_fp8 = _v5_moe.tilelang_moe_w2_fp8
 
         if tilelang_enabled() and not use_int4_w4a16:
             tilelang_moe_w1_swiglu_fp8(
