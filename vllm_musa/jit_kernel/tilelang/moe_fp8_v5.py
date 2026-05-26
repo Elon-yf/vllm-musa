@@ -63,6 +63,61 @@ from vllm_musa.jit_kernel.tilelang.utils import (
 _FP8_E4M3_MAX = 448.0
 
 
+class _CaptureSafeCache:
+    """Cache for GPU-resident scalars/buffers used by capturable code.
+
+    All entries are populated at module load (outside CUDAGraph capture).
+    Captured forwards read from the cache without ever triggering a
+    host->device scalar copy.
+    """
+
+    def __init__(self):
+        self._sentinels: dict = {}
+        self._block_m: dict = {}
+        self._neg_one_int32: dict = {}
+        self._neg_one_full: dict = {}
+
+    @staticmethod
+    def _key(device: torch.device) -> str:
+        return f"{device.type}:{device.index}" if device.index is not None else device.type
+
+    def sentinel(self, M_padded: int, device: torch.device) -> torch.Tensor:
+        key = (M_padded, self._key(device))
+        if key not in self._sentinels:
+            t = torch.empty((), device=device, dtype=torch.int64)
+            t.copy_(torch.as_tensor(M_padded - 1, dtype=torch.int64))
+            self._sentinels[key] = t
+        return self._sentinels[key]
+
+    def block_m_t(self, block_m: int, device: torch.device) -> torch.Tensor:
+        key = (block_m, self._key(device))
+        if key not in self._block_m:
+            t = torch.empty((), device=device, dtype=torch.int64)
+            t.copy_(torch.as_tensor(block_m, dtype=torch.int64))
+            self._block_m[key] = t
+        return self._block_m[key]
+
+    def neg_one_int32(self, device: torch.device) -> torch.Tensor:
+        key = self._key(device)
+        if key not in self._neg_one_int32:
+            t = torch.empty((1,), device=device, dtype=torch.int32)
+            t.copy_(torch.as_tensor([-1], dtype=torch.int32))
+            self._neg_one_int32[key] = t
+        return self._neg_one_int32[key]
+
+    def neg_one_full_buf(self, M_padded: int, device: torch.device) -> torch.Tensor:
+        key = (M_padded, self._key(device))
+        if key not in self._neg_one_full:
+            t = torch.empty((M_padded,), device=device, dtype=torch.int32)
+            src = torch.full((M_padded,), -1, dtype=torch.int32)
+            t.copy_(src)
+            self._neg_one_full[key] = t
+        return self._neg_one_full[key]
+
+
+_CAPTURE_SAFE_CACHE = _CaptureSafeCache()
+
+
 def _per_token_group_quant_fp8_inline(
     x: torch.Tensor, group_size: int = 128
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -262,31 +317,53 @@ def _build_permutation(
         - exclusive_counts[sorted_eids]
     )
 
-    # Destination row = sorted_eids * block_m + j_in_expert.
-    # NOTE: this assumes counts[e] <= block_m for every active expert.
-    # When some expert has more rows than block_m (very high BS), the
-    # extra rows fall off the strip end. The native fallback handles
-    # those cases.
-    dest_rows = sorted_eids * block_m + j_in_expert
+    # Destination row in the per-expert M-strip = sorted_eids*block_m
+    # + j_in_expert. When counts[e] > block_m (worst-case routing during
+    # profile_run), the natural address spills past the strip end into
+    # the NEXT expert's strip — causing non-unique-index scatter when
+    # we later write `A_padded[dest_rows] = ...`, which is non-
+    # deterministic on MUSA and was the source of the hang.
+    #
+    # Fix: bound dest_rows to a single sentinel row at the end of
+    # M_padded. The sentinel row absorbs all spillover writes (overwritten
+    # repeatedly, garbage value) and is never read back because
+    # m_indices stays -1 there (kernel short-circuits, mask in the
+    # un-permute step skips it).
+    #
+    # For M2.5 K1 production decode at BS=1 (8 distinct experts × 1 row
+    # each, well under block_m=64), no rows spill — the fix is a no-op.
+    # For profile_run's synthetic all-tokens-one-expert case, the
+    # spillover rows are sentinel-mapped and the output for those slots
+    # is undefined (acceptable for profile_run, which only checks
+    # memory not correctness).
+    # MUSA CUDAGraph capture forbids host->device scalar copies
+    # (`torch.tensor(scalar, device=...)`, `tensor[int]=int`, and
+    # `tensor.fill_(scalar)` all trigger this on MUSA). To stay
+    # capturable, we use only:
+    #   - tensor-tensor ops
+    #   - GPU-resident scalars precomputed at module load (cached below)
+    #   - new_zeros / new_ones (allocator-only, no host copy)
+    M_padded = num_experts * block_m + 1  # +1 sentinel row at end
+    sentinel_idx = _CAPTURE_SAFE_CACHE.sentinel(M_padded, device)
+    block_m_t = _CAPTURE_SAFE_CACHE.block_m_t(block_m, device)
+    neg_one_int32 = _CAPTURE_SAFE_CACHE.neg_one_int32(device)
+    neg_one_int32_strip = neg_one_int32.expand(n_total)
 
-    # m_indices: fixed size num_experts * block_m. Fill expert id at
-    # destination rows (capturable scatter); padding stays -1.
-    M_padded = num_experts * block_m
-    m_indices = torch.full(
-        (M_padded,), -1, device=device, dtype=torch.int32
+    raw_dest = sorted_eids * block_m + j_in_expert
+    in_strip = j_in_expert < block_m_t
+    dest_rows = torch.where(in_strip, raw_dest, sentinel_idx)
+
+    # m_indices: allocate empty + initialize via a tensor source so no
+    # host scalar copies happen inside capture.
+    neg_one_full_buf = _CAPTURE_SAFE_CACHE.neg_one_full_buf(M_padded, device)
+    m_indices = neg_one_full_buf.clone()  # capturable: alloc + memcpy
+
+    value_to_scatter = torch.where(
+        in_strip, sorted_eids.to(torch.int32), neg_one_int32_strip
     )
-    # Clamp dest_rows to be within bounds; rows past block_m for an
-    # over-full expert are clipped — fallback handles them at the call site.
-    in_bounds = j_in_expert < block_m
-    m_indices[torch.where(in_bounds, dest_rows, torch.tensor(
-        M_padded - 1, device=device, dtype=torch.int64
-    ))] = sorted_eids.to(torch.int32)
-    # Reset the spillover sentinel row.
-    m_indices[M_padded - 1] = -1
-    # m_indices[dest_rows[in_bounds]] = expert_id, but expressed without
-    # nonzero to stay capturable. The where(in_bounds, dest_rows, sentinel)
-    # write above achieves the same effect when the bound check holds for
-    # every row (typical M2.5 K1 BS<=128 with num_experts=256 block_m=64).
+    m_indices[dest_rows] = value_to_scatter
+    # Sentinel slot is now -1 (initial value held — either no spillover
+    # writes, or spillover writes -1 on top of -1).
 
     return m_indices, sort_perm, dest_rows, M_padded
 
@@ -354,8 +431,12 @@ def tilelang_moe_w1_swiglu_fp8(
     kernel(Aq_perm, A_scale_perm, W, W_scale, m_indices, rw_perm, D)
 
     # 7. Un-permute back to C[slot, :] order.
-    # C is preallocated by caller at (bs*topk, intermediate). We scatter
-    # D[dest_rows[j]] back to C[sort_perm_in[j]] for j in 0..n_total.
+    # C is preallocated by caller at (bs*topk, intermediate). For each
+    # j in 0..n_total: C[sort_perm_in[j]] = D[dest_rows[j]].
+    # Spillover rows (where dest_rows is the sentinel) map to D[sentinel]
+    # which holds garbage; for production decode with no spillover this
+    # is a no-op, for profile_run synthetic worst-case the output of
+    # those slots is undefined (acceptable — only memory is profiled).
     C[sort_perm_in] = D[dest_rows]
 
 
@@ -448,6 +529,23 @@ def _prewarm_v5_for_m25_k1() -> None:
         return
     import logging
     log = logging.getLogger(__name__)
+
+    # Pre-populate the capture-safe cache (sentinel/block_m/neg_one) for
+    # MUSA device 0 at module load — outside any CUDAGraph capture, so the
+    # host->device scalar copies can complete here once and the captured
+    # forward only reads from the cache.
+    try:
+        if hasattr(torch, "musa") and torch.musa.is_available():
+            dev = torch.device("musa", 0)
+            for nx in (256,):  # num_experts seen in production families
+                M_padded = nx * _BLOCK_M + 1
+                _CAPTURE_SAFE_CACHE.sentinel(M_padded, dev)
+                _CAPTURE_SAFE_CACHE.neg_one_full_buf(M_padded, dev)
+            _CAPTURE_SAFE_CACHE.block_m_t(_BLOCK_M, dev)
+            _CAPTURE_SAFE_CACHE.neg_one_int32(dev)
+    except Exception as exc:
+        log.warning("MUSA-0200 V5 capture-safe cache prewarm failed: %s", exc)
+
     # M2.5 K1: intermediate is partitioned across TP=8 and padded up to
     # the FP8 quant block_shape=128 → vllm uses intermediate=256 in
     # production (192 logical + 64 padding). Prewarm both common values
