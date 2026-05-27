@@ -4,6 +4,8 @@ import os
 
 import torch
 
+from vllm.utils.torch_utils import direct_register_custom_op
+
 from vllm_musa.jit_kernel.csrc.jit import load_musa_jit
 from vllm_musa.jit_kernel.utils import cache_once
 
@@ -209,14 +211,10 @@ def _rotary_embedding_impl(
     )
 
 
-# @register_custom_op(
-#     op_name="musa_rotary_embedding",
-#     mutates_args=["query", "key"],
-# )
 def _rotary_embedding_custom(
     positions: torch.Tensor,
     query: torch.Tensor,
-    key: torch.Tensor | None,
+    key: torch.Tensor,
     head_size: int,
     cos_sin_cache: torch.Tensor,
     is_neox: bool,
@@ -231,6 +229,33 @@ def _rotary_embedding_custom(
     )
 
 
+def _rotary_embedding_custom_fake(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+) -> None:
+    return
+
+
+# Register as a vLLM custom op so Dynamo sees a single opaque call
+# instead of trying to inline `load_musa_jit` (which the JIT-compile
+# + tvm_ffi.load_module machinery makes untraceable). Without this,
+# every model using MusaRotaryEmbedding fails compile-mode boot with
+# `SKIPPED INLINING <load_musa_jit>`. Schema matches the upstream
+# `flashinfer_rotary_embedding` custom op shape (key is a required
+# Tensor; the key=None caller path bypasses the custom op — see
+# `rotary_embedding` below).
+direct_register_custom_op(
+    op_name="musa_rotary_embedding",
+    op_func=_rotary_embedding_custom,
+    mutates_args=["query", "key"],
+    fake_impl=_rotary_embedding_custom_fake,
+)
+
+
 def rotary_embedding(
     positions: torch.Tensor,
     query: torch.Tensor,
@@ -239,7 +264,18 @@ def rotary_embedding(
     cos_sin_cache: torch.Tensor,
     is_neox: bool,
 ) -> None:
-    _rotary_embedding_custom(
+    if key is None:
+        # The custom op declares `mutates_args=["query", "key"]` with a
+        # required Tensor schema for key; combining Optional[Tensor]
+        # with mutates_args is not a well-defined torch.library
+        # contract. For the rare query-only caller, run the eager impl
+        # directly — it is non-mutating for key, so no custom-op
+        # registration is needed.
+        _rotary_embedding_impl(
+            positions, query, None, head_size, cos_sin_cache, is_neox
+        )
+        return
+    torch.ops.vllm.musa_rotary_embedding(
         positions,
         query,
         key,

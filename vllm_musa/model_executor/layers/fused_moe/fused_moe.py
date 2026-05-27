@@ -302,7 +302,18 @@ def fused_experts_impl(
 
 import vllm.model_executor.layers.fused_moe.fused_moe
 
-vllm.model_executor.layers.fused_moe.fused_moe.fused_experts_impl = fused_experts_impl
+# MUSA-0201: PR #34's v0.18.0-style fused_experts_impl override hijacked
+# vllm v0.20.0's modular_kernel dispatch with a blanket BS=1 GEMV fast path.
+# A/B on DeepSeek-V2-Lite-FP8 (audit 2026-05-27) showed:
+#   - 1024/256 cookbook: override 59.5 tok/s vs upstream 75.3 tok/s (-26.5%)
+#   - 256/2048 decode:   override 86.2 tok/s vs upstream 80.9 tok/s (+6.6%)
+# The decode advantage is real but the prefill cost is 10x. The right shape
+# is a hybrid dispatcher (per-expert token-count threshold), to be tracked
+# as a separate follow-up ticket. For now, let vllm upstream
+# fused_experts_impl run unhijacked so prefill scales normally.
+#
+# The TritonExperts._supports_quant_scheme patch is independent (it expands
+# MUSA's supported FP8 quant key list) and stays in place.
 vllm.model_executor.layers.fused_moe.fused_moe.TritonExperts._supports_quant_scheme = (
     _supports_quant_scheme
 )
