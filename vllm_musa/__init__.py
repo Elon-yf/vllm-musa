@@ -244,6 +244,13 @@ def _register_modules() -> None:
     import vllm_musa.utils  # noqa: F401
     import vllm_musa.v1  # noqa: F401
 
+    # MUSA-0164: opt-in dispatcher override that swaps upstream ``_C::<op>``
+    # impls for MUSA-native kernels via ``torchada.replace_op_impl``. Default
+    # OFF; enable with VLLM_MUSA_OP_PERF_OVERRIDES=1. Supersedes the prior
+    # _custom_ops_override.py Python-wrapper monkey-patch.
+    from vllm_musa._dispatcher_override import apply_overrides as _musa_apply_overrides
+    _musa_apply_overrides()
+
 
 def register_custom_ops() -> None:
     """
