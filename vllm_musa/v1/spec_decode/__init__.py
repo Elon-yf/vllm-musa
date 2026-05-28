@@ -1,18 +1,15 @@
-# Eagle3 full-loop spec-decode runner for MUSA.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 #
-# Per MUSA-0090, this package implements an SGLang-style EAGLEDraftCudaGraphRunner
-# adapted to vLLM's types. The runner captures the full N-step Eagle3 draft loop
-# in one cudagraph (vs vLLM's iterative per-step PIECEWISE dispatch), reducing
-# host-side overhead from ~30 ms per spec round to ~3 ms.
+# MUSA spec-decode helpers. The only surviving module is `utils`, which
+# installs a MUSA-Triton-adapted `eagle_prepare_next_token_padded_kernel`
+# replacing the upstream version that fails MUSA Triton compile with
+# `mismatched type for valid_count`.
 #
-# Design doc: generated/musa0090_impl/step1-design-doc.md
-# Q1 smoke: generated/musa0090_impl/step1_5-q1-cudagraph-smoke-result.md
-#
-# Public surface — used by the patch at:
-#     vllm-musa/vllm_musa/patches/vllm__v1__spec_decode__eagle.patch.py
-#
-# Imports are lazy on first use to avoid pulling vllm.v1.spec_decode types
-# at vllm-musa-init time (the patches/ system needs to monkey-patch them).
+# The MUSA-0090/0109 EagleFullLoopRunner was deleted in MUSA-0203 (the
+# giant-chain CUDAGraph capture corrupted draft MCCL barrier state on
+# yeahdongcn70 / mcc 5.1.0). Its replacement follows upstream PR #34880's
+# pattern: wrap the draft model with the standard `CUDAGraphWrapper`
+# + per-step dispatch instead of a one-shot N-step capture.
 
-# Existing MUSA-Triton kernel for prepare_next_token_padded — pre-MUSA-0090.
 from . import utils  # noqa: F401
