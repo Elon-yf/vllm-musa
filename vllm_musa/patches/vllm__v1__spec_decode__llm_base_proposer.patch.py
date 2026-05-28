@@ -192,6 +192,27 @@ _NEW_FFC_LOOP = """                cudagraph_runtime_mode=cudagraph_runtime_mode
                 batch_descriptor=batch_desc,
                 slot_mapping=self._get_slot_mapping(input_batch_size),"""
 
+# ---- Hunk 9b: propose() loop — in-place query_start_loc/query_start_loc_cpu ----
+# PR #34880 changes reassignment to in-place write so the captured loop graph's
+# data_ptr stays valid at replay. Reassignment created a fresh tensor each call
+# and the captured FA kernel read from the stale pre-capture pointer, which is
+# the root cause of Position 1-4 accept-rate collapse on Step 4.
+_OLD_QSL_REASSIGN = """        common_attn_metadata.query_start_loc = self.arange[: batch_size + 1]
+        common_attn_metadata.query_start_loc_cpu = torch.from_numpy(
+            self.token_arange_np[: batch_size + 1]
+        ).clone()"""
+
+_NEW_QSL_REASSIGN = """        # MUSA-0203 / PR #34880: in-place write keeps the captured graph's
+        # data_ptr valid across replays (the previous reassignment created a
+        # fresh tensor each call, stranding the captured FA kernel on a stale
+        # pointer and collapsing accept rate at positions > 0).
+        common_attn_metadata.query_start_loc[: batch_size + 1] = self.arange[
+            : batch_size + 1
+        ]
+        common_attn_metadata.query_start_loc_cpu[: batch_size + 1] = torch.from_numpy(
+            self.token_arange_np[: batch_size + 1]
+        ).clone()"""
+
 # ---- Hunk 11: full dummy_run rewrite — accept common_attn_metadata and
 # capture FULL-mode entries during boot. Without this, CUDAGraphWrapper
 # tries to capture at request time and trips validate_cudagraph_capturing_enabled.
@@ -360,6 +381,7 @@ PATCHES = [
     (_OLD_FFC_FIRST, _NEW_FFC_FIRST),
     (_OLD_PROPOSE_LOOP_DET, _NEW_PROPOSE_LOOP_DET),
     (_OLD_FFC_LOOP, _NEW_FFC_LOOP),
+    (_OLD_QSL_REASSIGN, _NEW_QSL_REASSIGN),
     (_OLD_DUMMY_RUN, _NEW_DUMMY_RUN),
     (_OLD_ISINSTANCE, _NEW_ISINSTANCE),
 ]
