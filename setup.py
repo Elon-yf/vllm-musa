@@ -395,6 +395,16 @@ MCC_FLAGS = [
     "-fno-strict-aliasing",
     "-fno-signed-zeros",
     "-DUSE_MUSA",
+    # MUSA-0203: mate's per-JIT CUDA_FLAGS (mate/mate/jit/gemm_ops.py,
+    # flash_attention_ops.py). Both flags are mcc-specific load-clustering
+    # hints. Initially added then reverted when they triggered a clang-14
+    # frontend segfault on `fused_layernorm_dynamic_per_token_quant.mu`;
+    # retried now that paged_attention_v1/v2 (compile-pressure peers) are
+    # out of the build.
+    "-mllvm",
+    "-mtgpu-load-cluster-mutation=1",
+    "-mllvm",
+    "--num-dwords-of-load-in-mutation=64",
 ]
 
 mcc_version = get_mcc_version()
