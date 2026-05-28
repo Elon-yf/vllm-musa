@@ -92,9 +92,15 @@ _NEW_LOAD_MODEL = """self.model = self._get_model()
         # CUDAGraphWrapper when target uses FULL captures. CUDAGraphWrapper
         # is a no-op when the runtime mode at call time doesn't match FULL,
         # so this is safe when target is PIECEWISE-only.
+        # Gated by VLLM_MUSA_DRAFT_FULL_WRAP=1 (default OFF). The wrap
+        # makes the captured replay produce stale draft tokens (accept
+        # rate drops 47% -> 19%) until we plumb target_model_batch_desc
+        # through the full PR #34880 caller chain.
+        import os as _os
         cudagraph_mode = self.compilation_config.cudagraph_mode
         if (
-            cudagraph_mode.has_full_cudagraphs()
+            _os.environ.get("VLLM_MUSA_DRAFT_FULL_WRAP", "0") == "1"
+            and cudagraph_mode.has_full_cudagraphs()
             and not self.vllm_config.parallel_config.use_ubatching
             and not self.speculative_config.disable_padded_drafter_batch
         ):
