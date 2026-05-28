@@ -46,9 +46,18 @@ import os
 
 _log = logging.getLogger(__name__)
 
-# MUSA-0109: the runner is verified and ON by default; set
-# VLLM_MUSA_EAGLE_RUNNER=0 to fall back to vLLM's iterative draft loop.
-_RUNNER_ENABLED = os.environ.get("VLLM_MUSA_EAGLE_RUNNER", "1") == "1"
+# MUSA-0203: default-OFF on yeahdongcn70 (mcc 5.1.0) toolchain. The
+# chain-tail-only captured-graph design shares vllm's global graph pool
+# with target captures, which under v0.20.0-dev modular_kernel FP8 MoE
+# (no override) causes accept-rate collapse to ~3% (positions 1-4 at 0%)
+# on M2.5+Eagle3 TP=8 — measured 23.94 tok/s vs 70.1 runner-OFF baseline.
+# The upstream V2 design (vllm/v1/worker/gpu/spec_decode/eagle/cudagraph.py)
+# uses a dedicated pool per Eagle to avoid this exact memory overlap;
+# adopting that requires the per-runner torch.cuda.graph_pool_handle()
+# path which previously hit a torch_musa allocator bug. Flip default to
+# OFF until the V2-style redesign lands. Set VLLM_MUSA_EAGLE_RUNNER=1
+# to re-enable for experiments / older yeahdongcn60 toolchain validation.
+_RUNNER_ENABLED = os.environ.get("VLLM_MUSA_EAGLE_RUNNER", "0") == "1"
 
 # MUSA-0109 (2026-05-20): the boot capture bakes the draft attention's
 # `max_seq_len` (a host int -> grid size) into the CUDAGraph; per-request
