@@ -153,8 +153,15 @@ VLLM_CSRC_SOURCES = [
     str(_VLLM_REPO.source_dir / "csrc/layernorm_quant_kernels.cu"),
     str(_VLLM_REPO.source_dir / "csrc/fused_qknorm_rope_kernel.cu"),
     str(_VLLM_REPO.source_dir / "csrc/quantization/activation_kernels.cu"),
-    str(_VLLM_REPO.source_dir / "csrc/attention/paged_attention_v1.cu"),
-    str(_VLLM_REPO.source_dir / "csrc/attention/paged_attention_v2.cu"),
+    # MUSA-0203 (2026-05-28): paged_attention_v1/v2 are CUDA-only and unused
+    # on MUSA (vllm uses FlashAttention via mate's flash_attn_varlen_func).
+    # Skipping them avoids ~2 min of compile time and ~1 mcc clang frontend
+    # segfault we hit when expanding mcc flags. Their schema declarations
+    # are also stripped from third_party/vllm/csrc/torch_bindings.cpp below
+    # so torch.ops._C lookups at vllm import time don't reference unbound
+    # kernels.
+    # str(_VLLM_REPO.source_dir / "csrc/attention/paged_attention_v1.cu"),
+    # str(_VLLM_REPO.source_dir / "csrc/attention/paged_attention_v2.cu"),
     str(_VLLM_REPO.source_dir / "csrc/cache_kernels_fused.cu"),
     str(
         _VLLM_REPO.source_dir
@@ -223,6 +230,22 @@ CSRC_TEXT_PATCHES = {
     str(_VLLM_REPO.source_dir / "csrc/torch_bindings.cpp"): [
         {"": '#include "torch_musa/csrc/aten/musa/MUSAContext.h"'},
         {"#ifndef USE_ROCM": "#ifndef USE_MUSA"},
+        # MUSA-0203: paged_attention_v1/v2 are CUDA-only and unused on MUSA
+        # (vllm uses FlashAttention via mate). Their .cu sources are dropped
+        # from VLLM_CSRC_SOURCES above. Strip the `ops.impl(..., &paged_attention_v*)`
+        # references so the linker doesn't need to resolve the unbuilt symbols.
+        # The `ops.def(...)` schema declarations are left intact (string-only,
+        # no symbol reference) so the operator name remains registered;
+        # invoking it on MUSA would error at dispatch time, which is fine
+        # because MUSA code paths never call paged_attention.
+        {
+            '  ops.impl("paged_attention_v1", torch::kCUDA, &paged_attention_v1);':
+            '  // MUSA-0203: paged_attention_v1 impl stripped (kernel not built on MUSA)',
+        },
+        {
+            '  ops.impl("paged_attention_v2", torch::kCUDA, &paged_attention_v2);':
+            '  // MUSA-0203: paged_attention_v2 impl stripped (kernel not built on MUSA)',
+        },
     ],
     str(_VLLM_REPO.source_dir / "csrc/quantization/w8a8/fp8/nvidia/quant_utils.cuh"): [
         {
@@ -304,14 +327,6 @@ CSRC_TEXT_PATCHES = {
             '#include "../quantization/w8a8/fp8/nvidia/quant_utils.cuh"': '#include "../quantization_musa/w8a8/fp8/nvidia/quant_utils.cuh"'
         },
     ],
-    str(_VLLM_REPO.source_dir / "csrc/attention/paged_attention_v1.cu"): [
-        {'#include "../cuda_compat.h"': '#include "cuda_compat.h"'},
-        {'#include "attention_musa/cuda_compat.h"': '#include "cuda_compat.h"'},
-    ],
-    str(_VLLM_REPO.source_dir / "csrc/attention/paged_attention_v2.cu"): [
-        {'#include "../cuda_compat.h"': '#include "cuda_compat.h"'},
-        {'#include "attention_musa/cuda_compat.h"': '#include "cuda_compat.h"'},
-    ],
     str(_VLLM_REPO.source_dir / "csrc/type_convert.cuh"): [
         {"defined(USE_ROCM)": "defined(USE_MUSA)"}
     ],
@@ -380,15 +395,6 @@ MCC_FLAGS = [
     "-fno-strict-aliasing",
     "-fno-signed-zeros",
     "-DUSE_MUSA",
-    # MUSA-0203: borrow mate's mcc tuning flags (mate/mate/jit/gemm_ops.py:CUDA_FLAGS).
-    # Both flags are mcc-specific load-clustering hints that mate uses for its
-    # FlashAttention and groupwise GEMM JITs on mp_31. Adding them to vllm-musa's
-    # native csrc compile may help close the yeahdongcn70 (mcc 5.1.0) toolchain
-    # regression vs yeahdongcn60 (mcc 4.3.6).
-    "-mllvm",
-    "-mtgpu-load-cluster-mutation=1",
-    "-mllvm",
-    "--num-dwords-of-load-in-mutation=64",
 ]
 
 mcc_version = get_mcc_version()
