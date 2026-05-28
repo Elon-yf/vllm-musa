@@ -143,8 +143,12 @@ _OLD_PROPOSE_FIRST_DET = """        cudagraph_runtime_mode, num_input_tokens, nu
             self._determine_batch_execution_and_padding(num_tokens)
         )"""
 
-_NEW_PROPOSE_FIRST_DET = """        cudagraph_runtime_mode, batch_desc, num_input_tokens, num_tokens_across_dp = (
-            self._determine_batch_execution_and_padding(num_tokens)
+_NEW_PROPOSE_FIRST_DET = """        # MUSA-0203 / PR #34880: derive uniform_decode locally (PR #34880 plumbs
+        # `target_model_batch_desc.uniform` from gpu_model_runner; we read it off
+        # common_attn_metadata.max_query_len == 1 to skip the caller-side hunks).
+        uniform_decode = common_attn_metadata.max_query_len == 1
+        cudagraph_runtime_mode, batch_desc, num_input_tokens, num_tokens_across_dp = (
+            self._determine_batch_execution_and_padding(num_tokens, uniform_decode)
         )"""
 
 # ---- Hunk 7: propose() first-forward set_forward_context — thread batch_desc ----
@@ -182,18 +186,130 @@ _NEW_FFC_LOOP = """                cudagraph_runtime_mode=cudagraph_runtime_mode
                 batch_descriptor=batch_desc,
                 slot_mapping=self._get_slot_mapping(input_batch_size),"""
 
-# ---- Hunk 10: dummy_run() unpack — match 4-tuple shape ----
-_OLD_DUMMY_UNPACK = """                cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
+# ---- Hunk 11: full dummy_run rewrite — accept common_attn_metadata and
+# capture FULL-mode entries during boot. Without this, CUDAGraphWrapper
+# tries to capture at request time and trips validate_cudagraph_capturing_enabled.
+_OLD_DUMMY_RUN = """    def dummy_run(
+        self,
+        num_tokens: int,
+        use_cudagraphs: bool = True,
+        is_graph_capturing: bool = False,
+        slot_mappings: dict[str, torch.Tensor] | None = None,
+    ) -> None:
+        # FIXME: when using tree-based specdec, adjust number of forward-passes
+        # according to the depth of the tree.
+        only_one_forward_pass = is_graph_capturing or self.parallel_drafting
+        for fwd_idx in range(
+            1 if only_one_forward_pass else self.num_speculative_tokens
+        ):
+            if fwd_idx <= 1:
+                cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
                     self._determine_batch_execution_and_padding(
                         num_tokens, use_cudagraphs=use_cudagraphs
                     )
-                )"""
+                )
 
-_NEW_DUMMY_UNPACK = """                cudagraph_runtime_mode, _, num_input_tokens, num_tokens_across_dp = (
-                    self._determine_batch_execution_and_padding(
-                        num_tokens, use_cudagraphs=use_cudagraphs
+            # Make sure to use EAGLE's own buffer during cudagraph capture.
+            if (
+                self._draft_attn_layer_names
+                and slot_mappings is not None
+                and next(iter(self._draft_attn_layer_names)) in slot_mappings
+            ):
+                slot_mapping_dict = self._get_slot_mapping(num_input_tokens)
+            else:
+                slot_mapping_dict = slot_mappings or {}
+
+            with set_forward_context(
+                None,
+                self.vllm_config,
+                num_tokens=num_input_tokens,
+                num_tokens_across_dp=num_tokens_across_dp,
+                cudagraph_runtime_mode=cudagraph_runtime_mode,
+                slot_mapping=slot_mapping_dict,
+            ):"""
+
+_NEW_DUMMY_RUN = """    def dummy_run(
+        self,
+        num_tokens: int,
+        common_attn_metadata: 'CommonAttentionMetadata | None' = None,
+        use_cudagraphs: bool = True,
+        is_graph_capturing: bool = False,
+        slot_mappings: dict[str, torch.Tensor] | None = None,
+    ) -> None:
+        # MUSA-0203 / PR #34880: when capturing FULL graphs for the draft,
+        # run 2 fwd passes (initial step + 1 decode step) so both the
+        # variable-len first-forward and the uniform decode step get
+        # captured at boot.
+        if self.parallel_drafting:
+            num_fwd_passes = 1
+        elif is_graph_capturing:
+            num_fwd_passes = min(self.num_speculative_tokens, 2)
+        else:
+            num_fwd_passes = self.num_speculative_tokens
+        for fwd_idx in range(num_fwd_passes):
+            if fwd_idx > 0 and common_attn_metadata is not None:
+                # Match propose()'s subsequent decode passes which dispatch
+                # with (batch_size, uniform=True, qdl=1).
+                uniform_decode = True
+                num_tokens = common_attn_metadata.num_reqs
+                uniform_decode_query_len = 1
+            else:
+                mode = self.cudagraph_dispatcher.cudagraph_mode
+                is_full_sep = (
+                    mode.decode_mode() == CUDAGraphMode.FULL
+                    and mode.separate_routine()
+                )
+                uniform_decode = is_full_sep and common_attn_metadata is not None
+                uniform_decode_query_len = None
+
+            (
+                cudagraph_runtime_mode,
+                batch_desc,
+                num_input_tokens,
+                num_tokens_across_dp,
+            ) = self._determine_batch_execution_and_padding(
+                num_tokens,
+                uniform_decode,
+                use_cudagraphs=use_cudagraphs,
+                uniform_decode_query_len=uniform_decode_query_len,
+            )
+
+            # Make sure to use EAGLE's own buffer during cudagraph capture.
+            if (
+                self._draft_attn_layer_names
+                and slot_mappings is not None
+                and next(iter(self._draft_attn_layer_names)) in slot_mappings
+            ):
+                slot_mapping_dict = self._get_slot_mapping(num_input_tokens)
+            else:
+                slot_mapping_dict = slot_mappings or {}
+
+            # MUSA-0203 / PR #34880: build per-layer attn metadata for the
+            # captured forward so attention backends see the right shape
+            # at capture time.
+            if common_attn_metadata is not None:
+                dummy_attn_metadata = {}
+                for attn_group in self.draft_attn_groups:
+                    attn_metadata = (
+                        attn_group.get_metadata_builder().build_for_drafting(
+                            common_attn_metadata=common_attn_metadata,
+                            draft_index=0,
+                        )
                     )
-                )"""
+                    for layer_name in attn_group.layer_names:
+                        dummy_attn_metadata[layer_name] = attn_metadata
+            else:
+                dummy_attn_metadata = None
+
+            with set_forward_context(
+                dummy_attn_metadata,
+                self.vllm_config,
+                num_tokens=num_input_tokens,
+                num_tokens_across_dp=num_tokens_across_dp,
+                cudagraph_runtime_mode=cudagraph_runtime_mode,
+                batch_descriptor=batch_desc,
+                slot_mapping=slot_mapping_dict,
+            ):"""
 
 # ---- Hunk 12: propose() isinstance check — unwrap CUDAGraphWrapper ----
 # When load_model wraps self.model with CUDAGraphWrapper, the isinstance check
@@ -238,6 +354,6 @@ PATCHES = [
     (_OLD_FFC_FIRST, _NEW_FFC_FIRST),
     (_OLD_PROPOSE_LOOP_DET, _NEW_PROPOSE_LOOP_DET),
     (_OLD_FFC_LOOP, _NEW_FFC_LOOP),
-    (_OLD_DUMMY_UNPACK, _NEW_DUMMY_UNPACK),
+    (_OLD_DUMMY_RUN, _NEW_DUMMY_RUN),
     (_OLD_ISINSTANCE, _NEW_ISINSTANCE),
 ]

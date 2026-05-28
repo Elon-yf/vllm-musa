@@ -1,78 +1,121 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""MUSA-0203: backport of vllm-project/vllm#34880 — gpu_model_runner.py.
+
+Wires the caller-side path that makes the draft model's CUDAGraphWrapper(FULL)
+actually capture entries during boot (instead of failing at request time with
+``validate_cudagraph_capturing_enabled``).
+
+Three changes:
+  1. Add ``supports_sd_full_graph`` flag (True for Eagle + padded drafter).
+  2. ``_dummy_run`` captures ``spec_decode_cm`` from ``_build_attention_metadata``
+     and passes it to ``drafter.dummy_run`` as ``common_attn_metadata``.
+  3. ``_dummy_run`` extends the ``use_cudagraphs`` predicate so FULL captures
+     are enabled when ``supports_sd_full_graph``.
+
+Skipped from PR #34880 (lower-priority, not strictly required to make the
+draft FULL capture path engage on MUSA's BS=1 SOTA workload):
+  - ``ExecuteModelState.batch_desc`` stash + ``propose_draft_token_ids``
+    target_model_batch_desc threading. Our llm_base_proposer.patch.py
+    derives ``uniform_decode`` locally from common_attn_metadata.max_query_len
+    instead of taking it as an external arg.
+  - ``input_batch.num_reqs_padded`` setter at execute_model.
+  - ``_capture_cudagraphs`` clear_graphs cleanup.
+  - ``_build_attn_group_metadata`` supports_sd_full_graph short-circuit
+    (only matters for unpadded drafter batch, which we don't use).
+
+History: this filename previously held the MUSA-0109 ``VLLM_MUSA_DRAFT_COPY_DEFAULT_STREAM``
+default-stream workaround that targeted the now-deleted EagleFullLoopRunner
+(MUSA-0203 cleanup). That patch is no longer reachable.
 """
-MUSA-0109 / MUSA-0090 layer-3 attempt: bypass `draft_token_ids_copy_stream`
-on MUSA so the H2D copy of draft tokens runs on the default stream (same
-stream the runner's CUDAGraph replay used).
 
-Why: with VLLM_MUSA_EAGLE_RUNNER=1, vllm's `_copy_draft_token_ids_to_cpu`
-fails with "MUDNN err 999 = unknown error" because it copies from
-runner-output (potentially CUDAGraph pool memory) on a DEDICATED stream
-(`self.draft_token_ids_copy_stream`). Forcing default-stream avoids the
-cross-stream interaction.
+# ---- Hunk 1: __init__ — initialize supports_sd_full_graph = False ----
+_OLD_INIT_FLAG = """        self.use_aux_hidden_state_outputs = False
+        # Set up speculative decoding."""
 
-This is a non-destructive change: same-stream copy is semantically
-identical to cross-stream copy + event-record + wait. The async-overlap
-benefit goes away, but at BS=1 the copy is ~12 bytes (int32 [bs=1, 3])
-so it doesn't matter.
+_NEW_INIT_FLAG = """        self.use_aux_hidden_state_outputs = False
+        # MUSA-0203 / PR #34880: tracks whether the draft model supports
+        # FULL-mode CUDA-graph capture (Eagle + padded drafter batch).
+        self.supports_sd_full_graph = False
+        # Set up speculative decoding."""
 
-Gated via VLLM_MUSA_DRAFT_COPY_DEFAULT_STREAM=1 (default OFF).
-Enable only when running with VLLM_MUSA_EAGLE_RUNNER=1.
-"""
+# ---- Hunk 2: __init__ — set the flag for Eagle proposers ----
+_OLD_EAGLE_INIT = """            elif self.speculative_config.use_eagle():
+                self.drafter = EagleProposer(self.vllm_config, self.device, self)
+                if self.speculative_config.method == "eagle3":
+                    self.use_aux_hidden_state_outputs = (
+                        self.drafter.eagle3_use_aux_hidden_state
+                    )"""
 
-PATCHES: list = []  # Monkey-patch only.
+_NEW_EAGLE_INIT = """            elif self.speculative_config.use_eagle():
+                self.drafter = EagleProposer(self.vllm_config, self.device, self)
+                if self.speculative_config.method == "eagle3":
+                    self.use_aux_hidden_state_outputs = (
+                        self.drafter.eagle3_use_aux_hidden_state
+                    )
+                # MUSA-0203 / PR #34880: enable FULL-mode draft capture when
+                # padded drafter batch is enabled.
+                self.supports_sd_full_graph = (
+                    not self.speculative_config.disable_padded_drafter_batch
+                )"""
 
-import logging
-import os
+# ---- Hunk 3: _dummy_run — capture spec_decode_cm from _build_attention_metadata ----
+_OLD_BUILD_ATTN = """                attn_metadata, _ = self._build_attention_metadata("""
 
-_log = logging.getLogger(__name__)
+_NEW_BUILD_ATTN = """                attn_metadata, spec_decode_cm = self._build_attention_metadata("""
 
-_ENABLED = os.environ.get("VLLM_MUSA_DRAFT_COPY_DEFAULT_STREAM", "0") == "1"
+# ---- Hunk 4: _dummy_run — extend use_cudagraphs predicate ----
+_OLD_USE_CG = """                # Eagle currently only supports PIECEWISE cudagraphs.
+                # Therefore only use cudagraphs if the main model uses PIECEWISE
+                # NOTE(lucas): this is a hack, need to clean up.
+                use_cudagraphs = (
+                    (
+                        is_graph_capturing
+                        and cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
+                    )
+                    or (
+                        not is_graph_capturing
+                        and cudagraph_runtime_mode != CUDAGraphMode.NONE
+                    )
+                ) and not self.speculative_config.enforce_eager"""
 
-if not _ENABLED:
-    _log.info(
-        "MUSA-0109: VLLM_MUSA_DRAFT_COPY_DEFAULT_STREAM=0; "
-        "draft_token_ids_copy_stream stays on a dedicated stream (default vllm)"
-    )
-else:
-    try:
-        import torch
-        from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-    except ImportError as exc:
-        _log.warning(
-            "MUSA-0109 draft_copy_stream: import failed (%s); patch disabled",
-            exc,
-        )
-        GPUModelRunner = None
+_NEW_USE_CG = """                # MUSA-0203 / PR #34880: Eagle now supports FULL cudagraphs via
+                # CUDAGraphWrapper around the draft model (gated on
+                # supports_sd_full_graph in __init__).
+                use_cudagraphs = (
+                    (
+                        is_graph_capturing
+                        and (
+                            cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
+                            or self.supports_sd_full_graph
+                        )
+                    )
+                    or (
+                        not is_graph_capturing
+                        and cudagraph_runtime_mode != CUDAGraphMode.NONE
+                    )
+                ) and not self.speculative_config.enforce_eager"""
 
-    if GPUModelRunner is not None and not getattr(
-        GPUModelRunner, "_musa_draft_copy_stream_patched", False
-    ):
-        _ORIGINAL_INIT = GPUModelRunner.__init__
+# ---- Hunk 5: _dummy_run — pass common_attn_metadata to drafter.dummy_run ----
+_OLD_DRAFTER_CALL = """                self.drafter.dummy_run(
+                    num_tokens,
+                    use_cudagraphs=use_cudagraphs,
+                    is_graph_capturing=is_graph_capturing,
+                    slot_mappings=slot_mappings,
+                )"""
 
-        def _musa_patched_init(self, *args, **kwargs):
-            _ORIGINAL_INIT(self, *args, **kwargs)
-            # Override the dedicated copy stream with the current default stream
-            # AFTER the original init has constructed everything else.
-            if getattr(self, "draft_token_ids_copy_stream", None) is not None:
-                # Replace with current stream so the H2D copy stays on it.
-                self.draft_token_ids_copy_stream = torch.cuda.current_stream()
-                _log.info(
-                    "MUSA-0109: draft_token_ids_copy_stream redirected to "
-                    "torch.cuda.current_stream() to avoid CUDAGraph pool "
-                    "cross-stream interaction"
-                )
-            if getattr(self, "valid_sampled_token_count_copy_stream", None) is not None:
-                self.valid_sampled_token_count_copy_stream = torch.cuda.current_stream()
-                _log.info(
-                    "MUSA-0109: valid_sampled_token_count_copy_stream redirected "
-                    "to torch.cuda.current_stream()"
-                )
+_NEW_DRAFTER_CALL = """                self.drafter.dummy_run(
+                    num_tokens,
+                    common_attn_metadata=spec_decode_cm,
+                    use_cudagraphs=use_cudagraphs,
+                    is_graph_capturing=is_graph_capturing,
+                    slot_mappings=slot_mappings,
+                )"""
 
-        GPUModelRunner.__init__ = _musa_patched_init
-        GPUModelRunner._musa_draft_copy_stream_patched = True
-        _log.info(
-            "MUSA-0109: GPUModelRunner.__init__ monkey-patched to redirect "
-            "copy streams to default stream (gate "
-            "VLLM_MUSA_DRAFT_COPY_DEFAULT_STREAM=1)"
-        )
+PATCHES = [
+    (_OLD_INIT_FLAG, _NEW_INIT_FLAG),
+    (_OLD_EAGLE_INIT, _NEW_EAGLE_INIT),
+    (_OLD_BUILD_ATTN, _NEW_BUILD_ATTN),
+    (_OLD_USE_CG, _NEW_USE_CG),
+    (_OLD_DRAFTER_CALL, _NEW_DRAFTER_CALL),
+]
