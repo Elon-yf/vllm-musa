@@ -59,7 +59,18 @@ _NEW_EAGLE_INIT = """            elif self.speculative_config.use_eagle():
                     not self.speculative_config.disable_padded_drafter_batch
                 )"""
 
-# ---- Hunk 3: _dummy_run — capture spec_decode_cm from _build_attention_metadata ----
+# ---- Hunk 3a: _dummy_run — declare spec_decode_cm None at function top ----
+# The assignment to spec_decode_cm happens inside an `if force_attention or
+# cudagraph_runtime_mode == CUDAGraphMode.FULL:` block. When that branch
+# doesn't fire (PIECEWISE without force_attention) the variable was never
+# assigned, but the drafter.dummy_run call always references it →
+# UnboundLocalError. Match PR #34880's declaration at the top of _dummy_run.
+_OLD_ATTN_DECL = """        attn_metadata: PerLayerAttnMetadata | None = None"""
+
+_NEW_ATTN_DECL = """        attn_metadata: PerLayerAttnMetadata | None = None
+        spec_decode_cm: 'CommonAttentionMetadata | None' = None"""
+
+# ---- Hunk 3b: _dummy_run — capture spec_decode_cm from _build_attention_metadata ----
 _OLD_BUILD_ATTN = """                attn_metadata, _ = self._build_attention_metadata("""
 
 _NEW_BUILD_ATTN = """                attn_metadata, spec_decode_cm = self._build_attention_metadata("""
@@ -115,6 +126,7 @@ _NEW_DRAFTER_CALL = """                self.drafter.dummy_run(
 PATCHES = [
     (_OLD_INIT_FLAG, _NEW_INIT_FLAG),
     (_OLD_EAGLE_INIT, _NEW_EAGLE_INIT),
+    (_OLD_ATTN_DECL, _NEW_ATTN_DECL),
     (_OLD_BUILD_ATTN, _NEW_BUILD_ATTN),
     (_OLD_USE_CG, _NEW_USE_CG),
     (_OLD_DRAFTER_CALL, _NEW_DRAFTER_CALL),
