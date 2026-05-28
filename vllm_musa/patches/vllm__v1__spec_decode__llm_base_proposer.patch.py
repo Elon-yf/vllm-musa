@@ -195,6 +195,38 @@ _NEW_DUMMY_UNPACK = """                cudagraph_runtime_mode, _, num_input_toke
                     )
                 )"""
 
+# ---- Hunk 12: propose() isinstance check — unwrap CUDAGraphWrapper ----
+# When load_model wraps self.model with CUDAGraphWrapper, the isinstance check
+# fails because self.model is now a CUDAGraphWrapper, not an Eagle3* class.
+# Unwrap before checking. This is PR #34880's matching fix for the load_model
+# wrap.
+_OLD_ISINSTANCE = """        if self.method in ("eagle3", "dflash"):
+            assert isinstance(
+                self.model,
+                (
+                    Eagle3LlamaForCausalLM,
+                    Eagle3DeepseekV2ForCausalLM,
+                    DFlashQwen3ForCausalLM,
+                ),
+            )"""
+
+_NEW_ISINSTANCE = """        if self.method in ("eagle3", "dflash"):
+            # MUSA-0203 / PR #34880: self.model may be wrapped by
+            # CUDAGraphWrapper(FULL) at load_model time; unwrap for the
+            # isinstance check.
+            if isinstance(self.model, CUDAGraphWrapper):
+                _draft_model = self.model.unwrap()
+            else:
+                _draft_model = self.model
+            assert isinstance(
+                _draft_model,
+                (
+                    Eagle3LlamaForCausalLM,
+                    Eagle3DeepseekV2ForCausalLM,
+                    DFlashQwen3ForCausalLM,
+                ),
+            )"""
+
 PATCHES = [
     (_OLD_IMPORTS, _NEW_IMPORTS),
     (_OLD_DISPATCHER_INIT, _NEW_DISPATCHER_INIT),
@@ -207,4 +239,5 @@ PATCHES = [
     (_OLD_PROPOSE_LOOP_DET, _NEW_PROPOSE_LOOP_DET),
     (_OLD_FFC_LOOP, _NEW_FFC_LOOP),
     (_OLD_DUMMY_UNPACK, _NEW_DUMMY_UNPACK),
+    (_OLD_ISINSTANCE, _NEW_ISINSTANCE),
 ]
