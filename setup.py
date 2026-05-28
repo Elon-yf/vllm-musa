@@ -72,6 +72,62 @@ def develop_dynamic_library(package_name, source_dir="./"):
         print(f"vLLM is not installed '{package_name}'")
 
 
+def _configure_ccache():
+    """MUSA-0203: enable ccache for mcc + c++ if available.
+
+    torch_musa's musa_extension.py reads ``PYTORCH_MCC`` to override the
+    mcc binary path, with a comment explicitly endorsing the
+    ``ccache mcc`` pattern (see musa_extension.py:135). We also set
+    ``CXX`` so the C++ portions of the build are cached. The .mu files
+    compile through mcc which is clang-14 under the hood, so ccache
+    handles them via its standard clang code path.
+
+    Opt-out via ``VLLM_MUSA_USE_CCACHE=0``. ccache config is sized
+    generously (20 GiB cache, content-based compiler check for safety
+    on mcc since mcc isn't a standard compiler binary that ccache
+    auto-detects).
+
+    Expected speedup on flag-only / few-file rebuilds: 5-15×.
+    First (cold) build is unaffected.
+    """
+    if os.environ.get("VLLM_MUSA_USE_CCACHE", "1") != "1":
+        return
+
+    ccache_path = shutil.which("ccache")
+    if ccache_path is None:
+        print("MUSA-0203: ccache not on PATH; building without ccache")
+        return
+
+    musa_home = os.environ.get("MUSA_HOME", "/usr/local/musa")
+    mcc_bin = os.path.join(musa_home, "bin", "mcc")
+    if not os.path.exists(mcc_bin):
+        print(f"MUSA-0203: {mcc_bin} not found; skipping ccache for mcc")
+        return
+
+    # Sensible defaults for a multi-GB MUSA csrc cache.
+    os.environ.setdefault("CCACHE_DIR", os.path.expanduser("~/.ccache_vllm_musa"))
+    os.environ.setdefault("CCACHE_MAXSIZE", "20G")
+    # Content-based compiler check is safe for mcc (the binary changes when
+    # mcc upgrades, invalidating the cache as expected).
+    os.environ.setdefault("CCACHE_COMPILERCHECK", "content")
+    # Don't poison the cache when the user is intentionally re-running the
+    # same compile (e.g. a flag-only A/B).
+    os.environ.setdefault("CCACHE_SLOPPINESS", "time_macros,locale")
+
+    # Only set if not already overridden by the user.
+    os.environ.setdefault("PYTORCH_MCC", f"{ccache_path} {mcc_bin}")
+    os.environ.setdefault("CXX", f"{ccache_path} /usr/bin/c++")
+    print(
+        f"MUSA-0203: ccache enabled "
+        f"(PYTORCH_MCC={os.environ['PYTORCH_MCC']!r}, "
+        f"CXX={os.environ['CXX']!r}, "
+        f"CCACHE_DIR={os.environ['CCACHE_DIR']})"
+    )
+
+
+_configure_ccache()
+
+
 def get_mcc_version():
     try:
         proc = subprocess.run(
