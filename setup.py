@@ -378,7 +378,17 @@ MCC_FLAGS = [
     "-ffast-math",
     "-fmusa-flush-denormals-to-zero",
     "-fno-strict-aliasing",
+    "-fno-signed-zeros",
     "-DUSE_MUSA",
+    # MUSA-0203: borrow mate's mcc tuning flags (mate/mate/jit/gemm_ops.py:CUDA_FLAGS).
+    # Both flags are mcc-specific load-clustering hints that mate uses for its
+    # FlashAttention and groupwise GEMM JITs on mp_31. Adding them to vllm-musa's
+    # native csrc compile may help close the yeahdongcn70 (mcc 5.1.0) toolchain
+    # regression vs yeahdongcn60 (mcc 4.3.6).
+    "-mllvm",
+    "-mtgpu-load-cluster-mutation=1",
+    "-mllvm",
+    "--num-dwords-of-load-in-mutation=64",
 ]
 
 mcc_version = get_mcc_version()
@@ -386,9 +396,15 @@ if mcc_version:
     try:
         # mcc_version can be compared normally for types 5.1.0, 5.1.0-rc1, v5.1.0, etc
         if version.parse(mcc_version) > version.parse("5.0.0"):
-            # Disable automatic vectorization optimization.
-            # After mtcc implements vectorization length restrictions, this option can be removed.
-            MCC_FLAGS += ["-mllvm", "-vectorize-slp=false"]
+            # MUSA-0203 (2026-05-28): vllm-musa used to disable SLP vectorization
+            # on mcc 5.1.0+ via `-mllvm -vectorize-slp=false`, with the comment
+            # "After mtcc implements vectorization length restrictions, this
+            # option can be removed." A/B on M2.5+Eagle3 BS=1 cookbook shows
+            # this disable was costing perf; mate's JIT compile does NOT set it.
+            # Re-enabling SLP vectorization on mcc 5.1.0+ to test toolchain win.
+            # If something regresses, set VLLM_MUSA_DISABLE_SLP=1 to opt back.
+            if os.environ.get("VLLM_MUSA_DISABLE_SLP", "0") == "1":
+                MCC_FLAGS += ["-mllvm", "-vectorize-slp=false"]
     except Exception as e:
         print(
             f"Warning: failed to get MUSA version, which may cause installation failure: {e}"
