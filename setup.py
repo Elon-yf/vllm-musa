@@ -43,8 +43,14 @@ from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 root = Path(__file__).parent.resolve()
+sys.path.insert(0, str(root))
+
+from build_utils.ccache import configure_compiler_cache
+
 third_party = Path("third_party")
 arch = platform.machine().lower()
+
+configure_compiler_cache(root)
 
 # Detect editable install (pip install -e .) or develop mode
 _is_editable_install = (
@@ -338,7 +344,7 @@ CSRC_TEXT_PATCHES = {
 # =============================================================================
 
 CXX_FLAGS = ["force_mcc"]
-LINK_LIBRARIES = ["c10", "torch", "torch_python"]
+LINK_LIBRARIES = ["c10", "torch", "torch_python", "musart"]
 EXTRA_LINK_ARGS = [
     "-Wl,-rpath,$ORIGIN/../../torch/lib",
     f"-L/usr/lib/{arch}-linux-gnu",
@@ -347,15 +353,20 @@ EXTRA_LINK_ARGS = [
 
 # Detect MTGPU target architecture
 DEFAULT_MTGPU_TARGET = "mp_31"
-MTGPU_TARGET = os.environ.get("MTGPU_TARGET", DEFAULT_MTGPU_TARGET)
+MTGPU_TARGET = os.environ.get("MTGPU_TARGET")
 
-if torch.musa.is_available():
+if MTGPU_TARGET:
+    print(f"Using MTGPU_TARGET from environment: {MTGPU_TARGET}")
+else:
+    MTGPU_TARGET = DEFAULT_MTGPU_TARGET
+
+if "MTGPU_TARGET" not in os.environ and torch.musa.is_available():
     try:
         device_props = torch.musa.get_device_properties(0)
         MTGPU_TARGET = f"mp_{device_props.major}{device_props.minor}"
     except Exception as e:
         print(f"Warning: Failed to detect GPU properties: {e}")
-else:
+elif "MTGPU_TARGET" not in os.environ:
     print(f"Warning: torch.musa not available. Using default target: {MTGPU_TARGET}")
 
 SUPPORTED_MTGPU_TARGETS = ["mp_22", "mp_31"]

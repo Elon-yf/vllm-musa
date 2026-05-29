@@ -85,6 +85,29 @@ The plugin leverages the following key components:
 | `VLLM_WORKER_MULTIPROC_METHOD=spawn` | Recommended for multi-process workers |
 | `VLLM_MUSA_CUSTOM_OP_USE_NATIVE` | Use vLLM custom ops native implementation (default: `False`) |
 | `VLLM_MUSA_WORKER_TERMINATION_TIMEOUT_S` | Control vLLM v1 worker shutdown timeout (default: `4s`) |
+| `VLLM_MUSA_USE_CCACHE` | Enable ccache for native extension builds when `ccache` is installed (default: `1`) |
+| `VLLM_MUSA_CCACHE` | Override the ccache executable used by `setup.py` (default: first `ccache` in `PATH`) |
+| `VLLM_MUSA_CCACHE_DIR` | Override the ccache directory used by `setup.py` (default: `<repo>/.ccache`) |
+| `VLLM_MUSA_CCACHE_MAXSIZE` | Optional ccache max-size value passed through as `CCACHE_MAXSIZE` |
+| `VLLM_MUSA_REAL_MCC` | Override the real MUSA compiler wrapped by ccache (default: detected `mcc`) |
+
+### ccache for native rebuilds
+
+When `ccache` is available in `PATH`, source installs automatically route the
+host C++ compiler and MUSA `mcc` through ccache. The generated `mcc` wrapper
+normalizes MUSA-only inputs such as `.mu` sources to cacheable `.cu` copies and
+hides `-x musa` from ccache while still passing it to `mcc`. The default cache
+lives in `<repo>/.ccache`, so a second
+`pip install -e . --no-build-isolation -v` from the same checkout can reuse
+cached `.cu`, `.mu`, and C++ object compilation.
+
+Useful commands:
+
+```bash
+ccache --zero-stats
+pip install -e . --no-build-isolation -v
+ccache --show-stats
+```
 
 ## Usage
 
