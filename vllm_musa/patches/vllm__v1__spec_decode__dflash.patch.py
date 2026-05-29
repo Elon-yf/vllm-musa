@@ -85,7 +85,13 @@ _NEW_BODY = """        import dataclasses as _dc
         # MUSA-0403: dflash parallel-drafting query_len (= 1 + num_speculative
         # tokens per request); dispatch FULL keys at this width, not Eagle's 1.
         uniform_decode_query_len = 1 + self.num_speculative_tokens
-        uniform_decode = common_attn_metadata is not None
+        # MUSA-0403: the patched inference propose() computes
+        # uniform_decode = common_attn_metadata.max_query_len == 1; for dflash
+        # common_attn_metadata is the non-causal new_cad with max_query_len =
+        # num_query_per_req (>1), so inference uniform_decode is always False.
+        # Match it here (boot captured uniform=True before -> key mismatch ->
+        # capture-at-inference).
+        uniform_decode = False
         (
             cudagraph_runtime_mode,
             batch_desc,
