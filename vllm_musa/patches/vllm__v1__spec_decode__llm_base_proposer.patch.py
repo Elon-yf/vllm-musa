@@ -80,7 +80,17 @@ _NEW_INIT_KEYS = """        \"\"\"Initialize cudagraph dispatcher keys for eagle
         \"\"\"
         if self.speculative_config.enforce_eager:
             cudagraph_mode = CUDAGraphMode.NONE
-        self.cudagraph_dispatcher.initialize_cudagraph_keys(cudagraph_mode)"""
+        # MUSA-0403: a parallel-drafting proposer (dflash) sees
+        # 1 + num_speculative_tokens query tokens per request, so register +
+        # dispatch FULL keys at that query_len (Eagle uses 1). Aligns the
+        # boot-captured batch_descriptor with the inference dispatch.
+        _draft_qdl = (
+            1 + self.num_speculative_tokens if self.parallel_drafting else 1
+        )
+        self.cudagraph_dispatcher.uniform_decode_query_len = _draft_qdl
+        self.cudagraph_dispatcher.initialize_cudagraph_keys(
+            cudagraph_mode, uniform_decode_query_len=_draft_qdl
+        )"""
 
 # ---- Hunk 4: load_model — wrap with CUDAGraphWrapper ----
 _OLD_LOAD_MODEL = """self.model = self._get_model()
