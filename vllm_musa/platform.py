@@ -285,6 +285,17 @@ class MUSAPlatformBase(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
+        # MUSA-0402: vllm.v1.spec_decode.dflash is not import-resolvable at the
+        # plugin-load platform-init pass, so apply_patches() silently skips it
+        # there. Re-apply now (vllm fully loaded, main process, before the
+        # spawn workers fork) when dflash spec-decode is active, so the
+        # DFlashProposer.dummy_run signature patch lands on the installed
+        # dflash.py that the workers will import.
+        spec_config = getattr(vllm_config, "speculative_config", None)
+        if spec_config is not None and getattr(spec_config, "method", None) == "dflash":
+            from .patches import apply_patches
+            apply_patches(force=True)
+
         parallel_config = vllm_config.parallel_config
         model_config = vllm_config.model_config
 
