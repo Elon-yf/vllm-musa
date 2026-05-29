@@ -158,6 +158,22 @@ class MUSAFlashAttentionBackend(AttentionBackend):
         return "FLASH_ATTN"
 
     @classmethod
+    def supports_non_causal(cls) -> bool:
+        # mate's FA3 wrapper (flash_attn_varlen_func) plumbs causal= through;
+        # required for dflash spec-decode verify (non-causal block attention).
+        # Base AttentionBackend defaults this to False, which made
+        # validate_configuration reject FLASH_ATTN for dflash.
+        return True
+
+    @classmethod
+    def supports_mm_prefix(cls) -> bool:
+        # gemma-4 (Gemma4ForConditionalGeneration) is mm_prefix_lm. For TEXT-only
+        # serving (the dflash workload) the partial-mm bidirectional attention
+        # path is dormant, so allow FLASH_ATTN selection. NOTE: multimodal
+        # (image/audio) input correctness on mate FA is NOT verified — text-only.
+        return True
+
+    @classmethod
     def supports_attn_type(cls, attn_type: str) -> bool:
         """FlashAttention supports all attention types."""
         return attn_type in (
