@@ -295,6 +295,37 @@ class MUSAPlatformBase(Platform):
         if spec_config is not None and getattr(spec_config, "method", None) == "dflash":
             from .patches import apply_patches
             apply_patches(force=True)
+            # MUSA-0403: the dflash draft-loop FULL CUDAGraph capture is
+            # default-on (opt out with VLLM_MUSA_DFLASH_FULL_WRAP=0). It makes
+            # the draft forward process a (1 + num_speculative_tokens)-token
+            # verify block, so every captured cudagraph size must be a whole
+            # multiple of that block. vLLM's default capture sizes
+            # ([1, 2, 4, 8, 16, ...]) are not block-aligned, and capturing the
+            # draft at a sub-block size raises "MUSA error: an illegal memory
+            # access". Coerce to pure FULL + the block-aligned subset of the
+            # configured sizes (default: the single BS=1 block). Multi-block
+            # (BS>1) draft capture is tracked separately (MUSA-0406).
+            import os as _df_os
+            if _df_os.environ.get("VLLM_MUSA_DFLASH_FULL_WRAP", "1") != "0":
+                _comp = getattr(vllm_config, "compilation_config", None)
+                _nspec = getattr(spec_config, "num_speculative_tokens", None)
+                if _comp is not None and _nspec:
+                    from vllm.config import CUDAGraphMode as _CGM
+                    _block = 1 + int(_nspec)
+                    _aligned = [
+                        s
+                        for s in (_comp.cudagraph_capture_sizes or [])
+                        if s % _block == 0
+                    ]
+                    _comp.cudagraph_capture_sizes = sorted(set(_aligned)) or [_block]
+                    _comp.max_cudagraph_capture_size = _comp.cudagraph_capture_sizes[-1]
+                    _comp.cudagraph_mode = _CGM.FULL
+                    logger.info(
+                        "MUSA-0403: dflash draft capture default-on; coerced "
+                        "cudagraph_mode=FULL, capture_sizes=%s (block=%d)",
+                        _comp.cudagraph_capture_sizes,
+                        _block,
+                    )
 
         parallel_config = vllm_config.parallel_config
         model_config = vllm_config.model_config
