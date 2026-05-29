@@ -9,7 +9,7 @@ Three test layers:
   1. Eager parity   — call the JIT directly and the native ref, compare.
   2. CUDAGraph parity (single capture) — wrap each in a single
      CUDAGraph capture and compare replay outputs to the eager refs.
-  3. Multi-replay   — capture once, replay many times with rotating
+  3. Multi-replay   — capture once, replay many times with the same
      position values, confirm no firmware reboot / NaN drift.
 
 If 1 passes but 2 fails -> bug in the JIT kernel's CUDAGraph
@@ -42,12 +42,10 @@ from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 
 
-# RotaryEmbedding.__init__ -> CustomOp.__init__ -> dispatch_forward()
-# reads the current vllm config. Install a minimal default config for the
-# whole test process so we can build modules outside an LLM context.
-_VLLM_CFG = VllmConfig()
-_VLLM_CFG_CM = set_current_vllm_config(_VLLM_CFG)
-_VLLM_CFG_CM.__enter__()
+# RotaryEmbedding.__init__ -> CustomOp.__init__ -> dispatch_forward() reads the
+# current vllm config. We enter set_current_vllm_config() inside main() (NOT at
+# import time) so importing this module -- e.g. during pytest collection -- does
+# not leak a global vLLM config into other tests in the same process. (PR #50)
 
 
 # ---- shape matrix ----------------------------------------------------------
@@ -178,7 +176,7 @@ def compare(label: str, kind: str, q_ref, k_ref, q_test, k_test, atol=1e-2, rtol
         return False
 
 
-def test_eager_parity(shape: Shape) -> bool:
+def check_eager_parity(shape: Shape) -> bool:
     """Layer 1: JIT vs native, both in eager mode."""
     try:
         positions, query, key, rope = make_inputs(shape)
@@ -215,7 +213,7 @@ def _capture_replay(callable_fn, *args):
     return out
 
 
-def test_captured_jit_parity(shape: Shape) -> bool:
+def check_captured_jit_parity(shape: Shape) -> bool:
     """Layer 2: JIT inside captured CUDAGraph vs native eager."""
     try:
         positions, query, key, rope = make_inputs(shape)
@@ -259,11 +257,12 @@ def test_captured_jit_parity(shape: Shape) -> bool:
         return False
 
 
-def test_multi_replay(shape: Shape, n_replays: int = 32) -> bool:
-    """Layer 3: capture once, replay N times with rotating positions.
+def check_multi_replay(shape: Shape, n_replays: int = 32) -> bool:
+    """Layer 3: capture once, then replay N times with the same captured
+    inputs, checking for NaN/Inf after each replay.
 
     If the kernel has a stale-pointer or first-call init issue, repeated
-    replays will surface it.
+    replays will surface it as NaN/Inf or a crash.
     """
     try:
         positions, query, key, rope = make_inputs(shape)
@@ -317,6 +316,8 @@ def main() -> int:
         print("FAIL no MUSA device available")
         return 1
     torch.musa.set_device(0)
+    # PR #50 review: enter the vLLM config here (not at import) -- see note above.
+    set_current_vllm_config(VllmConfig()).__enter__()
     print(f"=== MUSA-0203 rope unit tests on device {torch.musa.current_device()} ===")
     print(f"shapes tested: {len(SHAPES)}\n")
 
@@ -325,9 +326,9 @@ def main() -> int:
         print(f"--- {shape.label}  (q={shape.num_heads_per_rank}, "
               f"kv={shape.num_kv_heads_per_rank}, head_dim={shape.head_dim}, "
               f"rot_dim={shape.rotary_dim}, n_tok={shape.num_tokens}) ---")
-        r1 = test_eager_parity(shape)
-        r2 = test_captured_jit_parity(shape)
-        r3 = test_multi_replay(shape, n_replays=32)
+        r1 = check_eager_parity(shape)
+        r2 = check_captured_jit_parity(shape)
+        r3 = check_multi_replay(shape, n_replays=32)
         results.append((shape.label, r1, r2, r3))
 
     print("\n=== Summary ===")

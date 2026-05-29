@@ -395,16 +395,6 @@ MCC_FLAGS = [
     "-fno-strict-aliasing",
     "-fno-signed-zeros",
     "-DUSE_MUSA",
-    # MUSA-0203: mate's per-JIT CUDA_FLAGS (mate/mate/jit/gemm_ops.py,
-    # flash_attention_ops.py). Both flags are mcc-specific load-clustering
-    # hints. Initially added then reverted when they triggered a clang-14
-    # frontend segfault on `fused_layernorm_dynamic_per_token_quant.mu`;
-    # retried now that paged_attention_v1/v2 (compile-pressure peers) are
-    # out of the build.
-    "-mllvm",
-    "-mtgpu-load-cluster-mutation=1",
-    "-mllvm",
-    "--num-dwords-of-load-in-mutation=64",
 ]
 
 mcc_version = get_mcc_version()
@@ -421,6 +411,17 @@ if mcc_version:
             # If something regresses, set VLLM_MUSA_DISABLE_SLP=1 to opt back.
             if os.environ.get("VLLM_MUSA_DISABLE_SLP", "0") == "1":
                 MCC_FLAGS += ["-mllvm", "-vectorize-slp=false"]
+            # MUSA-0203 / PR #50 review: mate's mcc-specific load-clustering hints
+            # (mate/mate/jit/gemm_ops.py CUDA_FLAGS). Gated to mcc > 5.0.0 -- they
+            # are validated on 5.1.0; an older/unsupported mcc/LLVM may not
+            # recognize these -mllvm options and would otherwise hard-fail the
+            # build even when the version gate would allow it. Opt out with
+            # VLLM_MUSA_DISABLE_LOAD_CLUSTER=1.
+            if os.environ.get("VLLM_MUSA_DISABLE_LOAD_CLUSTER", "0") != "1":
+                MCC_FLAGS += [
+                    "-mllvm", "-mtgpu-load-cluster-mutation=1",
+                    "-mllvm", "--num-dwords-of-load-in-mutation=64",
+                ]
     except Exception as e:
         print(
             f"Warning: failed to get MUSA version, which may cause installation failure: {e}"
