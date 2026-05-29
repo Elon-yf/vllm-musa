@@ -312,13 +312,15 @@ class MUSAPlatformBase(Platform):
                 if _comp is not None and _nspec:
                     from vllm.config import CUDAGraphMode as _CGM
                     _block = 1 + int(_nspec)
-                    _aligned = [
-                        s
-                        for s in (_comp.cudagraph_capture_sizes or [])
-                        if s % _block == 0
-                    ]
-                    _comp.cudagraph_capture_sizes = sorted(set(_aligned)) or [_block]
-                    _comp.max_cudagraph_capture_size = _comp.cudagraph_capture_sizes[-1]
+                    # Capture exactly the single BS=1 verify block — the proven,
+                    # fast size (no padding). vLLM's default capture sizes are
+                    # either not block-aligned (1, 2, 4, 8, 16, ...) or far too
+                    # large (the only multiples of the block in the default set
+                    # are 72, 144, ... = BS>=8, which leave a BS=1 9-token decode
+                    # padded to 72 and running ~35 tok/s vs 48 at the exact
+                    # block). Multi-block (BS>1) draft capture is MUSA-0406.
+                    _comp.cudagraph_capture_sizes = [_block]
+                    _comp.max_cudagraph_capture_size = _block
                     _comp.cudagraph_mode = _CGM.FULL
                     logger.info(
                         "MUSA-0403: dflash draft capture default-on; coerced "
