@@ -24,7 +24,7 @@ def test_configure_compiler_cache_sets_torch_musa_env(monkeypatch, tmp_path):
 
     root = tmp_path / "repo"
     root.mkdir()
-    monkeypatch.setenv("PATH", str(bin_dir))
+    monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("VLLM_MUSA_CCACHE", "ccache")
     monkeypatch.setenv("VLLM_MUSA_REAL_MCC", "mcc")
     monkeypatch.delenv("CXX", raising=False)
@@ -43,6 +43,45 @@ def test_configure_compiler_cache_sets_torch_musa_env(monkeypatch, tmp_path):
         cache_dir / "wrappers" / "mcc-musa-compiler"
     )
     assert str(cache_dir / "wrappers") in os.environ["PATH"].split(os.pathsep)
+
+
+def test_host_compiler_fallback_uses_real_compiler_path(monkeypatch, tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    arg_log = tmp_path / "ccache-args.txt"
+    ccache = bin_dir / "ccache"
+    mcc = bin_dir / "mcc"
+    _write_executable(
+        ccache,
+        "#!/usr/bin/env bash\n"
+        f"printf '%s\\n' \"$@\" > {arg_log}\n"
+        "exit 0\n",
+    )
+    for compiler_name in ("cc", "c++", "gcc", "g++", "mcc"):
+        _write_executable(bin_dir / compiler_name, "#!/usr/bin/env bash\nexit 0\n")
+
+    def fail_symlink(*_args, **_kwargs):
+        raise OSError("symlinks disabled")
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    monkeypatch.setattr(Path, "symlink_to", fail_symlink)
+    monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("VLLM_MUSA_CCACHE", str(ccache))
+    monkeypatch.setenv("VLLM_MUSA_REAL_MCC", str(mcc))
+    monkeypatch.delenv("CXX", raising=False)
+    monkeypatch.delenv("PYTORCH_MCC", raising=False)
+    monkeypatch.delenv("CCACHE_DIR", raising=False)
+
+    assert configure_compiler_cache(root) is True
+
+    cache_dir = root / ".ccache"
+    gcc_wrapper = cache_dir / "wrappers" / "gcc"
+    subprocess.check_call([str(gcc_wrapper), "-c", "source.cpp"])
+
+    args = arg_log.read_text(encoding="utf-8").splitlines()
+    assert args[0] == str((bin_dir / "gcc").resolve())
+    assert args[0] != str(gcc_wrapper)
 
 
 def test_mcc_wrapper_presents_musa_sources_as_cu_to_ccache(monkeypatch, tmp_path):

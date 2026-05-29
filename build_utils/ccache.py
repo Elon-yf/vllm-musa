@@ -135,14 +135,34 @@ def _find_real_compiler(name: str) -> str | None:
     return shutil.which(name)
 
 
-def _resolve_executable(executable: str, *, follow_symlinks: bool = True) -> str:
+def _resolve_path(path: Path) -> Path:
+    try:
+        return path.resolve()
+    except OSError:
+        return path.absolute()
+
+
+def _resolve_executable(
+    executable: str,
+    *,
+    follow_symlinks: bool = True,
+    excluded_dirs: tuple[Path, ...] = (),
+) -> str:
     path = Path(executable)
     if path.parent != Path("."):
         if follow_symlinks:
             return str(path.resolve())
         return str(path.absolute())
 
-    found = shutil.which(executable)
+    excluded = {_resolve_path(excluded_dir) for excluded_dir in excluded_dirs}
+    path_entries = []
+    for path_entry in os.environ.get("PATH", "").split(os.pathsep):
+        search_dir = Path(path_entry or os.curdir)
+        if _resolve_path(search_dir) not in excluded:
+            path_entries.append(path_entry)
+
+    search_path = os.pathsep.join(path_entries)
+    found = shutil.which(executable, path=search_path)
     if not found:
         return executable
     if follow_symlinks:
@@ -179,9 +199,12 @@ def _link_ccache_wrapper(wrapper_dir: Path, compiler_name: str, ccache_bin: str)
         wrapper.symlink_to(ccache_bin)
     except OSError:
         # Some filesystems disallow symlinks; a tiny exec wrapper is good enough.
+        real_compiler = _resolve_executable(
+            compiler_name, excluded_dirs=(wrapper_dir,)
+        )
         wrapper.write_text(
             "#!/usr/bin/env bash\n"
-            f"exec {ccache_bin!r} {compiler_name!r} \"$@\"\n",
+            f"exec {shlex.quote(ccache_bin)} {shlex.quote(real_compiler)} \"$@\"\n",
             encoding="utf-8",
         )
         wrapper.chmod(0o755)
