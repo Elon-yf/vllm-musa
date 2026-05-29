@@ -153,8 +153,15 @@ VLLM_CSRC_SOURCES = [
     str(_VLLM_REPO.source_dir / "csrc/layernorm_quant_kernels.cu"),
     str(_VLLM_REPO.source_dir / "csrc/fused_qknorm_rope_kernel.cu"),
     str(_VLLM_REPO.source_dir / "csrc/quantization/activation_kernels.cu"),
-    str(_VLLM_REPO.source_dir / "csrc/attention/paged_attention_v1.cu"),
-    str(_VLLM_REPO.source_dir / "csrc/attention/paged_attention_v2.cu"),
+    # MUSA-0203 (2026-05-28): paged_attention_v1/v2 are CUDA-only and unused
+    # on MUSA (vllm uses FlashAttention via mate's flash_attn_varlen_func).
+    # Skipping them avoids ~2 min of compile time and ~1 mcc clang frontend
+    # segfault we hit when expanding mcc flags. Their schema declarations
+    # are also stripped from third_party/vllm/csrc/torch_bindings.cpp below
+    # so torch.ops._C lookups at vllm import time don't reference unbound
+    # kernels.
+    # str(_VLLM_REPO.source_dir / "csrc/attention/paged_attention_v1.cu"),
+    # str(_VLLM_REPO.source_dir / "csrc/attention/paged_attention_v2.cu"),
     str(_VLLM_REPO.source_dir / "csrc/cache_kernels_fused.cu"),
     str(
         _VLLM_REPO.source_dir
@@ -223,6 +230,22 @@ CSRC_TEXT_PATCHES = {
     str(_VLLM_REPO.source_dir / "csrc/torch_bindings.cpp"): [
         {"": '#include "torch_musa/csrc/aten/musa/MUSAContext.h"'},
         {"#ifndef USE_ROCM": "#ifndef USE_MUSA"},
+        # MUSA-0203: paged_attention_v1/v2 are CUDA-only and unused on MUSA
+        # (vllm uses FlashAttention via mate). Their .cu sources are dropped
+        # from VLLM_CSRC_SOURCES above. Strip the `ops.impl(..., &paged_attention_v*)`
+        # references so the linker doesn't need to resolve the unbuilt symbols.
+        # The `ops.def(...)` schema declarations are left intact (string-only,
+        # no symbol reference) so the operator name remains registered;
+        # invoking it on MUSA would error at dispatch time, which is fine
+        # because MUSA code paths never call paged_attention.
+        {
+            '  ops.impl("paged_attention_v1", torch::kCUDA, &paged_attention_v1);':
+            '  // MUSA-0203: paged_attention_v1 impl stripped (kernel not built on MUSA)',
+        },
+        {
+            '  ops.impl("paged_attention_v2", torch::kCUDA, &paged_attention_v2);':
+            '  // MUSA-0203: paged_attention_v2 impl stripped (kernel not built on MUSA)',
+        },
     ],
     str(_VLLM_REPO.source_dir / "csrc/quantization/w8a8/fp8/nvidia/quant_utils.cuh"): [
         {
@@ -304,14 +327,6 @@ CSRC_TEXT_PATCHES = {
             '#include "../quantization/w8a8/fp8/nvidia/quant_utils.cuh"': '#include "../quantization_musa/w8a8/fp8/nvidia/quant_utils.cuh"'
         },
     ],
-    str(_VLLM_REPO.source_dir / "csrc/attention/paged_attention_v1.cu"): [
-        {'#include "../cuda_compat.h"': '#include "cuda_compat.h"'},
-        {'#include "attention_musa/cuda_compat.h"': '#include "cuda_compat.h"'},
-    ],
-    str(_VLLM_REPO.source_dir / "csrc/attention/paged_attention_v2.cu"): [
-        {'#include "../cuda_compat.h"': '#include "cuda_compat.h"'},
-        {'#include "attention_musa/cuda_compat.h"': '#include "cuda_compat.h"'},
-    ],
     str(_VLLM_REPO.source_dir / "csrc/type_convert.cuh"): [
         {"defined(USE_ROCM)": "defined(USE_MUSA)"}
     ],
@@ -378,7 +393,18 @@ MCC_FLAGS = [
     "-ffast-math",
     "-fmusa-flush-denormals-to-zero",
     "-fno-strict-aliasing",
+    "-fno-signed-zeros",
     "-DUSE_MUSA",
+    # MUSA-0203: mate's per-JIT CUDA_FLAGS (mate/mate/jit/gemm_ops.py,
+    # flash_attention_ops.py). Both flags are mcc-specific load-clustering
+    # hints. Initially added then reverted when they triggered a clang-14
+    # frontend segfault on `fused_layernorm_dynamic_per_token_quant.mu`;
+    # retried now that paged_attention_v1/v2 (compile-pressure peers) are
+    # out of the build.
+    "-mllvm",
+    "-mtgpu-load-cluster-mutation=1",
+    "-mllvm",
+    "--num-dwords-of-load-in-mutation=64",
 ]
 
 mcc_version = get_mcc_version()
@@ -386,9 +412,15 @@ if mcc_version:
     try:
         # mcc_version can be compared normally for types 5.1.0, 5.1.0-rc1, v5.1.0, etc
         if version.parse(mcc_version) > version.parse("5.0.0"):
-            # Disable automatic vectorization optimization.
-            # After mtcc implements vectorization length restrictions, this option can be removed.
-            MCC_FLAGS += ["-mllvm", "-vectorize-slp=false"]
+            # MUSA-0203 (2026-05-28): vllm-musa used to disable SLP vectorization
+            # on mcc 5.1.0+ via `-mllvm -vectorize-slp=false`, with the comment
+            # "After mtcc implements vectorization length restrictions, this
+            # option can be removed." A/B on M2.5+Eagle3 BS=1 cookbook shows
+            # this disable was costing perf; mate's JIT compile does NOT set it.
+            # Re-enabling SLP vectorization on mcc 5.1.0+ to test toolchain win.
+            # If something regresses, set VLLM_MUSA_DISABLE_SLP=1 to opt back.
+            if os.environ.get("VLLM_MUSA_DISABLE_SLP", "0") == "1":
+                MCC_FLAGS += ["-mllvm", "-vectorize-slp=false"]
     except Exception as e:
         print(
             f"Warning: failed to get MUSA version, which may cause installation failure: {e}"
