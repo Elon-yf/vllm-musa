@@ -53,13 +53,13 @@ def _load_patch_config(patch_file: Path) -> list[tuple[str, str]]:
         return []
 
 
-def apply_patches():
+def apply_patches(force: bool = False):
     """Apply all patches for MUSA compatibility.
 
     This function should be called early during platform initialization.
     """
     global _patches_applied
-    if _patches_applied:
+    if _patches_applied and not force:
         return
 
     patch_files = _get_patch_files()

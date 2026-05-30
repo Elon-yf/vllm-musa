@@ -285,6 +285,64 @@ class MUSAPlatformBase(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
+        # MUSA-0402: vllm.v1.spec_decode.dflash is not import-resolvable at the
+        # plugin-load platform-init pass, so apply_patches() silently skips it
+        # there. Re-apply now (vllm fully loaded, main process, before the
+        # spawn workers fork) when dflash spec-decode is active, so the
+        # DFlashProposer.dummy_run signature patch lands on the installed
+        # dflash.py that the workers will import.
+        spec_config = getattr(vllm_config, "speculative_config", None)
+        # Detect dflash via the STABLE `use_dflash()` API (the same predicate
+        # gpu_model_runner branches on) rather than the `method` string, whose
+        # representation can change across vLLM versions; fall back to the string
+        # only if use_dflash() is unavailable.
+        _use_dflash = getattr(spec_config, "use_dflash", None)
+        if spec_config is not None and (
+            _use_dflash()
+            if callable(_use_dflash)
+            else getattr(spec_config, "method", None) == "dflash"
+        ):
+            from .patches import apply_patches
+            apply_patches(force=True)
+            # MUSA-0403: the dflash draft-loop FULL CUDAGraph capture is
+            # default-on (opt out with VLLM_MUSA_DFLASH_FULL_WRAP=0). It makes
+            # the draft forward process a (1 + num_speculative_tokens)-token
+            # verify block, so every captured cudagraph size must be a whole
+            # multiple of that block. vLLM's default capture sizes
+            # ([1, 2, 4, 8, 16, ...]) are not block-aligned, and capturing the
+            # draft at a sub-block size raises "MUSA error: an illegal memory
+            # access". Coerce to pure FULL + the block-aligned subset of the
+            # configured sizes (default: the single BS=1 block). Multi-block
+            # (BS>1) draft capture is tracked separately (MUSA-0406).
+            import os as _df_os
+            if _df_os.environ.get("VLLM_MUSA_DFLASH_FULL_WRAP", "1") != "0":
+                _comp = getattr(vllm_config, "compilation_config", None)
+                _nspec = getattr(spec_config, "num_speculative_tokens", None)
+                if _comp is not None and _nspec:
+                    from vllm.config import CUDAGraphMode as _CGM
+                    _block = 1 + int(_nspec)
+                    # Capture exactly the single BS=1 verify block — the proven,
+                    # fast size (no padding). vLLM's default capture sizes are
+                    # either not block-aligned (1, 2, 4, 8, 16, ...) or far too
+                    # large (the only multiples of the block in the default set
+                    # are 72, 144, ... = BS>=8, which leave a BS=1 9-token decode
+                    # padded to 72 and running ~35 tok/s vs 48 at the exact
+                    # block). MUSA-0406 extends this to BS=1,2,4,8 = block-aligned
+                    # [9,18,36,72]; a BS=N decode uses the size-N*block graph exactly.
+                    _maxseq = getattr(getattr(vllm_config, "scheduler_config", None),
+                                      "max_num_seqs", 8) or 8
+                    _comp.cudagraph_capture_sizes = [
+                        _block * k for k in (1, 2, 4, 8) if k <= max(1, _maxseq)
+                    ]
+                    _comp.max_cudagraph_capture_size = _comp.cudagraph_capture_sizes[-1]
+                    _comp.cudagraph_mode = _CGM.FULL
+                    logger.info(
+                        "MUSA-0403: dflash draft capture default-on; coerced "
+                        "cudagraph_mode=FULL, capture_sizes=%s (block=%d)",
+                        _comp.cudagraph_capture_sizes,
+                        _block,
+                    )
+
         parallel_config = vllm_config.parallel_config
         model_config = vllm_config.model_config
 

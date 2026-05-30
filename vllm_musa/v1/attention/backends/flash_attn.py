@@ -158,6 +158,34 @@ class MUSAFlashAttentionBackend(AttentionBackend):
         return "FLASH_ATTN"
 
     @classmethod
+    def supports_batch_invariance(cls) -> bool:
+        # MUSA-0405: mate flash_attn_varlen_func(deterministic=True) is
+        # batch-invariant (probe: seq0 solo vs batched max_abs_err=0.0), matching
+        # upstream FlashAttentionBackend. Probe: generated/musa0400/probe_fa_caps.py.
+        return True
+
+    @classmethod
+    def supports_non_causal(cls) -> bool:
+        # mate's FA3 wrapper (flash_attn_varlen_func) plumbs causal= through;
+        # required for dflash spec-decode verify (non-causal block attention).
+        # Base AttentionBackend defaults this to False, which made
+        # validate_configuration reject FLASH_ATTN for dflash.
+        return True
+
+    @classmethod
+    def supports_mm_prefix(cls) -> bool:
+        # MUSA-0405/0404: required for multimodal-model backend SELECTION (e.g.
+        # gemma-4, which registers as mm_prefix_lm even when served text-only — the
+        # dflash workload). mate flash_attn_varlen_func supports causal + window +
+        # attention_chunk masks but NOT an arbitrary partial 2D mask. This was
+        # VALIDATED on Qwen2.5-VL-7B (image input -> correct description, MUSA-0404
+        # regression), so the mm-prefix patterns these models actually use are
+        # handled correctly. A model whose mm-prefix needed an arbitrary partial 2D
+        # mask (not causal/window/chunk) would be wrong on this path — none is
+        # currently known or tested; revisit if such a model is served on FLASH_ATTN.
+        return True
+
+    @classmethod
     def supports_attn_type(cls, attn_type: str) -> bool:
         """FlashAttention supports all attention types."""
         return attn_type in (
@@ -169,8 +197,12 @@ class MUSAFlashAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_per_head_quant_scales(cls) -> bool:
-        fa_version = get_flash_attn_version()
-        return fa_version is not None and fa_version >= 3
+        # MUSA-0405: mate flash_attn_varlen_func rejects fp8 Q/K inputs
+        # ("inputs must be float16 or bfloat16"), so per-head FP8 quant-scale
+        # attention is NOT supported on MUSA — consistent with
+        # flash_attn_supports_fp8()=False and get_fp8_dtype_for_flashattn raising
+        # NotImplementedError. Probe: generated/musa0400/probe_fa_caps.py.
+        return False
 
     @staticmethod
     def get_impl_cls() -> type["FlashAttentionImpl"]:
@@ -221,7 +253,7 @@ class MUSAFlashAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_head_size(cls, head_size: int) -> bool:
-        return head_size % 8 == 0 and head_size <= 256
+        return head_size % 8 == 0 and head_size <= 512
 
     @classmethod
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:

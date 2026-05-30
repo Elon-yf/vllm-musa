@@ -123,9 +123,30 @@ _NEW_DRAFTER_CALL = """                self.drafter.dummy_run(
                     slot_mappings=slot_mappings,
                 )"""
 
+# ---- Hunk 6 (MUSA-0403): DEFAULT-ON FULL-mode draft capture for dflash ----
+# dflash hits use_dflash() (before use_eagle()) so it never set
+# supports_sd_full_graph -> draft transformer stays uncaptured -> the +47% eager
+# floor is draft-launch-bound. Capturing the draft loop lifts the fair compile
+# ratio 1.47x->1.83x (prose) and to 4.09x (predictable workloads); acceptance
+# stayed healthy (no per-position collapse) so set_inputs_first_pass buffer-
+# stability is verified. DEFAULT-ON; opt out with VLLM_MUSA_DFLASH_FULL_WRAP=0.
+# platform.check_and_update_config coerces dflash cudagraph sizes to block-
+# aligned + pure FULL so the default capture set does not crash the draft.
+_OLD_DFLASH_INIT = """            elif self.speculative_config.use_dflash():
+                self.drafter = DFlashProposer(self.vllm_config, self.device, self)
+                self.use_aux_hidden_state_outputs = True"""
+
+_NEW_DFLASH_INIT = """            elif self.speculative_config.use_dflash():
+                self.drafter = DFlashProposer(self.vllm_config, self.device, self)
+                self.use_aux_hidden_state_outputs = True
+                import os as _dflash_os
+                if _dflash_os.environ.get("VLLM_MUSA_DFLASH_FULL_WRAP", "1") != "0":
+                    self.supports_sd_full_graph = True"""
+
 PATCHES = [
     (_OLD_INIT_FLAG, _NEW_INIT_FLAG),
     (_OLD_EAGLE_INIT, _NEW_EAGLE_INIT),
+    (_OLD_DFLASH_INIT, _NEW_DFLASH_INIT),
     (_OLD_ATTN_DECL, _NEW_ATTN_DECL),
     (_OLD_BUILD_ATTN, _NEW_BUILD_ATTN),
     (_OLD_USE_CG, _NEW_USE_CG),
