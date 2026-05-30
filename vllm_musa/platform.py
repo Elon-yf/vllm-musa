@@ -318,9 +318,14 @@ class MUSAPlatformBase(Platform):
                     # large (the only multiples of the block in the default set
                     # are 72, 144, ... = BS>=8, which leave a BS=1 9-token decode
                     # padded to 72 and running ~35 tok/s vs 48 at the exact
-                    # block). Multi-block (BS>1) draft capture is MUSA-0406.
-                    _comp.cudagraph_capture_sizes = [_block]
-                    _comp.max_cudagraph_capture_size = _block
+                    # block). MUSA-0406 extends this to BS=1,2,4,8 = block-aligned
+                    # [9,18,36,72]; a BS=N decode uses the size-N*block graph exactly.
+                    _maxseq = getattr(getattr(vllm_config, "scheduler_config", None),
+                                      "max_num_seqs", 8) or 8
+                    _comp.cudagraph_capture_sizes = [
+                        _block * k for k in (1, 2, 4, 8) if k <= max(1, _maxseq)
+                    ]
+                    _comp.max_cudagraph_capture_size = _comp.cudagraph_capture_sizes[-1]
                     _comp.cudagraph_mode = _CGM.FULL
                     logger.info(
                         "MUSA-0403: dflash draft capture default-on; coerced "
