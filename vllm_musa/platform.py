@@ -292,7 +292,16 @@ class MUSAPlatformBase(Platform):
         # DFlashProposer.dummy_run signature patch lands on the installed
         # dflash.py that the workers will import.
         spec_config = getattr(vllm_config, "speculative_config", None)
-        if spec_config is not None and getattr(spec_config, "method", None) == "dflash":
+        # Detect dflash via the STABLE `use_dflash()` API (the same predicate
+        # gpu_model_runner branches on) rather than the `method` string, whose
+        # representation can change across vLLM versions; fall back to the string
+        # only if use_dflash() is unavailable.
+        _use_dflash = getattr(spec_config, "use_dflash", None)
+        if spec_config is not None and (
+            _use_dflash()
+            if callable(_use_dflash)
+            else getattr(spec_config, "method", None) == "dflash"
+        ):
             from .patches import apply_patches
             apply_patches(force=True)
             # MUSA-0403: the dflash draft-loop FULL CUDAGraph capture is

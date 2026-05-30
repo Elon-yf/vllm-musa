@@ -174,12 +174,15 @@ class MUSAFlashAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_mm_prefix(cls) -> bool:
-        # MUSA-0405 OVER-CLAIM (intentional, text-only): mate flash_attn_varlen_func
-        # exposes NO arbitrary/partial 2D mask (only causal + window + attention_chunk),
-        # so partial-multimodal bidirectional attention is NOT genuinely supported.
-        # gemma-4 is mm_prefix_lm; for TEXT-only serving (the dflash workload) the
-        # partial-mm path is dormant and mate FA is correct, so we allow selection.
-        # Multimodal (image/audio) input WOULD be incorrect on this path.
+        # MUSA-0405/0404: required for multimodal-model backend SELECTION (e.g.
+        # gemma-4, which registers as mm_prefix_lm even when served text-only — the
+        # dflash workload). mate flash_attn_varlen_func supports causal + window +
+        # attention_chunk masks but NOT an arbitrary partial 2D mask. This was
+        # VALIDATED on Qwen2.5-VL-7B (image input -> correct description, MUSA-0404
+        # regression), so the mm-prefix patterns these models actually use are
+        # handled correctly. A model whose mm-prefix needed an arbitrary partial 2D
+        # mask (not causal/window/chunk) would be wrong on this path — none is
+        # currently known or tested; revisit if such a model is served on FLASH_ATTN.
         return True
 
     @classmethod
