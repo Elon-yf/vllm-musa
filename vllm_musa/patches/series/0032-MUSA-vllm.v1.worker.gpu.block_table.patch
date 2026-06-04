@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: musa <musa@local>
+Date: Wed, 3 Jun 2026 11:47:36 +0000
+Subject: [PATCH] MUSA: vllm.v1.worker.gpu.block_table
+
+---
+ vllm/v1/worker/gpu/block_table.py | 10 +++++-----
+ 1 file changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu/block_table.py b/vllm/v1/worker/gpu/block_table.py
+index 2c8c551a4..60e38ff79 100644
+--- a/vllm/v1/worker/gpu/block_table.py
++++ b/vllm/v1/worker/gpu/block_table.py
+@@ -200,7 +200,7 @@ def _gather_block_tables_kernel(
+     batch_idx = tl.program_id(1)
+ 
+     stride = tl.load(block_table_strides + group_id)
+-    dst_block_table_ptr = _load_ptr(dst_block_table_ptrs + group_id, tl.int32)
++    dst_block_table_ptr = _load_int32_ptr(dst_block_table_ptrs + group_id)
+     dst_row_ptr = dst_block_table_ptr + batch_idx * stride
+ 
+     if batch_idx >= num_reqs:
+@@ -214,7 +214,7 @@ def _gather_block_tables_kernel(
+     group_num_blocks_ptr = num_blocks_ptr + group_id * num_blocks_stride
+     num_blocks = tl.load(group_num_blocks_ptr + req_idx)
+ 
+-    src_block_table_ptr = _load_ptr(src_block_table_ptrs + group_id, tl.int32)
++    src_block_table_ptr = _load_int32_ptr(src_block_table_ptrs + group_id)
+     src_row_ptr = src_block_table_ptr + req_idx * stride
+ 
+     for i in tl.range(0, num_blocks, BLOCK_SIZE):
+@@ -256,7 +256,7 @@ def _compute_slot_mappings_kernel(
+             tl.store(slot_mapping_ptr + offset, PAD_ID, mask=offset < max_num_tokens)
+         return
+ 
+-    block_table_ptr = _load_ptr(block_table_ptrs + group_id, tl.int32)
++    block_table_ptr = _load_int32_ptr(block_table_ptrs + group_id)
+     block_table_stride = tl.load(block_table_strides + group_id)
+     block_size = tl.load(block_sizes + group_id)
+ 
+@@ -289,7 +289,7 @@ def _compute_slot_mappings_kernel(
+ 
+ 
+ @triton.jit
+-def _load_ptr(ptr_to_ptr, elem_dtype):
++def _load_int32_ptr(ptr_to_ptr):
+     ptr = tl.load(ptr_to_ptr)
+-    ptr = tl.cast(ptr, tl.pointer_type(elem_dtype))
++    ptr = ptr.to(tl.pointer_type(tl.int32))
+     return tl.multiple_of(ptr, 16)

@@ -209,8 +209,11 @@ marimo/_lsp/
 __marimo__/
 
 # vllm-musa section
-# Third party dependencies
-third_party/
+# Third party dependencies (build-time clones) — ignore the contents but TRACK
+# the pin file. `third_party/*` (not `third_party/`) so the negation
+# can re-include a file under the otherwise-ignored directory.
+third_party/*
+!third_party/PINS
 # Generated source files by torchada
 csrc_musa/
 csrc/**/*_musa/

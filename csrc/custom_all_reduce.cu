@@ -71,7 +71,7 @@ void all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out,
   TORCH_CHECK(_is_weak_contiguous(inp));
   auto input_size = inp.numel() * inp.element_size();
 
-  // MUSA-0075: handle non-vector-aligned numel by zero-padding the tail of
+  // handle non-vector-aligned numel by zero-padding the tail of
   // the input AND using a scratch region in reg_buffer for the output, then
   // memcpy back to the user's out. Background: torch_musa 2.9.0's Inductor
   // compile-mode lowering can pass non-aligned numel to this op (e.g. fp32
@@ -116,11 +116,11 @@ void all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out,
     // Non-aligned path -- use reg_buffer as both input pad-zone and output
     // scratch. Requires reg_buffer to hold 2 * aligned_bytes.
     TORCH_CHECK(reg_buffer != nullptr,
-                "MUSA-0075: non-aligned custom_all_reduce numel requires a "
+                "non-aligned custom_all_reduce numel requires a "
                 "non-null reg_buffer (compile-mode lowering bypass path)");
     int64_t needed_bytes = 2 * aligned_bytes;
     TORCH_CHECK(needed_bytes <= reg_buffer_sz_bytes,
-                "MUSA-0075: reg_buffer too small for tail-padded "
+                "reg_buffer too small for tail-padded "
                 "custom_all_reduce (need ", needed_bytes,
                 " have ", reg_buffer_sz_bytes, ")");
     void* in_buf = reg_buffer;
@@ -161,7 +161,7 @@ void all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out,
           "custom allreduce only supports float32, float16 and bfloat16");
   }
 
-  // MUSA-0075: when we ran with non-aligned numel, kernel wrote to the
+  // when we ran with non-aligned numel, kernel wrote to the
   // reg_buffer-scratch. Memcpy only the first orig_bytes back to user's out.
   if (pad_count > 0) {
     int64_t orig_bytes = orig_numel * out.element_size();

@@ -19,19 +19,3 @@ def test_deepseek_v4_fused_qkv_rmsnorm_custom_op_is_registered():
     assert "&deepseek_v4_fused_q_kv_rmsnorm" in bindings
     assert "deepseek_v4_fused_q_kv_rmsnorm(" in headers
     assert "csrc/musa/attention/deepseek_v4_fused_qkv_rmsnorm.mu" in setup
-
-
-def test_deepseek_v4_fused_qkv_rmsnorm_patch_uses_native_by_default():
-    source = _read(
-        "vllm_musa/patches/"
-        "vllm__v1__attention__ops__deepseek_v4_ops__fused_qk_rmsnorm.patch.py"
-    )
-
-    assert "VLLM_MUSA_DEEPSEEK_V4_QKV_RMSNORM_FALLBACK" in source
-    assert "return _musa_fused_q_kv_rmsnorm(qr, kv, q_weight, kv_weight, eps)" in source
-    assert "_musa_rmsnorm_fallback(qr, q_weight, eps)" in source
-    assert "_OLD_HELPERS" in source
-    assert "_OLD_FALLBACK_RETURN" in source
-    assert source.index("return _musa_fused_q_kv_rmsnorm") < source.index(
-        "_musa_rmsnorm_fallback(qr, q_weight, eps)"
-    )

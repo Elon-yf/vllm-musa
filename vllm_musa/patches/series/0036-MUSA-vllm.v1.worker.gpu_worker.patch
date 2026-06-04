@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: musa <musa@local>
+Date: Wed, 3 Jun 2026 11:47:36 +0000
+Subject: [PATCH] MUSA: vllm.v1.worker.gpu_worker
+
+---
+ vllm/v1/worker/gpu_worker.py | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 582c6a17c..8ba6c417d 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -234,7 +234,7 @@ class Worker(WorkerBase):
+ 
+     @instrument(span_name="Init device")
+     def init_device(self):
+-        if self.device_config.device_type == "cuda":
++        if self.device_config.device_type in ("cuda", "musa"):
+             # This env var set by Ray causes exceptions with graph building.
+             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
+             parallel_config = self.parallel_config
+@@ -260,7 +260,7 @@ class Worker(WorkerBase):
+                     f"DP adjusted local rank {self.local_rank} is out of bounds. "
+                 )
+                 visible_device_count = (
+-                    torch.accelerator.device_count() if torch.cuda.is_available() else 0
++                    torch.accelerator.device_count() if torch.musa.is_available() else 0
+                 )
+                 assert self.parallel_config.local_world_size <= visible_device_count, (
+                     f"local_world_size ({self.parallel_config.local_world_size}) must "
+@@ -901,7 +901,7 @@ class Worker(WorkerBase):
+                         self.profiler_config,
+                         worker_name=trace_name,
+                         local_rank=self.local_rank,
+-                        activities=["CPU", "CUDA"],
++                        activities=["CPU", "MUSA"],
+                     )
+                     logger.debug(
+                         "Starting torch profiler with trace name: %s", trace_name

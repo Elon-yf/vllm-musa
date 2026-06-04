@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: musa <musa@local>
+Date: Wed, 3 Jun 2026 11:47:35 +0000
+Subject: [PATCH] MUSA: vllm.models.deepseek_v4.nvidia.model
+
+---
+ vllm/models/deepseek_v4/nvidia/model.py | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4/nvidia/model.py b/vllm/models/deepseek_v4/nvidia/model.py
+index 25f0a73..d434c32 100644
+--- a/vllm/models/deepseek_v4/nvidia/model.py
++++ b/vllm/models/deepseek_v4/nvidia/model.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ import typing
+ from collections.abc import Callable, Iterable
+ from itertools import islice
+@@ -65,6 +66,13 @@ from vllm.sequence import IntermediateTensors
+ from vllm.utils.torch_utils import direct_register_custom_op
+ 
+ 
++def _musa_deepseek_v4_disable_aux_overlap() -> bool:
++    return (
++        current_platform.is_musa()
++        and os.getenv("VLLM_MUSA_DEEPSEEK_V4_DISABLE_AUX_OVERLAP", "0") == "1"
++    )
++
++
+ class DeepseekV4MLP(nn.Module):
+     def __init__(
+         self,
+@@ -1101,7 +1109,11 @@ class DeepseekV4Model(nn.Module):
+         # Disable them on ROCm / XPU because of hang issues / no overlap.
+         aux_stream_list = (
+             None
+-            if current_platform.is_rocm() or current_platform.is_xpu()
++            if (
++                current_platform.is_rocm()
++                or current_platform.is_xpu()
++                or _musa_deepseek_v4_disable_aux_overlap()
++            )
+             else [torch.cuda.Stream() for _ in range(3)]
+         )
+ 
+@@ -1229,7 +1241,9 @@ class DeepseekV4Model(nn.Module):
+                 res_mix,
+                 residual,
+             )
+-        if layer is not None and current_platform.is_cuda():
++        if layer is not None and (
++            current_platform.is_cuda() or current_platform.is_musa()
++        ):
+             hidden_states = layer.hc_post(hidden_states, residual, post_mix, res_mix)
+ 
+         if not get_pp_group().is_last_rank:

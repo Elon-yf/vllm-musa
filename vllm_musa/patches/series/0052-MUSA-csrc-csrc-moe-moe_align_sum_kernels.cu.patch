@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: musa <musa@local>
+Date: Thu, 4 Jun 2026 02:46:37 +0000
+Subject: [PATCH] MUSA(csrc): csrc/moe/moe_align_sum_kernels.cu
+
+---
+ csrc/moe/moe_align_sum_kernels.cu | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/csrc/moe/moe_align_sum_kernels.cu b/csrc/moe/moe_align_sum_kernels.cu
+index a8fa59b19..c086d6f3b 100644
+--- a/csrc/moe/moe_align_sum_kernels.cu
++++ b/csrc/moe/moe_align_sum_kernels.cu
+@@ -6,8 +6,8 @@
+ #include <ATen/ATen.h>
+ #include <ATen/cuda/Atomic.cuh>
+ 
+-#include "../cuda_compat.h"
+-#include "../dispatch_utils.h"
++#include "cuda_compat.h"
++#include "dispatch_utils.h"
+ #include "core/math.hpp"
+ 
+ #define CEILDIV(x, y) (((x) + (y) - 1) / (y))

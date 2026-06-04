@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: musa <musa@local>
+Date: Wed, 3 Jun 2026 11:47:35 +0000
+Subject: [PATCH] MUSA: vllm.model_executor.layers.quantization.utils.fp8_utils
+
+---
+ vllm/model_executor/layers/quantization/utils/fp8_utils.py | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/vllm/model_executor/layers/quantization/utils/fp8_utils.py b/vllm/model_executor/layers/quantization/utils/fp8_utils.py
+index 8b20c13a9..3a9dc53bc 100644
+--- a/vllm/model_executor/layers/quantization/utils/fp8_utils.py
++++ b/vllm/model_executor/layers/quantization/utils/fp8_utils.py
+@@ -575,8 +575,8 @@ def per_token_group_quant_fp8(
+ 
+     # prefer CUDA/XPU kernel if available
+     # TODO(bnell): this causes some fp8 moe test to fail.
+-    if current_platform.is_cuda() and x.is_contiguous():
+-        torch.ops._C.per_token_group_fp8_quant(
++    if (current_platform.is_cuda() or current_platform.is_musa()) and x.is_contiguous():
++        torch.ops._C_musa_ops.per_token_group_fp8_quant(
+             x,
+             x_q,
+             x_s,
+@@ -591,7 +591,7 @@ def per_token_group_quant_fp8(
+         return x_q, x_s
+ 
+     if current_platform.is_xpu() and x.is_contiguous():
+-        torch.ops._C.per_token_group_fp8_quant(
++        torch.ops._C_musa_ops.per_token_group_fp8_quant(
+             x, x_q, x_s, group_size, eps, fp8_min, fp8_max, use_ue8m0
+         )
+         return x_q, x_s

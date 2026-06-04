@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-MUSA-0124: run the Eagle3 draft model at TP=1 (replicated) while the
+run the Eagle3 draft model at TP=1 (replicated) while the
 target model runs at the configured TP (e.g. 8).
 
 Why
@@ -43,17 +43,16 @@ per-rank compile-cache directory and the write collision cannot occur.
 Gating
 ------
 Off by default during bring-up. Enable with `VLLM_MUSA_DRAFT_TP1=1`.
-The default flips to on once the perf gate (ticket MUSA-0124) passes.
+The default flips to on once the perf gate passes.
 
 Patch style
 -----------
 `PATCHES = []` — no file mutation; the monkey-patch is the import side
-effect (same mechanism as the MUSA-0090 eagle patch). Idempotent via
+effect (same mechanism as the eagle patch). Idempotent via
 the `_musa_draft_tp1_patched` class marker.
 
-Filename note: `patches/__init__.py` `apply_patches()` derives a module
-name from the filename (`__` -> `.`) and `find_spec()`s it; a patch file
-whose name maps to a non-existent module is skipped entirely. This file
+Filename note: `patches/__init__.py` `apply_object_patches()` derives a
+module name from the filename (`__` -> `.`) for the patch report. This file
 is therefore named after `vllm.distributed.parallel_state` — a real
 module, and the one that provides the `patch_tensor_parallel_group`
 context manager this patch wires. It does NOT mutate parallel_state.py
@@ -67,7 +66,7 @@ import os
 
 _log = logging.getLogger(__name__)
 
-# Off by default during bring-up; flip to "1" default once MUSA-0124's
+# Off by default during bring-up; flip to "1" default once 's
 # perf gate passes.
 _ENABLED = os.environ.get("VLLM_MUSA_DRAFT_TP1", "0") == "1"
 
@@ -117,7 +116,7 @@ def _get_draft_tp1_group():
         group_name="musa_draft_tp1",
     )
     _log.info(
-        "MUSA-0124: built per-rank TP=1 draft group (world_size=%d)",
+        "built per-rank TP=1 draft group (world_size=%d)",
         world_size,
     )
     return _DRAFT_TP1_GROUP
@@ -132,8 +131,22 @@ def _is_musa() -> bool:
         return False
 
 
-if _ENABLED:
-    # CRITICAL ORDER (same hazard as the MUSA-0090 eagle patch): importing
+def apply() -> None:
+    """explicit object-patch entry (was an import-time side effect).
+
+    wire the per-rank TP=1 draft group onto
+    ``SpecDecodeBaseProposer.load_model`` + ``EagleProposer.propose``, gated by
+    ``VLLM_MUSA_DRAFT_TP1`` (default off; idempotent via the
+    ``_musa_draft_tp1_patched`` class marker). Called by
+    ``vllm_musa.patches.apply_object_patches()`` at plugin load.
+    """
+    if not _ENABLED:
+        _log.debug(
+            "draft-TP=1 patch dormant (set VLLM_MUSA_DRAFT_TP1=1 to enable)"
+        )
+        return
+
+    # CRITICAL ORDER (same hazard as the eagle patch): importing
     # `vllm.v1.spec_decode.eagle` / `llm_base_proposer` triggers their
     # `from vllm.v1.spec_decode.utils import eagle_prepare_next_token_padded_kernel`.
     # vllm-musa replaces that kernel with a MUSA-Triton-adapted version via
@@ -150,7 +163,7 @@ if _ENABLED:
         from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
     except ImportError as exc:  # pragma: no cover
         _log.debug(
-            "MUSA-0124 draft-TP=1 patch: cannot import proposer classes "
+            "draft-TP=1 patch: cannot import proposer classes "
             "(probably an unsupported vllm version). Skipping: %s",
             exc,
         )
@@ -169,14 +182,14 @@ if _ENABLED:
             if not _is_musa():
                 return _orig_load_model(self, target_model)
             tp1 = _get_draft_tp1_group()
-            _log.info("MUSA-0124: constructing draft model under TP=1 context")
+            _log.info("constructing draft model under TP=1 context")
             with patch_tensor_parallel_group(tp1):
                 return _orig_load_model(self, target_model)
 
         SpecDecodeBaseProposer.load_model = _musa_tp1_load_model
 
         # --- wrap draft FORWARD ---
-        # EagleProposer.propose may already be wrapped by the MUSA-0090
+        # EagleProposer.propose may already be wrapped by the
         # patch; we wrap whatever it currently is. Both wrappers only
         # delegate, so nesting order does not matter for correctness.
         if EagleProposer is not None:
@@ -193,10 +206,6 @@ if _ENABLED:
 
         SpecDecodeBaseProposer._musa_draft_tp1_patched = True
         _log.info(
-            "MUSA-0124: draft-TP=1 patch installed "
+            "draft-TP=1 patch installed "
             "(load_model + propose wrapped; VLLM_MUSA_DRAFT_TP1=1)"
         )
-else:
-    _log.debug(
-        "MUSA-0124: draft-TP=1 patch dormant (set VLLM_MUSA_DRAFT_TP1=1 " "to enable)"
-    )

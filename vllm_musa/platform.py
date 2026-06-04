@@ -33,7 +33,6 @@ logger = init_logger(__name__)
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
-_QWEN3_MOE_FP8_MAX_CUDAGRAPH_CAPTURE_SIZE = 64
 _DEEPSEEK_V4_GEMV_MOE_BLOCK_ENV = "VLLM_MUSA_GEMV_MOE_BLOCK"
 _DEEPSEEK_V4_DEFAULT_GEMV_MOE_BLOCK = "32x8"
 _DEEPSEEK_V4_FLASHMLA_SPARSE_BLOCK_ENV = (
@@ -62,27 +61,6 @@ _DEEPSEEK_V4_TP8_PROFILE_DEFAULTS = {
         _DEEPSEEK_V4_TP8_AGGRESSIVE_LONG_PREFILL_DEFAULTS
     ),
 }
-
-
-def _is_qwen3_moe_fp8_model(model_config: Any | None) -> bool:
-    if model_config is None:
-        return False
-
-    hf_config = getattr(model_config, "hf_config", None)
-    architectures = getattr(model_config, "architectures", None)
-    if architectures is None and hf_config is not None:
-        architectures = getattr(hf_config, "architectures", None)
-    if not any("Qwen3Moe" in str(arch) for arch in architectures or ()):
-        return False
-
-    if getattr(model_config, "quantization", None) == "fp8":
-        return True
-
-    quantization_config = getattr(hf_config, "quantization_config", None)
-    if isinstance(quantization_config, dict):
-        return quantization_config.get("quant_method") == "fp8"
-
-    return False
 
 
 def _is_deepseek_v4_model(model_config: Any | None) -> bool:
@@ -217,7 +195,7 @@ def register_attention_backends() -> None:
     )
     tree_attn_backend = getattr(AttentionBackendEnum, "TREE_ATTN", None)
     if tree_attn_backend is not None:
-        # MUSA-0094: tree drafting via a MUSA-routed TreeAttention backend
+        # tree drafting via a MUSA-routed TreeAttention backend
         # (Triton unified_attention is already MUSA-patched; reshape_and_cache_flash
         # is wired through fa_utils.reshape_and_cache_flash). v0.22 removed this
         # enum member, so only register it on older upstream snapshots.
@@ -305,17 +283,10 @@ class MUSAPlatformBase(Platform):
         fusion barrier; in eager mode there is no fusion to lose so the
         kernel provider is taken directly.
 
-        NOTE (MUSA-0057): this is a **correctness / upstream-consistency**
-        change, NOT a perf fix. MUSA-0057's controlled A/B/C bisect
-        proved there is no rms_norm-related perf regression on
-        MiniMax-M2.7 — `["native"]` and `["musa", "native"]` measure the
-        same batch1 throughput. An earlier revision of this docstring
-        claimed MUSA-0055 had measured a 20-56% regression caused by
-        this priority list; that delta was traced to a stale/anomalous
-        baseline measurement, not a real regression (see the MUSA-0057
-        ticket). The `musa` provider stays registered (see
-        `vllm_musa/kernels/musa_ops.py`) for the eager / explicit
-        opt-in path.
+        NOTE: this is a correctness / upstream-consistency choice, not a
+        perf change — `["native"]` and `["musa", "native"]` measure the
+        same batch1 throughput. The `musa` provider stays registered (see
+        `vllm_musa/kernels/musa_ops.py`) for the eager / explicit opt-in path.
         """
         from vllm.config.compilation import CompilationMode
         from vllm.config.kernel import IrOpPriorityConfig
@@ -325,8 +296,8 @@ class MUSAPlatformBase(Platform):
         if using_inductor:
             # Let Inductor fuse the native reference impl. Keep the
             # `musa` custom-op provider out of the priority here — it is
-            # a fusion barrier (no measurable batch1 effect per
-            # MUSA-0057, but native is the upstream-aligned default).
+            # a fusion barrier (no measurable batch1 effect, but native
+            # is the upstream-aligned default).
             default = ["native"]
             rms_norm = ["native"]
         else:
@@ -391,27 +362,14 @@ class MUSAPlatformBase(Platform):
         if all(s not in compilation_config.custom_ops for s in ("all", "none")):
             compilation_config.custom_ops.append("all")
 
-        if (
-            compilation_config.max_cudagraph_capture_size is None
-            and compilation_config.cudagraph_capture_sizes is None
-            and _is_qwen3_moe_fp8_model(vllm_config.model_config)
-        ):
-            compilation_config.max_cudagraph_capture_size = (
-                _QWEN3_MOE_FP8_MAX_CUDAGRAPH_CAPTURE_SIZE
-            )
-            logger.info(
-                "Capping MUSA Qwen3 MoE FP8 cudagraph capture size to %d.",
-                compilation_config.max_cudagraph_capture_size,
-            )
-
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
-        # MUSA-0402: vllm.v1.spec_decode.dflash is not import-resolvable at the
-        # plugin-load platform-init pass, so apply_patches() silently skips it
-        # there. Re-apply now (vllm fully loaded, main process, before the
-        # spawn workers fork) when dflash spec-decode is active, so the
-        # DFlashProposer.dummy_run signature patch lands on the installed
-        # dflash.py that the workers will import.
+        # when dflash spec-decode is active, coerce the draft-loop
+        # CUDAGraph capture to block-aligned FULL sizes (see below). The dflash
+        # source patch (DFlashProposer.dummy_run signature) is applied at BUILD
+        # time to the cloned vLLM (setup.py -> series/0030 dflash.patch), so the
+        # installed dflash.py the spawn workers import is already patched — no
+        # runtime source-patching is needed here.
         spec_config = getattr(vllm_config, "speculative_config", None)
         # Detect dflash via the STABLE `use_dflash()` API (the same predicate
         # gpu_model_runner branches on) rather than the `method` string, whose
@@ -423,10 +381,7 @@ class MUSAPlatformBase(Platform):
             if callable(_use_dflash)
             else getattr(spec_config, "method", None) == "dflash"
         ):
-            from .patches import apply_patches
-
-            apply_patches(force=True)
-            # MUSA-0403: the dflash draft-loop FULL CUDAGraph capture is
+            # the dflash draft-loop FULL CUDAGraph capture is
             # default-on (opt out with VLLM_MUSA_DFLASH_FULL_WRAP=0). It makes
             # the draft forward process a (1 + num_speculative_tokens)-token
             # verify block, so every captured cudagraph size must be a whole
@@ -435,7 +390,7 @@ class MUSAPlatformBase(Platform):
             # draft at a sub-block size raises "MUSA error: an illegal memory
             # access". Coerce to pure FULL + the block-aligned subset of the
             # configured sizes (default: the single BS=1 block). Multi-block
-            # (BS>1) draft capture is tracked separately (MUSA-0406).
+            # (BS>1) draft capture is tracked separately.
             import os as _df_os
 
             if _df_os.environ.get("VLLM_MUSA_DFLASH_FULL_WRAP", "1") != "0":
@@ -451,7 +406,7 @@ class MUSAPlatformBase(Platform):
                     # large (the only multiples of the block in the default set
                     # are 72, 144, ... = BS>=8, which leave a BS=1 9-token decode
                     # padded to 72 and running ~35 tok/s vs 48 at the exact
-                    # block). MUSA-0406 extends this to BS=1,2,4,8 = block-aligned
+                    # block). extends this to BS=1,2,4,8 = block-aligned
                     # [9,18,36,72]; a BS=N decode uses the size-N*block graph exactly.
                     _maxseq = (
                         getattr(
@@ -467,7 +422,7 @@ class MUSAPlatformBase(Platform):
                     _comp.max_cudagraph_capture_size = _comp.cudagraph_capture_sizes[-1]
                     _comp.cudagraph_mode = _CGM.FULL
                     logger.info(
-                        "MUSA-0403: dflash draft capture default-on; coerced "
+                        "dflash draft capture default-on; coerced "
                         "cudagraph_mode=FULL, capture_sizes=%s (block=%d)",
                         _comp.cudagraph_capture_sizes,
                         _block,

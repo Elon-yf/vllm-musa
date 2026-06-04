@@ -58,6 +58,7 @@ SystemEnv = namedtuple(
         "cpu_info",
         "vllm_version",
         "vllm_musa_version",
+        "patch_report",
         "vllm_build_flags",
         "gpu_topo",
         "env_vars",
@@ -224,6 +225,35 @@ def get_vllm_musa_version():
     if not VLLM_MUSA_AVAILABLE:
         return "N/A"
     return vllm_musa.__version__
+
+
+def get_patch_report():
+    """a concise vLLM-MUSA object-patch report for diagnostics.
+
+    Returns None (rendered as "Could not collect") if vllm-musa is unavailable or
+    anything goes wrong — collect_env must never crash. vLLM **source** patches
+    are applied at build time and are not listed here; this summarizes the
+    runtime **object** patches plus any anomalies (load-failed /
+    misplaced-source-patch / error).
+    """
+    if not VLLM_MUSA_AVAILABLE:
+        return None
+    try:
+        report = vllm_musa.patch_report()
+    except Exception:
+        return None
+    n = len(report)
+    side = sum(1 for e in report if e.get("status") == "side-effect")
+    failures = sum(1 for e in report if e.get("is_failure"))
+    lines = [f"{n} object patches: {side} active / {failures} failures"]
+    for e in report:
+        if e.get("status") != "side-effect":
+            req = "required" if e.get("required", True) else "optional"
+            lines.append(
+                f"  {e.get('id', e.get('file', '?')):<52} "
+                f"{e.get('status', '?'):<16} {req}".rstrip()
+            )
+    return "\n".join(lines)
 
 
 def summarize_vllm_build_flags():
@@ -461,6 +491,7 @@ def get_env_info():
         cpu_info=get_cpu_info(run_lambda),
         vllm_version=vllm_version,
         vllm_musa_version=get_vllm_musa_version(),
+        patch_report=get_patch_report(),
         vllm_build_flags=vllm_build_flags,
         gpu_topo=gpu_topo,
         env_vars=get_env_vars(),
@@ -505,6 +536,11 @@ vLLM Build Flags:
   {vllm_build_flags}
 GPU Topology:
   {gpu_topo}
+
+==============================
+   vLLM-MUSA Patch Report
+==============================
+{patch_report}
 
 ==============================
        MUSA / GPU Info

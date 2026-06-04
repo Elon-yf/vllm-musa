@@ -1,0 +1,62 @@
+# vLLM patch-series sync/maintenance.
+#
+# Maintains vLLM-MUSA's source modifications as a `git format-patch` series against
+# a pinned upstream vLLM tag. Cross-version bumps use `git am -3` (true 3-way
+# merge), so trivial upstream drift auto-merges and only real conflicts need
+# hand-resolution.
+#
+# This is the *maintenance/generation* tool (developer + CI). The *build-time*
+# application of the resulting series to third_party/vllm lives in
+# vllm_musa/patches/build_apply.py. There is no runtime source-patching fallback.
+#
+# Usage:
+#   make -f Makefile.sync checkout            # clone + checkout the pinned vLLM
+#   make -f Makefile.sync apply-patches       # git am -3 the series onto it
+#   make -f Makefile.sync format-patches      # regenerate the series from commits
+#   make -f Makefile.sync clean apply-patches # fresh re-apply
+#   # version bump: edit VLLM_TAG in third_party/PINS, then:
+#   make -f Makefile.sync clean apply-patches # resolve conflicts via `git am --continue`
+#   make -f Makefile.sync format-patches      # rewrite series onto the new base
+
+UPSTREAM := https://github.com/vllm-project/vllm.git
+# Pinned upstream vLLM ref — single source of truth in third_party/PINS, read by
+# BOTH this Makefile and setup.py, so they cannot desync on a bump.
+VLLM_TAG := $(shell sed -n 's/^VLLM_TAG=//p' third_party/PINS)
+WORKDIR := third_party/vllm
+PATCHES_DIR := vllm_musa/patches/series
+
+PATCHES := $(wildcard $(PATCHES_DIR)/*.patch)
+# per-patch stamp files (.<name>.patched) — gitignored; make incremental apply
+PATCHED := $(join $(dir $(PATCHES)),$(addsuffix ed,$(addprefix .,$(notdir $(PATCHES)))))
+
+.NOTPARALLEL:
+.PHONY: checkout apply-patches format-patches clean help
+
+help:
+	@echo "checkout | apply-patches | format-patches | clean   (pin: VLLM_TAG=$(VLLM_TAG) from third_party/PINS)"
+
+# --- fresh pinned checkout of upstream vLLM (a real git repo: 3-way works) ---
+$(WORKDIR):
+	git clone $(UPSTREAM) $(WORKDIR)
+
+checkout: $(WORKDIR)
+	git -C $(WORKDIR) fetch --tags
+	git -C $(WORKDIR) checkout -f $(VLLM_TAG)
+
+# --- replay the series as commits via `git am -3` (delegated to
+#     musa_sync — ONE git code path, manifest-ordered, true 3-way per patch) ---
+apply-patches:
+	python3 tools/musa_sync.py rebase $(VLLM_TAG)
+
+# --- regenerate the series FROM the commits (delegated to musa_sync;
+#     --no-signature --no-numbered --zero-commit, KEEP blob index lines for 3-way) ---
+format-patches: | $(PATCHES_DIR)
+	python3 tools/musa_sync.py regen
+
+$(PATCHES_DIR):
+	mkdir -p $(PATCHES_DIR)
+
+# --- reset for a clean re-apply ---
+clean: checkout
+	@git -C $(WORKDIR) am --abort 2>/dev/null || true
+	$(RM) $(PATCHES_DIR)/.*.patched

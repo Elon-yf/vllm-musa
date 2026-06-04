@@ -76,10 +76,10 @@ vllm.v1.spec_decode.utils.eagle_prepare_next_token_padded_kernel = (
 )
 
 
-# MUSA-0109 / MUSA-0090 reproduction fix (2026-05-17): the upstream
+# reproduction fix (2026-05-17): the upstream
 # `update_num_computed_tokens_for_batch_change` is wrapped with
 # `@torch.compile(dynamic=True, backend=current_platform.simple_compile_backend)`,
-# and on MUSA the simple_compile_backend is Inductor. When the MUSA-0090
+# and on MUSA the simple_compile_backend is Inductor. When the
 # EagleFullLoopRunner captures a CUDAGraph and the next execute_model triggers
 # Inductor's Triton precompile of this function, the MUSA driver returns
 # "unknown error" (likely due to capture state interaction).
@@ -100,7 +100,7 @@ def _musa_update_num_computed_tokens_for_batch_change(
     """Eager (no torch.compile) version of update_num_computed_tokens_for_batch_change.
 
     Same semantics as upstream; just avoids Inductor precompile on MUSA which
-    crashes after a MUSA-0090 EagleFullLoopRunner CUDAGraph replay.
+    crashes after a EagleFullLoopRunner CUDAGraph replay.
     """
     gather_indices = prev_positions.clamp(min=0)
     valid_counts = valid_sampled_token_count[gather_indices]

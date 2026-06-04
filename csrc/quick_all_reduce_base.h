@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// MUSA-0088 first-pass port of SGLang's quick_all_reduce_base.h. NOT YET COMPILED.
+// first-pass port of SGLang's quick_all_reduce_base.h. NOT YET COMPILED.
 //
 #pragma once
 
@@ -10,13 +10,13 @@
 #include <cstdint>
 
 #define __quickreduce_device_inline__ __device__ __forceinline__
-#define __quickreduce_launch_bounds_two_shot__ __launch_bounds__(128, 4)  // MUSA-0088: kBlockSize=128
-#define __quickreduce_launch_bounds_one_shot__ __launch_bounds__(256, 4)  // MUSA-0088: half of HIP
+#define __quickreduce_launch_bounds_two_shot__ __launch_bounds__(128, 4)  // kBlockSize=128
+#define __quickreduce_launch_bounds_one_shot__ __launch_bounds__(256, 4)  // half of HIP
 
 namespace quickreduce {
 
-typedef __mt_bfloat16 nv_bfloat16;  // MUSA-0088: __hip_bfloat16 -> __mt_bfloat16
-typedef __mt_bfloat162 nv_bfloat162;  // MUSA-0088: __hip_bfloat162 -> __mt_bfloat162
+typedef __mt_bfloat16 nv_bfloat16;  // __hip_bfloat16 -> __mt_bfloat16
+typedef __mt_bfloat162 nv_bfloat162;  // __hip_bfloat162 -> __mt_bfloat162
 
 using int32x2_t = __attribute__((__vector_size__(2 * sizeof(int)))) int;
 using int32x4_t = __attribute__((__vector_size__(4 * sizeof(int)))) int;
@@ -38,7 +38,7 @@ static constexpr int kNegOne = 0xBC00BC00;  // {-1, -1}, fp16x2_t
 // Number of atoms (4xf16x2_t) processed by a single thread
 static constexpr int kAtoms = 8;
 
-// MUSA-0088: warp/block-size adaptation for MTT S5000.
+// warp/block-size adaptation for MTT S5000.
 // HIP/AMD CDNA wavefront = 64; MUSA on S5000 = 32. To preserve the
 // "4 warps per block" ratio that the codec macros assume, drop block
 // size from 256 (= 4*64) to 128 (= 4*32). This is the conservative
@@ -72,13 +72,13 @@ __quickreduce_device_inline__ __host__ unsigned long divceil(unsigned long x, un
   return ((x + y - 1) / y);
 }
 
-// MUSA-0091: BufferResource was originally a UNION holding an int32x4_t
+// BufferResource was originally a UNION holding an int32x4_t
 // descriptor that AMD GCN's vector buffer-fetch unit consumes (the
 // `buffer_load_dwordx4` / `buffer_store_dwordx4` AMD intrinsics). MUSA's
 // mp_31 backend does not have an equivalent buffer-fetch unit and cannot
 // lower `llvm.amdgcn.raw.buffer.{load,store}.v4i32` — observed as
 // `error in backend: lsu.st.2d requires constant blx, bly, stride` and
-// `v4i32,ch = llvm.amdgcn.raw.buffer.load` in MUSA-0088 iter-3
+// `v4i32,ch = llvm.amdgcn.raw.buffer.load` in iter-3
 // (`generated/musa0088/iter3-final-state-and-mcc-segfault.md`).
 //
 // Replacement: plain pointer wrapper + portable `int32x4_t*` vector
@@ -94,7 +94,7 @@ struct BufferResource {
   uint32_t range;
 };
 
-// MUSA-0091: AMD `llvm.amdgcn.raw.buffer.load.v4i32` -> portable int4 load.
+// AMD `llvm.amdgcn.raw.buffer.load.v4i32` -> portable int4 load.
 // The original AMD signature took `(int32x4_t srsrc, int32_t voffset,
 // int32_t soffset, int32_t aux)` where srsrc was the buffer descriptor and
 // aux was AMD-specific. We take a `BufferResource const&` to keep the
@@ -139,7 +139,7 @@ __quickreduce_device_inline__ void packed_assign_add<half>(int32x4_t* A, int32x4
   int32x4_t& tR_fragment = A[0];
   int32x4_t& tA_fragment = B[0];
 
-  // MUSA-0088: AMD GCN v_pk_add_f16 -> portable __hadd2. Use cast-and-offset
+  // AMD GCN v_pk_add_f16 -> portable __hadd2. Use cast-and-offset
   // because tR_fragment is a clang vector (__vector_size__ attribute) — taking
   // address of [i] is rejected.
   int32_t* rp = reinterpret_cast<int32_t*>(&tR_fragment);
@@ -166,7 +166,7 @@ __quickreduce_device_inline__ int packed_max(int a, int b);
 
 template <>
 __quickreduce_device_inline__ int packed_max<half>(int a, int b) {
-  // MUSA-0088: AMD GCN v_pk_max_f16 -> portable __hmax2.
+  // AMD GCN v_pk_max_f16 -> portable __hmax2.
   __half2 a2 = *reinterpret_cast<__half2*>(&a);
   __half2 b2 = *reinterpret_cast<__half2*>(&b);
   __half2 r2 = __hmax2(a2, b2);
@@ -189,7 +189,7 @@ __quickreduce_device_inline__ int packed_min(int a, int b);
 
 template <>
 __quickreduce_device_inline__ int packed_min<half>(int a, int b) {
-  // MUSA-0088: AMD GCN v_pk_min_f16 -> portable __hmin2.
+  // AMD GCN v_pk_min_f16 -> portable __hmin2.
   __half2 a2 = *reinterpret_cast<__half2*>(&a);
   __half2 b2 = *reinterpret_cast<__half2*>(&b);
   __half2 r2 = __hmin2(a2, b2);
@@ -236,7 +236,7 @@ __quickreduce_device_inline__ int packed_add(int a, int b);
 
 template <>
 __quickreduce_device_inline__ int packed_add<half>(int a, int b) {
-  // MUSA-0088: AMD GCN v_pk_add_f16 -> portable __hadd2.
+  // AMD GCN v_pk_add_f16 -> portable __hadd2.
   __half2 a2 = *reinterpret_cast<__half2*>(&a);
   __half2 b2 = *reinterpret_cast<__half2*>(&b);
   __half2 r2 = __hadd2(a2, b2);
@@ -256,7 +256,7 @@ __quickreduce_device_inline__ int packed_add<nv_bfloat16>(int a, int b) {
 
 template <>
 __quickreduce_device_inline__ int packed_add<int16_t>(int a, int b) {
-  // MUSA-0088: AMD GCN v_pk_add_i16 -> scalar int16x2 add via bit-fiddle.
+  // AMD GCN v_pk_add_i16 -> scalar int16x2 add via bit-fiddle.
   int16_t a_lo = static_cast<int16_t>(a & 0xFFFF);
   int16_t a_hi = static_cast<int16_t>((a >> 16) & 0xFFFF);
   int16_t b_lo = static_cast<int16_t>(b & 0xFFFF);
@@ -274,7 +274,7 @@ template <>
 __quickreduce_device_inline__ int packed_sub<half>(int a, int b) {
   int result;
 
-  // MUSA-0088: AMD GCN v_pk_fma_f16(-1, b, a) = a - b -> portable __hsub2.
+  // AMD GCN v_pk_fma_f16(-1, b, a) = a - b -> portable __hsub2.
   __half2 a2 = *reinterpret_cast<__half2*>(&a);
   __half2 b2 = *reinterpret_cast<__half2*>(&b);
   __half2 r2 = __hsub2(a2, b2);
@@ -296,7 +296,7 @@ __quickreduce_device_inline__ int packed_mul(int a, int b);
 
 template <>
 __quickreduce_device_inline__ int packed_mul<half>(int a, int b) {
-  // MUSA-0088: AMD GCN v_pk_mul_f16 -> portable __hmul2.
+  // AMD GCN v_pk_mul_f16 -> portable __hmul2.
   __half2 a2 = *reinterpret_cast<__half2*>(&a);
   __half2 b2 = *reinterpret_cast<__half2*>(&b);
   __half2 r2 = __hmul2(a2, b2);

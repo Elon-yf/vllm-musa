@@ -1,231 +1,93 @@
 # vLLM MUSA Platform Patches
 
-This directory contains patches that modify vLLM source files at runtime to ensure compatibility with the MUSA platform.
+vLLM-MUSA carries two distinct kinds of change to upstream vLLM. Source edits
+(the vast majority) are applied to a **cloned, pinned vLLM at build time** as a
+`git format-patch` series. A tiny set of live-object monkey-patches that have no
+source-diff form run at **import time**. There is no runtime source-patching and
+no fallback path.
 
-## Why Patches Are Needed
+## 1. Source patches — build-time `git` series (the primary mechanism)
 
-The MUSA platform uses a modified version of Triton that has some syntax incompatibilities with the standard Triton used by vLLM. These patches fix these incompatibilities at runtime when the MUSA platform plugin is loaded.
-
-## Patch File Naming Convention
-
-Patch files follow this naming convention:
+`setup.py` clones the pinned upstream vLLM into `third_party/vllm@<tag>` and
+applies the diff series in `series/` to it before installing, so the installed
+vLLM is already patched.
 
 ```
-{module_path_with_double_underscores}.patch.py
+series/0001-MUSA-….patch …  the source-of-truth diff series (git format-patch)
+build_apply.py               stdlib-only build-time applier (idempotent git apply)
+Makefile.sync                cross-version regeneration (git am -3 + format-patch)
+setup.py::_apply_musa_patch_series   wires build_apply into the build
 ```
 
-For example:
-- `vllm__attention__ops__triton_unified_attention.patch.py` patches `vllm.attention.ops.triton_unified_attention`
+- **Idempotency**: a patch that already
+  `git apply --reverse --check`-es is skipped; otherwise it is applied forward;
+  a forward failure is a **loud conflict** (the pinned vLLM moved — regenerate).
+- Set `VLLM_MUSA_NO_BUILD_PATCH=1` to skip the build-time apply (e.g. when
+  installing against an already-patched tree).
 
-The double underscores (`__`) in the filename are converted to dots (`.`) to form the target module path.
+### Adding or changing a source patch
 
-## Patch File Format
+Edit the cloned vLLM and regenerate the series — do **not** hand-write a
+`.patch` file:
 
-Each patch file should define a `PATCHES` list containing tuples of `(old_string, new_string)`:
+```bash
+make -f Makefile.sync checkout          # clone/reset third_party/vllm@<tag>
+make -f Makefile.sync apply-patches      # git am -3 the current series
+#   … edit third_party/vllm, git commit inside the clone …
+make -f Makefile.sync format-patches     # regenerate series/ from the commits
+git add vllm_musa/patches/series
+```
+
+### Bumping the pinned vLLM version
+
+Edit `FETCH_HEAD`/the tag in `Makefile.sync`, then:
+
+```bash
+make -f Makefile.sync clean apply-patches   # git am -3 auto-3-way onto the new base
+#   … resolve any conflicts, then: git am --continue …
+make -f Makefile.sync format-patches         # rebase the series onto the new base
+git add setup.py Makefile.sync vllm_musa/patches/series   # commit pin + series
+```
+
+## 2. Object patches — import-time `apply()` (live objects, not source)
+
+A few MUSA changes patch **live Python objects** (monkey-patch a method, prime a
+Triton kernel) rather than editing a source file, so they have no diff form and
+must run in-process. They are the **only** runtime patches:
+
+| File | What it does |
+|---|---|
+| `vllm__v1__spec_decode__eagle.patch.py` | Primes the Eagle3 draft kernel. |
+| `vllm__distributed__parallel_state.patch.py` | Wires draft-TP=1 (`VLLM_MUSA_DRAFT_TP1=1`). |
+
+Convention for an object patch file:
 
 ```python
-PATCHES = [
-    ("old code to replace", "new replacement code"),
-    # ... more patches
-]
+# vllm__some__module.patch.py  — name maps to vllm.some.module (`__` -> `.`)
+PATCHES: list = []            # empty: this file does NOT transform source
+
+def apply() -> None:          # idempotent; called by apply_object_patches()
+    ...                       # install the monkey-patch / prime the kernel
 ```
 
-## Current Patches
-
-### vllm__v1__sample__ops__topk_topp_triton.patch.py
-
-**Target:** `vllm.v1.sample.ops.topk_topp_triton`
-
-**Issue:** MUSA Triton doesn't support Python's annotated assignment syntax (PEP 526)
-
-**Error:**
-```
-triton.compiler.errors.CompilationError:
-    left: tl.int32 = 0
-    ^
-AttributeError("'AnnAssign' object has no attribute 'targets'")
-```
-
-**Fix:** Replace `left: tl.int32 = 0` with `left = 0`
-
-**Affected Function:** `find_seq_idx()` - Binary search helper for the unified attention kernel
-
-### vllm__v1__worker__gpu_worker.patch.py
-
-**Target:** `vllm.v1.worker.gpu_worker`
-
-**vLLM Versions:** 0.10.x and 0.13.x (all V1 engine versions)
-
-**Issue:** The V1 GPU worker only checks for `device.type == "cuda"`, which doesn't match MUSA devices
-
-**Fix:** Extend device type check to also accept "musa" device type
-
-**Note:** No patch is needed for `torch.device("cuda:X")` because torchada automatically aliases it to `torch.device("musa:X")` when imported.
-
-
-### vllm__distributed__device_communicators__all2all.patch.py
-
-**Target:** `vllm.distributed.device.communicators.all2all`
-
-**Issue:** MUSA's version of the communicator doesn't support the `explicitly_destroy` argument
-
-**Fix:** Remove `explicitly_destroy=True,` parameter from all2all calls
-
-### vllm__distributed__device_communicators__custom_all_reduce.patch.py
-
-**Target:** `vllm.distributed.device.communicators.custom_all_reduce`
-
-**Changes:**
-- Increase `CustomAllreduce.max_size` from 8MB to 128MB to better support MUSA
-- Add platform check for CUDA-specific MUSA_VISIBLE_DEVICES behavior
-- Enable MUSA's custom_allreduce backend
-
-### vllm__model_executor__layers__fused_moe__deep_gemm_moe.patch.py
-
-**Target:** `vllm.model_executor.layers.fused_moe.deep_gemm_moe.DeepGemmExperts`
-
-**Issue:** The `m_grouped_fp8_gemm_nt_contiguous` function requires `a2q_scale` tensor to be contiguous on MUSA
-
-**Fix:** Add `a2q_scale.contiguous()` before calling `m_grouped_fp8_gemm_nt_contiguous`
-
-### vllm__model_executor__layers__quantization__fp8.patch.py
-
-**Target:** `vllm.model_executor.layers.quantization.fp8`
-
-**Changes:**
-- Add MUSA to the list of platforms that don't support Marlin backend
-- Adjust minimum compute capability from 75 (NVIDIA Hopper) to 31 (MUSA)
-
-### vllm__model_executor__layers__quantization__utils__fp8_utils.patch.py
-
-**Target:** `vllm.model_executor.layers.quantization.utils.fp8_utils`
-
-**Issue:** Per-token quantization requires contiguous tensors on MUSA
-
-**Fix:** Add MUSA platform check alongside CUDA for contiguous tensor requirement
-
-### vllm__profiler__wrapper.patch.py
-
-**Target:** `vllm.profiler.wrapper`
-
-**Changes:**
-- Update `TorchProfilerActivity` type literal to include "MUSA"
-
-### vllm__utils__deep_gemm.patch.py
-
-**Target:** `vllm.utils.deep_gemm`
-
-**Changes:**
-- Enable DeepGemm support on MUSA devices
-- Adjust device capability check from 90 (NVIDIA Hopper) to 31 (MUSA)
-
-### vllm__v1__attention__backends__fa_utils.patch.py
-
-**Target:** `vllm.v1.attention.backends.fa_utils`
-
-**Issue:** Different Flash Attention version requirements for MUSA vs other platforms
-
-**Fix:** Force Flash Attention v2 for MUSA devices
-
-### vllm__v1__attention__backends__mla__flashmla.patch.py
-
-**Target:** `vllm.v1.attention.backends.mla.flashmla`
-
-**Changes:**
-- Adjust reorder batch threshold from 128 to 1 for MUSA performance
-
-### vllm__v1__attention__ops__flashmla.patch.py
-
-**Target:** `vllm.v1.attention.ops.flashmla`
-
-**Issue:** Device capability detection incompatible with MUSA architecture
-
-**Fix:** Replace capability family for MUSA
-
-### vllm__v1__sample__ops__topk_topp_sampler.patch.py
-
-**Target:** `vllm.v1.sample.ops.topk_topp_sampler`
-
-**Issue:** Triton-based sampling kernel not compatible with MUSA Triton compiler
-
-**Fix:** Disable Triton path for MUSA and use PyTorch fallback implementation.
-For large decode batches, enable `VLLM_MUSA_SAMPLER_FAST_PATH` by default to
-use a MUSA-safe top-k prefilter path:
-- top-k only: use the existing `apply_top_k_only` path for batch >= 16,
-  vocab >= 65536, and `max_k <= 1024`.
-- top-k + top-p: prefilter with `torch.topk` only for batch >= 16,
-  vocab >= 65536, and `max_k <= 1024`; fall back to the PyTorch sort path for
-  top-k-disabled rows, large `k`, or kth-logit ties.
-- top-p only and unsupported shapes stay on the current PyTorch fallback.
-
-### vllm__v1__sample__ops__topk_topp_triton.patch.py
-
-**Target:** `vllm.v1.sample.ops.topk_topp_triton`
-
-**Changes:**
-- Remove `tl.cast()` calls for intermediate `tl.int32` conversions (MUSA Triton handles this better)
-- Refactor conditional logic for `final_pivot` to improve MUSA Triton compatibility
-
-## Version-Specific Patches
-
-Some patches are version-specific and will be automatically skipped if the target module doesn't exist:
-
-| Patch | vLLM v0.20.0x |
-|-------|-------------|
-| `vllm__v1__sample__ops__topk_topp_triton` | ✅ Applied |
-| `vllm__v1__worker__gpu_worker` | ✅ Applied |
-| `vllm__distributed__device_communicators__all2all` | ✅ Applied |
-| `vllm__distributed__device_communicators__custom_all_reduce` | ✅ Applied |
-| `vllm__model_executor__layers__quantization__fp8` | ✅ Applied |
-| `vllm__model_executor__layers__quantization__utils__fp8_utils` | ✅ Applied |
-| `vllm__profiler__wrapper` | ✅ Applied |
-| `vllm__utils__deep_gemm` | ✅ Applied |
-| `vllm__v1__attention__backends__fa_utils` | ✅ Applied |
-| `vllm__v1__attention__backends__mla__flashmla` | ✅ Applied |
-| `vllm__v1__attention__ops__flashmla` | ✅ Applied |
-| `vllm__v1__sample__ops__topk_topp_sampler` | ✅ Applied |
-| `vllm__v1__sample__ops__topk_topp_triton` | ✅ Applied |
-
-
-When a patch is skipped due to a missing module, a debug message is logged (not a warning), as this is expected behavior for version-specific patches.
-
-## How Patches Are Applied
-
-1. When the MUSA platform plugin is loaded, it calls `apply_patches()` from this module
-2. The function scans for all `*.patch.py` files in this directory
-3. For each patch file:
-   - Extracts the target module name from the filename
-   - Loads the `PATCHES` list from the patch file
-   - Reads the target module's source file
-   - Applies string replacements
-   - Writes the patched source back to disk
-   - Clears the module from `sys.modules` to force a fresh import
-
-## Adding New Patches
-
-1. Create a new file named `{module__path}.patch.py`
-2. Add documentation explaining the issue and solution
-3. Define the `PATCHES` list with your replacements
-4. Test that the patch is applied correctly
-
-Example:
-```python
-# vllm__some__module.patch.py
-"""
-Patch for vllm.some.module
-
-Issue: Description of the problem
-Solution: Description of the fix
-"""
-
-PATCHES = [
-    ("problematic code", "fixed code"),
-]
-```
+`vllm_musa.patches.apply_object_patches()` loads each `*.patch.py` in
+deterministic name order and calls `apply()` where present. It is wired from
+`vllm_musa.__init__._register_patches()` at import time and is idempotent.
+
+> A `*.patch.py` with a **non-empty** `PATCHES` list is now a mistake — source
+> edits belong in `series/`. `patch_report()` flags such a file as
+> `misplaced-source-patch`.
+
+## 3. Patch report
+
+`vllm_musa.patches.patch_report()` (also `vllm_musa.patch_report()`, surfaced by
+`vllm_collect_env`) is a read-only audit of the object patches: their `apply()`
+presence, status, and metadata. It never modifies anything. Build-time source
+patches are not audited here — the installed vLLM is already patched.
 
 ## Notes
 
-- Patches modify files on disk, so they persist across Python sessions
-- Patches are only applied once per module (tracked by `_patches_applied` flag)
-- If a patch has already been applied (old string not found), it's skipped silently
-- Failed patches log a warning but don't prevent the platform from loading
+- `import torchada` must precede any `torch.cuda.*` / FlashAttention import; the
+  package `__init__` does this first.
+- Object-patch `apply()` functions must be idempotent (spawn workers re-import
+  `vllm_musa`).

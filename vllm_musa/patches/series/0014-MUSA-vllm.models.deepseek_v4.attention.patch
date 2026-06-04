@@ -1,0 +1,158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: musa <musa@local>
+Date: Wed, 3 Jun 2026 11:47:35 +0000
+Subject: [PATCH] MUSA: vllm.models.deepseek_v4.attention
+
+---
+ vllm/models/deepseek_v4/attention.py | 108 +++++++++++++++++++++++++--
+ 1 file changed, 102 insertions(+), 6 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4/attention.py b/vllm/models/deepseek_v4/attention.py
+index d052b41..fcec8f6 100644
+--- a/vllm/models/deepseek_v4/attention.py
++++ b/vllm/models/deepseek_v4/attention.py
+@@ -76,6 +76,61 @@ if TYPE_CHECKING:
+ logger = init_logger(__name__)
+ 
+ 
++def _musa_deepseek_v4_linear_out_dtype(
++    a: torch.Tensor,
++    weight: torch.Tensor,
++    out_dtype: torch.dtype,
++) -> torch.Tensor:
++    if (
++        current_platform.is_musa()
++        or getattr(torch.version, "musa", None) is not None
++        or a.device.type == "musa"
++        or weight.device.type == "musa"
++    ):
++        return F.linear(a.to(out_dtype), weight.to(out_dtype))
++    return torch.mm(a, weight.T, out_dtype=out_dtype)
++
++
++def _musa_deepseek_v4_is_musa_tensor(tensor: torch.Tensor) -> bool:
++    return (
++        current_platform.is_musa()
++        or getattr(torch.version, "musa", None) is not None
++        or getattr(tensor.device, "type", None) == "musa"
++    )
++
++
++def _musa_deepseek_v4_qnorm_rope_kv_insert(
++    q: torch.Tensor,
++    kv: torch.Tensor,
++    kv_cache: torch.Tensor,
++    slot_mapping: torch.Tensor,
++    positions: torch.Tensor,
++    cos_sin_cache: torch.Tensor,
++    padded_heads: int,
++    eps: float,
++    block_size: int,
++) -> torch.Tensor:
++    from vllm_musa import _custom_ops as _musa_custom_ops
++
++    active_slot_mapping = slot_mapping
++    if slot_mapping.shape[0] > q.shape[0]:
++        active_slot_mapping = slot_mapping[: q.shape[0]].contiguous()
++
++    _musa_custom_ops.deepseek_v4_qnorm_rope_kv_insert(
++        q,
++        kv,
++        kv_cache,
++        active_slot_mapping,
++        positions.contiguous(),
++        cos_sin_cache,
++        eps,
++        block_size,
++    )
++    if q.shape[1] < padded_heads:
++        return F.pad(q, (0, 0, 0, padded_heads - q.shape[1]), value=0.0)
++    return q
++
++
+ def _select_v4_sparse_impl() -> "type[DeepseekV4SparseMLAAttentionImpl]":
+     """Pick the platform-specific V4 sparse MLA impl class. Sole platform check."""
+     if current_platform.is_rocm():
+@@ -363,10 +418,10 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
+             compressor = self.compressor
+ 
+             def compressor_kv_score() -> torch.Tensor:
+-                return torch.mm(
++                return _musa_deepseek_v4_linear_out_dtype(
+                     hidden_states,
+-                    compressor.fused_wkv_wgate.weight.T,
+-                    out_dtype=torch.float32,
++                    compressor.fused_wkv_wgate.weight,
++                    torch.float32,
+                 )
+ 
+             aux_fns[0] = compressor_kv_score
+@@ -380,10 +435,10 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
+                 return weights
+ 
+             def indexer_compressor_kv_score() -> torch.Tensor:
+-                return torch.mm(
++                return _musa_deepseek_v4_linear_out_dtype(
+                     hidden_states,
+-                    indexer.compressor.fused_wkv_wgate.weight.T,
+-                    out_dtype=torch.float32,
++                    indexer.compressor.fused_wkv_wgate.weight,
++                    torch.float32,
+                 )
+ 
+             aux_fns[1] = indexer_weights_proj
+@@ -529,6 +584,19 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
+         #            allocates and returns the padded q tensor.
+         #   KV side: GPT-J RoPE + UE8M0 FP8 quant + paged cache insert
+         # kv is unchanged; mla_attn reads kv solely via swa_kv_cache.
++        if _musa_deepseek_v4_is_musa_tensor(q):
++            return _musa_deepseek_v4_qnorm_rope_kv_insert(
++                q,
++                kv,
++                swa_kv_cache,
++                swa_metadata.slot_mapping,
++                positions.to(torch.int64),
++                self.rotary_emb.cos_sin_cache,
++                self.padded_heads,
++                self.eps,
++                swa_metadata.block_size,
++            )
++
+         return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+             q,
+             kv,
+@@ -580,6 +648,34 @@ def deepseek_v4_fp8_einsum(
+     equation: str,
+     recipe: list[int],
+ ) -> None:
++    if (
++        current_platform.is_musa()
++        or getattr(torch.version, "musa", None) is not None
++        or a.device.type == "musa"
++        or out.device.type == "musa"
++    ):
++        try:
++            from vllm_musa.deepseek_v4_jit.fp8_einsum import (
++                try_musa_deepseek_v4_fp8_einsum,
++            )
++
++            handled, reason = try_musa_deepseek_v4_fp8_einsum(
++                a, a_scale, b, b_scale, out, equation
++            )
++        except Exception as exc:
++            handled = False
++            reason = f"{type(exc).__name__}: {exc}"
++        if handled:
++            logger.warning_once(
++                "Using MUSA DeepSeek-V4 FP8 einsum provider: %s.",
++                reason,
++            )
++            return
++        raise NotImplementedError(
++            "MUSA DeepSeek-V4 FP8 einsum could not use a supported local "
++            f"provider for {equation!r}; upstream DeepGEMM fp8_einsum is "
++            f"not available in the MUSA runtime. Reason: {reason}"
++        )
+     fp8_einsum(equation, (a, a_scale), (b, b_scale), out, recipe=tuple(recipe))
+ 
+ 

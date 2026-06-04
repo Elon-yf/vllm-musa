@@ -120,7 +120,7 @@ def apply(
     shared_experts_input: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     if layer.ep_size != None and layer.ep_size <= 1:
-        # MUSA-3173: the legacy fused_experts() path only computes routed
+        # the legacy fused_experts() path only computes routed
         # experts. For the no-overlap path used by DeepSeek-V2/V3 on MUSA, the
         # MoE runner computes shared experts separately and combines them with
         # this routed output. Only compute shared experts here when the runner

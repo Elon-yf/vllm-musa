@@ -1,0 +1,161 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: musa <musa@local>
+Date: Thu, 4 Jun 2026 02:46:36 +0000
+Subject: [PATCH] MUSA(csrc-file): csrc/mamba/mamba_ssm/selective_scan_fwd.cu
+
+---
+ csrc/mamba/mamba_ssm/selective_scan_fwd.cu | 46 ++++++++--------------
+ 1 file changed, 17 insertions(+), 29 deletions(-)
+
+diff --git a/csrc/mamba/mamba_ssm/selective_scan_fwd.cu b/csrc/mamba/mamba_ssm/selective_scan_fwd.cu
+index ba2f0cc61..c196d5f44 100644
+--- a/csrc/mamba/mamba_ssm/selective_scan_fwd.cu
++++ b/csrc/mamba/mamba_ssm/selective_scan_fwd.cu
+@@ -152,7 +152,7 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
+             cache_index * params.ssm_states_batch_stride +
+             dim_id * kNRows * params.ssm_states_dim_stride;
+     }
+-    
++
+     float D_val[kNRows] = {0};
+     if (params.D_ptr != nullptr) {
+         #pragma unroll
+@@ -168,6 +168,7 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
+         }
+     }
+ 
++
+     // Use block_size for chunking when APC is enabled, otherwise use 2048 for backwards compatibility
+     const int block_size = params.cache_enabled ? params.block_size : 2048;
+ 
+@@ -231,7 +232,7 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
+         }
+         u += chunk_tokens;
+         delta += chunk_tokens;
+-    
++
+         float delta_vals[kNRows][kNItems], delta_u_vals[kNRows][kNItems], out_vals[kNRows][kNItems];
+         #pragma unroll
+         for (int r = 0; r < kNRows; ++r) {
+@@ -333,12 +334,12 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
+ 
+                     // Store state at the end of each aligned chunk when cache is enabled
+                     if (params.cache_enabled && batch_cache_indices != nullptr) {
++
+                         size_t cache_slot;
+                         if (chunk == n_chunks - 1) {
+                             cache_slot = batch_cache_indices[block_idx_last_scheduled[batch_id]];
+                         } else {
+-                            const int block_idx_completed = (current_position + chunk_tokens - 1) / block_size;
+-                            cache_slot = batch_cache_indices[block_idx_completed];
++                            cache_slot = batch_cache_indices[block_idx_first_scheduled[batch_id] + chunk];
+                         }
+ 
+                         size_t state_offset = cache_slot * params.ssm_states_batch_stride +
+@@ -462,8 +463,9 @@ void selective_scan_fwd_cuda(SSMParamsBase &params, cudaStream_t stream) {
+     #endif
+ }
+ 
+-template void selective_scan_fwd_cuda<at::BFloat16, float, at::BFloat16>(SSMParamsBase &params, cudaStream_t stream);
+-template void selective_scan_fwd_cuda<at::BFloat16, float, float>(SSMParamsBase &params, cudaStream_t stream);
++// ==================== MUSA ADAPTATION ====================
++// template void selective_scan_fwd_cuda<at::BFloat16, float, at::BFloat16>(SSMParamsBase &params, cudaStream_t stream);
++// template void selective_scan_fwd_cuda<at::BFloat16, float, float>(SSMParamsBase &params, cudaStream_t stream);
+ template void selective_scan_fwd_cuda<at::Half, float, at::Half>(SSMParamsBase &params, cudaStream_t stream);
+ template void selective_scan_fwd_cuda<at::Half, float, float>(SSMParamsBase &params, cudaStream_t stream);
+ template void selective_scan_fwd_cuda<float, float, float>(SSMParamsBase &params, cudaStream_t stream);
+@@ -480,20 +482,6 @@ template void selective_scan_fwd_cuda<float, float, float>(SSMParamsBase &params
+         } else if (STYPE == at::ScalarType::Float) {                                \
+             using state_t = float;                                                  \
+             __VA_ARGS__();                                                          \
+-        } else {                                                                    \
+-            AT_ERROR(#NAME, " not implemented for state type '", toString(STYPE), "'"); \
+-        }                                                                           \
+-    } else if (ITYPE == at::ScalarType::BFloat16) {                                 \
+-        using input_t = at::BFloat16;                                               \
+-        using weight_t = float;                                                     \
+-        if (STYPE == at::ScalarType::BFloat16) {                                    \
+-            using state_t = at::BFloat16;                                           \
+-            __VA_ARGS__();                                                          \
+-        } else if (STYPE == at::ScalarType::Float) {                                \
+-            using state_t = float;                                                  \
+-            __VA_ARGS__();                                                          \
+-        } else {                                                                    \
+-            AT_ERROR(#NAME, " not implemented for state type '", toString(STYPE), "'"); \
+         }                                                                           \
+     } else if (ITYPE == at::ScalarType::Float)  {                                   \
+         using input_t = float;                                                      \
+@@ -503,7 +491,7 @@ template void selective_scan_fwd_cuda<float, float, float>(SSMParamsBase &params
+     } else {                                                                        \
+         AT_ERROR(#NAME, " not implemented for input type '", toString(ITYPE), "'"); \
+     }
+-
++// ========================== END ==========================
+ 
+ template<typename input_t, typename weight_t, typename state_t>
+ void selective_scan_fwd_cuda(SSMParamsBase &params, cudaStream_t stream);
+@@ -645,7 +633,7 @@ void set_ssm_params_fwd(SSMParamsBase &params,
+         }
+         params.out_batch_stride = out.stride(0);
+         params.out_d_stride = out.stride(1);
+-        
++
+         params.ssm_states_batch_stride = ssm_states.stride(0);
+         params.ssm_states_dim_stride = ssm_states.stride(1);
+         params.ssm_states_dstate_stride = ssm_states.stride(2);
+@@ -664,8 +652,8 @@ void selective_scan_fwd(const torch::Tensor &u, const torch::Tensor &delta,
+                   const std::optional<torch::Tensor> &cache_indices,
+                   const std::optional<torch::Tensor> &has_initial_state,
+                   const torch::Tensor &ssm_states,
+-                  // used to identify padding entries if cache_indices provided
+-                  // in case of padding, the kernel will return early
++                  // used to identify null-block entries if cache_indices provided
++                  // in case of null-block, the kernel will return early
+                   int64_t null_block_id,
+                   int64_t block_size,
+                   const std::optional<torch::Tensor> &block_idx_first_scheduled_token,
+@@ -716,7 +704,7 @@ void selective_scan_fwd(const torch::Tensor &u, const torch::Tensor &delta,
+     if (varlen) {
+         CHECK_SHAPE(B, n_groups, dstate, seqlen);
+     } else {
+-        CHECK_SHAPE(B, batch_size, n_groups, dstate, seqlen); 
++        CHECK_SHAPE(B, batch_size, n_groups, dstate, seqlen);
+     }
+     TORCH_CHECK(B.stride(-1) == 1 || B.size(-1) == 1);
+ 
+@@ -724,7 +712,7 @@ void selective_scan_fwd(const torch::Tensor &u, const torch::Tensor &delta,
+     if (varlen) {
+         CHECK_SHAPE(C, n_groups, dstate, seqlen);
+     } else {
+-        CHECK_SHAPE(C, batch_size, n_groups, dstate, seqlen); 
++        CHECK_SHAPE(C, batch_size, n_groups, dstate, seqlen);
+     }
+     TORCH_CHECK(C.stride(-1) == 1 || C.size(-1) == 1);
+ 
+@@ -775,7 +763,7 @@ void selective_scan_fwd(const torch::Tensor &u, const torch::Tensor &delta,
+             CHECK_SHAPE(cache_indices_, batch_size);
+         }
+     }
+-   
++
+ 
+     at::Tensor z, out_z;
+     const bool has_z = z_.has_value();
+@@ -789,7 +777,7 @@ void selective_scan_fwd(const torch::Tensor &u, const torch::Tensor &delta,
+         } else {
+             CHECK_SHAPE(z, batch_size, dim, seqlen);
+         }
+-        
++
+         out_z = z;
+     }
+ 
+@@ -822,7 +810,7 @@ void selective_scan_fwd(const torch::Tensor &u, const torch::Tensor &delta,
+                        last_chunk_indices
+                        );
+ 
+-    
++
+     const at::cuda::OptionalCUDAGuard device_guard(device_of(u));
+     auto stream = at::cuda::getCurrentCUDAStream().stream();
+     DISPATCH_WTYPE_ITYPE_FLOAT_AND_HALF_AND_BF16(u.scalar_type(), ssm_states.scalar_type(), "selective_scan_fwd", [&] {

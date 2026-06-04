@@ -1,0 +1,10 @@
+# Single source of truth for the upstream pins (the MDM).
+# Read by BOTH setup.py (regex) and Makefile.sync ($(shell sed)) so a version
+# bump edits ONE place and the generation base can never desync from the build
+# base. KEY=VALUE only — NOT TOML (tomllib is 3.11+, the build box is py3.10,
+# the package floor is 3.9), so the build needs no parser dependency.
+VLLM_TAG=v0.22.0
+# FlashInfer is intentionally DECOUPLED from upstream vLLM's choice: vLLM v0.22.0
+# uses v0.6.11.post2, which breaks the MUSA csrc_musa/include_musa build path.
+# Bump this consciously, not in lockstep with VLLM_TAG.
+FLASHINFER_COMMIT=bc29697ba20b7e6bdb728ded98f04788e16ee021

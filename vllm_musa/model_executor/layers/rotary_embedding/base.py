@@ -23,7 +23,7 @@ class MusaRotaryEmbedding(RotaryEmbedding):
         query: torch.Tensor,
         key: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        # MUSA-0202: do NOT reassign self.cos_sin_cache inside forward.
+        # do NOT reassign self.cos_sin_cache inside forward.
         # CUDAGraph-aware Dynamo flags `self.cos_sin_cache = ...` as a
         # buffer mutation and refuses to compile (RuntimeError: Assigning
         # / modifying buffers of nn.Module during forward pass is not

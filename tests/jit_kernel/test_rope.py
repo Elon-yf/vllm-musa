@@ -1,4 +1,4 @@
-"""MUSA-0203 rope kernel unit + integration tests.
+"""rope kernel unit + integration tests.
 
 Compare the PR #47 csrc-JIT rope kernel against vLLM's upstream
 `RotaryEmbedding.forward_native` (pure PyTorch reference) for the
@@ -61,7 +61,7 @@ class Shape:
 
 
 # The "did this work for the user matrix" column tracks what we observed
-# in MUSA-0202 / MUSA-0203 testing on yeahdongcn70.
+# in testing.
 SHAPES = [
     # Eagle3 draft, the failing case at TP=8 + captured chain
     Shape(
@@ -396,7 +396,7 @@ def main() -> int:
     torch.musa.set_device(0)
     # PR #50 review: enter the vLLM config here (not at import) -- see note above.
     set_current_vllm_config(VllmConfig()).__enter__()
-    print(f"=== MUSA-0203 rope unit tests on device {torch.musa.current_device()} ===")
+    print(f"=== rope unit tests on device {torch.musa.current_device()} ===")
     print(f"shapes tested: {len(SHAPES)}\n")
 
     results = []

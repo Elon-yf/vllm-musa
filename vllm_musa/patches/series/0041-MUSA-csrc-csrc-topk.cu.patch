@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: musa <musa@local>
+Date: Thu, 4 Jun 2026 02:46:36 +0000
+Subject: [PATCH] MUSA(csrc): csrc/topk.cu
+
+---
+ csrc/topk.cu | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/csrc/topk.cu b/csrc/topk.cu
+index 9ca9aa882..9313ca368 100644
+--- a/csrc/topk.cu
++++ b/csrc/topk.cu
+@@ -6,13 +6,13 @@
+ #include <cuda_runtime.h>
+ #include <algorithm>
+ 
+-#ifndef USE_ROCM
++#ifndef USE_MUSA
+   #include "persistent_topk.cuh"
+ #endif
+ 
+ namespace {
+ 
+-#ifndef USE_ROCM
++#ifndef USE_MUSA
+ template <int TopK>
+ void launch_persistent_topk(const torch::Tensor& logits,
+                             const torch::Tensor& lengths, torch::Tensor& output,
+@@ -229,7 +229,7 @@ void launch_persistent_topk(const torch::Tensor& logits,
+ void persistent_topk(const torch::Tensor& logits, const torch::Tensor& lengths,
+                      torch::Tensor& output, torch::Tensor& workspace, int64_t k,
+                      int64_t max_seq_len) {
+-#ifndef USE_ROCM
++#ifndef USE_MUSA
+   TORCH_CHECK(logits.is_cuda(), "logits must be CUDA tensor");
+   TORCH_CHECK(lengths.is_cuda(), "lengths must be CUDA tensor");
+   TORCH_CHECK(output.is_cuda(), "output must be CUDA tensor");

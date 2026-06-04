@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: musa <musa@local>
+Date: Thu, 4 Jun 2026 02:46:36 +0000
+Subject: [PATCH] MUSA(csrc): csrc/torch_bindings.cpp
+
+---
+ csrc/torch_bindings.cpp | 15 ++++++++-------
+ 1 file changed, 8 insertions(+), 7 deletions(-)
+
+diff --git a/csrc/torch_bindings.cpp b/csrc/torch_bindings.cpp
+index 487ff8df9..0358e8cae 100644
+--- a/csrc/torch_bindings.cpp
++++ b/csrc/torch_bindings.cpp
+@@ -1,3 +1,4 @@
++#include "torch_musa/csrc/aten/musa/MUSAContext.h"
+ #include "cache.h"
+ #include "cuda_utils.h"
+ #include "ops.h"
+@@ -46,7 +47,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+       "    int tp_rank, int blocksparse_local_blocks,"
+       "    int blocksparse_vert_stride, int blocksparse_block_size,"
+       "    int blocksparse_head_sliding_step) -> ()");
+-  ops.impl("paged_attention_v1", torch::kCUDA, &paged_attention_v1);
++  // paged_attention_v1 impl stripped (kernel not built on MUSA)
+ 
+   // PagedAttention V2.
+   ops.def(
+@@ -60,7 +61,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+       "    int tp_rank, int blocksparse_local_blocks,"
+       "    int blocksparse_vert_stride, int blocksparse_block_size,"
+       "    int blocksparse_head_sliding_step) -> ()");
+-  ops.impl("paged_attention_v2", torch::kCUDA, &paged_attention_v2);
++  // paged_attention_v2 impl stripped (kernel not built on MUSA)
+ 
+   // Merge attn states
+   // Implements section 2.2 of https://www.arxiv.org/pdf/2501.01005
+@@ -102,8 +103,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+       "Tensor q_in, Tensor kv, Tensor! k_cache, "
+       "Tensor slot_mapping, Tensor position_ids, Tensor cos_sin_cache, "
+       "int q_head_padded, float eps, int cache_block_size) -> Tensor");
+-  ops.impl("fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert", torch::kCUDA,
+-           &fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert);
++  // MUSA: fused DeepSeek-V4 qnorm/rope/cache impl stripped;
++  // vllm_musa redirects this path to native/JIT MUSA implementations.
+ 
+   // Apply repetition penalties to logits in-place
+   ops.def(
+@@ -131,7 +132,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+   ops.impl("persistent_topk", torch::kCUDA, &persistent_topk);
+ 
+   // Quantization ops
+-#ifndef USE_ROCM
++#ifndef USE_MUSA
+ 
+   // Note about marlin kernel 'workspace' arguments:
+   // Technically these should be mutable since they are modified by the kernel.
+@@ -211,7 +212,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+ 
+ #endif
+ 
+-#ifndef USE_ROCM
++#ifndef USE_MUSA
+   // Expert-specialization mxfp8 blockscaled grouped quantization (SM100+).
+   ops.def(
+       "mxfp8_experts_quant("
+@@ -249,7 +250,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+       "Tensor? last_chunk_indices) -> ()");
+   ops.impl("selective_scan_fwd", torch::kCUDA, &selective_scan_fwd);
+ 
+-#ifndef USE_ROCM
++#ifndef USE_MUSA
+   ops.def(
+       "minimax_allreduce_rms("
+       "Tensor input,"

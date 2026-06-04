@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: musa <musa@local>
+Date: Thu, 4 Jun 2026 02:46:36 +0000
+Subject: [PATCH] MUSA(csrc): csrc/attention/merge_attn_states.cu
+
+---
+ csrc/attention/merge_attn_states.cu | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/csrc/attention/merge_attn_states.cu b/csrc/attention/merge_attn_states.cu
+index 75f066e80..fc01c1297 100644
+--- a/csrc/attention/merge_attn_states.cu
++++ b/csrc/attention/merge_attn_states.cu
+@@ -5,9 +5,9 @@
+ #include <algorithm>
+ #include <limits>
+ 
+-#include "attention_dtypes.h"
+-#include "attention_utils.cuh"
+-#include "../quantization/w8a8/fp8/common.cuh"
++#include "attention_musa/attention_dtypes.h"
++#include "attention_musa/attention_utils.cuh"
++#include "quantization/w8a8/fp8/common.cuh"
+ #include "../dispatch_utils.h"
+ 
+ namespace vllm {
