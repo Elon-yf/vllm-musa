@@ -99,6 +99,37 @@ def develop_dynamic_library(package_name, source_dir="./"):
         print(f"vLLM is not installed '{package_name}'")
 
 
+def _warn_if_vllm_shadowed(source_dir):
+    """After an editable vLLM install, warn loudly if ``import vllm`` still
+    resolves OUTSIDE the clone -- i.e. another vLLM (e.g. a system install
+    seen through a ``--system-site-packages`` venv) shadows the appended
+    editable finder, so edits to ``third_party/vllm`` will NOT take effect."""
+    try:
+        origin = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import importlib.util as u; s = u.find_spec('vllm');"
+                " print(s.origin if s and s.origin else '')",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        ).stdout.strip()
+    except Exception:
+        return
+    expected = str(Path(source_dir).resolve())
+    if origin and expected not in origin:
+        print(
+            "\n*** WARNING: editable vLLM is SHADOWED ***\n"
+            f"    `import vllm` resolves to: {origin}\n"
+            f"    expected under:           {expected}\n"
+            "    Another vLLM is winning (e.g. a system/global install seen via\n"
+            "    a --system-site-packages venv). Edits to third_party/vllm will\n"
+            "    NOT take effect. Use a clean venv without a pre-existing vLLM.\n"
+        )
+
+
 def get_mcc_version():
     try:
         proc = subprocess.run(
@@ -557,11 +588,33 @@ class _CustomBuildExt(BuildExtension):
 
     @staticmethod
     def _install_vllm(repo_path):
-        """install vllm at a specific tag/commit, using existing torch"""
+        """Install the cloned + patched vLLM, using the existing torch.
+
+        When vllm-musa itself is installed editable (``pip install -e .``),
+        vLLM is installed EDITABLE from ``third_party/vllm`` so a developer can
+        edit the patched vLLM source in place -- edits take effect at runtime;
+        commit them in ``third_party/vllm`` and run
+        ``python tools/musa_sync.py regen`` to capture them as ``series/``
+        patches. A regular (non-editable) install bakes vLLM in.
+
+        Sole-vLLM requirement: the editable install only takes effect if no
+        other vLLM is importable. The PEP 660 editable finder is appended to
+        ``sys.meta_path``, so a vLLM already on ``sys.path`` (e.g. a system
+        install seen through a ``--system-site-packages`` venv) shadows it.
+        Use a clean venv without a pre-existing vLLM for editable development;
+        ``_warn_if_vllm_shadowed`` flags it after install if it happens.
+        """
         source_dir = Path(repo_path)
 
         env = os.environ.copy()
         env["VLLM_TARGET_DEVICE"] = "empty"
+
+        # Dev (editable) installs of vllm-musa install vLLM editable too, so
+        # third_party/vllm edits are live; regular installs bake it in.
+        vllm_install_cmd = [sys.executable, "-m", "pip", "install"]
+        if _is_editable_install:
+            vllm_install_cmd.append("-e")
+        vllm_install_cmd += [str(source_dir), "--no-build-isolation", "-v"]
 
         steps = [
             {
@@ -584,16 +637,12 @@ class _CustomBuildExt(BuildExtension):
                 "env": None,
             },
             {
-                "name": "Install vllm without target device",
-                "cmd": [
-                    sys.executable,
-                    "-m",
-                    "pip",
-                    "install",
-                    str(source_dir),
-                    "--no-build-isolation",
-                    "-v",
-                ],
+                "name": (
+                    "Install vllm EDITABLE (dev)"
+                    if _is_editable_install
+                    else "Install vllm without target device"
+                ),
+                "cmd": vllm_install_cmd,
                 "shell": False,
                 "env": env,
             },
@@ -746,3 +795,4 @@ setup(
 
 if _is_editable_install:
     develop_dynamic_library("vllm")
+    _warn_if_vllm_shadowed(_VLLM_REPO.source_dir)
