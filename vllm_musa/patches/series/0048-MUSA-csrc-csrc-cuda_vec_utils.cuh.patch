@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: musa <musa@local>
+Date: Thu, 4 Jun 2026 02:46:36 +0000
+Subject: [PATCH] MUSA(csrc): csrc/cuda_vec_utils.cuh
+
+---
+ csrc/cuda_vec_utils.cuh | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/csrc/cuda_vec_utils.cuh b/csrc/cuda_vec_utils.cuh
+index efbb09994..7626c98f4 100644
+--- a/csrc/cuda_vec_utils.cuh
++++ b/csrc/cuda_vec_utils.cuh
+@@ -3,8 +3,8 @@
+ 
+ #pragma once
+ 
+-#include <torch/headeronly/util/BFloat16.h>
+-#include <torch/headeronly/util/Half.h>
++#include <c10/util/BFloat16.h>
++#include <c10/util/Half.h>
+ #include <cassert>
+ 
+ #ifdef USE_ROCM

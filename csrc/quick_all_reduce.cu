@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 //
-// MUSA-0088 first-pass mechanical port of SGLang's quick_all_reduce.cu.
+// first-pass mechanical port of SGLang's quick_all_reduce.cu.
 // Source: sglang/sgl-kernel/csrc/allreduce/quick_all_reduce.cu
-// Translation: mechanical sed-pass per MUSA-0080 iter-2 breakdown,
+// Translation: mechanical sed-pass per iter-2 breakdown,
 // plus USE_ROCM -> USE_MUSA and HIPStreamMasquerading -> CUDAStream.
 // NOT YET COMPILED OR TESTED. Follow-up:
 //   - Wire into vllm-musa/setup.py MUSA_KERNELS list
 //   - Add Python wrappers + dispatcher integration per the iter-2 breakdown
 //   - Compile via mcc + iterate on errors
-//   - Correctness gate (greedy parity) + perf A/B per MUSA-0088 ACs
+//   - Correctness gate (greedy parity) + perf A/B per ACs
 //
 #include <ATen/cuda/Exceptions.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -112,7 +112,7 @@ int64_t qr_max_size() {
   template struct quickreduce::AllReduceTwoshot<T, Codec<T, 4>, cast_bf2half>; \
   template struct quickreduce::AllReduceTwoshot<T, Codec<T, 8>, cast_bf2half>;
 
-// MUSA-0088 iter-5: strip to M2.5 production shape only (bf16 CodecFP, no cast).
+// iter-5: strip to M2.5 production shape only (bf16 CodecFP, no cast).
 // The full template surface (36 instantiations) triggers an mcc internal
 // segfault in CallGraph Pass Manager. Restricting to this single shape
 // keeps the kernel binary small and lets mcc complete. Other shapes
@@ -127,7 +127,7 @@ INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecFP, false)
 // INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ6, true)
 // INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ8, true)
 
-// MUSA-0088 iter-5: half-dtype variants stripped (only bf16 kept above).
+// iter-5: half-dtype variants stripped (only bf16 kept above).
 // INSTANTIATE_FOR_WORLDSIZE(half, quickreduce::CodecFP, false)
 // INSTANTIATE_FOR_WORLDSIZE(half, quickreduce::CodecQ4, false)
 // INSTANTIATE_FOR_WORLDSIZE(half, quickreduce::CodecQ6, false)

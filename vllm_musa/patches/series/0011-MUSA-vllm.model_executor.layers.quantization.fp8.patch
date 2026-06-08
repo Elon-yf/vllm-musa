@@ -1,0 +1,22 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: musa <musa@local>
+Date: Wed, 3 Jun 2026 11:47:35 +0000
+Subject: [PATCH] MUSA: vllm.model_executor.layers.quantization.fp8
+
+---
+ vllm/model_executor/layers/quantization/fp8.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/vllm/model_executor/layers/quantization/fp8.py b/vllm/model_executor/layers/quantization/fp8.py
+index 41e2e1978..8258c733a 100644
+--- a/vllm/model_executor/layers/quantization/fp8.py
++++ b/vllm/model_executor/layers/quantization/fp8.py
+@@ -145,7 +145,7 @@ class Fp8Config(QuantizationConfig):
+ 
+     @classmethod
+     def get_min_capability(cls) -> int:
+-        return 75
++        return 31
+ 
+     @classmethod
+     def get_config_filenames(cls) -> list[str]:

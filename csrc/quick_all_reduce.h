@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 //
-// MUSA-0088 first-pass port of SGLang's quick_all_reduce.h.
-// Translation: mechanical sed-pass per MUSA-0080 iter-2 breakdown
+// first-pass port of SGLang's quick_all_reduce.h.
+// Translation: mechanical sed-pass per iter-2 breakdown
 // + hipLaunchKernelGGL -> direct <<<grid, block, sharedMem, stream>>>.
 //
 // NOT YET COMPILED. Follow-up:
@@ -12,7 +12,7 @@
 //   - DONE: musaIpcMemLazyEnablePeerAccess exists in driver_types.h.
 //   - musaMallocWithFlags / musaDeviceMallocUncached not in MUSA SDK;
 //     replaced with plain musaMalloc (microopt only, not correctness).
-//   - Build + correctness + perf A/B per MUSA-0088 ACs
+//   - Build + correctness + perf A/B per ACs
 //
 #pragma once
 
@@ -119,7 +119,7 @@ struct DeviceComms {
     int64_t data_buffer_size = 2 * this->kMaxProblemSize;
     int64_t total_buffer_size = flags_buffer_size + data_buffer_size;
     data_offset = flags_buffer_size;
-    // MUSA-0088: hipExtMallocWithFlags(..., hipDeviceMallocUncached) has no
+    // hipExtMallocWithFlags(..., hipDeviceMallocUncached) has no
     // direct MUSA equivalent. Use plain musaMalloc; the uncached flag on
     // HIP was a microoptimisation for AMD's MI300 cache hierarchy and isn't
     // strictly necessary for correctness on MTT S5000. If profiling shows

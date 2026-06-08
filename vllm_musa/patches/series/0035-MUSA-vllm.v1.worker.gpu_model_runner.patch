@@ -1,0 +1,112 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: musa <musa@local>
+Date: Wed, 3 Jun 2026 11:47:36 +0000
+Subject: [PATCH] MUSA: vllm.v1.worker.gpu_model_runner
+
+---
+ vllm/v1/worker/gpu_model_runner.py | 40 ++++++++++++++++++++++++++----
+ 1 file changed, 35 insertions(+), 5 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index d51bf2284..70aab3fb1 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -532,6 +532,9 @@ class GPUModelRunner(
+         self.encoder_cudagraph_manager: EncoderCudaGraphManager | None = None
+ 
+         self.use_aux_hidden_state_outputs = False
++        # / PR #34880: tracks whether the draft model supports
++        # FULL-mode CUDA-graph capture (Eagle + padded drafter batch).
++        self.supports_sd_full_graph = False
+         # Set up speculative decoding.
+         # NOTE(Jiayi): currently we put the entire draft model on
+         # the last PP rank. This is not ideal if there are many
+@@ -584,6 +587,9 @@ class GPUModelRunner(
+             elif self.speculative_config.use_dflash():
+                 self.drafter = DFlashProposer(self.vllm_config, self.device, self)
+                 self.use_aux_hidden_state_outputs = True
++                import os as _dflash_os
++                if _dflash_os.environ.get("VLLM_MUSA_DFLASH_FULL_WRAP", "1") != "0":
++                    self.supports_sd_full_graph = True
+             elif self.speculative_config.method == "suffix":
+                 self.drafter = SuffixDecodingProposer(self.vllm_config)
+             elif self.speculative_config.use_eagle():
+@@ -592,6 +598,11 @@ class GPUModelRunner(
+                     self.use_aux_hidden_state_outputs = (
+                         self.drafter.eagle3_use_aux_hidden_state
+                     )
++                # / PR #34880: enable FULL-mode draft capture when
++                # padded drafter batch is enabled.
++                self.supports_sd_full_graph = (
++                    not self.speculative_config.disable_padded_drafter_batch
++                )
+             elif self.speculative_config.method == "medusa":
+                 self.drafter = MedusaProposer(
+                     vllm_config=self.vllm_config, device=self.device
+@@ -4407,6 +4418,20 @@ class GPUModelRunner(
+                 spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens
+                 <= self.effective_drafter_max_model_len
+             )
++            if (
++                current_platform.is_musa()
++                and not self.input_batch.sampling_metadata.all_greedy
++                and __import__("os").environ.get(
++                    "VLLM_MUSA_SPEC_DECODE_RANDOM_FALLBACK",
++                    "1",
++                ).lower()
++                not in ("0", "false", "no", "off")
++            ):
++                # The MUSA random rejection-sampling kernel is not
++                # correctness-stable yet. Do not run the drafter for
++                # non-greedy requests; the target model already sampled one
++                # correct token for this step.
++                input_fits_in_drafter = False
+             use_gpu_toks = (
+                 spec_config.use_eagle()
+                 or spec_config.uses_draft_model()
+@@ -5690,6 +5715,7 @@ class GPUModelRunner(
+         )
+ 
+         attn_metadata: PerLayerAttnMetadata | None = None
++        spec_decode_cm: 'CommonAttentionMetadata | None' = None
+ 
+         slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
+             num_tokens_padded=num_tokens_padded,
+@@ -5741,7 +5767,7 @@ class GPUModelRunner(
+                 self.input_batch.block_table.commit_block_table(num_reqs_padded)
+ 
+                 pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
+-                attn_metadata, _ = self._build_attention_metadata(
++                attn_metadata, spec_decode_cm = self._build_attention_metadata(
+                     num_tokens=num_tokens_unpadded,
+                     num_tokens_padded=num_tokens_padded if pad_attn else None,
+                     num_reqs=num_reqs_padded,
+@@ -5848,13 +5874,16 @@ class GPUModelRunner(
+                     | Gemma4Proposer,
+                 )
+                 assert self.speculative_config is not None
+-                # Eagle currently only supports PIECEWISE cudagraphs.
+-                # Therefore only use cudagraphs if the main model uses PIECEWISE
+-                # NOTE(lucas): this is a hack, need to clean up.
++                # / PR #34880: Eagle now supports FULL cudagraphs via
++                # CUDAGraphWrapper around the draft model (gated on
++                # supports_sd_full_graph in __init__).
+                 use_cudagraphs = (
+                     (
+                         is_graph_capturing
+-                        and cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
++                        and (
++                            cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
++                            or self.supports_sd_full_graph
++                        )
+                     )
+                     or (
+                         not is_graph_capturing
+@@ -5874,6 +5903,7 @@ class GPUModelRunner(
+ 
+                 self.drafter.dummy_run(
+                     num_tokens,
++                    common_attn_metadata=spec_decode_cm,
+                     use_cudagraphs=use_cudagraphs,
+                     is_graph_capturing=is_graph_capturing,
+                     slot_mappings=slot_mappings,

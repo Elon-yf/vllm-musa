@@ -1,15 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-Patches for vLLM compatibility with MUSA platform.
+"""Runtime patches for vLLM compatibility with the MUSA platform.
 
-This module contains patches that modify vLLM source files at runtime
-to ensure compatibility with the MUSA Triton version.
+vLLM **source** edits are applied at BUILD time: ``setup.py`` clones the pinned
+upstream vLLM into ``third_party/vllm`` and applies the
+``vllm_musa/patches/series/`` ``git format-patch`` series via ``build_apply.py``
+(``Makefile.sync`` regenerates the series across vLLM versions). The installed
+vLLM is therefore already patched; this module does **not** rewrite installed
+vLLM source at runtime and there is no runtime fallback.
+
+What remains here is runtime-only by nature:
+
+- :func:`apply_object_patches` — the explicit in-process object/monkey-patch
+  phase (live-object edits with no source-diff form: the spec-decode kernel
+  prime and the draft-TP=1 wiring). These patch live objects, not files.
+- :func:`patch_report` — a read-only audit of those object patches, surfaced by
+  ``vllm_collect_env``.
 """
 
 import importlib.util
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 
@@ -17,15 +29,86 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-_patches_applied = False
+_object_patches_applied = False
+
+
+@dataclass(frozen=True)
+class PatchSpec:
+    """Declarative metadata for one vLLM-MUSA patch.
+
+    Fields are *derived* by default; a patch file may override any of them with
+    optional module-level constants (``PATCH_ID``, ``PATCH_PHASE``,
+    ``PATCH_REQUIRED``, ``PATCH_VERSION_RANGE``, ``PATCH_REMOVAL_CONDITION``,
+    ``PATCH_COMPAT_NOTE``). Existing patch files define none of these, so they
+    keep working unchanged — the override is opt-in.
+    """
+
+    id: str
+    module: str
+    file: str
+    kind: str  # "source-transform" | "side-effect"
+    phase: str = "plugin-load"
+    process_scope: str = "disk-persistent"  # source-transform; "process-local" for side-effect
+    required: bool = True
+    version_range: str | None = None
+    removal_condition: str | None = None
+    compat_note: str | None = None
+
+
+def _load_patch_spec(
+    module_name: str,
+    patch_file: Path,
+    patch_module: ModuleType | None = None,
+) -> PatchSpec:
+    """Build the:class:`PatchSpec` for a patch file.
+
+    ``kind``/``process_scope`` are derived from the loaded module; the rest
+    default sensibly and may be overridden by optional ``PATCH_*`` constants.
+    """
+    pid = patch_file.name
+    if pid.endswith(".patch.py"):
+        pid = pid[: -len(".patch.py")]
+    if patch_module is None:
+        patch_module = _load_patch_module(patch_file)
+    patches = getattr(patch_module, "PATCHES", []) if patch_module else []
+    has_norm = (
+        callable(getattr(patch_module, "normalize_source", None))
+        if patch_module
+        else False
+    )
+    kind = "source-transform" if (patches or has_norm) else "side-effect"
+    scope = "process-local" if kind == "side-effect" else "disk-persistent"
+
+    def _override(name: str, default):
+        return getattr(patch_module, name, default) if patch_module else default
+
+    return PatchSpec(
+        id=_override("PATCH_ID", pid),
+        module=module_name,
+        file=patch_file.name,
+        kind=kind,
+        phase=_override("PATCH_PHASE", "plugin-load"),
+        process_scope=scope,
+        required=bool(_override("PATCH_REQUIRED", True)),
+        version_range=_override("PATCH_VERSION_RANGE", None),
+        removal_condition=_override("PATCH_REMOVAL_CONDITION", None),
+        compat_note=_override("PATCH_COMPAT_NOTE", None),
+    )
 
 
 def _get_patch_files():
-    """Get all patch files in the patches directory."""
+    """Get all patch files in the patches directory, in deterministic order.
+
+    sort by filename so discovery/application order is reproducible
+    across machines and runs (``glob`` order is filesystem-dependent). Patches
+    target independent modules so order does not affect correctness, but a
+    stable order makes the patch report and any import-side-effect ordering
+    deterministic.
+    """
     patches_dir = Path(__file__).parent
     patch_files = []
 
-    for patch_file in patches_dir.glob("*.patch.py"):
+    for patch_file in sorted(patches_dir.glob("*.patch.py")):
         # Extract module name from filename
         # Format: module.name.patch.py -> module.name
         module_name = patch_file.stem.rsplit(".patch", 1)[0]
@@ -54,38 +137,6 @@ def _load_patch_module(patch_file: Path) -> ModuleType | None:
     except Exception as e:
         logger.warning(f"Failed to load patch config from {patch_file}: {e}")
         return None
-
-
-def _load_patch_config(patch_file: Path) -> list[tuple[str, str]]:
-    """Load patch configuration from a patch file.
-
-    Patch files should define a PATCHES list of (old_str, new_str) tuples.
-    """
-    module = _load_patch_module(patch_file)
-    if module is None:
-        return []
-    return getattr(module, "PATCHES", [])
-
-
-def _normalize_source(
-    patch_module: ModuleType,
-    source: str,
-    module_name: str,
-) -> str:
-    normalizer = getattr(patch_module, "normalize_source", None)
-    if not callable(normalizer):
-        return source
-    try:
-        normalized = normalizer(source)
-    except Exception as e:
-        logger.warning(f"Failed to normalize patched source for {module_name}: {e}")
-        return source
-    if not isinstance(normalized, str):
-        logger.warning(
-            "Ignoring non-string normalized source returned for %s", module_name
-        )
-        return source
-    return normalized
 
 
 def _resolve_module_origin(module_name: str) -> str | None:
@@ -138,129 +189,122 @@ def _resolve_module_origin(module_name: str) -> str | None:
     return spec.origin
 
 
-def apply_patches(force: bool = False):
-    """Apply all patches for MUSA compatibility.
+def patch_report() -> list[dict]:
+    """Read-only status of the runtime object patches.
 
-    This function should be called early during platform initialization.
+    vLLM **source** edits are applied at BUILD time (the ``series/`` diff series
+    via ``build_apply.py``), so the installed vLLM is already patched and is not
+    audited here. This reports the in-process **object** patches — each a
+    ``*.patch.py`` with an empty ``PATCHES`` list and a module-level
+    ``apply()`` — and is surfaced by ``vllm_collect_env``. It never modifies
+    anything and is safe to call at any time.
+
+    Each entry carries ``module``, ``file``, ``id``, ``kind``, ``object_patch``
+    (whether it exposes ``apply()``), ``status`` (``side-effect`` /
+    ``load-failed`` / ``misplaced-source-patch`` / ``error``), ``phase``,
+    ``process_scope``, ``required``, ``version_range``, ``removal_condition`` and
+    ``is_failure``. Returned in deterministic ``_get_patch_files()`` order.
     """
-    global _patches_applied
-    if _patches_applied and not force:
-        return
-
-    patch_files = _get_patch_files()
-
-    for module_name, patch_file in patch_files:
+    report: list[dict] = []
+    for module_name, patch_file in _get_patch_files():
+        entry: dict = {
+            "module": module_name,
+            "file": patch_file.name,
+            "id": patch_file.name,
+            "kind": "unknown",
+            "target_resolved": False,
+            "status": "unknown",
+            "phase": "plugin-load",
+            "process_scope": "process-local",
+            "required": True,
+            "version_range": None,
+            "removal_condition": None,
+        }
         try:
-            # Resolve source path without importing the patched module. Several
-            # DeepSeek-V4 modules import MUSA attention helpers during module
-            # import, so importlib.find_spec(module_name) can trip plugin
-            # circularity before the patches that would make the import safe.
-            origin = _resolve_module_origin(module_name)
-            if origin is None:
-                continue
-
-            # Read the source file
-            try:
-                with open(origin, "r") as f:
-                    source = f.read()
-            except (IOError, OSError) as e:
-                logger.debug(f"Cannot read {origin}: {e}, skipping patch")
-                continue
-
-            # Load patches from patch file. Loading can also install
-            # monkey-patches for patch modules that intentionally use an empty
-            # PATCHES list.
+            entry["target_resolved"] = _resolve_module_origin(module_name) is not None
             patch_module = _load_patch_module(patch_file)
+            spec = _load_patch_spec(module_name, patch_file, patch_module)
+            entry.update(
+                id=spec.id,
+                kind=spec.kind,
+                phase=spec.phase,
+                process_scope=spec.process_scope,
+                required=spec.required,
+                version_range=spec.version_range,
+                removal_condition=spec.removal_condition,
+            )
             if patch_module is None:
-                continue
-            patches = getattr(patch_module, "PATCHES", [])
-
-            patched_source = _normalize_source(patch_module, source, module_name)
-            source_normalized = patched_source != source
-            if not patches and not source_normalized:
-                continue
-
-            # Check if any patches are needed.
-            # MUSA-0089/0096 fix: for INSERT-style patches (where `new` contains
-            # `old` plus extra inserted text), `old in source` remains True after
-            # first apply, causing accumulation across re-imports. Gate on
-            # `new not in source` to detect "patch already applied" state.
-            # Behaviour-preserving for REPLACEMENT-style patches where `new`
-            # differs entirely from `old`.
-            needs_patch = (
-                any(
-                    old in patched_source and new not in patched_source
-                    for old, new in patches
-                )
-                or source_normalized
-            )
-            if not needs_patch:
-                logger.debug(f"No patches needed for {module_name}")
-                continue
-
-            # Apply patches.
-            # MUSA-0089/0096 fix: same `new not in patched_source` gate as
-            # the outer needs_patch check. Without this, INSERT-style patches
-            # re-apply on every import and accumulate (e.g., MUSA-0088's
-            # cuda_communicator.py grew 10 duplicate `elif current_platform.is_musa()`
-            # blocks before MUSA-0089 caught it and manual sed -i restored).
-            applied_count = 0
-            for old, new in patches:
-                if old in patched_source and new not in patched_source:
-                    patched_source = patched_source.replace(old, new)
-                    applied_count += 1
-            patched_source = _normalize_source(
-                patch_module,
-                patched_source,
-                module_name,
-            )
-            if patched_source == source:
-                logger.debug(f"No source changes produced for {module_name}")
-                continue
-
-            # Write back the patched source ATOMICALLY via tempfile + rename.
-            # Rationale: vLLM's spawn-based multiproc executor starts N worker
-            # processes nearly simultaneously, each of which re-imports
-            # vllm_musa and therefore re-runs apply_patches(). If a worker
-            # holds the file open for read (e.g. during `import
-            # vllm.utils.deep_gemm`) while another process is mid-write, the
-            # worker can observe a truncated/partial file and raise an
-            # ImportError mid-startup (observed during MUSA-0046 MiniMax-M2.7
-            # smoke #4, 2026-05-14). Atomic rename guarantees readers see
-            # either the pre-patch or post-patch content, never partial.
-            #
-            # Do not evict an already-imported module from sys.modules: some
-            # vLLM modules register torch custom ops at import time, and
-            # re-importing them would register the same schema twice in the
-            # current process.
-            import tempfile  # noqa: I001 — local import keeps top-level imports stable
-
-            tmp_fd, tmp_path = tempfile.mkstemp(
-                prefix=os.path.basename(origin) + ".",
-                dir=os.path.dirname(origin),
-            )
-            try:
-                with os.fdopen(tmp_fd, "w") as f:
-                    f.write(patched_source)
-                os.rename(tmp_path, origin)
-            except Exception:
-                # Best-effort cleanup on error.
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
-                raise
-
-            logger.info(f"Applied {applied_count} patch(es) to {module_name}")
-
-        except Exception as e:
-            # More detailed error handling for circular imports
-            if "circular import" in str(e) or "partially initialized" in str(e):
-                logger.debug(
-                    f"Skipping patch for {module_name} due to circular import "
-                    f"during initialization: {e}"
-                )
+                entry.update(kind="load-failed", status="load-failed")
+            elif spec.kind == "side-effect":
+                entry["object_patch"] = callable(getattr(patch_module, "apply", None))
+                entry["status"] = "side-effect"
             else:
-                logger.warning(f"Failed to apply patches to {module_name}: {e}")
+                # A non-empty-PATCHES (source-transform) .patch.py is misplaced
+                # now that source edits live in series/ and apply at build time.
+                # Flag it loudly rather than silently treating it as runtime.
+                entry["status"] = "misplaced-source-patch"
+        except Exception as e:  # a report must never raise
+            entry.update(status="error", error=str(e))
+        entry["is_failure"] = bool(entry.get("required", True)) and entry["status"] in {
+            "load-failed",
+            "misplaced-source-patch",
+            "error",
+        }
+        report.append(entry)
+    return report
 
-    _patches_applied = True
+
+def apply_object_patches(force: bool = False) -> list[dict]:
+    """Apply explicit in-process object/monkey patches.
+
+    Source-transform edits mutate vLLM's *files* and are applied at BUILD time
+    (the ``series/`` diff series). A few MUSA patches instead install in-process
+    object monkey-patches or prime a Triton kernel — live-object edits with no
+    source-diff form. These historically ran as an **import-time side effect**
+    of the legacy disk patcher — implicit, order-fragile, and invisible to any
+    report. Making them explicit, such a patch file keeps
+    ``PATCHES = []`` and defines a module-level idempotent ``def apply() -> None``;
+    this phase loads each patch module in deterministic :func:`_get_patch_files`
+    order and calls ``apply()`` where present.
+
+    Ordering / correctness notes:
+
+    - Files sort by name, so ``vllm.distributed.parallel_state`` (draft-TP=1)
+      is visited before ``vllm.v1.spec_decode.eagle`` (kernel prime). This
+      matches the previous import-time order exactly. Both orders
+      are safe: parallel_state's ``apply()`` is dormant unless
+      ``VLLM_MUSA_DRAFT_TP1=1`` and, when active, primes the kernel itself
+      before importing the proposer classes; eagle's ``apply()`` is an
+      idempotent prime import. The proposer modules are not bound by vLLM until
+      model load, which is after this phase.
+    - Each ``apply()`` is individually idempotent (import is a no-op after the
+      first; the draft-TP=1 wiring guards on a class marker), so this phase is
+      safe to call more than once. ``force`` re-runs it anyway.
+
+    Returns a per-patch list of ``{module, file, status, [error]}`` dicts for
+    logging/diagnostics. Never raises — a failing object-patch is logged and
+    recorded (best-effort contract).
+    """
+    global _object_patches_applied
+    if _object_patches_applied and not force:
+        return []
+
+    results: list[dict] = []
+    for module_name, patch_file in _get_patch_files():
+        patch_module = _load_patch_module(patch_file)
+        if patch_module is None:
+            continue
+        apply_fn = getattr(patch_module, "apply", None)
+        if not callable(apply_fn):
+            continue
+        entry: dict = {"module": module_name, "file": patch_file.name, "status": "applied"}
+        try:
+            apply_fn()
+            logger.info(f"Applied object-patch {module_name}")
+        except Exception as e:
+            entry.update(status="error", error=str(e))
+            logger.warning(f"Failed to apply object-patch {module_name}: {e}")
+        results.append(entry)
+
+    _object_patches_applied = True
+    return results

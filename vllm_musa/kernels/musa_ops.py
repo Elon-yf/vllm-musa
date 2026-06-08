@@ -9,7 +9,7 @@ Currently registers:
   compatibility shim, so this provider self-disables until a real MUSA kernel
   is present.
 
-Engine log from MUSA-0049 baseline confirms:
+Engine log from baseline confirms:
     ir_op_priority=IrOpPriorityConfig(rms_norm=['native'])
 
 i.e. before this provider lands, every decoder layer per token uses

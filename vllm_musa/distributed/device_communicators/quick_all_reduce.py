@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""MUSA-0088 iter-2: Python wrapper for the SGLang-ported quick_all_reduce
+"""iter-2: Python wrapper for the SGLang-ported quick_all_reduce
 kernel.
 
 Scaffolding only — calls into `torch.ops._C_quick_ar.*` which are
@@ -40,7 +40,7 @@ try:
     _QUICK_AR_AVAILABLE = True
 except (AttributeError, RuntimeError) as exc:
     logger.info_once(
-        "MUSA-0088: quick_all_reduce ops not available (%s); "
+        "quick_all_reduce ops not available (%s); "
         "QuickAllReduce will no-op and the standard custom_all_reduce path "
         "stays active. This is expected until the kernel compile lands.",
         exc,
@@ -76,7 +76,7 @@ class QuickAllReduce:
 
         if world_size not in self._SUPPORTED_WORLD_SIZES:
             logger.warning(
-                "MUSA-0088: QuickAllReduce disabled — world_size=%d "
+                "QuickAllReduce disabled — world_size=%d "
                 "not in supported set %s.",
                 world_size,
                 self._SUPPORTED_WORLD_SIZES,
@@ -91,7 +91,7 @@ class QuickAllReduce:
             self.fptr = torch.ops._C_quick_ar.init(rank, world_size, self.max_size)
         except Exception as exc:
             logger.warning(
-                "MUSA-0088: QuickAllReduce init failed (%s); disabling.", exc
+                "QuickAllReduce init failed (%s); disabling.", exc
             )
             self.disabled = True
             self.fptr = 0
@@ -111,7 +111,7 @@ class QuickAllReduce:
             torch.ops._C_quick_ar.open_handles(self.fptr, all_handles)
         except Exception as exc:
             logger.warning(
-                "MUSA-0088: QuickAllReduce IPC handle exchange failed "
+                "QuickAllReduce IPC handle exchange failed "
                 "(%s); disabling.",
                 exc,
             )

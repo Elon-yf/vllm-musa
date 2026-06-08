@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""MUSA-0087: Inductor template heuristics for device_type='musa'.
+"""Inductor template heuristics for device_type='musa'.
 
 Without this registration, vllm/Inductor logs (per rank, per `mm` op):
 
@@ -27,7 +27,7 @@ from vllm.logger import init_logger
 # vllm.logger.init_logger returns a Logger that supports info_once /
 # warning_once. The previous use of logging.getLogger here raised
 # AttributeError at call sites, which was caught by the broad except
-# in vllm_musa/__init__.py and silently disabled MUSA-0087 heuristic
+# in vllm_musa/__init__.py and silently disabled heuristic
 # registration — see PR #40 review comment.
 logger = init_logger(__name__)
 
@@ -45,15 +45,15 @@ def maybe_register_musa_template_heuristics() -> None:
     global _REGISTERED
     if _REGISTERED:
         return
-    # MUSA-0087: registration is DEFAULT-OFF because the MUSA mm/bmm
+    # registration is DEFAULT-OFF because the MUSA mm/bmm
     # heuristic surfaces a `RuntimeError: MUSA error: unknown error` in
     # Eagle3 draft compile (scalar_tensor lowering) at TP=8. Reproduced
-    # in the M2.5 SOTA perf-sweep on yeahdongcn60 (2026-05-18). Opt in
+    # in an M2.5 perf-sweep. Opt in
     # via VLLM_MUSA_ENABLE_INDUCTOR_HEURISTICS=1 for benchmark probes
     # that don't trigger the crash.
     if os.getenv("VLLM_MUSA_ENABLE_INDUCTOR_HEURISTICS", "0") != "1":
         logger.info_once(
-            "MUSA-0087: Inductor template heuristic registration is "
+            "Inductor template heuristic registration is "
             "default-off (Eagle3 draft compile crash on TP=8 M2.5). "
             "Set VLLM_MUSA_ENABLE_INDUCTOR_HEURISTICS=1 to opt in for "
             "non-Eagle3 workloads."
@@ -74,7 +74,7 @@ def maybe_register_musa_template_heuristics() -> None:
         )
     except ImportError as exc:
         logger.warning_once(
-            "MUSA-0087: torch._inductor template-heuristics API not "
+            "torch._inductor template-heuristics API not "
             "available (%s); skipping MUSA registration. Compiled `mm` "
             "ops on MUSA will fall through to ATen via torchada.",
             exc,
@@ -123,6 +123,6 @@ def maybe_register_musa_template_heuristics() -> None:
 
     _REGISTERED = True
     logger.info_once(
-        "MUSA-0087: Inductor template heuristics registered for "
+        "Inductor template heuristics registered for "
         "device_type='musa' (mm + bmm + addmm + baddbmm + scaled_mm)."
     )

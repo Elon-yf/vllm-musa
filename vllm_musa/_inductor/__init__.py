@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""MUSA-0087: Inductor integration hooks for MUSA device type.
+"""Inductor integration hooks for MUSA device type.
 
 Registers Inductor template heuristics for ``device_type="musa"`` so
 compiled ``mm``/``bmm``/``addmm``/``baddbmm``/``scaled_mm`` ops can

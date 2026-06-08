@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// MUSA-0088 first-pass mechanical port of SGLang's quick_all_reduce.cuh.
+// first-pass mechanical port of SGLang's quick_all_reduce.cuh.
 // NOT YET COMPILED. Follow-up work in iter-2 breakdown.
 //
 #pragma once
@@ -321,7 +321,7 @@ struct CodecQ6 : public CodecBase {
           q2w >>= 4;
           if constexpr (std::is_same<T, half>::value) {
             int32_t q6 = q4 | (q2 << 4) | kHalf2_1024;
-            // MUSA-0088: dead-code (if(0) above) AMD GCN asm replaced with __hadd2 equivalent.
+            // dead-code (if(0) above) AMD GCN asm replaced with __hadd2 equivalent.
             {
               int32_t* wp = reinterpret_cast<int32_t*>(&w);
               __half2 q6_h2 = *reinterpret_cast<__half2*>(&q6);

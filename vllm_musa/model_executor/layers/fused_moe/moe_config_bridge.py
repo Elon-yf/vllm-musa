@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Bridge torchada's autotuned MoE configs into vLLM's search path.
 
-MUSA-0053: vLLM's `get_moe_configs`
+vLLM's `get_moe_configs`
 (`vllm/model_executor/layers/fused_moe/fused_moe.py`) only searches
 `vllm/model_executor/layers/fused_moe/configs/<name>.json`, building the
 filename with no space in the `block_shape` segment
@@ -16,7 +16,7 @@ torchada ships its autotuned MUSA configs under
 
 Net effect on a stock MUSA install: vLLM never finds the tuned configs
 and logs `Using default MoE config. Performance might be sub-optimal!`
-(observed in the MUSA-0049 MiniMax-M2.7 baseline for
+(observed in the MiniMax-M2.7 baseline for
 `E=32,N=1536,dtype=fp8_w8a8,block_shape=[128,128]`).
 
 This module, imported once at platform init, copies every

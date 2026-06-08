@@ -50,6 +50,27 @@ from build_utils.ccache import configure_compiler_cache
 third_party = Path("third_party")
 arch = platform.machine().lower()
 
+
+def _read_pins():
+    """read the single upstream-pin source of truth (third_party/PINS).
+
+    KEY=VALUE only (no TOML — tomllib is 3.11+, the build box is py3.10). The same
+    file is read by Makefile.sync, so the generation base cannot desync from the
+    build base across version bumps.
+    """
+    pins = {}
+    pins_path = root / "third_party" / "PINS"
+    for line in pins_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        pins[key.strip()] = value.split("#", 1)[0].strip()
+    return pins
+
+
+_PINS = _read_pins()
+
 configure_compiler_cache(root)
 
 # Detect editable install (pip install -e .) or develop mode
@@ -120,17 +141,18 @@ class _RepoInfo:
 _VLLM_REPO = _RepoInfo(
     name="vllm",
     git_repository="https://github.com/vllm-project/vllm.git",
-    git_tag="v0.22.0",
+    # pin read from third_party/PINS (single source of truth).
+    git_tag=_PINS["VLLM_TAG"],
     git_shallow=False,
 )
 
 _FLASHINFER_REPO = _RepoInfo(
     name="flashinfer",
     git_repository="https://github.com/flashinfer-ai/flashinfer.git",
-    # Keep the prepared MUSA-compatible FlashInfer baseline. Upstream vLLM
-    # v0.22.0 uses v0.6.11.post2, but that tag currently breaks the MUSA
-    # csrc_musa/include_musa build path used by vllm-musa.
-    git_tag="bc29697ba20b7e6bdb728ded98f04788e16ee021",
+    # Keep the prepared MUSA-compatible FlashInfer baseline (intentionally
+    # decoupled from upstream vLLM's choice — see the comment in third_party/PINS).
+    # pin read from third_party/PINS.
+    git_tag=_PINS["FLASHINFER_COMMIT"],
     git_shallow=False,
 )
 
@@ -149,7 +171,7 @@ VLLM_CSRC_SOURCES = [
     str(_VLLM_REPO.source_dir / "csrc/mamba/mamba_ssm/selective_scan_fwd.cu"),
     str(_VLLM_REPO.source_dir / "csrc/cache_kernels.cu"),
     str(_VLLM_REPO.source_dir / "csrc/cache_kernels_fused.cu"),
-    # MUSA-0203 (2026-05-28): paged_attention_v1/v2 are CUDA-only and unused
+    # (2026-05-28): paged_attention_v1/v2 are CUDA-only and unused
     # on MUSA (vllm uses FlashAttention via mate's flash_attn_varlen_func).
     # Skipping them avoids compile time and mcc frontend failures. Their impl
     # registrations are stripped from third_party/vllm/csrc/torch_bindings.cpp
@@ -234,7 +256,7 @@ CSRC_TEXT_PATCHES = {
     str(_VLLM_REPO.source_dir / "csrc/torch_bindings.cpp"): [
         {"": '#include "torch_musa/csrc/aten/musa/MUSAContext.h"'},
         {"#ifndef USE_ROCM": "#ifndef USE_MUSA"},
-        # MUSA-0203: paged_attention_v1/v2 are CUDA-only and unused on MUSA
+        # paged_attention_v1/v2 are CUDA-only and unused on MUSA
         # (vllm uses FlashAttention via mate). Their .cu sources are dropped
         # from VLLM_CSRC_SOURCES above. Strip the `ops.impl(..., &paged_attention_v*)`
         # references so the linker doesn't need to resolve the unbuilt symbols.
@@ -243,10 +265,10 @@ CSRC_TEXT_PATCHES = {
         # invoking it on MUSA would error at dispatch time, which is fine
         # because MUSA code paths never call paged_attention.
         {
-            '  ops.impl("paged_attention_v1", torch::kCUDA, &paged_attention_v1);': "  // MUSA-0203: paged_attention_v1 impl stripped (kernel not built on MUSA)",
+            '  ops.impl("paged_attention_v1", torch::kCUDA, &paged_attention_v1);': "  // paged_attention_v1 impl stripped (kernel not built on MUSA)",
         },
         {
-            '  ops.impl("paged_attention_v2", torch::kCUDA, &paged_attention_v2);': "  // MUSA-0203: paged_attention_v2 impl stripped (kernel not built on MUSA)",
+            '  ops.impl("paged_attention_v2", torch::kCUDA, &paged_attention_v2);': "  // paged_attention_v2 impl stripped (kernel not built on MUSA)",
         },
         {
             '  ops.impl("fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert", torch::kCUDA,\n           &fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert);': "  // MUSA: fused DeepSeek-V4 qnorm/rope/cache impl stripped;\n  // vllm_musa redirects this path to native/JIT MUSA implementations.",
@@ -432,7 +454,7 @@ if mcc_version:
     try:
         # mcc_version can be compared normally for types 5.1.0, 5.1.0-rc1, v5.1.0, etc
         if version.parse(mcc_version) > version.parse("5.0.0"):
-            # MUSA-0203 (2026-05-28): vllm-musa used to disable SLP vectorization
+            # (2026-05-28): vllm-musa used to disable SLP vectorization
             # on mcc 5.1.0+ via `-mllvm -vectorize-slp=false`, with the comment
             # "After mtcc implements vectorization length restrictions, this
             # option can be removed." A/B on M2.5+Eagle3 BS=1 cookbook shows
@@ -441,7 +463,7 @@ if mcc_version:
             # If something regresses, set VLLM_MUSA_DISABLE_SLP=1 to opt back.
             if os.environ.get("VLLM_MUSA_DISABLE_SLP", "0") == "1":
                 MCC_FLAGS += ["-mllvm", "-vectorize-slp=false"]
-            # MUSA-0203 / PR #50 review: mate's mcc-specific load-clustering hints
+            # / PR #50 review: mate's mcc-specific load-clustering hints
             # (mate/mate/jit/gemm_ops.py CUDA_FLAGS). Gated to mcc > 5.0.0 -- they
             # are validated on 5.1.0; an older/unsupported mcc/LLVM may not
             # recognize these -mllvm options and would otherwise hard-fail the
@@ -528,20 +550,10 @@ class _CustomBuildExt(BuildExtension):
         else:
             subprocess.check_call(["git", "fetch", "--all"], cwd=repo_path)
             subprocess.check_call(["git", "checkout", git_tag], cwd=repo_path)
-        # XXX (MUSA): Implement this in a more appropriate way.
-        # This patch only applies to the vendored vLLM tree; FlashInfer does not
-        # contain vllm/ir/tolerances.py.
-        tolerances_py = repo_path / "vllm/ir/tolerances.py"
-        if tolerances_py.exists():
-            subprocess.check_call(
-                [
-                    "sed",
-                    "-i",
-                    "/torch\\.float4_e2m1fn_x2/s/^/#/",
-                    str(tolerances_py.relative_to(repo_path)),
-                ],
-                cwd=repo_path,
-            )
+        # the vllm/ir/tolerances.py float4 edit is now a build-applied
+        # cat-1 patch (series/0055-MUSA-vllm.ir.tolerances.patch) classified by the
+        # manifest, not an ad-hoc sed here. _apply_musa_patch_series applies it to
+        # the cloned vLLM after checkout.
 
     @staticmethod
     def _install_vllm(repo_path):
@@ -650,6 +662,35 @@ class _CustomBuildExt(BuildExtension):
             else:
                 print(f"Skipping (already patched): {file_path}")
 
+    @staticmethod
+    def _apply_musa_patch_series(repo_path):
+        """apply the vLLM-MUSA unified-diff series to the cloned vLLM
+        at build time, so the installed vLLM is
+        pre-patched. This is the only vLLM source-patch mechanism; there is no
+        runtime source-patching and no fallback. No-op until
+        ``vllm_musa/patches/series`` is populated (the ``Makefile.sync``
+        bootstrap).
+
+        ``build_apply.py`` is stdlib-only and loaded by file path so this does
+        not import the ``vllm_musa`` package before it is installed. ``strict``
+        makes a drifted patch fail the build loudly (the pinned vLLM moved —
+        regenerate the series via ``make -f Makefile.sync``).
+        """
+        if os.environ.get("VLLM_MUSA_NO_BUILD_PATCH", "0") == "1":
+            return
+        repo = Path(repo_path)
+        series = Path(root) / "vllm_musa" / "patches" / "series"
+        if not repo.is_dir() or not series.is_dir():
+            return
+        import importlib.util as _ilu
+
+        ba_path = Path(root) / "vllm_musa" / "patches" / "build_apply.py"
+        spec = _ilu.spec_from_file_location("_musa_build_apply", ba_path)
+        ba = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(ba)
+        for name, status in ba.apply_patch_series(repo, series, strict=True):
+            print(f"MUSA build patch: {status:16} {name}")
+
     def run(self):
         if os.environ.get("SKIP_THIRD_PARTY", "0") == "1":
             print("Skipping third-party repositories cloning (SKIP_THIRD_PARTY=1)")
@@ -669,13 +710,22 @@ class _CustomBuildExt(BuildExtension):
             )
             print("Third-party repositories ready.")
 
+        # pre-patch the cloned vLLM (Python patch series) BEFORE
+        # installing it, so the installed vLLM is patched at build time rather
+        # than rewritten at runtime. No-op until the series dir is populated.
+        self._apply_musa_patch_series(_VLLM_REPO.source_dir)
+
         self._install_vllm(_VLLM_REPO.source_dir)
 
         # Re-ensure numpy<2 after vllm installation (vllm may pull in numpy>=2)
         _ensure_numpy_compatible()
 
-        self._apply_file_overrides(_VLLM_REPO.source_dir)
-        self._apply_text_patches()
+        # csrc divergence is now part of the build-time series — cat-2
+        # text-edits + cat-3 whole-file diffs, applied above by
+        # _apply_musa_patch_series alongside the cat-1 python patches. The legacy
+        # CSRC_FILE_OVERRIDES / CSRC_TEXT_PATCHES str-replace mechanism is retired
+        # (the series is the single, reviewable, drift-loud path; a moved csrc
+        # anchor now fails `git apply` loudly instead of silently no-opping).
 
         super().run()
 

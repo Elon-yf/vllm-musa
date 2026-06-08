@@ -76,7 +76,7 @@ class MusaUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         shared_experts: object | None = None,
         shared_experts_input: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        # MUSA-3171: vLLM v0.22 passes shared experts through the MoE runner,
+        # vLLM v0.22 passes shared experts through the MoE runner,
         # but the legacy fused_experts() helper only computes routed experts and
         # does not accept shared_experts kwargs. Return routed output here; the
         # runner computes and combines shared experts for non-overlapped MUSA

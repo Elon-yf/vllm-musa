@@ -314,12 +314,10 @@ if not hasattr(_upstream_fused_moe, "_musa_original_fused_experts_impl"):
 
 
 def _musa_fused_experts_impl_dispatch(*args, **kwargs) -> torch.Tensor:
-    # MUSA-0201: PR #34's v0.18.0-style fused_experts_impl override hijacked
-    # vLLM v0.20.0's modular_kernel dispatch globally and hurt some prefill
-    # workloads. DeepSeek-V4-Flash-Base TP8 graph+MTP decode, however, depends
-    # on this native GEMV MoE path for the accepted 40+ tok/s baseline.
-    # Keep the upstream implementation as the default for other models, and
-    # let platform.py opt DeepSeek-V4 in per serving process.
+    # The native GEMV MoE path (fused_experts_impl) is opt-in: it can hurt some
+    # prefill workloads, but DeepSeek-V4-Flash-Base TP8 graph+MTP decode depends
+    # on it for its accepted baseline. Default to the upstream implementation for
+    # other models; platform.py opts DeepSeek-V4 in per serving process.
     if os.environ.get("VLLM_MUSA_DEEPSEEK_V4_FUSED_MOE_GEMV", "0") == "1":
         return fused_experts_impl(*args, **kwargs)
     return _upstream_fused_moe._musa_original_fused_experts_impl(*args, **kwargs)

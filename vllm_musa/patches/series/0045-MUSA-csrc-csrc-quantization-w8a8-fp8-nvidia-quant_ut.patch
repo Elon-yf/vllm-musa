@@ -1,0 +1,21 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: musa <musa@local>
+Date: Thu, 4 Jun 2026 02:46:36 +0000
+Subject: [PATCH] MUSA(csrc): csrc/quantization/w8a8/fp8/nvidia/quant_utils.cuh
+
+---
+ csrc/quantization/w8a8/fp8/nvidia/quant_utils.cuh | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/csrc/quantization/w8a8/fp8/nvidia/quant_utils.cuh b/csrc/quantization/w8a8/fp8/nvidia/quant_utils.cuh
+index 3b7e25dc5..342067c34 100644
+--- a/csrc/quantization/w8a8/fp8/nvidia/quant_utils.cuh
++++ b/csrc/quantization/w8a8/fp8/nvidia/quant_utils.cuh
+@@ -1,6 +1,6 @@
+ #pragma once
+ 
+-#include "../../../../attention/attention_dtypes.h"
++#include "../../../../../csrc_musa/attention_musa/attention_dtypes.h"
+ #include <assert.h>
+ #include <float.h>
+ #include <stdint.h>

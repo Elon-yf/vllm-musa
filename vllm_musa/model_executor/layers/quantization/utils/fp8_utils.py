@@ -219,7 +219,7 @@ def silu_mul_per_token_group_quant_fp8_musa(
 
     fp8_dtype = current_platform.fp8_dtype()
 
-    # MUSA-0101: sphere_silu_post_quant_v1 is ~1.6-1.9x faster than the
+    # sphere_silu_post_quant_v1 is ~1.6-1.9x faster than the
     # _C_musa_ops kernel for small-M (tokens <= 256, hidden_dim == 3072,
     # row-major non-UE8M0 scale). Bit-exact dequant match validated at
     # M=128. If the caller pre-allocated `output`, we must copy into it

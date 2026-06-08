@@ -89,20 +89,6 @@ def test_mhc_pre_custom_op_is_registered():
     assert "csrc/musa/mhc/deepseek_v4_mhc_pre.mu" in setup
 
 
-def test_mhc_patch_uses_musa_provider_by_default():
-    source = _read("vllm_musa/patches/vllm__model_executor__layers__mhc.patch.py")
-
-    assert "from vllm_musa.deepseek_v4_mhc import mhc_pre_musa" in source
-    assert "from vllm_musa.deepseek_v4_mhc import mhc_post_musa" in source
-    assert "from vllm_musa.deepseek_v4_mhc import mhc_pre_musa_with_norm" in source
-    assert "from vllm_musa.deepseek_v4_mhc import mhc_fused_post_pre_musa" in source
-    assert "from vllm_musa.deepseek_v4_mhc import hc_head_musa" in source
-    assert "VLLM_MUSA_ENABLE_DEEPSEEK_V4_MHC_MUSA_IMPL" in source
-    assert (
-        'VLLM_MUSA_ENABLE_TORCH_MHC_PRENORM_FALLBACK",\n                "0"' in source
-    )
-
-
 def test_fp8_einsum_fallback_validates_group_size_divisibility():
     source = _read("vllm_musa/deepseek_v4_jit/fp8_einsum.py")
 

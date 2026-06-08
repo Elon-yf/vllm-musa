@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: musa <musa@local>
+Date: Wed, 3 Jun 2026 11:47:35 +0000
+Subject: [PATCH] MUSA: vllm.distributed.device_communicators.custom_all_reduce
+
+---
+ vllm/distributed/device_communicators/custom_all_reduce.py | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/vllm/distributed/device_communicators/custom_all_reduce.py b/vllm/distributed/device_communicators/custom_all_reduce.py
+index 65a196264..3bbb04fd1 100644
+--- a/vllm/distributed/device_communicators/custom_all_reduce.py
++++ b/vllm/distributed/device_communicators/custom_all_reduce.py
+@@ -55,7 +55,7 @@ class CustomAllreduce:
+         self,
+         group: ProcessGroup,
+         device: int | str | torch.device,
+-        max_size=8192 * 1024,
++        max_size=16 * 8192 * 1024,
+         symm_mem_enabled=False,
+     ) -> None:
+         """
+@@ -131,7 +131,7 @@ class CustomAllreduce:
+                     max_size,
+                 )
+         cuda_visible_devices = envs.CUDA_VISIBLE_DEVICES
+-        if cuda_visible_devices:
++        if cuda_visible_devices and current_platform.is_cuda():
+             device_ids = list(map(int, cuda_visible_devices.split(",")))
+         else:
+             device_ids = list(range(current_platform.device_count()))
+@@ -160,7 +160,7 @@ class CustomAllreduce:
+         # this is expensive to compute at the first time
+         # then we cache the result
+         # On AMD GPU, p2p is always enabled between XGMI connected GPUs
+-        if not current_platform.is_rocm() and not _can_p2p(rank, world_size):
++        if not current_platform.is_rocm() and not current_platform.is_musa() and not _can_p2p(rank, world_size):
+             logger.warning(
+                 "Custom allreduce is disabled because your platform lacks "
+                 "GPU P2P capability or P2P test failed. To silence this "
