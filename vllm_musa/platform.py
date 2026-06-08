@@ -465,6 +465,10 @@ class MUSAPlatformBase(Platform):
 
         route_native = _will_capture_piecewise_cudagraph(vllm_config)
         logger.debug("MUSA custom-op native-routing: piecewise=%s", route_native)
+        # Set the flag process-wide (not on the config): the op forward_oot paths read
+        # this env live and spawn workers inherit os.environ. First-writer-wins (the
+        # is_set() guard) is safe -- the native path is correct in every cudagraph mode,
+        # so an inherited value can never yield wrong output, only the native path.
         if route_native and not musa_envs.VLLM_MUSA_CUSTOM_OP_USE_NATIVE.is_set():
             musa_envs.VLLM_MUSA_CUSTOM_OP_USE_NATIVE.set(True)
             logger.info(
