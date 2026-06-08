@@ -207,6 +207,30 @@ def register_attention_backends() -> None:
         )
 
 
+def _will_capture_piecewise_cudagraph(vllm_config: Any) -> bool:
+    """Whether this config will do PIECEWISE CUDAGraph capture under torch.compile.
+
+    Called from ``check_and_update_config`` (``VllmConfig.__post_init__``), which runs
+    BEFORE vLLM finalizes ``compilation_config.backend``/``mode`` and the
+    ``cudagraph_mode`` default -- so we cannot gate on ``backend == "inductor"`` (unset
+    here). Exclude only the cases that never capture piecewise: ``enforce_eager``,
+    ``mode == NONE``, or an explicitly non-piecewise ``cudagraph_mode``. A ``None``
+    ``cudagraph_mode`` means "not yet defaulted"; the v1 default is FULL_AND_PIECEWISE
+    (piecewise), so None counts as piecewise.
+    """
+    from vllm.config.compilation import CompilationMode
+
+    if getattr(vllm_config.model_config, "enforce_eager", False):
+        return False
+    comp = vllm_config.compilation_config
+    if comp.mode == CompilationMode.NONE:
+        return False
+    cg_mode = getattr(comp, "cudagraph_mode", None)
+    if cg_mode is not None and not cg_mode.has_piecewise_cudagraphs():
+        return False
+    return True
+
+
 class MUSAPlatformBase(Platform):
     _enum = PlatformEnum.OOT  # Out-of-tree platform
     device_name: str = "musa"
@@ -427,6 +451,32 @@ class MUSAPlatformBase(Platform):
                         _comp.cudagraph_capture_sizes,
                         _block,
                     )
+
+        # FP8 correctness under torch.compile + PIECEWISE CUDAGraph capture: the
+        # MUSA RMSNorm / SiluAndMul / per-token-group FP8-quant custom-op kernels
+        # (forward_oot) are opaque to Inductor's quant fusion and leave the quant's
+        # (q, scale) in buffers it cannot lifetime-track, so the captured piecewise
+        # graph reads a stale scale and the FP8 forward emits degenerate output.
+        # Route them to the native (decomposable, Inductor-fused, CUDAGraph-safe)
+        # path while piecewise capture is active -- no perf loss (Inductor fuses the
+        # quant). Eager / FULL_DECODE_ONLY and bf16 are unaffected, as is the
+        # deep_gemm linear path (it fuses quant+GEMM, so its buffers never escape).
+        from vllm_musa.utils.environ import envs as musa_envs
+
+        route_native = _will_capture_piecewise_cudagraph(vllm_config)
+        logger.debug("MUSA custom-op native-routing: piecewise=%s", route_native)
+        # Set the flag process-wide (not on the config): the op forward_oot paths read
+        # this env live and spawn workers inherit os.environ. First-writer-wins (the
+        # is_set() guard) is safe -- the native path is correct in every cudagraph mode,
+        # so an inherited value can never yield wrong output, only the native path.
+        if route_native and not musa_envs.VLLM_MUSA_CUSTOM_OP_USE_NATIVE.is_set():
+            musa_envs.VLLM_MUSA_CUSTOM_OP_USE_NATIVE.set(True)
+            logger.info(
+                "Routing MUSA RMSNorm/SiluAndMul/QuantFP8 to the native "
+                "(Inductor-fused) path: the custom-op kernels corrupt FP8 output "
+                "under piecewise CUDAGraph capture. Set "
+                "VLLM_MUSA_CUSTOM_OP_USE_NATIVE=0 to force the kernels."
+            )
 
         parallel_config = vllm_config.parallel_config
         model_config = vllm_config.model_config
