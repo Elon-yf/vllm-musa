@@ -84,14 +84,31 @@ if _is_editable_install:
     Path("vllm").mkdir(exist_ok=True)
 
 
-def develop_dynamic_library(package_name, source_dir="./"):
+def develop_dynamic_library(package_name, source_dir="./", target_override=None):
+    """Copy the built dynamic libraries (.so) into the package directory.
+
+    Editable-install fixup only. With an EDITABLE vLLM there is no
+    ``site-packages/<pkg>/`` directory -- ``importlib.metadata`` resolves to a
+    non-existent path -- so the caller passes ``target_override`` (the editable
+    package dir in the clone). Without it the .so would be copied to a stale /
+    non-existent location and ``import <pkg>._C`` would break.
+    """
     try:
-        dist = distribution(package_name)
-        install_path = dist.locate_file(package_name)
+        if target_override is not None:
+            target_dir = Path(target_override)
+        else:
+            dist = distribution(package_name)
+            target_dir = Path(dist.locate_file(package_name))
 
-        target_dir = Path(install_path)
+        if not target_dir.is_dir():
+            print(
+                f"WARNING: {package_name} package dir not found at "
+                f"{target_dir}; skipping .so copy (import {package_name}._C "
+                "may be broken)"
+            )
+            return
+
         source_path = Path(source_dir) / "vllm"
-
         for file_path in source_path.glob("*.so"):
             shutil.copy2(file_path, target_dir)
 
@@ -794,5 +811,7 @@ setup(
 )
 
 if _is_editable_install:
-    develop_dynamic_library("vllm")
+    # Editable vLLM has no site-packages package dir, so place the built .so in
+    # the editable package dir (the clone) -- else `import vllm._C` would break.
+    develop_dynamic_library("vllm", target_override=_VLLM_REPO.source_dir / "vllm")
     _warn_if_vllm_shadowed(_VLLM_REPO.source_dir)
