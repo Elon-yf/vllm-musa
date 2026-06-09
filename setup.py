@@ -86,10 +86,21 @@ def develop_dynamic_library(package_name, source_dir="./", target_override=None)
         if not target_dir.is_dir():
             return
         src_dir = Path(source_dir)
-        for src in [src_dir / "vllm", *sorted(src_dir.glob("build/lib*/vllm"))]:
-            if src.is_dir() and src.resolve() != target_dir.resolve():
-                for so in src.glob("*.so"):
+        candidates = sorted(
+            (
+                d
+                for d in (src_dir / "vllm", *src_dir.glob("build/lib*/vllm"))
+                if d.is_dir() and d.resolve() != target_dir.resolve()
+            ),
+            key=lambda d: d.stat().st_mtime,
+            reverse=True,
+        )
+        for src in candidates:
+            sos = list(src.glob("*.so"))
+            if sos:
+                for so in sos:
                     shutil.copy2(so, target_dir)
+                break
     except PackageNotFoundError:
         print(f"vLLM is not installed '{package_name}'")
 

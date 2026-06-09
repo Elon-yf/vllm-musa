@@ -60,8 +60,8 @@ Both run `setup.py`, which clones upstream vLLM at `third_party/PINS:VLLM_TAG` i
 
 > **vLLM is always installed editable** (both commands above), so edits to
 > `third_party/vllm` are live (see §2). It uses setuptools *compat* (path-based)
-> mode — a `.pth` that puts `third_party/vllm` on `sys.path` ahead of site-packages,
-> so `import vllm` resolves to the clone and wins over any system vLLM (e.g. a
+> mode — a `.pth` that adds `third_party/vllm` to `sys.path`, so `import vllm`
+> resolves to the clone and wins over any system vLLM (e.g. a
 > `--system-site-packages` venv). No clean venv required.
 
 ## 2. The developer edit loop (fast iteration)
