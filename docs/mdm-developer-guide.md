@@ -44,13 +44,13 @@ is fine for running but not for `regen`.
 ## 1. Build & install
 
 Prereqs: a MUSA environment (`torch_musa`, `torchada`, `mate`, … per
-`pyproject.toml`) and a **clean venv** (see the caveat).
+`pyproject.toml`).
 
 ```bash
-# developer install (recommended) — also installs vLLM EDITABLE (see §2):
+# developer install (recommended) — vllm-musa editable:
 pip install -e . --no-build-isolation -v
 
-# end-user install — vLLM baked in:
+# end-user install — vllm-musa baked in:
 pip install . --no-build-isolation -v
 ```
 
@@ -58,21 +58,19 @@ Both run `setup.py`, which clones upstream vLLM at `third_party/PINS:VLLM_TAG` i
 `third_party/vllm`, `git apply`s the series, builds the MUSA extensions
 (`vllm._C`, `vllm._moe_C`, `vllm_musa._C`) from the patched csrc, and installs vLLM.
 
-> **⚠ Clean-venv caveat (editable installs).** Editable vLLM uses a PEP 660 finder
-> that is *appended* to `sys.meta_path`, so it loses to any vLLM already on
-> `sys.path`. If your venv was created with `--system-site-packages` and the base
-> image ships a vLLM, that one **shadows** the editable copy (`import vllm` resolves
-> to the wrong version). `setup.py` prints `*** WARNING: editable vLLM is SHADOWED
-> ***` if it detects this. Use a venv **without** a pre-existing vLLM for editable
-> development.
+> **vLLM is always installed editable** (both commands above), so edits to
+> `third_party/vllm` are live (see §2). It uses setuptools *compat* (path-based)
+> mode — a `.pth` that adds `third_party/vllm` to `sys.path`, so `import vllm`
+> resolves to the clone and wins over any system vLLM (e.g. a
+> `--system-site-packages` venv). No clean venv required.
 
 ## 2. The developer edit loop (fast iteration)
 
-After an **editable** install, edit the patched vLLM source in place — Python edits
-take effect on the next run, no reinstall:
+vLLM is always editable, so edit the patched source in place — Python edits take
+effect on the next run, no reinstall:
 
 ```bash
-$EDITOR third_party/vllm/vllm/<file>.py     # live immediately under `pip install -e .`
+$EDITOR third_party/vllm/vllm/<file>.py     # live on the next run
 ```
 
 (csrc / `.cu` edits still need a rebuild: `pip install -e . --no-build-isolation -v`.)
@@ -87,7 +85,7 @@ checkout, so note your change, then reproduce it there as a commit.
 |---|---|---|---|
 | 1 | PY-EDIT | series `.patch` | python edit to an upstream vLLM file |
 | 2 | CSRC-EDIT | series `.patch` | C++/CUDA edit to an upstream csrc file |
-| 3 | CSRC-FILE | series `.patch` (whole-file diff) | full rewrite of an upstream csrc file (also list it in `setup.py:CSRC_FILE_OVERRIDES`) |
+| 3 | CSRC-FILE | series `.patch` (whole-file diff) | full rewrite of an upstream csrc file (the whole-file diff lives in the series) |
 | 4a | MOD-COPY (copy) | `module-drift/*.diff` tripwire (never applied) | a modified *copy* of an upstream module; `verify` warns if upstream drifts |
 | 4b | MOD-COPY (rebind) | series `.patch` | a single-method rebind of an upstream module |
 | 5 | NEW-MOD | plain tracked source | a genuinely-new MUSA module / native csrc |

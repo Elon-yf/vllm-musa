@@ -104,7 +104,11 @@ def _series_entries() -> list:
         else:
             cat = "1"
             phase = "pre-install"
-            intent = "python source edit to upstream vLLM (migrated runtime patch)"
+            intent = (
+                "python source edit to upstream vLLM (migrated runtime patch)"
+                if target.endswith(".py")
+                else f"build-applied edit to upstream {target}"
+            )
         out.append(
             DivSpec(
                 id=p.stem,
