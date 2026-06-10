@@ -13,7 +13,6 @@ methods natively, where ``setdefault`` keeps this a no-op. With the entry,
 default-mode boots save and reload compile artifacts on torch 2.9.
 """
 
-import torch
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -26,6 +25,8 @@ _CACHE_SALT = "vllm-musa-aot-cache-safelist-v1"
 
 def apply() -> None:
     try:
+        import torch
+
         safelist = torch._inductor.config.unsafe_marked_cacheable_functions
     except Exception as e:
         logger.debug("Skipping AOT-cache safelist patch: %s", e)

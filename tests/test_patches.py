@@ -1213,6 +1213,7 @@ class TestObjectPatchPhase:
         # torch/vLLM config compat shims migrated from vllm_musa/__init__.py
         "torch._functorch.config",
         "torch._inductor.config",
+        "torch._inductor.aot_cache_safelist",
         "vllm.compilation.backends",
         "vllm.compilation.compiler_interface",
         "vllm._custom_ops",
