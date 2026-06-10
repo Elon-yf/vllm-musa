@@ -213,7 +213,6 @@ _SHADOW_MODULES = [
     ("5", "vllm_musa/model_executor/kernels/linear/scaled_mm/torch_scaled_mm.py", None, "new MUSA module (no upstream)"),
     ("5", "vllm_musa/model_executor/layers/activation.py", "vllm/model_executor/layers/activation.py", "OOT subclass/register seam"),
     ("5", "vllm_musa/model_executor/layers/fused_moe/fused_moe.py", "vllm/model_executor/layers/fused_moe/fused_moe.py", "rebinds upstream (sim 0.08) — 4b-conversion candidate"),
-    ("5", "vllm_musa/model_executor/layers/fused_moe/moe_config_bridge.py", None, "new MUSA module (no upstream)"),
     ("5", "vllm_musa/model_executor/layers/fused_moe/router/grouped_topk_router.py", "vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py", "shadow (sim 0.25)"),
     ("5", "vllm_musa/model_executor/layers/fused_moe/unquantized_fused_moe_method.py", "vllm/model_executor/layers/fused_moe/unquantized_fused_moe_method.py", "OOT subclass/register seam"),
     ("5", "vllm_musa/model_executor/layers/layernorm.py", "vllm/model_executor/layers/layernorm.py", "OOT subclass/register seam"),
