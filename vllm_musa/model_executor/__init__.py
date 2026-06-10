@@ -1,6 +1,5 @@
 import vllm_musa.model_executor.layers.activation
 import vllm_musa.model_executor.layers.fused_moe.fused_moe
-import vllm_musa.model_executor.layers.fused_moe.moe_config_bridge  # noqa: F401
 import vllm_musa.model_executor.layers.fused_moe.router.grouped_topk_router
 import vllm_musa.model_executor.layers.fused_moe.unquantized_fused_moe_method
 import vllm_musa.model_executor.layers.layernorm
