@@ -77,12 +77,10 @@ def musa_platform_plugin() -> str | None:
     return None
 
 
-# register Inductor template heuristics for device_type='musa'
-# so compiled mm/bmm/addmm/baddbmm/scaled_mm ops use Triton autotune
-# instead of falling through to the empty fallback heuristic.
-# Default-OFF (Eagle3 TP=8 crash on M2.5); opt in for non-Eagle3 workloads
-# via VLLM_MUSA_ENABLE_INDUCTOR_HEURISTICS=1. Also silently no-ops on
-# old torch versions.
+# Optional, default-off registration of Inductor GEMM template heuristics
+# for device_type='musa'. The default ATen lowering is the fast path; set
+# VLLM_MUSA_ENABLE_INDUCTOR_HEURISTICS=1 to experiment with Triton GEMM
+# autotuning. No-ops quietly on old torch versions.
 try:
     from vllm_musa._inductor import maybe_register_musa_template_heuristics
 

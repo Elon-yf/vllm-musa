@@ -2,20 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inductor template heuristics for device_type='musa'.
 
-Without this registration, vllm/Inductor logs (per rank, per `mm` op):
+Without this registration Inductor finds no Triton GEMM template
+heuristic for ``device_type='musa'``, logs ``No template heuristic
+found ...`` once per GEMM op, and lowers GEMMs to the ATen backend
+(muBLAS) — the fast path on MUSA today.
 
-    No template heuristic found - template_name=triton::mm,
-    device_type=musa, op_name=mm. ... Using fallback
-    TemplateConfigHeuristics instance.
-
-The fallback returns an empty Triton config iterator, so Inductor
-never attempts Triton autotune for `mm` on MUSA. With this
-registration MUSA inherits the CUDA tile-size configs as a safe
-starting point; per-shape MUSA tuning can be added incrementally.
-
-Default-off (Eagle3 TP=8 crash, see commit log + the comment in
-``maybe_register_musa_template_heuristics`` below). Opt in with:
-``VLLM_MUSA_ENABLE_INDUCTOR_HEURISTICS=1`` for non-Eagle3 workloads.
+Default-off: enabling the Triton GEMM templates has shown no runtime
+win over the ATen lowering, increases autotune compile time, and can
+destabilize spec-decode draft compiles. Opt in with
+``VLLM_MUSA_ENABLE_INDUCTOR_HEURISTICS=1`` to experiment, e.g. when
+tuning MUSA-specific tile configs.
 """
 
 from __future__ import annotations
@@ -24,11 +20,8 @@ import os
 
 from vllm.logger import init_logger
 
-# vllm.logger.init_logger returns a Logger that supports info_once /
-# warning_once. The previous use of logging.getLogger here raised
-# AttributeError at call sites, which was caught by the broad except
-# in vllm_musa/__init__.py and silently disabled heuristic
-# registration — see PR #40 review comment.
+# init_logger provides info_once/warning_once (plain logging.getLogger
+# does not).
 logger = init_logger(__name__)
 
 # Idempotency guard
@@ -45,18 +38,13 @@ def maybe_register_musa_template_heuristics() -> None:
     global _REGISTERED
     if _REGISTERED:
         return
-    # registration is DEFAULT-OFF because the MUSA mm/bmm
-    # heuristic surfaces a `RuntimeError: MUSA error: unknown error` in
-    # Eagle3 draft compile (scalar_tensor lowering) at TP=8. Reproduced
-    # in an M2.5 perf-sweep. Opt in
-    # via VLLM_MUSA_ENABLE_INDUCTOR_HEURISTICS=1 for benchmark probes
-    # that don't trigger the crash.
+    # Default-off: no measured win over the ATen GEMM lowering, slower
+    # autotune compiles, and known spec-decode draft-compile instability.
     if os.getenv("VLLM_MUSA_ENABLE_INDUCTOR_HEURISTICS", "0") != "1":
-        logger.info_once(
-            "Inductor template heuristic registration is "
-            "default-off (Eagle3 draft compile crash on TP=8 M2.5). "
-            "Set VLLM_MUSA_ENABLE_INDUCTOR_HEURISTICS=1 to opt in for "
-            "non-Eagle3 workloads."
+        logger.debug(
+            "MUSA Inductor GEMM template heuristics are disabled "
+            "(default). Set VLLM_MUSA_ENABLE_INDUCTOR_HEURISTICS=1 to "
+            "experiment with Triton GEMM autotuning."
         )
         _REGISTERED = True
         return
@@ -82,20 +70,40 @@ def maybe_register_musa_template_heuristics() -> None:
         _REGISTERED = True
         return
 
-    # MUSAConfigHeuristic inherits all CUDA configs as a safe starting
-    # point. Per-shape MUSA tuning can override defaults in future PRs.
-    class MUSAConfigHeuristic(CUDAConfigHeuristic):
-        """MUSA template heuristic.
+    try:
+        from torch._inductor.template_heuristics.triton import GemmConfig
+    except ImportError:
+        GemmConfig = None
 
-        Phase-1: inherit CUDA tile-size configs verbatim. MTT S5000 has
-        the same warp size (32) and max threads/block (1024) as CUDA
-        Hopper-class hardware so the CUDA defaults are a reasonable
-        starting point. Phase-2 can override `default_mm_config` etc.
-        with MUSA-tuned tile sizes once profiled.
+    class MUSAConfigHeuristic(CUDAConfigHeuristic):
+        """Template config heuristic for MUSA (MTT S5000).
+
+        Tile configs swept on S5000 against the ATen lowering across
+        transformer linear-layer shapes. Software pipelining beyond
+        ``num_stages=1`` and the small CUDA-default tiles both lose on
+        this hardware, so the list favors single-stage, deep-K tiles
+        and stays within the ~128 KB/block shared-memory budget.
         """
 
         def __init__(self) -> None:
             super().__init__()
+            if GemmConfig is None:
+                return
+            # (block_m, block_n, block_k, num_stages, num_warps)
+            self.mm_configs = [
+                # large-M tiles
+                GemmConfig(256, 64, 256, 1, 16),
+                GemmConfig(256, 128, 64, 1, 8),
+                GemmConfig(128, 128, 64, 1, 8),
+                # mid-M tiles
+                GemmConfig(64, 64, 256, 1, 4),
+                GemmConfig(64, 128, 128, 1, 8),
+                GemmConfig(64, 128, 64, 2, 4),
+                # small-M tiles
+                GemmConfig(32, 128, 64, 1, 4),
+                GemmConfig(16, 128, 64, 1, 4),
+                GemmConfig(16, 64, 64, 1, 2),
+            ]
 
     # Register the four common (template, device, op) combinations.
     # The decorator-based pattern matches CUDAMMTemplateConfigHeuristic
@@ -114,7 +122,7 @@ def maybe_register_musa_template_heuristics() -> None:
     ):
         """Addmm/baddbmm template heuristic for MUSA."""
 
-    # scaled_mm (FP8 path) — the M2.5 FP8 layers compile through this.
+    # scaled_mm (FP8 linear layers).
     @register_template_heuristic(mm_template.uid, "musa", op_name="scaled_mm")
     class MUSAScaledMMTemplateConfigHeuristic(  # noqa: F841 — register-only
         MMTemplateConfigMixin, MUSAConfigHeuristic
