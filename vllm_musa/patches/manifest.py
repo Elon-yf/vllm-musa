@@ -174,6 +174,15 @@ _CAT6: list[DivSpec] = [
         intent="filter missing torch._inductor.config keys in vLLM compile contexts",
     ),
     DivSpec(
+        id="torch___inductor__aot_cache_safelist",
+        category="6",
+        path="vllm_musa/patches/torch___inductor__aot_cache_safelist.patch.py",
+        upstream_path=None,
+        apply_phase="runtime",
+        required=False,
+        intent="mark torch-wrap Tensor methods AOT-cache safe on torch 2.9 (compile cache)",
+    ),
+    DivSpec(
         id="vllm__compilation__backends",
         category="6",
         path="vllm_musa/patches/vllm__compilation__backends.patch.py",
