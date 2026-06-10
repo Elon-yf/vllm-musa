@@ -9,10 +9,8 @@ artifact is not serializable" unless ``VLLM_DISABLE_COMPILE_CACHE=1``.
 
 torch exposes ``unsafe_marked_cacheable_functions`` exactly for this; the dict
 value is a version salt mixed into cache keys. torch >= 2.10 safelists tensor
-methods natively, where ``setdefault`` keeps this a no-op. Verified on
-yeahdongcn70 / torch 2.9 (MUSA-0511): with the entry, default-mode boots save
-and reload compile artifacts; the only other offender was torchada's factory
-wrappers (fixed in torchada).
+methods natively, where ``setdefault`` keeps this a no-op. With the entry,
+default-mode boots save and reload compile artifacts on torch 2.9.
 """
 
 import torch
@@ -23,7 +21,7 @@ logger = init_logger(__name__)
 PATCHES: list = []
 
 _SAFE_TENSOR_METHODS = ("torch._tensor.split",)
-_CACHE_SALT = "vllm-musa-0511-v1"
+_CACHE_SALT = "vllm-musa-aot-cache-safelist-v1"
 
 
 def apply() -> None:
