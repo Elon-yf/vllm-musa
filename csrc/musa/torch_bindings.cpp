@@ -35,15 +35,6 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _musa_ops), musa_ops) {
                 &musa_reshape_and_cache_flash_nhd);
 
   musa_ops.def(
-      "per_token_group_fp8_quant(Tensor input, Tensor! output_q, Tensor! "
-      "output_s, "
-      "int group_size, float eps, float fp8_min, float fp8_max, bool "
-      "scale_ue8m0, bool dummy_is_scale_transposed, bool dummy_is_tma_aligned "
-      ") -> ()");
-  musa_ops.impl("per_token_group_fp8_quant", torch::kMUSA,
-           &per_token_group_quant_fp8);
-
-  musa_ops.def(
       "silu_and_mul_per_token_group_fp8_quant(Tensor input, Tensor! output_q, "
       "Tensor! output_s, int group_size, float eps, float fp8_min, "
       "float fp8_max) -> ()");

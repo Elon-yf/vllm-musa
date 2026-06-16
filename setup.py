@@ -165,9 +165,14 @@ VLLM_CSRC_SOURCES = [
 ]
 
 VLLM_STABLE_CSRC_SOURCES = [
-    # XXX (MUSA): schema-only shim -- the CUDA stable kernels need
-    # torch/headeronly/core/Dispatch.h, which is absent from torch_musa.
     str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/torch_bindings.cpp"),
+    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/activation_kernels.cu"),
+    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/layernorm_kernels.cu"),
+    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/pos_encoding_kernels.cu"),
+    str(_VLLM_REPO.source_dir
+        / "csrc/libtorch_stable/quantization/w8a8/fp8/per_token_group_quant.cu"),
+    str(_VLLM_REPO.source_dir
+        / "csrc/libtorch_stable/quantization/w8a8/int8/per_token_group_quant.cu"),
 ]
 
 VLLM_MUSA_CSRC_SOURCES = [
@@ -183,9 +188,7 @@ VLLM_MUSA_CSRC_SOURCES = [
     "csrc/musa/attention/deepseek_v4_inv_rope_fp8_quant.mu",
     "csrc/musa/mhc/deepseek_v4_mhc_pre.mu",
     "csrc/musa/moe/deepseek_v4_topk_softplus_sqrt.mu",
-    # XXX (MUSA): non-stable -- upstream v0.22 moved this under csrc/libtorch_stable,
-    # which needs stable-ABI headers not yet on MUSA.
-    "csrc/musa/quantization/per_token_group_quant.cu",
+    "csrc/musa/quantization/silu_and_mul_per_token_group_fp8_quant.cu",
     "csrc/musa/sampler.mu",
     str(_FLASHINFER_REPO.source_dir / "csrc/norm.cu"),
     str(_FLASHINFER_REPO.source_dir / "csrc/renorm.cu"),
@@ -261,6 +264,26 @@ COMPILE_ARGS = {
     "cxx": CXX_FLAGS,
 }
 
+# The libtorch-stable kernels need torchada's stable-ABI compat: force-include
+# the TORCH_BOX boxer header, define CUDA_VERSION=0 (the sm100/Blackwell fast
+# paths compile out on MUSA), and link torch_cpu (the AOTI stable-ABI shims live
+# in libtorch_cpu.so). torchada's include_paths() auto-appends the stable_compat
+# include dir, and its import patches torch_musa's stable::Tensor accessors.
+from torchada.utils.cpp_extension import (
+    stable_compat_box_header as _ta_stable_box,
+    stable_compat_include_dir as _ta_stable_inc,
+)
+
+_STABLE_BOX_HEADER = _ta_stable_box()
+# Explicitly add torchada's stable_compat include dir (the include_paths()
+# auto-append does not reach the torch_musa MUSAExtension compile path).
+STABLE_INCLUDE_DIRS = INCLUDE_DIRS + [_ta_stable_inc()]
+STABLE_COMPILE_ARGS = {
+    "mcc": MCC_FLAGS + ["-DCUDA_VERSION=0", "-include", _STABLE_BOX_HEADER],
+    "cxx": CXX_FLAGS + ["-include", _STABLE_BOX_HEADER],
+}
+STABLE_LINK_LIBRARIES = LINK_LIBRARIES + ["torch_cpu"]
+
 # =============================================================================
 # Extension Modules
 # =============================================================================
@@ -278,9 +301,9 @@ EXT_MODULES = [
     CUDAExtension(
         name="vllm._C_stable_libtorch",
         sources=VLLM_STABLE_CSRC_SOURCES,
-        include_dirs=INCLUDE_DIRS,
-        extra_compile_args=COMPILE_ARGS,
-        libraries=LINK_LIBRARIES,
+        include_dirs=STABLE_INCLUDE_DIRS,
+        extra_compile_args=STABLE_COMPILE_ARGS,
+        libraries=STABLE_LINK_LIBRARIES,
         extra_link_args=EXTRA_LINK_ARGS,
         py_limited_api=False,
     ),
