@@ -108,7 +108,7 @@ def per_token_group_quant_fp8(
             )
         x_kernel = x if x.is_contiguous() else x.contiguous()
 
-        torch.ops._C_musa_ops.per_token_group_fp8_quant(
+        torch.ops._C.per_token_group_fp8_quant(
             x_kernel,
             x_q,
             x_s,

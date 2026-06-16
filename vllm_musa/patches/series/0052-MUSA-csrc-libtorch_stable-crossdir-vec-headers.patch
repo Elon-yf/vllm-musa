@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: musa <musa@local>
+Date: Thu, 4 Jun 2026 02:46:36 +0000
+Subject: [PATCH] MUSA(csrc): libtorch_stable 3-family cross-dir vec includes
+
+diff --git a/csrc/libtorch_stable/activation_kernels.cu b/csrc/libtorch_stable/activation_kernels.cu
+index 28fdce5c3..cdab45634 100644
+--- a/csrc/libtorch_stable/activation_kernels.cu
++++ b/csrc/libtorch_stable/activation_kernels.cu
+@@ -4,7 +4,7 @@
+ #include <cmath>
+ 
+ #include "../cuda_compat.h"
+-#include "../cuda_vec_utils.cuh"
++#include "cuda_vec_utils.cuh"
+ #include "dispatch_utils.h"
+ #include "torch_utils.h"
+ 
+diff --git a/csrc/libtorch_stable/layernorm_kernels.cu b/csrc/libtorch_stable/layernorm_kernels.cu
+index fb714b1b1..1f8bf2001 100644
+--- a/csrc/libtorch_stable/layernorm_kernels.cu
++++ b/csrc/libtorch_stable/layernorm_kernels.cu
+@@ -4,7 +4,7 @@
+ 
+ #include "../cub_helpers.h"
+ #include "../core/batch_invariant.hpp"
+-#include "../type_convert.cuh"
++#include "type_convert.cuh"
+ #include "dispatch_utils.h"
+ #include "quantization/vectorization_utils.cuh"
+ 
