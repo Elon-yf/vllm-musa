@@ -4,11 +4,8 @@ Date: Thu, 4 Jun 2026 02:46:36 +0000
 Subject: [PATCH] MUSA(csrc-file): csrc/mamba/mamba_ssm/selective_scan_fwd.cu
 
 ---
- csrc/mamba/mamba_ssm/selective_scan_fwd.cu | 46 ++++++++--------------
- 1 file changed, 17 insertions(+), 29 deletions(-)
-
 diff --git a/csrc/mamba/mamba_ssm/selective_scan_fwd.cu b/csrc/mamba/mamba_ssm/selective_scan_fwd.cu
-index ba2f0cc61..c196d5f44 100644
+index ba2f0cc..b35a4b2 100644
 --- a/csrc/mamba/mamba_ssm/selective_scan_fwd.cu
 +++ b/csrc/mamba/mamba_ssm/selective_scan_fwd.cu
 @@ -152,7 +152,7 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
@@ -52,19 +49,16 @@ index ba2f0cc61..c196d5f44 100644
                          }
  
                          size_t state_offset = cache_slot * params.ssm_states_batch_stride +
-@@ -462,8 +463,9 @@ void selective_scan_fwd_cuda(SSMParamsBase &params, cudaStream_t stream) {
+@@ -462,8 +463,6 @@ void selective_scan_fwd_cuda(SSMParamsBase &params, cudaStream_t stream) {
      #endif
  }
  
 -template void selective_scan_fwd_cuda<at::BFloat16, float, at::BFloat16>(SSMParamsBase &params, cudaStream_t stream);
 -template void selective_scan_fwd_cuda<at::BFloat16, float, float>(SSMParamsBase &params, cudaStream_t stream);
-+// ==================== MUSA ADAPTATION ====================
-+// template void selective_scan_fwd_cuda<at::BFloat16, float, at::BFloat16>(SSMParamsBase &params, cudaStream_t stream);
-+// template void selective_scan_fwd_cuda<at::BFloat16, float, float>(SSMParamsBase &params, cudaStream_t stream);
  template void selective_scan_fwd_cuda<at::Half, float, at::Half>(SSMParamsBase &params, cudaStream_t stream);
  template void selective_scan_fwd_cuda<at::Half, float, float>(SSMParamsBase &params, cudaStream_t stream);
  template void selective_scan_fwd_cuda<float, float, float>(SSMParamsBase &params, cudaStream_t stream);
-@@ -480,20 +482,6 @@ template void selective_scan_fwd_cuda<float, float, float>(SSMParamsBase &params
+@@ -480,20 +479,6 @@ template void selective_scan_fwd_cuda<float, float, float>(SSMParamsBase &params
          } else if (STYPE == at::ScalarType::Float) {                                \
              using state_t = float;                                                  \
              __VA_ARGS__();                                                          \
@@ -85,16 +79,15 @@ index ba2f0cc61..c196d5f44 100644
          }                                                                           \
      } else if (ITYPE == at::ScalarType::Float)  {                                   \
          using input_t = float;                                                      \
-@@ -503,7 +491,7 @@ template void selective_scan_fwd_cuda<float, float, float>(SSMParamsBase &params
-     } else {                                                                        \
+@@ -504,7 +489,6 @@ template void selective_scan_fwd_cuda<float, float, float>(SSMParamsBase &params
          AT_ERROR(#NAME, " not implemented for input type '", toString(ITYPE), "'"); \
      }
--
-+// ========================== END ==========================
  
+-
  template<typename input_t, typename weight_t, typename state_t>
  void selective_scan_fwd_cuda(SSMParamsBase &params, cudaStream_t stream);
-@@ -645,7 +633,7 @@ void set_ssm_params_fwd(SSMParamsBase &params,
+ 
+@@ -645,7 +629,7 @@ void set_ssm_params_fwd(SSMParamsBase &params,
          }
          params.out_batch_stride = out.stride(0);
          params.out_d_stride = out.stride(1);
@@ -103,7 +96,7 @@ index ba2f0cc61..c196d5f44 100644
          params.ssm_states_batch_stride = ssm_states.stride(0);
          params.ssm_states_dim_stride = ssm_states.stride(1);
          params.ssm_states_dstate_stride = ssm_states.stride(2);
-@@ -664,8 +652,8 @@ void selective_scan_fwd(const torch::Tensor &u, const torch::Tensor &delta,
+@@ -664,8 +648,8 @@ void selective_scan_fwd(const torch::Tensor &u, const torch::Tensor &delta,
                    const std::optional<torch::Tensor> &cache_indices,
                    const std::optional<torch::Tensor> &has_initial_state,
                    const torch::Tensor &ssm_states,
@@ -114,7 +107,36 @@ index ba2f0cc61..c196d5f44 100644
                    int64_t null_block_id,
                    int64_t block_size,
                    const std::optional<torch::Tensor> &block_idx_first_scheduled_token,
-@@ -716,7 +704,7 @@ void selective_scan_fwd(const torch::Tensor &u, const torch::Tensor &delta,
+@@ -678,6 +662,28 @@ void selective_scan_fwd(const torch::Tensor &u, const torch::Tensor &delta,
+     TORCH_CHECK(input_type == at::ScalarType::Float || input_type == at::ScalarType::Half || input_type == at::ScalarType::BFloat16);
+     TORCH_CHECK(weight_type == at::ScalarType::Float);
+ 
++    // mcc cannot codegen the bf16 kernel (no isel for v2bf16 insert in cub I/O);
++    // route bf16 through the float kernel: upcast, recurse, copy outputs back.
++    if (input_type == at::ScalarType::BFloat16) {
++        auto u_f = u.to(at::ScalarType::Float);
++        auto delta_f = delta.to(at::ScalarType::Float);
++        auto B_f = (B.scalar_type() == at::ScalarType::BFloat16) ? B.to(at::ScalarType::Float) : B;
++        auto C_f = (C.scalar_type() == at::ScalarType::BFloat16) ? C.to(at::ScalarType::Float) : C;
++        std::optional<torch::Tensor> z_f = z_.has_value()
++            ? std::optional<torch::Tensor>(z_.value().to(at::ScalarType::Float)) : std::nullopt;
++        const bool ssm_bf16 = (ssm_states.scalar_type() == at::ScalarType::BFloat16);
++        auto ssm_f = ssm_bf16 ? ssm_states.to(at::ScalarType::Float) : ssm_states;
++        selective_scan_fwd(u_f, delta_f, A, B_f, C_f, D_, z_f, delta_bias_, delta_softplus,
++                           query_start_loc, cache_indices, has_initial_state, ssm_f,
++                           null_block_id, block_size, block_idx_first_scheduled_token,
++                           block_idx_last_scheduled_token, initial_state_idx,
++                           cu_chunk_seqlen, last_chunk_indices);
++        delta.copy_(delta_f);
++        if (z_.has_value()) z_.value().copy_(z_f.value());
++        if (ssm_bf16) ssm_states.copy_(ssm_f);
++        return;
++    }
++
+     const bool is_variable_B = B.dim() >= 3;
+     const bool is_variable_C = C.dim() >= 3;
+ 
+@@ -716,7 +722,7 @@ void selective_scan_fwd(const torch::Tensor &u, const torch::Tensor &delta,
      if (varlen) {
          CHECK_SHAPE(B, n_groups, dstate, seqlen);
      } else {
@@ -123,7 +145,7 @@ index ba2f0cc61..c196d5f44 100644
      }
      TORCH_CHECK(B.stride(-1) == 1 || B.size(-1) == 1);
  
-@@ -724,7 +712,7 @@ void selective_scan_fwd(const torch::Tensor &u, const torch::Tensor &delta,
+@@ -724,7 +730,7 @@ void selective_scan_fwd(const torch::Tensor &u, const torch::Tensor &delta,
      if (varlen) {
          CHECK_SHAPE(C, n_groups, dstate, seqlen);
      } else {
@@ -132,7 +154,7 @@ index ba2f0cc61..c196d5f44 100644
      }
      TORCH_CHECK(C.stride(-1) == 1 || C.size(-1) == 1);
  
-@@ -775,7 +763,7 @@ void selective_scan_fwd(const torch::Tensor &u, const torch::Tensor &delta,
+@@ -775,7 +781,7 @@ void selective_scan_fwd(const torch::Tensor &u, const torch::Tensor &delta,
              CHECK_SHAPE(cache_indices_, batch_size);
          }
      }
@@ -141,7 +163,7 @@ index ba2f0cc61..c196d5f44 100644
  
      at::Tensor z, out_z;
      const bool has_z = z_.has_value();
-@@ -789,7 +777,7 @@ void selective_scan_fwd(const torch::Tensor &u, const torch::Tensor &delta,
+@@ -789,7 +795,7 @@ void selective_scan_fwd(const torch::Tensor &u, const torch::Tensor &delta,
          } else {
              CHECK_SHAPE(z, batch_size, dim, seqlen);
          }
@@ -150,7 +172,7 @@ index ba2f0cc61..c196d5f44 100644
          out_z = z;
      }
  
-@@ -822,7 +810,7 @@ void selective_scan_fwd(const torch::Tensor &u, const torch::Tensor &delta,
+@@ -822,7 +828,7 @@ void selective_scan_fwd(const torch::Tensor &u, const torch::Tensor &delta,
                         last_chunk_indices
                         );
  
@@ -159,3 +181,6 @@ index ba2f0cc61..c196d5f44 100644
      const at::cuda::OptionalCUDAGuard device_guard(device_of(u));
      auto stream = at::cuda::getCurrentCUDAStream().stream();
      DISPATCH_WTYPE_ITYPE_FLOAT_AND_HALF_AND_BF16(u.scalar_type(), ssm_states.scalar_type(), "selective_scan_fwd", [&] {
+-- 
+2.34.1
+
