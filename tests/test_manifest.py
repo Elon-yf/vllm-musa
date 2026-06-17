@@ -108,6 +108,7 @@ def test_cat6_object_patches(manifest):
         "vllm__compilation__backends",
         "vllm__compilation__compiler_interface",
         "vllm___custom_ops",
+        "torch___inductor__aot_cache_safelist",
     }
     for e in cat6:
         assert e.apply_phase == "runtime"
