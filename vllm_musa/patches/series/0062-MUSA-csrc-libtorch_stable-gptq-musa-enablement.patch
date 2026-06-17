@@ -79,16 +79,15 @@ index e3f79c5..5e6a99a 100644
            : (int*)q_perm.data_ptr(),
        q_weight.size(0) * 32 / bit, q_weight.size(1), bit);
 diff --git a/csrc/libtorch_stable/torch_bindings.cpp b/csrc/libtorch_stable/torch_bindings.cpp
-index 1601c3b..f16f09e 100644
+index 7de356b..0827de2 100644
 --- a/csrc/libtorch_stable/torch_bindings.cpp
 +++ b/csrc/libtorch_stable/torch_bindings.cpp
-@@ -542,3 +542,10 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CompositeExplicitAutograd, ops) {
+@@ -576,3 +576,9 @@ STABLE_TORCH_LIBRARY_IMPL(_C, PrivateUse1, ops) {
  }
- 
+ #endif
  REGISTER_EXTENSION(_C_stable_libtorch)
 +
-+// MUSA: register gptq in its own block -- the main CUDA block aborts at the
-+// uncompiled scaled int8/fp8 quant ops (static-init throw) and skips gptq.
++// MUSA: gptq in its own registration block, isolated from other ops' static-init.
 +STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, gptq_ops) {
 +  gptq_ops.impl("gptq_gemm", TORCH_BOX(&gptq_gemm));
 +  gptq_ops.impl("gptq_shuffle", TORCH_BOX(&gptq_shuffle));
