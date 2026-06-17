@@ -231,6 +231,7 @@ _SHADOW_MODULES = [
     ("5", "vllm_musa/model_executor/layers/fused_moe/router/grouped_topk_router.py", "vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py", "shadow (sim 0.25)"),
     ("5", "vllm_musa/model_executor/layers/fused_moe/unquantized_fused_moe_method.py", "vllm/model_executor/layers/fused_moe/unquantized_fused_moe_method.py", "OOT subclass/register seam"),
     ("5", "vllm_musa/model_executor/layers/layernorm.py", "vllm/model_executor/layers/layernorm.py", "OOT subclass/register seam"),
+    ("5", "vllm_musa/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py", "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py", "runtime override for Qwen3.5 GDN MATE prefill/decode"),
     ("5", "vllm_musa/model_executor/layers/quantization/fp8.py", "vllm/model_executor/layers/quantization/fp8.py", "rebinds upstream (sim 0.02) — 4b-conversion candidate"),
     ("5", "vllm_musa/model_executor/layers/quantization/input_quant_fp8.py", "vllm/model_executor/layers/quantization/input_quant_fp8.py", "OOT subclass/register seam"),
     ("5", "vllm_musa/model_executor/layers/quantization/utils/fp8_utils.py", "vllm/model_executor/layers/quantization/utils/fp8_utils.py", "shadow (sim 0.12)"),

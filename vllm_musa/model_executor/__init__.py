@@ -3,6 +3,7 @@ import vllm_musa.model_executor.layers.fused_moe.fused_moe
 import vllm_musa.model_executor.layers.fused_moe.router.grouped_topk_router
 import vllm_musa.model_executor.layers.fused_moe.unquantized_fused_moe_method
 import vllm_musa.model_executor.layers.layernorm
+import vllm_musa.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn
 import vllm_musa.model_executor.layers.quantization.fp8
 import vllm_musa.model_executor.layers.quantization.input_quant_fp8
 import vllm_musa.model_executor.layers.quantization.utils.fp8_utils
