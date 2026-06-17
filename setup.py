@@ -166,6 +166,7 @@ VLLM_CSRC_SOURCES = [
 
 VLLM_STABLE_CSRC_SOURCES = [
     str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/torch_bindings.cpp"),
+    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/quantization/gptq/q_gemm.cu"),
     str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/activation_kernels.cu"),
     str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/layernorm_kernels.cu"),
     str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/pos_encoding_kernels.cu"),
