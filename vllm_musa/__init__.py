@@ -143,6 +143,9 @@ def _register_patches() -> None:
 def _register_ops() -> None:
     """Register OOT custom ops (activation, layernorm, fused_moe, etc.)."""
     import vllm_musa.model_executor  # noqa: F401
+    import vllm_musa.jit_kernel.csrc.moe as _moe  # noqa: F401
+
+    _moe.prewarm()
 
 
 def _register_modules() -> None:

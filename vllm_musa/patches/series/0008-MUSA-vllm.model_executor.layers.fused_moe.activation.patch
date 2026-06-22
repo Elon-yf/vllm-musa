@@ -4,21 +4,23 @@ Date: Wed, 3 Jun 2026 11:47:35 +0000
 Subject: [PATCH] MUSA: vllm.model_executor.layers.fused_moe.activation
 
 ---
- vllm/model_executor/layers/fused_moe/activation.py | 6 +++++-
- 1 file changed, 5 insertions(+), 1 deletion(-)
+ vllm/model_executor/layers/fused_moe/activation.py | 8 ++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
 
 diff --git a/vllm/model_executor/layers/fused_moe/activation.py b/vllm/model_executor/layers/fused_moe/activation.py
 index b2e67e622..441ffca34 100644
 --- a/vllm/model_executor/layers/fused_moe/activation.py
 +++ b/vllm/model_executor/layers/fused_moe/activation.py
-@@ -122,7 +122,11 @@ def apply_moe_activation(
- 
+@@ -122,7 +122,13 @@ def apply_moe_activation(
+
      # Activations with gated multiplication (gate × activation(up))
      if activation == MoEActivation.SILU:
 -        torch.ops._C.silu_and_mul(output, input)
 +        if input.device.type == "musa":
-+            d = input.shape[-1] // 2
-+            output.copy_(F.silu(input[..., :d]) * input[..., d:])
++            from vllm_musa.jit_kernel.csrc.moe import maybe_fast_silu_and_mul
++            if not maybe_fast_silu_and_mul(output, input):
++                d = input.shape[-1] // 2
++                output.copy_(F.silu(input[..., :d]) * input[..., d:])
 +        else:
 +            torch.ops._C.silu_and_mul(output, input)
      elif activation == MoEActivation.GELU:
