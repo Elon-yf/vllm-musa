@@ -4,49 +4,25 @@ Date: Tue, 23 Jun 2026 17:15:00 +0800
 Subject: [PATCH] MUSA: vllm.v1.attention.backends.gdn_attn
 
 ---
- vllm/v1/attention/backends/gdn_attn.py | 31 +++++++++++++++++++++++++++----
- 1 file changed, 27 insertions(+), 4 deletions(-)
+ vllm/v1/attention/backends/gdn_attn.py | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
 
 diff --git a/vllm/v1/attention/backends/gdn_attn.py b/vllm/v1/attention/backends/gdn_attn.py
 --- a/vllm/v1/attention/backends/gdn_attn.py
 +++ b/vllm/v1/attention/backends/gdn_attn.py
-@@ -275,10 +275,37 @@
+@@ -275,7 +275,12 @@
                      query_lens,
                      output_size=query_start_loc_cpu[-1].item(),
                  )
 -                index = torch.argsort(spec_token_masks, stable=True)
++                sort_key = (
++                    spec_token_masks.to(torch.int32)
++                    if spec_token_masks.device.type == "musa"
++                    else spec_token_masks
++                )
++                index = torch.argsort(sort_key, stable=True)
                  num_non_spec_tokens = num_prefill_tokens + num_decode_tokens
--                non_spec_token_indx = index[:num_non_spec_tokens]
--                spec_token_indx = index[num_non_spec_tokens:]
-+                if query_start_loc.device.type == "musa":
-+                    # muDNN sort does not support this stable bool argsort on MUSA.
-+                    spec_seq_pos = torch.nonzero(
-+                        spec_sequence_masks_cpu, as_tuple=True
-+                    )[0]
-+                    already_partitioned = (
-+                        spec_seq_pos.numel() == 0
-+                        or spec_sequence_masks_cpu[spec_seq_pos[0].item() :]
-+                        .all()
-+                        .item()
-+                    )
-+                    if already_partitioned:
-+                        token_indices = torch.arange(
-+                            query_start_loc_cpu[-1].item(),
-+                            dtype=torch.long,
-+                            device=query_start_loc.device,
-+                        )
-+                        non_spec_token_indx = token_indices[:num_non_spec_tokens]
-+                        spec_token_indx = token_indices[num_non_spec_tokens:]
-+                    else:
-+                        non_spec_token_indx = torch.where(~spec_token_masks)[0]
-+                        spec_token_indx = torch.where(spec_token_masks)[0]
-+                else:
-+                    index = torch.argsort(spec_token_masks, stable=True)
-+                    non_spec_token_indx = index[:num_non_spec_tokens]
-+                    spec_token_indx = index[num_non_spec_tokens:]
-
-                 spec_state_indices_tensor = block_table_tensor[
-                     spec_sequence_masks_cpu, : self.num_spec + 1
-                 ]
---
+                 non_spec_token_indx = index[:num_non_spec_tokens]
+                 spec_token_indx = index[num_non_spec_tokens:]
+-- 
 2.34.1
