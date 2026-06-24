@@ -361,6 +361,13 @@ class _CustomBuildExt(BuildExtension):
         env = os.environ.copy()
         env["VLLM_TARGET_DEVICE"] = "empty"
 
+        # When third_party/vllm is synced via `git archive | tar` (the transfer
+        # used when GitHub is unreachable from the build host) it carries no .git,
+        # so vLLM's setuptools-scm cannot derive a version and metadata generation
+        # fails. Supply the version explicitly in that case.
+        if not (source_dir / ".git").exists():
+            env.setdefault("SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM", "0.24.0")
+
         # always editable; compat (path-based .pth) -- the default PEP 660 finder
         # mis-resolves vLLM's submodules and loses to a system vLLM.
         vllm_install_cmd = [
