@@ -289,6 +289,7 @@ _STABLE_BOX_HEADER = _ta_stable_box()
 STABLE_INCLUDE_DIRS = INCLUDE_DIRS + [
     _ta_stable_inc(),
     str(_VLLM_REPO.source_dir / "csrc/attention"),
+    str(_VLLM_REPO.source_dir / "csrc/quantization"),
 ]
 STABLE_COMPILE_ARGS = {
     "mcc": MCC_FLAGS + ["-DCUDA_VERSION=0", "-include", _STABLE_BOX_HEADER],
