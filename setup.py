@@ -142,26 +142,12 @@ INCLUDE_DIRS = [
 # =============================================================================
 
 VLLM_CSRC_SOURCES = [
-    str(_VLLM_REPO.source_dir / "csrc/mamba/mamba_ssm/selective_scan_fwd.cu"),
-    str(_VLLM_REPO.source_dir / "csrc/cache_kernels.cu"),
-    str(_VLLM_REPO.source_dir / "csrc/cache_kernels_fused.cu"),
     # paged_attention_v1/v2: CUDA-only, unused on MUSA (mate FlashAttention);
     # skipped + impl-stripped in torch_bindings.cpp (cat-2 patch).
     # str(_VLLM_REPO.source_dir / "csrc/attention/paged_attention_v1.cu"),
     # str(_VLLM_REPO.source_dir / "csrc/attention/paged_attention_v2.cu"),
-    str(_VLLM_REPO.source_dir / "csrc/attention/merge_attn_states.cu"),
-    str(_VLLM_REPO.source_dir / "csrc/sampler.cu"),
-    str(_VLLM_REPO.source_dir / "csrc/topk.cu"),
     str(_VLLM_REPO.source_dir / "csrc/cuda_view.cu"),
-    str(
-        _VLLM_REPO.source_dir
-        / "csrc/quantization/fused_kernels/fused_silu_mul_block_quant.cu"
-    ),
-    str(_VLLM_REPO.source_dir / "csrc/quantization/activation_kernels.cu"),
-    str(_VLLM_REPO.source_dir / "csrc/cuda_utils_kernels.cu"),
-    str(_VLLM_REPO.source_dir / "csrc/custom_all_reduce.cu"),
     str(_VLLM_REPO.source_dir / "csrc/torch_bindings.cpp"),
-    str(_VLLM_REPO.source_dir / "csrc/minimax_reduce_rms_kernel.cu"),
 ]
 
 VLLM_STABLE_CSRC_SOURCES = [
@@ -174,6 +160,20 @@ VLLM_STABLE_CSRC_SOURCES = [
         / "csrc/libtorch_stable/quantization/w8a8/fp8/per_token_group_quant.cu"),
     str(_VLLM_REPO.source_dir
         / "csrc/libtorch_stable/quantization/w8a8/int8/per_token_group_quant.cu"),
+    # Relocated from csrc/* into csrc/libtorch_stable/* by the v0.24.0 stable-ABI
+    # consolidation; compiled into the stable extension at their new paths.
+    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/mamba/selective_scan_fwd.cu"),
+    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/cache_kernels.cu"),
+    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/cache_kernels_fused.cu"),
+    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/attention/merge_attn_states.cu"),
+    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/sampler.cu"),
+    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/topk.cu"),
+    str(_VLLM_REPO.source_dir
+        / "csrc/libtorch_stable/quantization/fused_kernels/fused_silu_mul_block_quant.cu"),
+    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/quantization/activation_kernels.cu"),
+    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/cuda_utils_kernels.cu"),
+    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/custom_all_reduce.cu"),
+    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/minimax_reduce_rms_kernel.cu"),
 ]
 
 VLLM_MUSA_CSRC_SOURCES = [
