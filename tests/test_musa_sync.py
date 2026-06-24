@@ -33,9 +33,9 @@ def test_report(ms, capsys):
     rc = ms.main(["report"])
     out = capsys.readouterr().out
     assert rc == 0
-    assert "96 divergences" in out
-    assert "'1': 42" in out and "'2': 16" in out and "'3': 4" in out
-    assert "'4a': 2" in out and "'5': 24" in out and "'6': 8" in out
+    assert "102 divergences" in out
+    assert "'1': 46" in out and "'2': 19" in out and "'3': 1" in out
+    assert "'4a': 2" in out and "'5': 26" in out and "'6': 8" in out
 
 
 def test_report_doc(ms, capsys):
@@ -55,7 +55,7 @@ def test_probe_upstream(ms, tmp_path):
 
 
 def test_read_pin(ms):
-    assert ms.read_pin("VLLM_TAG") == "v0.22.0"
+    assert ms.read_pin("VLLM_TAG") == "6c427dd40141870b9076c9a9f128eec3a7ce86bc"
     assert ms.read_pin("DOES_NOT_EXIST", "fallback") == "fallback"
 
 

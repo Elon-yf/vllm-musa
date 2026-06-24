@@ -4,11 +4,11 @@ Date: Wed, 3 Jun 2026 11:47:35 +0000
 Subject: [PATCH] MUSA: vllm.models.deepseek_v4.nvidia.model
 
 ---
- vllm/models/deepseek_v4/nvidia/model.py | 18 ++++++++++++++++--
- 1 file changed, 16 insertions(+), 2 deletions(-)
+ vllm/models/deepseek_v4/nvidia/model.py | 27 ++++++++++++++++++++-----
+ 1 file changed, 22 insertions(+), 5 deletions(-)
 
 diff --git a/vllm/models/deepseek_v4/nvidia/model.py b/vllm/models/deepseek_v4/nvidia/model.py
-index 25f0a730f..d434c320e 100644
+index aa60ad34c..5ba6181e6 100644
 --- a/vllm/models/deepseek_v4/nvidia/model.py
 +++ b/vllm/models/deepseek_v4/nvidia/model.py
 @@ -1,5 +1,6 @@
@@ -16,10 +16,10 @@ index 25f0a730f..d434c320e 100644
  # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +import os
  import typing
- from collections.abc import Callable, Iterable
+ from collections.abc import Callable, Iterable, MutableSequence, Sequence
  from itertools import islice
-@@ -65,6 +66,13 @@ from vllm.sequence import IntermediateTensors
- from vllm.utils.torch_utils import direct_register_custom_op
+@@ -70,6 +71,13 @@ from vllm.utils.math_utils import cdiv
+ from vllm.v1.attention.backends.registry import AttentionBackendEnum
  
  
 +def _musa_deepseek_v4_disable_aux_overlap() -> bool:
@@ -32,27 +32,36 @@ index 25f0a730f..d434c320e 100644
  class DeepseekV4MLP(nn.Module):
      def __init__(
          self,
-@@ -1101,7 +1109,11 @@ class DeepseekV4Model(nn.Module):
-         # Disable them on ROCm / XPU because of hang issues / no overlap.
-         aux_stream_list = (
-             None
--            if current_platform.is_rocm() or current_platform.is_xpu()
+@@ -945,7 +953,16 @@ class DeepseekV4Model(nn.Module):
+         # DeepseekV4Attention.attn_gemm_parallel_execute
+         # (compressor kv_score, indexer.weights_proj, indexer.compressor
+         # kv_score). fused_wqa_wkv stays on the default stream.
+-        aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
++        # Disable them on ROCm / XPU because of hang issues / no overlap.
++        aux_stream_list = (
++            None
 +            if (
 +                current_platform.is_rocm()
 +                or current_platform.is_xpu()
 +                or _musa_deepseek_v4_disable_aux_overlap()
 +            )
-             else [torch.cuda.Stream() for _ in range(3)]
-         )
++            else [torch.cuda.Stream() for _ in range(3)]
++        )
  
-@@ -1229,7 +1241,9 @@ class DeepseekV4Model(nn.Module):
+         # Reserved topk indices buffer for all Indexer layers to reuse.
+         self.topk_indices_buffer = torch.empty(
+@@ -1067,10 +1084,10 @@ class DeepseekV4Model(nn.Module):
                  res_mix,
                  residual,
              )
--        if layer is not None and current_platform.is_cuda():
+-        if layer is not None:
+-            hidden_states = mhc_post_tilelang(
+-                hidden_states, residual, post_mix, res_mix
+-            )
 +        if layer is not None and (
 +            current_platform.is_cuda() or current_platform.is_musa()
 +        ):
-             hidden_states = layer.hc_post(hidden_states, residual, post_mix, res_mix)
++            hidden_states = layer.hc_post(hidden_states, residual, post_mix, res_mix)
  
          if not get_pp_group().is_last_rank:
+             return IntermediateTensors({"hidden_states": hidden_states})

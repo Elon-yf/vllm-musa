@@ -8,10 +8,10 @@ Subject: [PATCH] MUSA: vllm.compilation.passes.pass_manager
  1 file changed, 1 insertion(+), 1 deletion(-)
 
 diff --git a/vllm/compilation/passes/pass_manager.py b/vllm/compilation/passes/pass_manager.py
-index 9c86518a9..bed548391 100644
+index 4b98ac577..5a4bbcb26 100644
 --- a/vllm/compilation/passes/pass_manager.py
 +++ b/vllm/compilation/passes/pass_manager.py
-@@ -41,7 +41,7 @@ if current_platform.is_cuda_alike():
+@@ -43,7 +43,7 @@ if current_platform.is_cuda_alike():
      from .utility.scatter_split_replace import ScatterSplitReplacementPass
      from .utility.split_coalescing import SplitCoalescingPass
  
@@ -19,4 +19,4 @@ index 9c86518a9..bed548391 100644
 +if current_platform.is_cuda() or current_platform.is_musa():
      from .fusion.allreduce_rms_fusion import AllReduceFusionPass
      from .fusion.collective_fusion import AsyncTPPass
-     from .fusion.minimax_qk_norm_fusion import MiniMaxQKNormPass
+ 

@@ -8,26 +8,26 @@ Subject: [PATCH] MUSA: vllm.model_executor.layers.sparse_attn_indexer
  1 file changed, 1013 insertions(+)
 
 diff --git a/vllm/model_executor/layers/sparse_attn_indexer.py b/vllm/model_executor/layers/sparse_attn_indexer.py
-index 9597708b6..da27c5ab2 100644
+index 45c5d5f78..3f3a68013 100644
 --- a/vllm/model_executor/layers/sparse_attn_indexer.py
 +++ b/vllm/model_executor/layers/sparse_attn_indexer.py
 @@ -2,9 +2,12 @@
  # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
  """Custom Sparse Attention Indexer layers."""
-
+ 
 +import os
 +
  import torch
-
+ 
  import vllm.envs as envs
 +from vllm_musa import _custom_ops as _musa_custom_ops
  from vllm import _custom_ops as ops
  from vllm._aiter_ops import rocm_aiter_ops
  from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 @@ -31,6 +34,982 @@ from vllm.v1.worker.workspace import current_workspace_manager
-
+ 
  logger = init_logger(__name__)
-
+ 
 +
 +def _musa_sparse_indexer_is_current_stream_capturing() -> bool:
 +    for module_name in ("musa", "cuda"):
@@ -1005,9 +1005,9 @@ index 9597708b6..da27c5ab2 100644
 +    return topk_indices_buffer
 +
  RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
-
+ 
  # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
-@@ -456,6 +1435,40 @@ class SparseAttnIndexer(CustomOp):
+@@ -457,6 +1436,40 @@ class SparseAttnIndexer(CustomOp):
              return self.forward_cuda(hidden_states, q_quant, k, weights)
          elif current_platform.is_rocm():
              return self.forward_hip(hidden_states, q_quant, k, weights)

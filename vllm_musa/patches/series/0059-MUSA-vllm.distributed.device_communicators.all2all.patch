@@ -8,10 +8,10 @@ Subject: [PATCH] MUSA: vllm.distributed.device_communicators.all2all
  1 file changed, 2 insertions(+), 2 deletions(-)
 
 diff --git a/vllm/distributed/device_communicators/all2all.py b/vllm/distributed/device_communicators/all2all.py
-index 33ff55a64..174f007aa 100644
+index 0066a60dd..de2bbb766 100644
 --- a/vllm/distributed/device_communicators/all2all.py
 +++ b/vllm/distributed/device_communicators/all2all.py
-@@ -225,7 +225,7 @@ class DeepEPHTAll2AllManager(DeepEPAll2AllManagerBase):
+@@ -226,7 +226,7 @@ class DeepEPHTAll2AllManager(DeepEPAll2AllManagerBase):
              num_rdma_bytes=num_rdma_bytes,
              low_latency_mode=False,
              num_qps_per_rank=num_qps_per_rank,
@@ -20,7 +20,7 @@ index 33ff55a64..174f007aa 100644
          )
          return kwargs
  
-@@ -302,7 +302,7 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
+@@ -303,7 +303,7 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
              num_qps_per_rank=num_qps_per_rank,
              allow_nvlink_for_low_latency_mode=True,
              allow_mnnvl=envs.VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL,

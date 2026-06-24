@@ -4,14 +4,14 @@ Date: Wed, 3 Jun 2026 11:47:35 +0000
 Subject: [PATCH] MUSA: vllm.models.deepseek_v4.attention
 
 ---
- vllm/models/deepseek_v4/attention.py | 108 +++++++++++++++++++++++++--
- 1 file changed, 102 insertions(+), 6 deletions(-)
+ vllm/models/deepseek_v4/attention.py | 80 +++++++++++++++++++++++++---
+ 1 file changed, 74 insertions(+), 6 deletions(-)
 
 diff --git a/vllm/models/deepseek_v4/attention.py b/vllm/models/deepseek_v4/attention.py
-index d052b41fc..fcec8f6ae 100644
+index 29a19d902..330a8ff18 100644
 --- a/vllm/models/deepseek_v4/attention.py
 +++ b/vllm/models/deepseek_v4/attention.py
-@@ -76,6 +76,61 @@ if TYPE_CHECKING:
+@@ -61,6 +61,61 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
  logger = init_logger(__name__)
  
  
@@ -70,10 +70,10 @@ index d052b41fc..fcec8f6ae 100644
 +    return q
 +
 +
- def _select_v4_sparse_impl() -> "type[DeepseekV4SparseMLAAttentionImpl]":
-     """Pick the platform-specific V4 sparse MLA impl class. Sole platform check."""
-     if current_platform.is_rocm():
-@@ -363,10 +418,10 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
+ def _resolve_dsv4_kv_cache_dtype(
+     use_fp8_ds_mla_layout: bool,
+     kv_cache_dtype: str,
+@@ -382,10 +437,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
              compressor = self.compressor
  
              def compressor_kv_score() -> torch.Tensor:
@@ -87,7 +87,7 @@ index d052b41fc..fcec8f6ae 100644
                  )
  
              aux_fns[0] = compressor_kv_score
-@@ -380,10 +435,10 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
+@@ -399,10 +454,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                  return weights
  
              def indexer_compressor_kv_score() -> torch.Tensor:
@@ -101,10 +101,10 @@ index d052b41fc..fcec8f6ae 100644
                  )
  
              aux_fns[1] = indexer_weights_proj
-@@ -529,6 +584,19 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
-         #            allocates and returns the padded q tensor.
-         #   KV side: GPT-J RoPE + UE8M0 FP8 quant + paged cache insert
-         # kv is unchanged; mla_attn reads kv solely via swa_kv_cache.
+@@ -539,6 +594,19 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
+         cos_sin_cache = self.rotary_emb.cos_sin_cache
+         cache_dtype = swa_kv_cache.dtype
+ 
 +        if _musa_deepseek_v4_is_musa_tensor(q):
 +            return _musa_deepseek_v4_qnorm_rope_kv_insert(
 +                q,
@@ -118,41 +118,6 @@ index d052b41fc..fcec8f6ae 100644
 +                swa_metadata.block_size,
 +            )
 +
-         return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
-             q,
-             kv,
-@@ -580,6 +648,34 @@ def deepseek_v4_fp8_einsum(
-     equation: str,
-     recipe: list[int],
- ) -> None:
-+    if (
-+        current_platform.is_musa()
-+        or getattr(torch.version, "musa", None) is not None
-+        or a.device.type == "musa"
-+        or out.device.type == "musa"
-+    ):
-+        try:
-+            from vllm_musa.deepseek_v4_jit.fp8_einsum import (
-+                try_musa_deepseek_v4_fp8_einsum,
-+            )
-+
-+            handled, reason = try_musa_deepseek_v4_fp8_einsum(
-+                a, a_scale, b, b_scale, out, equation
-+            )
-+        except Exception as exc:
-+            handled = False
-+            reason = f"{type(exc).__name__}: {exc}"
-+        if handled:
-+            logger.warning_once(
-+                "Using MUSA DeepSeek-V4 FP8 einsum provider: %s.",
-+                reason,
-+            )
-+            return
-+        raise NotImplementedError(
-+            "MUSA DeepSeek-V4 FP8 einsum could not use a supported local "
-+            f"provider for {equation!r}; upstream DeepGEMM fp8_einsum is "
-+            f"not available in the MUSA runtime. Reason: {reason}"
-+        )
-     fp8_einsum(equation, (a, a_scale), (b, b_scale), out, recipe=tuple(recipe))
- 
- 
+         # kv is unchanged; attention reads kv solely via swa_kv_cache.
+         if cache_dtype == torch.uint8:
+             # fp8_ds_mla UE8M0 paged path. Horizontally fused:

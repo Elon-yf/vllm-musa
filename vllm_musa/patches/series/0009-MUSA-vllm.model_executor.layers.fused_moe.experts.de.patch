@@ -9,32 +9,34 @@ Subject: [PATCH] MUSA:
  1 file changed, 8 insertions(+), 2 deletions(-)
 
 diff --git a/vllm/model_executor/layers/fused_moe/experts/deep_gemm_moe.py b/vllm/model_executor/layers/fused_moe/experts/deep_gemm_moe.py
-index e3e15e316..12ce3c549 100644
+index 160cff1ee..c9c36b2f4 100644
 --- a/vllm/model_executor/layers/fused_moe/experts/deep_gemm_moe.py
 +++ b/vllm/model_executor/layers/fused_moe/experts/deep_gemm_moe.py
-@@ -299,8 +299,11 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
-         assert a1q.size(0) == M_sum
+@@ -355,9 +355,12 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
+         # under cudagraph replay.
+         with mk_alignment_scope(align_used):
+             mm1_out = _resize_cache(workspace2, (M_sum, N))
++            # MUSA mate ragged_moe_gemm_8bit asserts scale tensors are contiguous.
++            a1q_scale = a1q_scale.contiguous()
++            w1_scale = self.w1_scale.contiguous()
+             m_grouped_fp8_gemm_nt_contiguous(
+                 (a1q, a1q_scale),
+-                (w1, self.w1_scale),
++                (w1, w1_scale),
+                 mm1_out,
+                 expert_ids,
+                 **gemm_kwargs,
+@@ -372,9 +375,12 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
+             )
  
-         mm1_out = _resize_cache(workspace2, (M_sum, N))
-+        # MUSA mate ragged_moe_gemm_8bit asserts scale tensors are contiguous.
-+        a1q_scale = a1q_scale.contiguous()
-+        w1_scale = self.w1_scale.contiguous()
-         m_grouped_fp8_gemm_nt_contiguous(
--            (a1q, a1q_scale), (w1, self.w1_scale), mm1_out, expert_ids
-+            (a1q, a1q_scale), (w1, w1_scale), mm1_out, expert_ids
-         )
- 
-         activation_out_dim = self.adjust_N_for_activation(N, activation)
-@@ -312,8 +315,11 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
-         )
- 
-         mm2_out = _resize_cache(workspace2, (M_sum, K))
-+        # MUSA mate ragged_moe_gemm_8bit asserts scale tensors are contiguous.
-+        a2q_scale = a2q_scale.contiguous()
-+        w2_scale = self.w2_scale.contiguous()
-         m_grouped_fp8_gemm_nt_contiguous(
--            (a2q, a2q_scale), (w2, self.w2_scale), mm2_out, expert_ids
-+            (a2q, a2q_scale), (w2, w2_scale), mm2_out, expert_ids
-         )
- 
-         if apply_router_weight_on_input:
+             mm2_out = _resize_cache(workspace2, (M_sum, K))
++            # MUSA mate ragged_moe_gemm_8bit asserts scale tensors are contiguous.
++            a2q_scale = a2q_scale.contiguous()
++            w2_scale = self.w2_scale.contiguous()
+             m_grouped_fp8_gemm_nt_contiguous(
+                 (a2q, a2q_scale),
+-                (w2, self.w2_scale),
++                (w2, w2_scale),
+                 mm2_out,
+                 expert_ids,
+                 **gemm_kwargs,

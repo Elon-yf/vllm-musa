@@ -3,25 +3,31 @@ From: musa <musa@local>
 Date: Thu, 4 Jun 2026 02:46:36 +0000
 Subject: [PATCH] MUSA(csrc): libtorch_stable torch_bindings PrivateUse1 impls
 
+---
+ csrc/libtorch_stable/torch_bindings.cpp | 34 +++++++++++++++++++++++++
+ 1 file changed, 34 insertions(+)
+
 diff --git a/csrc/libtorch_stable/torch_bindings.cpp b/csrc/libtorch_stable/torch_bindings.cpp
-index 1601c3bd5..7de356bbf 100644
+index d55c12d38..7a40bb355 100644
 --- a/csrc/libtorch_stable/torch_bindings.cpp
 +++ b/csrc/libtorch_stable/torch_bindings.cpp
-@@ -424,6 +424,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
-   ops.def("ggml_moe_get_block_size(int type) -> int");
+@@ -626,6 +626,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
+       "    int blocksparse_head_sliding_step) -> ()");
  }
  
 +#if !defined(USE_MUSA)
  STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
- #ifndef USE_ROCM
-   ops.impl("permute_cols", TORCH_BOX(&permute_cols));
-@@ -520,11 +521,13 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
-   ops.impl("ggml_moe_a8", TORCH_BOX(&ggml_moe_a8));
-   ops.impl("ggml_moe_a8_vec", TORCH_BOX(&ggml_moe_a8_vec));
+   // Per-token group quantization
+   ops.impl("per_token_group_fp8_quant", TORCH_BOX(&per_token_group_quant_fp8));
+@@ -761,6 +762,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cuda_utils, cuda_utils) {
+   cuda_utils.def(
+       "get_max_shared_memory_per_block_device_attribute(int device_id) -> int");
  }
 +#endif
  
- // These capability-check functions take only primitive args (no tensors), so
+ STABLE_TORCH_LIBRARY_IMPL(_C_cuda_utils, CompositeExplicitAutograd,
+                           cuda_utils) {
+@@ -775,6 +777,7 @@ STABLE_TORCH_LIBRARY_IMPL(_C_cuda_utils, CompositeExplicitAutograd,
  // there is no device to dispatch on. CompositeExplicitAutograd makes them
  // available for all backends. This is the stable ABI equivalent of calling
  // ops.impl("op_name", &func) without a dispatch key in the non-stable API.
@@ -29,9 +35,9 @@ index 1601c3bd5..7de356bbf 100644
  STABLE_TORCH_LIBRARY_IMPL(_C, CompositeExplicitAutograd, ops) {
  #ifndef USE_ROCM
    ops.impl("cutlass_scaled_mm_supports_fp8",
-@@ -540,5 +543,36 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CompositeExplicitAutograd, ops) {
-   // GGML block size lookup (no tensor args)
-   ops.impl("ggml_moe_get_block_size", TORCH_BOX(&ggml_moe_get_block_size));
+@@ -937,5 +940,36 @@ STABLE_TORCH_LIBRARY_IMPL(_C_cache_ops, CUDA, ops) {
+   ops.impl("cp_gather_indexer_k_quant_cache",
+            TORCH_BOX(&cp_gather_indexer_k_quant_cache));
  }
 +#endif
  

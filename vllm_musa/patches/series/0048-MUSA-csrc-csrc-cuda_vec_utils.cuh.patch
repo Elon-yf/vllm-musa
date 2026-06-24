@@ -4,13 +4,13 @@ Date: Thu, 4 Jun 2026 02:46:36 +0000
 Subject: [PATCH] MUSA(csrc): csrc/cuda_vec_utils.cuh
 
 ---
- csrc/cuda_vec_utils.cuh | 4 ++--
+ csrc/libtorch_stable/cuda_vec_utils.cuh | 4 ++--
  1 file changed, 2 insertions(+), 2 deletions(-)
 
-diff --git a/csrc/cuda_vec_utils.cuh b/csrc/cuda_vec_utils.cuh
-index efbb09994..7626c98f4 100644
---- a/csrc/cuda_vec_utils.cuh
-+++ b/csrc/cuda_vec_utils.cuh
+diff --git a/csrc/libtorch_stable/cuda_vec_utils.cuh b/csrc/libtorch_stable/cuda_vec_utils.cuh
+index ec6e60724..3739c0a6c 100644
+--- a/csrc/libtorch_stable/cuda_vec_utils.cuh
++++ b/csrc/libtorch_stable/cuda_vec_utils.cuh
 @@ -3,8 +3,8 @@
  
  #pragma once

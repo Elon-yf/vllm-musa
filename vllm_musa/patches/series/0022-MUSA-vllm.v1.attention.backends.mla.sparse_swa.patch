@@ -8,10 +8,10 @@ Subject: [PATCH] MUSA: vllm.v1.attention.backends.mla.sparse_swa
  1 file changed, 39 insertions(+), 10 deletions(-)
 
 diff --git a/vllm/v1/attention/backends/mla/sparse_swa.py b/vllm/v1/attention/backends/mla/sparse_swa.py
-index f0e444e49..7f0a2b102 100644
+index df23f3437..c88a8b7da 100644
 --- a/vllm/v1/attention/backends/mla/sparse_swa.py
 +++ b/vllm/v1/attention/backends/mla/sparse_swa.py
-@@ -17,7 +17,7 @@ from vllm.v1.attention.backend import (
+@@ -18,7 +18,7 @@ from vllm.v1.attention.backend import (
      MultipleOf,
  )
  from vllm.v1.attention.backends.utils import split_decodes_and_prefills
@@ -20,7 +20,7 @@ index f0e444e49..7f0a2b102 100644
  from vllm.v1.kv_cache_interface import (
      KVCacheSpec,
      MLAAttentionSpec,
-@@ -287,14 +287,21 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
+@@ -398,14 +398,21 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
          )
  
          # NOTE: Ensure all metadata tensors maintain fixed memory addresses
@@ -50,7 +50,7 @@ index f0e444e49..7f0a2b102 100644
  
          if num_decode_tokens > 0:
              self.decode_swa_lens[num_decode_tokens:] = 0
-@@ -446,6 +453,28 @@ def _compute_prefill_metadata_kernel(
+@@ -608,6 +615,28 @@ def _compute_prefill_metadata_kernel(
      tl.store(prefill_gather_lens_ptr + offset, gather_len, mask=mask)
  
  
@@ -76,15 +76,15 @@ index f0e444e49..7f0a2b102 100644
 +    tl.store(is_valid_token_ptr + token_idx, slot >= 0)
 +
 +
- @triton.jit
+ @triton.jit(do_not_specialize=["token_offset"])
  def _compute_swa_indices_and_lens_kernel(
      swa_indices_ptr,
-@@ -463,7 +492,7 @@ def _compute_swa_indices_and_lens_kernel(
- ):
-     token_idx = tl.program_id(0)
+@@ -627,7 +656,7 @@ def _compute_swa_indices_and_lens_kernel(
+     pid = tl.program_id(0)
+     token_idx = pid + token_offset
      is_valid = tl.load(is_valid_token_ptr + token_idx)
 -    if not is_valid:
 +    if is_valid == 0:
-         tl.store(swa_lens_ptr + token_idx, 0)
+         tl.store(swa_lens_ptr + pid, 0)
          return
  
