@@ -369,6 +369,10 @@ class _CustomBuildExt(BuildExtension):
             "--config-settings",
             "editable_mode=compat",
             "--no-build-isolation",
+            # MUSA: install against the in-container torch_musa. Without --no-deps
+            # pip resolves transitive deps (compressed-tensors -> torch>=2.10) and
+            # downloads the CUDA torch wheel, clobbering torch_musa.
+            "--no-deps",
             "-v",
         ]
 
