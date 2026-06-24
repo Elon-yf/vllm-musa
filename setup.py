@@ -147,6 +147,9 @@ VLLM_CSRC_SOURCES = [
     # str(_VLLM_REPO.source_dir / "csrc/attention/paged_attention_v1.cu"),
     # str(_VLLM_REPO.source_dir / "csrc/attention/paged_attention_v2.cu"),
     str(_VLLM_REPO.source_dir / "csrc/cuda_view.cu"),
+    # cuda_utils_kernels lives under libtorch_stable/ but upstream compiles it
+    # into the regular _C extension (VLLM_EXT_SRC), not the stable one.
+    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/cuda_utils_kernels.cu"),
     str(_VLLM_REPO.source_dir / "csrc/torch_bindings.cpp"),
 ]
 
@@ -171,7 +174,6 @@ VLLM_STABLE_CSRC_SOURCES = [
     str(_VLLM_REPO.source_dir
         / "csrc/libtorch_stable/quantization/fused_kernels/fused_silu_mul_block_quant.cu"),
     str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/quantization/activation_kernels.cu"),
-    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/cuda_utils_kernels.cu"),
     str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/custom_all_reduce.cu"),
     str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/minimax_reduce_rms_kernel.cu"),
 ]
@@ -278,7 +280,16 @@ from torchada.utils.cpp_extension import (
 _STABLE_BOX_HEADER = _ta_stable_box()
 # Explicitly add torchada's stable_compat include dir (the include_paths()
 # auto-append does not reach the torch_musa MUSAExtension compile path).
-STABLE_INCLUDE_DIRS = INCLUDE_DIRS + [_ta_stable_inc()]
+# csrc/attention/ holds header-only deps (attention_dtypes.h + the dtype_*.cuh it
+# pulls in) of the relocated libtorch_stable/attention kernels, but has no compiled
+# source of its own, so nothing else deep-ports it. List it here so the MUSA porting
+# emits csrc/attention_musa/, which the kernels' includes resolve to (one copy ->
+# no double-include). The quant headers live under libtorch_stable/ and already
+# deep-port via the stable sources, so they are NOT listed here.
+STABLE_INCLUDE_DIRS = INCLUDE_DIRS + [
+    _ta_stable_inc(),
+    str(_VLLM_REPO.source_dir / "csrc/attention"),
+]
 STABLE_COMPILE_ARGS = {
     "mcc": MCC_FLAGS + ["-DCUDA_VERSION=0", "-include", _STABLE_BOX_HEADER],
     "cxx": CXX_FLAGS + ["-include", _STABLE_BOX_HEADER],
