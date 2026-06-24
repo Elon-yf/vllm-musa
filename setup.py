@@ -280,17 +280,7 @@ from torchada.utils.cpp_extension import (
 _STABLE_BOX_HEADER = _ta_stable_box()
 # Explicitly add torchada's stable_compat include dir (the include_paths()
 # auto-append does not reach the torch_musa MUSAExtension compile path).
-# csrc/attention/ holds header-only deps (attention_dtypes.h + the dtype_*.cuh it
-# pulls in) of the relocated libtorch_stable/attention kernels, but has no compiled
-# source of its own, so nothing else deep-ports it. List it here so the MUSA porting
-# emits csrc/attention_musa/, which the kernels' includes resolve to (one copy ->
-# no double-include). The quant headers live under libtorch_stable/ and already
-# deep-port via the stable sources, so they are NOT listed here.
-STABLE_INCLUDE_DIRS = INCLUDE_DIRS + [
-    _ta_stable_inc(),
-    str(_VLLM_REPO.source_dir / "csrc/attention"),
-    str(_VLLM_REPO.source_dir / "csrc/quantization"),
-]
+STABLE_INCLUDE_DIRS = INCLUDE_DIRS + [_ta_stable_inc()]
 STABLE_COMPILE_ARGS = {
     "mcc": MCC_FLAGS + ["-DCUDA_VERSION=0", "-include", _STABLE_BOX_HEADER],
     "cxx": CXX_FLAGS + ["-include", _STABLE_BOX_HEADER],
