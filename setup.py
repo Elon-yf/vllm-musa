@@ -170,6 +170,7 @@ VLLM_STABLE_CSRC_SOURCES = [
     str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/mamba/selective_scan_fwd.cu"),
     str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/cache_kernels.cu"),
     str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/cache_kernels_fused.cu"),
+    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/musa_cache_ops_reg.cu"),
     str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/attention/merge_attn_states.cu"),
     str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/sampler.cu"),
     str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/topk.cu"),
@@ -201,10 +202,15 @@ VLLM_MUSA_CSRC_SOURCES = [
 ]
 
 VLLM_MOE_CSRC_SOURCES = [
-    str(_VLLM_REPO.source_dir / "csrc/moe/moe_align_sum_kernels.cu"),
-    str(_VLLM_REPO.source_dir / "csrc/moe/topk_softmax_kernels.cu"),
-    str(_VLLM_REPO.source_dir / "csrc/moe/topk_softplus_sqrt_kernels.cu"),
-    str(_VLLM_REPO.source_dir / "csrc/moe/torch_bindings.cpp"),
+    # Relocated from csrc/moe/* into csrc/libtorch_stable/moe/* by the v0.24.0
+    # stable-ABI consolidation. On MUSA these are built as a regular (at::Tensor)
+    # extension: the kernels are converted off the stable ABI (the stable path
+    # needs torch::stable::sum_out with an int[] dim that torch_musa 2.9 cannot
+    # box), the bindings are a regular TORCH_LIBRARY, and moe_ops.h is at::Tensor.
+    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/moe/moe_align_sum_kernels.cu"),
+    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/moe/topk_softmax_kernels.cu"),
+    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/moe/topk_softplus_sqrt_kernels.cu"),
+    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/moe/torch_bindings.cpp"),
 ]
 
 # =============================================================================
