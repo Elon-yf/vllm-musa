@@ -33,8 +33,8 @@ def test_report(ms, capsys):
     rc = ms.main(["report"])
     out = capsys.readouterr().out
     assert rc == 0
-    assert "111 divergences" in out
-    assert "'1': 50" in out and "'2': 24" in out and "'3': 1" in out
+    assert "113 divergences" in out
+    assert "'1': 52" in out and "'2': 24" in out and "'3': 1" in out
     assert "'4a': 2" in out and "'5': 26" in out and "'6': 8" in out
 
 

@@ -4,17 +4,21 @@ Date: Wed, 3 Jun 2026 11:47:35 +0000
 Subject: [PATCH] MUSA: vllm.models.deepseek_v4.attention
 
 ---
- vllm/models/deepseek_v4/attention.py | 80 +++++++++++++++++++++++++---
- 1 file changed, 74 insertions(+), 6 deletions(-)
+ vllm/models/deepseek_v4/attention.py | 83 +++++++++++++++++++++++++---
+ 1 file changed, 77 insertions(+), 6 deletions(-)
 
 diff --git a/vllm/models/deepseek_v4/attention.py b/vllm/models/deepseek_v4/attention.py
-index 29a19d902..330a8ff18 100644
+index 29a19d9..1f39ffa 100644
 --- a/vllm/models/deepseek_v4/attention.py
 +++ b/vllm/models/deepseek_v4/attention.py
-@@ -61,6 +61,61 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
+@@ -61,6 +61,65 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
  logger = init_logger(__name__)
  
  
++# MUSA: the DeepSeek-V4 attention helpers below branch on the active platform.
++from vllm.platforms import current_platform
++
++
 +def _musa_deepseek_v4_linear_out_dtype(
 +    a: torch.Tensor,
 +    weight: torch.Tensor,
@@ -73,7 +77,7 @@ index 29a19d902..330a8ff18 100644
  def _resolve_dsv4_kv_cache_dtype(
      use_fp8_ds_mla_layout: bool,
      kv_cache_dtype: str,
-@@ -382,10 +437,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
+@@ -382,10 +441,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
              compressor = self.compressor
  
              def compressor_kv_score() -> torch.Tensor:
@@ -87,7 +91,7 @@ index 29a19d902..330a8ff18 100644
                  )
  
              aux_fns[0] = compressor_kv_score
-@@ -399,10 +454,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
+@@ -399,10 +458,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                  return weights
  
              def indexer_compressor_kv_score() -> torch.Tensor:
@@ -101,7 +105,7 @@ index 29a19d902..330a8ff18 100644
                  )
  
              aux_fns[1] = indexer_weights_proj
-@@ -539,6 +594,19 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
+@@ -539,6 +598,19 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
          cos_sin_cache = self.rotary_emb.cos_sin_cache
          cache_dtype = swa_kv_cache.dtype
  
