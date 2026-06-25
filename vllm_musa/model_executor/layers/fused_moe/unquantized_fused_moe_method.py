@@ -24,7 +24,6 @@ from vllm.model_executor.layers.fused_moe.modular_kernel import (
 )
 
 logger = init_logger(__name__)
-from vllm.utils.torch_utils import is_torch_equal_or_newer
 
 _FUSED_EXPERTS_ACCEPTS_SHARED_EXPERTS = (
     "shared_experts" in inspect.signature(fused_experts).parameters
@@ -82,20 +81,16 @@ class MusaUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         shared_experts: object | None = None,
         shared_experts_input: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        # vLLM v0.22 passes shared experts through the MoE runner,
-        # but the legacy fused_experts() helper only computes routed experts and
-        # does not accept shared_experts kwargs. Return routed output here; the
-        # runner computes and combines shared experts for non-overlapped MUSA
-        # paths. Keep inplace disabled when shared experts exist so this legacy
-        # op never mutates an input that another path may still consume.
-        is_inplace = (not is_torch_equal_or_newer("2.9")) and shared_experts is None
+        # Shared experts are passed through the MoE runner, but the legacy
+        # fused_experts() helper only computes routed experts and does not accept
+        # shared_experts kwargs. Return routed output here; the runner computes
+        # and combines shared experts for non-overlapped MUSA paths.
         return fused_experts(
             hidden_states=x,
             w1=layer.w13_weight,
             w2=layer.w2_weight,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            inplace=is_inplace,
             activation=layer.activation,
             quant_config=self.moe_quant_config,
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
