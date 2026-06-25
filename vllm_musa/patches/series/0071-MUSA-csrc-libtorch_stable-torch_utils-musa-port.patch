@@ -2,17 +2,36 @@ From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: musa <musa@local>
 Date: Thu, 25 Jun 2026 14:14:35 +0800
 Subject: [PATCH] MUSA(csrc): port the relocated libtorch_stable torch_utils.h
- device API to MUSA
+ device API to MUSA, with a content include-guard so duplicate-path porter
+ copies coalesce
 
 ---
- csrc/libtorch_stable/torch_utils.h | 42 +++++++++++++++---------------
- 1 file changed, 21 insertions(+), 21 deletions(-)
+ csrc/libtorch_stable/torch_utils.h | 51 +++++++++++++++++-------------
+ 1 file changed, 29 insertions(+), 22 deletions(-)
 
 diff --git a/csrc/libtorch_stable/torch_utils.h b/csrc/libtorch_stable/torch_utils.h
-index f023467..0373ec8 100644
+index f023467..e25d926 100644
 --- a/csrc/libtorch_stable/torch_utils.h
 +++ b/csrc/libtorch_stable/torch_utils.h
-@@ -22,15 +22,15 @@
+@@ -1,4 +1,5 @@
+-#pragma once
++#ifndef VLLM_MUSA_LIBTORCH_STABLE_TORCH_UTILS_H
++#define VLLM_MUSA_LIBTORCH_STABLE_TORCH_UTILS_H
+ 
+ #include <torch/csrc/inductor/aoti_torch/c/shim.h>
+ #include <torch/csrc/stable/accelerator.h>
+@@ -14,6 +15,10 @@
+ #include <string>
+ #include <vector>
+ 
++#ifndef TORCH_UTILS_CHECK
++#define TORCH_UTILS_CHECK STD_TORCH_CHECK
++#endif
++
+ // Stable ABI equivalent of TORCH_CHECK_NOT_IMPLEMENTED.
+ #define STD_TORCH_CHECK_NOT_IMPLEMENTED(cond, ...) \
+   STD_TORCH_CHECK(cond, "NotImplementedError: ", __VA_ARGS__)
+@@ -22,15 +27,15 @@
  // Uses raw CUDA/HIP APIs instead of ATen functions.
  // Using inline ensures a single instance across all translation units.
  inline std::deque<std::once_flag> device_flags;
@@ -33,7 +52,7 @@ index f023467..0373ec8 100644
    }
    device_flags.resize(device_count);
    device_properties.resize(device_count);
-@@ -41,25 +41,25 @@ inline void initDeviceVectors() {
+@@ -41,25 +46,25 @@ inline void initDeviceVectors() {
  }
  
  inline void initDeviceProperty(int device_index) {
@@ -69,7 +88,7 @@ index f023467..0373ec8 100644
    }
    STD_TORCH_CHECK(device_index >= 0 && static_cast<size_t>(device_index) <
                                             device_properties.size(),
-@@ -72,17 +72,17 @@ inline cudaDeviceProp* get_device_prop() {
+@@ -72,17 +77,19 @@ inline cudaDeviceProp* get_device_prop() {
  }
  
  // Utility to get the current CUDA stream for a given device using stable APIs.
@@ -93,3 +112,5 @@ index f023467..0373ec8 100644
 -  return reinterpret_cast<cublasHandle_t>(blas_handle_ptr);
 +  return reinterpret_cast<mublasHandle_t>(blas_handle_ptr);
  }
++
++#endif  // VLLM_MUSA_LIBTORCH_STABLE_TORCH_UTILS_H
