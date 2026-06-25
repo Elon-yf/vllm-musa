@@ -5,7 +5,6 @@ import vllm.model_executor.layers.quantization.fp8 as vllm_fp8
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import FusedMoE, fused_experts
 from vllm.platforms import current_platform
-from vllm.utils.torch_utils import is_torch_equal_or_newer
 
 logger = init_logger(__name__)
 
@@ -119,7 +118,10 @@ def apply(
     shared_experts: object | None = None,
     shared_experts_input: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    if layer.ep_size != None and layer.ep_size <= 1:
+    ep_size = getattr(layer, "ep_size", None)
+    if ep_size is None:
+        ep_size = layer.moe_config.ep_size
+    if ep_size != None and ep_size <= 1:
         # the legacy fused_experts() path only computes routed
         # experts. For the no-overlap path used by DeepSeek-V2/V3 on MUSA, the
         # MoE runner computes shared experts separately and combines them with
@@ -130,14 +132,12 @@ def apply(
         )
         if run_shared_in_quant_method:
             se_input = shared_experts_input if shared_experts_input is not None else x
-        is_inplace = (not is_torch_equal_or_newer("2.9")) and shared_experts is None
         routed = fused_experts(
             hidden_states=x,
             w1=layer.w13_weight,
             w2=layer.w2_weight,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            inplace=is_inplace,
             activation=layer.activation,
             global_num_experts=layer.global_num_experts,
             apply_router_weight_on_input=layer.apply_router_weight_on_input,

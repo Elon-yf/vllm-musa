@@ -283,12 +283,12 @@ class MUSAFlashAttentionBackend(AttentionBackend):
         use_mla: bool,
         has_sink: bool,
         use_sparse: bool,
+        use_mm_prefix: bool,
         device_capability: DeviceCapability,
     ) -> str | None:
-        # ==================== MUSA ADAPTATION ====================
+        # MUSA: attention sinks are supported regardless of compute capability.
         if has_sink and current_platform.is_musa():
             return None
-        # ========================== END ==========================
         if has_sink and device_capability < DeviceCapability(9, 0):
             return "sink not supported on compute capability < 9.0"
         return None

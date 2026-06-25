@@ -4,11 +4,11 @@ Date: Wed, 3 Jun 2026 11:47:36 +0000
 Subject: [PATCH] MUSA: vllm.utils.deep_gemm
 
 ---
- vllm/utils/deep_gemm.py | 15 ++++++++++++++-
- 1 file changed, 14 insertions(+), 1 deletion(-)
+ vllm/utils/deep_gemm.py | 22 +++++++++++++++++++---
+ 1 file changed, 20 insertions(+), 2 deletions(-)
 
 diff --git a/vllm/utils/deep_gemm.py b/vllm/utils/deep_gemm.py
-index 0a1644bcc..48225573f 100644
+index 0a1644b..2f287bb 100644
 --- a/vllm/utils/deep_gemm.py
 +++ b/vllm/utils/deep_gemm.py
 @@ -69,6 +69,13 @@ class DeepGemmQuantScaleFMT(Enum):
@@ -47,3 +47,17 @@ index 0a1644bcc..48225573f 100644
      return [mk_align_size, mk_align_size]
  
  
+@@ -365,7 +378,12 @@ def set_mk_alignment_for_contiguous_layout(value: int) -> None:
+     dg = _import_deep_gemm()
+     if dg is None:
+         raise RuntimeError("DeepGEMM is not available")
+-    dg.set_mk_alignment_for_contiguous_layout(value)
++    setter = getattr(dg, "set_mk_alignment_for_contiguous_layout", None)
++    if setter is None:
++        # MUSA: the MUSA DeepGEMM backend has no BLOCK_M alignment setter; the
++        # alignment is fixed, so skip rather than fail.
++        return
++    setter(value)
+ 
+ 
+ @contextlib.contextmanager

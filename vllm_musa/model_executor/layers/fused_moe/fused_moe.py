@@ -9,7 +9,6 @@ import torch
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.utils import (
-    disable_inplace,
     moe_kernel_quantize_input,
 )
 from vllm.model_executor.layers.quantization.utils.mxfp4_utils import dequant_mxfp4
@@ -30,6 +29,12 @@ from vllm.triton_utils import tl
 from vllm_musa import _custom_ops as musa_ops
 
 logger = init_logger(__name__)
+
+
+def disable_inplace() -> bool:
+    # MUSA: in-place fused-expert output is always allowed here.
+    return False
+
 
 _MOE_SHAPE_INVENTORY_ENV = "VLLM_MUSA_DEEPSEEK_V4_MOE_SHAPE_INVENTORY"
 _MOE_SHAPE_INVENTORY_PATH_ENV = "VLLM_MUSA_DEEPSEEK_V4_MOE_SHAPE_INVENTORY_PATH"

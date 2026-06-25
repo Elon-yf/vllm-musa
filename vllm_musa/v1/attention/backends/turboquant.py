@@ -92,6 +92,7 @@ class MUSATurboQuantAttentionBackend(_turboquant_attn.TurboQuantAttentionBackend
         use_mla: bool,
         has_sink: bool,
         use_sparse: bool,
+        use_mm_prefix: bool,
         device_capability: DeviceCapability,
     ) -> str | None:
         if use_mla:
@@ -108,5 +109,6 @@ class MUSATurboQuantAttentionBackend(_turboquant_attn.TurboQuantAttentionBackend
             use_mla=use_mla,
             has_sink=has_sink,
             use_sparse=use_sparse,
+            use_mm_prefix=use_mm_prefix,
             device_capability=device_capability,
         )

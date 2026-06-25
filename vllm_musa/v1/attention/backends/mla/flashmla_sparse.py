@@ -33,6 +33,7 @@ class MUSAFlashMLASparseBackend(FlashMLASparseBackend):
         use_mla: bool,
         has_sink: bool,
         use_sparse: bool,
+        use_mm_prefix: bool,
         device_capability: DeviceCapability,
     ) -> str | None:
         return is_flashmla_sparse_supported()[1]
@@ -57,6 +58,7 @@ class MUSADeepseekV4FlashMLASparseBackend(DeepseekV4FlashMLASparseBackend):
         use_mla: bool,
         has_sink: bool,
         use_sparse: bool,
+        use_mm_prefix: bool,
         device_capability: DeviceCapability,
     ) -> str | None:
         return is_flashmla_sparse_supported()[1]

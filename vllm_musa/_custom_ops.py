@@ -8,6 +8,12 @@ try:
 except ImportError as e:
     logging.error("Failed to import from vllm._C: %r", e)
 
+try:
+    # MUSA: register the _moe_C MoE ops (moe_align_block_size, topk_softmax, moe_sum).
+    import vllm._moe_C  # noqa: F401
+except ImportError as e:
+    logging.error("Failed to import from vllm._moe_C: %r", e)
+
 
 def musa_fused_gemv_moe(
     A: torch.Tensor,

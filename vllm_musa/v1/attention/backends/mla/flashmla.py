@@ -84,6 +84,7 @@ class MUSAFlashMLABackend(MLACommonBackend):
         use_mla: bool,
         has_sink: bool,
         use_sparse: bool,
+        use_mm_prefix: bool,
         device_capability: DeviceCapability,
     ) -> str | None:
         if use_sparse:

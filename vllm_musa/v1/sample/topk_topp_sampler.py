@@ -254,9 +254,13 @@ def forward_musa(
     return sample_from_logits(logits, k, p, min_p), None
 
 
-def _topk_topp_sampler_init(self: Any, logprobs_mode: LogprobsMode = "raw_logprobs"):
+def _topk_topp_sampler_init(
+    self: Any,
+    logprobs_mode: LogprobsMode = "raw_logprobs",
+    use_fp64_gumbel: bool = False,
+):
     original_init = vllm_topk_topp_sampler.TopKTopPSampler._musa_original_init
-    original_init(self, logprobs_mode)
+    original_init(self, logprobs_mode, use_fp64_gumbel)
     if (
         logprobs_mode not in ("processed_logits", "processed_logprobs")
         and current_platform.is_musa()
@@ -565,6 +569,7 @@ def _worker_sample(
     pos: torch.Tensor,
     input_ids: torch.Tensor,
     expanded_local_pos: torch.Tensor,
+    return_logprobs: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if (
         logits.shape[0] == idx_mapping_np.shape[0]
@@ -625,6 +630,7 @@ def _worker_sample(
         pos,
         input_ids,
         expanded_local_pos,
+        return_logprobs=return_logprobs,
     )
 
 
