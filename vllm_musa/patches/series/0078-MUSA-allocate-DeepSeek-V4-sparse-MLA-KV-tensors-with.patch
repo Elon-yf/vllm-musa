@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Joey-gvwal <joey_gvwal@yeah.net>
+Date: Fri, 26 Jun 2026 14:33:08 +0800
+Subject: [PATCH] MUSA: allocate DeepSeek-V4 sparse MLA KV tensors without
+ offsets
+
+---
+ vllm/v1/core/kv_cache_utils.py | 43 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 43 insertions(+)
+
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index a3822e7fc..f95ad36e5 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -1281,6 +1281,17 @@ def _get_kv_cache_config_packed(
+     num_blocks = available_memory // total_num_bytes_per_block
+     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+ 
++    if _use_musa_deepseek_v4_zero_offset_kv_tensors(kv_cache_groups):
++        # MATE sparse FlashMLA decode rebuilds page views from the cache tensor
++        # storage. Offset aliases from the packed backing tensor overrun there,
++        # so keep the same per-page layout but give each page-size slot an
++        # offset-zero allocation on MUSA.
++        return num_blocks, [
++            KVCacheTensor(size=ps * num_blocks, shared_by=slot)
++            for ps, slots in buckets.items()
++            for slot in slots
++        ]
++
+     total_size = total_num_bytes_per_block * num_blocks
+ 
+     kv_cache_tensors: list[KVCacheTensor] = []
+@@ -1300,6 +1311,38 @@ def _get_kv_cache_config_packed(
+     return num_blocks, kv_cache_tensors
+ 
+ 
++def _use_musa_deepseek_v4_zero_offset_kv_tensors(
++    kv_cache_groups: list[KVCacheGroupSpec],
++) -> bool:
++    try:
++        from vllm.platforms import current_platform
++    except Exception:
++        return False
++
++    is_musa = getattr(current_platform, "is_musa", None)
++    if not callable(is_musa) or not is_musa():
++        return False
++
++    found_deepseek_v4 = False
++    found_sparse_swa = False
++    for group in kv_cache_groups:
++        spec = group.kv_cache_spec
++        specs: Iterable[KVCacheSpec]
++        if isinstance(spec, UniformTypeKVCacheSpecs):
++            specs = spec.kv_cache_specs.values()
++        else:
++            specs = (spec,)
++        for layer_spec in specs:
++            if getattr(layer_spec, "model_version", None) != "deepseek_v4":
++                continue
++            found_deepseek_v4 = True
++            if isinstance(layer_spec, SlidingWindowMLASpec):
++                found_sparse_swa = True
++
++    return found_deepseek_v4 and found_sparse_swa
++
++
+ _get_kv_cache_config_deepseek_v4 = _get_kv_cache_config_packed
+ 
+ 
