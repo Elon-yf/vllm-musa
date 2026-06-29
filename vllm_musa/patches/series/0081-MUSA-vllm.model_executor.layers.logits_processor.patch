@@ -1,0 +1,99 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Joey-gvwal <joey_gvwal@yeah.net>
+Date: Mon, 29 Jun 2026 16:55:00 +0800
+Subject: [PATCH] MUSA: avoid logits gather collectives on TP
+
+---
+ vllm/model_executor/layers/logits_processor.py | 51 +++++++++++++++++++++++---
+ 1 file changed, 47 insertions(+), 4 deletions(-)
+
+diff --git a/vllm/model_executor/layers/logits_processor.py b/vllm/model_executor/layers/logits_processor.py
+index 3541b9706..651505ab0 100644
+--- a/vllm/model_executor/layers/logits_processor.py
++++ b/vllm/model_executor/layers/logits_processor.py
+@@ -5,8 +5,10 @@
+ import torch
+ 
+ from vllm.distributed import (
++    get_tensor_model_parallel_rank,
+     get_tensor_model_parallel_world_size,
+     tensor_model_parallel_all_gather,
++    tensor_model_parallel_all_reduce,
+     tensor_model_parallel_gather,
+ )
+ from vllm.model_executor.custom_op import PluggableLayer
+@@ -72,7 +74,35 @@ class LogitsProcessor(PluggableLayer):
+                 logits *= self.scale
+         return logits
+ 
+-    def _gather_logits(self, logits: torch.Tensor) -> torch.Tensor:
++    def _use_musa_logits_all_reduce(self) -> bool:
++        is_musa = getattr(current_platform, "is_musa", None)
++        return callable(is_musa) and is_musa()
++
++    def _musa_all_reduce_logits(
++        self,
++        logits: torch.Tensor,
++        lm_head: VocabParallelEmbedding,
++    ) -> torch.Tensor:
++        """Rebuild all-gathered logits using the TP all-reduce backend."""
++        tp_size = get_tensor_model_parallel_world_size()
++        if tp_size == 1:
++            return logits
++
++        tp_rank = get_tensor_model_parallel_rank()
++        shard_size = logits.shape[-1]
++        full_logits = torch.zeros(
++            (*logits.shape[:-1], shard_size * tp_size),
++            dtype=logits.dtype,
++            device=logits.device,
++        )
++        full_logits.narrow(-1, shard_size * tp_rank, shard_size).copy_(logits)
++        return tensor_model_parallel_all_reduce(full_logits)
++
++    def _gather_logits(
++        self,
++        logits: torch.Tensor,
++        lm_head: VocabParallelEmbedding,
++    ) -> torch.Tensor:
+         """gather/all-gather the logits tensor across model parallel group."""
+         if self.use_all_gather:
+             # Gather is not supported for some devices such as TPUs.
+@@ -80,7 +110,12 @@ class LogitsProcessor(PluggableLayer):
+             # NOTE(woosuk): Here, the outputs of every device should not be None
+             # because XLA requires strict SPMD among all devices. Every device
+             # should execute the same operations after gathering the logits.
+-            logits = tensor_model_parallel_all_gather(logits)
++            if self._use_musa_logits_all_reduce():
++                # Preserve the all-gather layout while avoiding MCCL
++                # gather/all_gather paths that are not reliable on MUSA.
++                logits = self._musa_all_reduce_logits(logits, lm_head)
++            else:
++                logits = tensor_model_parallel_all_gather(logits)
+         else:
+             # None may be returned for rank > 0
+             logits = tensor_model_parallel_gather(logits)
+@@ -96,7 +131,7 @@ class LogitsProcessor(PluggableLayer):
+         logits = lm_head.quant_method.apply(lm_head, hidden_states, bias=embedding_bias)
+ 
+         # Gather logits for TP
+-        logits = self._gather_logits(logits)
++        logits = self._gather_logits(logits, lm_head)
+ 
+         # Remove paddings in vocab (if any).
+         if logits is not None:
+@@ -128,6 +163,14 @@ class LogitsProcessor(PluggableLayer):
+         if self.scale != 1.0:
+             logits = logits * self.scale
+ 
++        if self._use_musa_logits_all_reduce() and tp_size > 1:
++            # MTP proposer top-token selection only needs the global argmax.
++            # Reconstructing logits through all-reduce avoids all_gather of
++            # rank-local (value, index) pairs on MUSA.
++            logits = self._musa_all_reduce_logits(logits, lm_head)
++            logits = logits[..., : self.org_vocab_size]
++            return logits.argmax(dim=-1).to(torch.int64)
++
+         # Mask out padding entries beyond org_vocab_size on this shard.
+         num_pad = lm_head.shard_indices.num_org_vocab_padding
+         if num_pad > 0:
