@@ -345,6 +345,11 @@ class FlashAttentionMetadata:
 
     causal: bool = True
 
+    # MUSA: pure-prefill batch with no cached prefix (every context_len == 0),
+    # so prefill attention reads contiguous K/V (no block_table) and mate routes
+    # to the faster mubin TCE flash-attention.
+    prefill_no_prefix: bool = False
+
 
 def _get_sliding_window_configs(
     vllm_config: VllmConfig,
@@ -564,10 +569,14 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             )
             prefill_seq_lens = common_attn_metadata.seq_lens[num_decodes:num_reqs]
             prefill_max_seq_len = int(prefill_seq_lens.max().item())
+            # MUSA: sum(seq_lens) == num_prefill_tokens iff every prefill request
+            # has zero cached context (seq_len_i >= query_len_i), i.e. no prefix.
+            prefill_no_prefix = int(prefill_seq_lens.sum().item()) == num_prefill_tokens
         else:
             prefill_query_start_loc = None
             prefill_seq_lens = None
             prefill_max_seq_len = 0
+            prefill_no_prefix = False
         # ========================== END ==========================
 
         if envs.VLLM_BATCH_INVARIANT:
@@ -716,6 +725,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             num_prefill_tokens=num_prefill_tokens,
             prefill_query_start_loc=prefill_query_start_loc,
             prefill_max_seq_len=prefill_max_seq_len,
+            prefill_no_prefix=prefill_no_prefix,
             cu_seqlens_k=cu_seqlens_k,
             block_table=block_table_tensor,
             slot_mapping=slot_mapping,
@@ -817,6 +827,15 @@ class FlashAttentionImpl(AttentionImpl):
                 "Sinks must have the same number of heads as the number of "
                 "heads in the layer"
             )
+
+        # MUSA: layer-static eligibility for the contiguous-KV mubin-TCE prefill
+        # path (none of these features can be represented by the plain varlen call).
+        self._mubin_prefill_ok = (
+            self.sinks is None
+            and (self.sliding_window is None or self.sliding_window[0] < 0)
+            and not self.logits_soft_cap
+            and not self.kv_cache_dtype.startswith("fp8")
+        )
 
         self.supports_quant_query_input = False
 
@@ -976,9 +995,42 @@ class FlashAttentionImpl(AttentionImpl):
                         softcap=self.logits_soft_cap,
                         k_descale=layer._k_scale.expand(decode_descale_shape),
                         v_descale=layer._v_scale.expand(decode_descale_shape),
+                        scheduler_metadata=attn_metadata.scheduler_metadata,
                         num_splits=attn_metadata.max_num_splits,
                     )
                     output[:num_decode_tokens] = decode_output
+                elif (
+                    num_decodes == 0
+                    and num_prefills > 0
+                    and attn_metadata.prefill_no_prefix
+                    and attn_metadata.causal
+                    and not attn_metadata.use_cascade
+                    and self._mubin_prefill_ok
+                ):
+                    # MUSA: pure prefill, no cached prefix -> attend the contiguous
+                    # new K/V (no block_table/seqused_k) so mate routes to the
+                    # faster mubin TCE flash-attention.
+                    flash_attn_varlen_func(
+                        q=query[:num_actual_tokens].view(
+                            -1, self.num_heads, self.head_size
+                        ),
+                        k=key[:num_actual_tokens].view(
+                            -1, self.num_kv_heads, self.head_size
+                        ),
+                        v=value[:num_actual_tokens].view(
+                            -1, self.num_kv_heads, self.head_size
+                        ),
+                        out=output[:num_actual_tokens].view(
+                            -1, self.num_heads, self.head_size
+                        ),
+                        cu_seqlens_q=cu_seqlens_q,
+                        cu_seqlens_k=cu_seqlens_q,
+                        max_seqlen_q=max_seqlen_q,
+                        max_seqlen_k=max_seqlen_q,
+                        softmax_scale=self.scale,
+                        causal=True,
+                        num_splits=attn_metadata.max_num_splits,
+                    )
                 else:
                     # Eagle verifier and mixed/extend batches may have multiple
                     # query tokens per request, so they must attend through the
