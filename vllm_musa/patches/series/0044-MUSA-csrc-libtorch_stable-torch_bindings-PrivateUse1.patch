@@ -4,9 +4,28 @@ Date: Thu, 4 Jun 2026 02:46:36 +0000
 Subject: [PATCH] MUSA(csrc): libtorch_stable torch_bindings PrivateUse1 impls
 
 ---
- csrc/libtorch_stable/torch_bindings.cpp | 34 +++++++++++++++++++++++++
- 1 file changed, 34 insertions(+)
+ csrc/libtorch_stable/ops.h              |  6 ++++++
+ csrc/libtorch_stable/torch_bindings.cpp | 35 +++++++++++++++++++++++++
+ 2 files changed, 41 insertions(+)
 
+diff --git a/csrc/libtorch_stable/ops.h b/csrc/libtorch_stable/ops.h
+index d60b68a5..11b44dfb 100644
+--- a/csrc/libtorch_stable/ops.h
++++ b/csrc/libtorch_stable/ops.h
+@@ -13,6 +13,12 @@
+ inline torch::stable::Tensor weak_ref_tensor(torch::stable::Tensor& tensor) {
++#if defined(USE_MUSA)
++  // Ensure tensor is on MUSA
++  STD_TORCH_CHECK(tensor.device().is_privateuseone(),
++                  "Tensor must be on MUSA device");
++#else
+   // Ensure tensor is on CUDA
+   STD_TORCH_CHECK(tensor.device().is_cuda(), "Tensor must be on CUDA device");
++#endif
+-
++
+   // Get the raw data pointer
+   void* data_ptr = tensor.mutable_data_ptr();
 diff --git a/csrc/libtorch_stable/torch_bindings.cpp b/csrc/libtorch_stable/torch_bindings.cpp
 index d55c12d38..7a40bb355 100644
 --- a/csrc/libtorch_stable/torch_bindings.cpp
@@ -35,7 +54,7 @@ index d55c12d38..7a40bb355 100644
  STABLE_TORCH_LIBRARY_IMPL(_C, CompositeExplicitAutograd, ops) {
  #ifndef USE_ROCM
    ops.impl("cutlass_scaled_mm_supports_fp8",
-@@ -937,5 +940,36 @@ STABLE_TORCH_LIBRARY_IMPL(_C_cache_ops, CUDA, ops) {
+@@ -937,5 +940,37 @@ STABLE_TORCH_LIBRARY_IMPL(_C_cache_ops, CUDA, ops) {
    ops.impl("cp_gather_indexer_k_quant_cache",
             TORCH_BOX(&cp_gather_indexer_k_quant_cache));
  }
@@ -49,6 +68,7 @@ index d55c12d38..7a40bb355 100644
 +// dispatch key -- via torchada's TORCH_BOX shim (the stable ABI does not
 +// translate the CUDA dispatch-key token like torch.library's Python path does).
 +STABLE_TORCH_LIBRARY_IMPL(_C, PrivateUse1, ops) {
++  ops.impl("weak_ref_tensor", TORCH_BOX(&weak_ref_tensor));
 +  ops.impl("silu_and_mul", TORCH_BOX(&silu_and_mul));
 +  ops.impl("mul_and_silu", TORCH_BOX(&mul_and_silu));
 +  ops.impl("gelu_and_mul", TORCH_BOX(&gelu_and_mul));
