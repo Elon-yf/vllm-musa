@@ -340,7 +340,10 @@ def _deepseek_v4_moe_deepgemm_prefill_impl(
         deepgemm_moe_permute,
         deepgemm_unpermute_and_reduce,
     )
-    from vllm.utils.deep_gemm import m_grouped_fp8_gemm_nt_contiguous
+    from vllm.utils.deep_gemm import (
+        m_grouped_fp8_gemm_nt_contiguous,
+        mk_alignment_scope,
+    )
 
     logger.info_once(
         "Using DeepSeek-V4 MUSA grouped DeepGEMM MoE prefill path "
@@ -356,7 +359,13 @@ def _deepseek_v4_moe_deepgemm_prefill_impl(
         block_shape=[128, 128],
     )
 
-    qhidden_perm, qhidden_scale_perm, expert_ids, inv_perm = deepgemm_moe_permute(
+    (
+        qhidden_perm,
+        qhidden_scale_perm,
+        expert_ids,
+        inv_perm,
+        align_used,
+    ) = deepgemm_moe_permute(
         aq=qhidden,
         aq_scale=a1_scale,
         topk_ids=topk_ids,
@@ -366,40 +375,41 @@ def _deepseek_v4_moe_deepgemm_prefill_impl(
     )
 
     _, N, K = w1.shape
-    mm1_out = torch.empty(
-        (qhidden_perm.shape[0], N),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
-    )
-    m_grouped_fp8_gemm_nt_contiguous(
-        (qhidden_perm, qhidden_scale_perm.contiguous()),
-        (w1, w1_scale.contiguous()),
-        mm1_out,
-        expert_ids,
-    )
+    with mk_alignment_scope(align_used):
+        mm1_out = torch.empty(
+            (qhidden_perm.shape[0], N),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        m_grouped_fp8_gemm_nt_contiguous(
+            (qhidden_perm, qhidden_scale_perm.contiguous()),
+            (w1, w1_scale.contiguous()),
+            mm1_out,
+            expert_ids,
+        )
 
-    a2q = torch.empty(
-        (qhidden_perm.shape[0], N // 2),
-        device=hidden_states.device,
-        dtype=torch.float8_e4m3fn,
-    )
-    a2q, a2q_scale = _silu_mul_per_token_group_fp8_quant_musa_large(
-        mm1_out.view(-1, N),
-        a2q,
-        group_size=128,
-    )
+        a2q = torch.empty(
+            (qhidden_perm.shape[0], N // 2),
+            device=hidden_states.device,
+            dtype=torch.float8_e4m3fn,
+        )
+        a2q, a2q_scale = _silu_mul_per_token_group_fp8_quant_musa_large(
+            mm1_out.view(-1, N),
+            a2q,
+            group_size=128,
+        )
 
-    mm2_out = torch.empty(
-        (qhidden_perm.shape[0], K),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
-    )
-    m_grouped_fp8_gemm_nt_contiguous(
-        (a2q, a2q_scale.contiguous()),
-        (w2, w2_scale.contiguous()),
-        mm2_out,
-        expert_ids,
-    )
+        mm2_out = torch.empty(
+            (qhidden_perm.shape[0], K),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        m_grouped_fp8_gemm_nt_contiguous(
+            (a2q, a2q_scale.contiguous()),
+            (w2, w2_scale.contiguous()),
+            mm2_out,
+            expert_ids,
+        )
 
     if inplace and not disable_inplace():
         output = hidden_states
