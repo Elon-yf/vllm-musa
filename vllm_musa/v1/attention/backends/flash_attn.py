@@ -831,7 +831,8 @@ class FlashAttentionImpl(AttentionImpl):
         # MUSA: layer-static eligibility for the contiguous-KV mubin-TCE prefill
         # path (none of these features can be represented by the plain varlen call).
         self._mubin_prefill_ok = (
-            self.sinks is None
+            self.attn_type == AttentionType.DECODER
+            and self.sinks is None
             and (self.sliding_window is None or self.sliding_window[0] < 0)
             and not self.logits_soft_cap
             and not self.kv_cache_dtype.startswith("fp8")
