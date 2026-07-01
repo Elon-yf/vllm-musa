@@ -281,7 +281,7 @@ index 3133243..b334e2b 100644
    custom_ar.impl("allocate_shared_buffer_and_handle",
                   TORCH_BOX(&allocate_shared_buffer_and_handle));
    custom_ar.impl("free_shared_buffer", TORCH_BOX(&free_shared_buffer));
-@@ -960,18 +1009,25 @@ STABLE_TORCH_LIBRARY_IMPL(_C_cache_ops, CUDA, ops) {
+@@ -960,18 +1009,30 @@ STABLE_TORCH_LIBRARY_IMPL(_C_cache_ops, CUDA, ops) {
  // translate the CUDA dispatch-key token like torch.library's Python path does).
  STABLE_TORCH_LIBRARY_IMPL(_C, PrivateUse1, ops) {
    ops.impl("weak_ref_tensor", TORCH_BOX(&weak_ref_tensor));
@@ -302,6 +302,13 @@ index 3133243..b334e2b 100644
    ops.impl("silu_and_mul_with_clamp", TORCH_BOX(&silu_and_mul_clamp));
    ops.impl("rms_norm", TORCH_BOX(&rms_norm));
    ops.impl("fused_add_rms_norm", TORCH_BOX(&fused_add_rms_norm));
++  // Layernorm+quant fusion kernels (rms_quant_fusion compile-pass targets).
++  ops.impl("rms_norm_static_fp8_quant", TORCH_BOX(&rms_norm_static_fp8_quant));
++  ops.impl("fused_add_rms_norm_static_fp8_quant",
++           TORCH_BOX(&fused_add_rms_norm_static_fp8_quant));
++  ops.impl("rms_norm_dynamic_per_token_quant",
++           TORCH_BOX(&rms_norm_dynamic_per_token_quant));
++  ops.impl("rms_norm_per_block_quant", TORCH_BOX(&rms_norm_per_block_quant));
 +  ops.impl("silu_and_mul_per_block_quant",
 +           TORCH_BOX(&silu_and_mul_per_block_quant));
    ops.impl("rotary_embedding", TORCH_BOX(&rotary_embedding));

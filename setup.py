@@ -176,6 +176,12 @@ VLLM_STABLE_CSRC_SOURCES = [
     str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/topk.cu"),
     str(_VLLM_REPO.source_dir
         / "csrc/libtorch_stable/quantization/fused_kernels/fused_silu_mul_block_quant.cu"),
+    # Layernorm+quant fusion kernels (rms_norm_static_fp8_quant,
+    # fused_add_rms_norm_static_fp8_quant, rms_norm_dynamic_per_token_quant,
+    # rms_norm_per_block_quant): emitted by the rms_quant_fusion compile pass.
+    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/layernorm_quant_kernels.cu"),
+    str(_VLLM_REPO.source_dir
+        / "csrc/libtorch_stable/quantization/fused_kernels/fused_layernorm_dynamic_per_token_quant.cu"),
     str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/quantization/activation_kernels.cu"),
     str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/custom_all_reduce.cu"),
     str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/minimax_reduce_rms_kernel.cu"),
