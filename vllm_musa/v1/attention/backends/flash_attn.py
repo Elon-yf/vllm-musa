@@ -445,6 +445,8 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             self.compilation_config.cudagraph_mode.has_full_cudagraphs()
         )
         self.max_cudagraph_size = self.compilation_config.max_cudagraph_capture_size
+
+        self._sm_count = 60
         # ==================== MUSA ADAPTATION ====================
         self._cu_seqlens_k_buffer: torch.Tensor | None = None
         # ========================== END ==========================
@@ -470,6 +472,12 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             self.max_num_splits = (
                 self.attention_config.flash_attn_max_num_splits_for_cuda_graph
             )
+            try:
+                self._sm_count = torch.musa.get_device_properties(
+                    self.device
+                ).multi_processor_count
+            except Exception:
+                self._sm_count = 60
 
         # ==================== MUSA ADAPTATION ====================
         if self.use_full_cuda_graph:
@@ -546,7 +554,22 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             # usage, because the intermediate buffers of size [num_splits,
             # num_heads, num_tokens, head_size] are allocated. Therefore,
             # we only set num_splits when using cuda graphs.
-            max_num_splits = self.max_num_splits
+            # MUSA: scale the captured KV-split count by the decode token count.
+            # A large decode batch already saturates the SMs, so a fixed split
+            # count over-partitions the KV (extra partial passes + a heavier
+            # combine) and slows decode; small batches still need splits to fill
+            # the SMs. Use decode tokens only (not decode+prefill) so a mixed
+            # step does not collapse the decode split count to 1. splits =
+            # ceil(sms / (decode_tokens * kv_heads)); equals the pure-decode
+            # capture value since there decode tokens == total tokens.
+            _decode_bs = max(1, num_decode_tokens)
+            max_num_splits = max(
+                1,
+                min(
+                    self.max_num_splits,
+                    -(-self._sm_count // (_decode_bs * self.num_heads_kv)),
+                ),
+            )
 
         # ==================== MUSA ADAPTATION ====================
         if num_decodes > 0:
@@ -979,6 +1002,8 @@ class FlashAttentionImpl(AttentionImpl):
                 )
 
                 if use_decode_fast_path:
+                    # MUSA branch 1/4 - pure decode batch (no prefill, 1 query token per
+                    # seq): whole batch attends through the paged KV cache decode kernel.
                     decode_descale_shape = (num_decodes, self.num_kv_heads)
                     decode_output = flash_attn_with_kvcache(
                         q=query[:num_decode_tokens].view(
@@ -1008,9 +1033,9 @@ class FlashAttentionImpl(AttentionImpl):
                     and not attn_metadata.use_cascade
                     and self._mubin_prefill_ok
                 ):
-                    # MUSA: pure prefill, no cached prefix -> attend the contiguous
-                    # new K/V (no block_table/seqused_k) so mate routes to the
-                    # faster mubin TCE flash-attention.
+                    # MUSA branch 2/4 - pure prefill with no cached prefix: attend the
+                    # contiguous new K/V (no block_table/seqused_k) so mate routes to the
+                    # fast mubin varlen_causal TCE kernel, not the slow paged FmhaFwd.
                     flash_attn_varlen_func(
                         q=query[:num_actual_tokens].view(
                             -1, self.num_heads, self.head_size
@@ -1032,10 +1057,77 @@ class FlashAttentionImpl(AttentionImpl):
                         causal=True,
                         num_splits=attn_metadata.max_num_splits,
                     )
+                elif (
+                    num_decodes > 0
+                    and num_prefills > 0
+                    and num_decode_tokens == num_decodes
+                    and attn_metadata.prefill_no_prefix
+                    and attn_metadata.causal
+                    and not attn_metadata.use_cascade
+                    and self._mubin_prefill_ok
+                    and self.sinks is None
+                    and attn_metadata.decode_block_table is not None
+                    and attn_metadata.decode_seq_lens is not None
+                    and attn_metadata.decode_query_start_loc is not None
+                    and attn_metadata.prefill_query_start_loc is not None
+                ):
+                    # MUSA branch 3/4 - mixed decode+prefill step: split the query into
+                    # [decode | prefill] (decode tokens come first). Attend decode tokens through the
+                    # paged KV cache and the no-prefix prefill tokens against their
+                    # contiguous new K/V (no block_table) so mate routes prefill to the
+                    # mubin TCE kernel instead of the slow paged FmhaFwd used for the
+                    # whole batch when decode and prefill share a step.
+                    decode_descale_shape = (num_decodes, self.num_kv_heads)
+                    # MUSA: no scheduler_metadata here. It is built for the full
+                    # num_reqs (decode+prefill) layout and does not match this
+                    # decode-only slice; a mixed step runs eager (never captured
+                    # under FULL_DECODE_ONLY), so the kernel builds its own
+                    # decode schedule.
+                    output[:num_decode_tokens] = flash_attn_with_kvcache(
+                        q=query[:num_decode_tokens].view(
+                            -1, self.num_heads, self.head_size
+                        ),
+                        k_cache=key_cache,
+                        v_cache=value_cache,
+                        page_table=attn_metadata.decode_block_table,
+                        cache_seqlens=attn_metadata.decode_seq_lens,
+                        cu_seqlens_q=attn_metadata.decode_query_start_loc,
+                        max_seqlen_q=1,
+                        softmax_scale=self.scale,
+                        causal=attn_metadata.causal,
+                        window_size=sliding_window_size,
+                        softcap=self.logits_soft_cap,
+                        k_descale=layer._k_scale.expand(decode_descale_shape),
+                        v_descale=layer._v_scale.expand(decode_descale_shape),
+                        num_splits=attn_metadata.max_num_splits,
+                    )
+                    flash_attn_varlen_func(
+                        q=query[num_decode_tokens:num_actual_tokens].view(
+                            -1, self.num_heads, self.head_size
+                        ),
+                        k=key[num_decode_tokens:num_actual_tokens].view(
+                            -1, self.num_kv_heads, self.head_size
+                        ),
+                        v=value[num_decode_tokens:num_actual_tokens].view(
+                            -1, self.num_kv_heads, self.head_size
+                        ),
+                        out=output[num_decode_tokens:num_actual_tokens].view(
+                            -1, self.num_heads, self.head_size
+                        ),
+                        cu_seqlens_q=attn_metadata.prefill_query_start_loc,
+                        cu_seqlens_k=attn_metadata.prefill_query_start_loc,
+                        max_seqlen_q=attn_metadata.prefill_max_seq_len,
+                        max_seqlen_k=attn_metadata.prefill_max_seq_len,
+                        softmax_scale=self.scale,
+                        causal=True,
+                        num_splits=attn_metadata.max_num_splits,
+                    )
                 else:
-                    # Eagle verifier and mixed/extend batches may have multiple
-                    # query tokens per request, so they must attend through the
-                    # paged KV cache with the original query_start_loc layout.
+                    # MUSA branch 4/4 - paged fallback for every other case: cascade
+                    # attention, prefill with a cached prefix (chunked/extend), spec/Eagle
+                    # verify (multiple query tokens per seq), or layers ineligible for the
+                    # mubin fast path (sliding-window/softcap/fp8/sinks). All tokens attend
+                    # through the paged KV cache with the original query_start_loc layout.
                     flash_attn_varlen_func(
                         q=query[:num_actual_tokens].view(
                             -1, self.num_heads, self.head_size
