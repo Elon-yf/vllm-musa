@@ -11,10 +11,7 @@ series of MUSA's source modifications against the pinned `vllm@<tag>`
   (`git format-patch --no-signature --zero-commit`, keeping `index` blob lines so
   `git am -3` 3-way works across version bumps).
 
-Bootstrapped 2026-06-03 from the legacy `*.patch.py` source-transforms: **36 patches**
-(the live v0.22.0 source edits). Excluded by design: the 2 object/registration patches
-(`eagle` prime, `parallel_state` — they patch live objects, stay runtime),
-the ~11 dead DeepSeek-V4 old-namespace patches (targets absent on v0.22), and 2
-anchor-absent patches (`all2all`, `triton_unified_attention` — to review: obsolete on
-v0.22 or stale anchor). Verified: `git am -3` replays all 36 cleanly onto a fresh
-`vllm@v0.22.0`.
+Currently **81 patches** — the MUSA source edits against `vllm@v0.24.0`, applied at
+build. Runtime object/registration patches (which patch live objects at import) are
+kept separately in `vllm_musa/patches/`, not in this build-time series. Verified:
+`git am -3` replays all 81 cleanly onto a fresh `vllm@v0.24.0`.
