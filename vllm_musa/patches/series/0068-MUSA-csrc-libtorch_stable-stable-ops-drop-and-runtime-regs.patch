@@ -281,7 +281,7 @@ index 3133243..b334e2b 100644
    custom_ar.impl("allocate_shared_buffer_and_handle",
                   TORCH_BOX(&allocate_shared_buffer_and_handle));
    custom_ar.impl("free_shared_buffer", TORCH_BOX(&free_shared_buffer));
-@@ -960,18 +1009,30 @@ STABLE_TORCH_LIBRARY_IMPL(_C_cache_ops, CUDA, ops) {
+@@ -960,18 +1009,41 @@ STABLE_TORCH_LIBRARY_IMPL(_C_cache_ops, CUDA, ops) {
  // translate the CUDA dispatch-key token like torch.library's Python path does).
  STABLE_TORCH_LIBRARY_IMPL(_C, PrivateUse1, ops) {
    ops.impl("weak_ref_tensor", TORCH_BOX(&weak_ref_tensor));
@@ -311,6 +311,15 @@ index 3133243..b334e2b 100644
 +  ops.impl("rms_norm_per_block_quant", TORCH_BOX(&rms_norm_per_block_quant));
 +  ops.impl("silu_and_mul_per_block_quant",
 +           TORCH_BOX(&silu_and_mul_per_block_quant));
++  // Scaled FP8/INT8 activation-quant kernels. static_scaled_fp8_quant is
++  // intentionally omitted: its int[]? group_shape arg is unboxable on
++  // torch_musa's stable ABI (from()/to() have no ArrayRef path). The dynamic
++  // FP8 paths and both INT8 ops take only Tensor args and box cleanly.
++  ops.impl("dynamic_scaled_fp8_quant", TORCH_BOX(&dynamic_scaled_fp8_quant));
++  ops.impl("dynamic_per_token_scaled_fp8_quant",
++           TORCH_BOX(&dynamic_per_token_scaled_fp8_quant));
++  ops.impl("static_scaled_int8_quant", TORCH_BOX(&static_scaled_int8_quant));
++  ops.impl("dynamic_scaled_int8_quant", TORCH_BOX(&dynamic_scaled_int8_quant));
    ops.impl("rotary_embedding", TORCH_BOX(&rotary_embedding));
    // w8a8 per-token-group quant (MUSA-0/Option-3 consolidation): the upstream
    // stable kernels replace the native csrc/musa non-fused re-impl. The MUSA-only

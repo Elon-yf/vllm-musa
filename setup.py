@@ -165,6 +165,15 @@ VLLM_STABLE_CSRC_SOURCES = [
         / "csrc/libtorch_stable/quantization/w8a8/fp8/per_token_group_quant.cu"),
     str(_VLLM_REPO.source_dir
         / "csrc/libtorch_stable/quantization/w8a8/int8/per_token_group_quant.cu"),
+    # Scaled FP8/INT8 quant kernels (dynamic_scaled_fp8_quant,
+    # dynamic_per_token_scaled_fp8_quant, static/dynamic_scaled_int8_quant): the
+    # dynamic paths back _custom_ops.scaled_fp8_quant / scaled_int8_quant, used by
+    # FP8/INT8 activation quantization. static_scaled_fp8_quant is also built here
+    # but stays CUDA-only (its int[] group_shape arg is unboxable on the stable ABI).
+    str(_VLLM_REPO.source_dir
+        / "csrc/libtorch_stable/quantization/w8a8/fp8/common.cu"),
+    str(_VLLM_REPO.source_dir
+        / "csrc/libtorch_stable/quantization/w8a8/int8/scaled_quant.cu"),
     # Relocated from csrc/* into csrc/libtorch_stable/* by the v0.24.0 stable-ABI
     # consolidation; compiled into the stable extension at their new paths.
     str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/mamba/selective_scan_fwd.cu"),

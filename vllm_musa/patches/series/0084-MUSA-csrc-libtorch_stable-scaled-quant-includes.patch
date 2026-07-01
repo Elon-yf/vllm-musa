@@ -1,0 +1,105 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: musa <musa@local>
+Date: Tue, 01 Jul 2026 17:30:00 +0800
+Subject: [PATCH] MUSA(csrc): compile the libtorch_stable scaled fp8/int8 quant
+ kernels on mcc
+
+Normalize the relocated scaled-quant kernels' includes so they build under the
+MUSA porter's per-file _musa tree (same idiom as the layernorm-quant kernels),
+and route the int8 rounding helpers off the NVIDIA-only PTX path:
+
+- common.cu (fp8) and scaled_quant.cu (int8): the ".." relative parents do not
+  resolve after the porter relocates each file. Route the regular-tree parents
+  (fp8/common.cuh, cub_helpers.h) through the vllm/csrc include root and the
+  stable-tree headers (dispatch_utils.h/torch_utils.h -- they carry the
+  VLLM_STABLE_DISPATCH_* macros and get_current_cuda_stream) through
+  libtorch_stable/. Route vectorization_utils through libtorch_stable/ so its
+  vec_n_t/q8_n_t coalesce with the copy pulled transitively by fp8/common.cuh
+  (a path-based "#pragma once" would not dedupe two ported-tree copies ->
+  redefinition on mcc).
+- scaled_quant.cu float_to_int8_rn / float_to_int32_rn / int32_to_int8: mcc
+  cannot assemble the NVIDIA-only `cvt.rni.sat.*` inline PTX (it emits wrong
+  int8s), so take the portable std::nearbyint + saturate path that ROCm already
+  uses -- guard the ROCm branches with `|| defined(USE_MUSA)`.
+
+These kernels define dynamic_scaled_fp8_quant, dynamic_per_token_scaled_fp8_quant
+and the static/dynamic int8 quant ops (all Tensor-arg, boxable), plus
+static_scaled_fp8_quant (kept CUDA-only -- its int[] group_shape is unboxable).
+
+---
+diff --git a/csrc/libtorch_stable/quantization/w8a8/fp8/common.cu b/csrc/libtorch_stable/quantization/w8a8/fp8/common.cu
+index d02fc2296..ee1860840 100644
+--- a/csrc/libtorch_stable/quantization/w8a8/fp8/common.cu
++++ b/csrc/libtorch_stable/quantization/w8a8/fp8/common.cu
+@@ -1,8 +1,15 @@
+-#include "../../../../quantization/w8a8/fp8/common.cuh"
+-#include "../../../dispatch_utils.h"
+-#include "../../../../cub_helpers.h"
+-#include "../../vectorization_utils.cuh"
+-#include "../../../torch_utils.h"
++// MUSA: the porter emits this file into a per-file _musa tree; route the
++// regular-tree parents through the csrc include root and keep the stable-tree
++// headers (dispatch_utils.h/torch_utils.h provide the VLLM_STABLE_DISPATCH_*
++// macros + get_current_cuda_stream) via libtorch_stable/. vectorization_utils
++// goes through libtorch_stable/ so its vec_n_t/q8_n_t coalesce with the copy
++// pulled transitively by fp8/common.cuh (a path-based "#pragma once" would not
++// dedupe two ported-tree copies -> redefinition on mcc).
++#include "quantization/w8a8/fp8/common.cuh"
++#include "libtorch_stable/dispatch_utils.h"
++#include "cub_helpers.h"
++#include "libtorch_stable/quantization/vectorization_utils.cuh"
++#include "libtorch_stable/torch_utils.h"
+ #include <torch/csrc/stable/macros.h>
+ namespace vllm {
+ 
+diff --git a/csrc/libtorch_stable/quantization/w8a8/int8/scaled_quant.cu b/csrc/libtorch_stable/quantization/w8a8/int8/scaled_quant.cu
+index ede7913a3..c5708cacc 100644
+--- a/csrc/libtorch_stable/quantization/w8a8/int8/scaled_quant.cu
++++ b/csrc/libtorch_stable/quantization/w8a8/int8/scaled_quant.cu
+@@ -2,13 +2,19 @@
+ 
+ #include <cmath>
+ 
+-#include "../../../dispatch_utils.h"
+-#include "../../../torch_utils.h"
+-#include "../../vectorization_utils.cuh"
+-#include "../../../../cub_helpers.h"
++// MUSA: normalize the relocated includes for the porter's per-file _musa tree
++// (see the fp8 sibling): stable-tree dispatch_utils.h/torch_utils.h via
++// libtorch_stable/, vectorization_utils via libtorch_stable/ to coalesce
++// vec_n_t/q8_n_t, cub_helpers via the csrc root.
++#include "libtorch_stable/dispatch_utils.h"
++#include "libtorch_stable/torch_utils.h"
++#include "libtorch_stable/quantization/vectorization_utils.cuh"
++#include "cub_helpers.h"
+ 
+ static inline __device__ int8_t float_to_int8_rn(float x) {
+-#ifdef USE_ROCM
++// MUSA: mcc cannot assemble the NVIDIA-only `cvt.rni.sat.s8.f32` PTX below
++// (it emits wrong int8s), so take the portable nearbyint+saturate path ROCm uses.
++#if defined(USE_ROCM) || defined(USE_MUSA)
+   static constexpr auto i8_min =
+       static_cast<float>(std::numeric_limits<int8_t>::min());
+   static constexpr auto i8_max =
+@@ -37,7 +43,8 @@ static inline __device__ int8_t float_to_int8_rn(float x) {
+ }
+ 
+ static inline __device__ int32_t float_to_int32_rn(float x) {
+-#ifdef USE_ROCM
++// MUSA: same as float_to_int8_rn -- avoid the NVIDIA-only cvt PTX on mcc.
++#if defined(USE_ROCM) || defined(USE_MUSA)
+   // int32_max is not exactly representable as float.
+   // Therefore, we need to be careful and manually return int32_max on overflow.
+   // For symmetry, we also do the same for int32_min, even though it is exactly
+@@ -72,7 +79,8 @@ static inline __device__ int32_t float_to_int32_rn(float x) {
+ }
+ 
+ static inline __device__ int8_t int32_to_int8(int32_t x) {
+-#ifdef USE_ROCM
++// MUSA: same as float_to_int8_rn -- avoid the NVIDIA-only cvt PTX on mcc.
++#if defined(USE_ROCM) || defined(USE_MUSA)
+   static constexpr auto i8_min =
+       static_cast<int32_t>(std::numeric_limits<int8_t>::min());
+   static constexpr auto i8_max =
+-- 
+2.34.1
