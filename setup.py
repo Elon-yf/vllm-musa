@@ -487,7 +487,7 @@ setup(
     include_package_data=False,
     # pinned here because --no-build-isolation skips pyproject.toml deps
     install_requires=[
-        "torchada>=0.1.62",
+        "torchada>=0.1.69",
         "mthreads-ml-py>=2.2.11",
         "numpy<2",
         "openai>=2.24.0",
