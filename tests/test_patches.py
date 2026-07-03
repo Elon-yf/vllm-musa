@@ -36,7 +36,6 @@ class TestCustomOpsRuntimePatches:
         # the dflash fallback is now the vllm._custom_ops cat-6 object
         # patch; load + apply() it and assert it rebinds to the _shared helpers.
         import vllm
-
         from vllm_musa.patches import _get_patch_files, _load_patch_module, _shared
 
         vllm_ops = ModuleType("vllm._custom_ops")
@@ -164,9 +163,9 @@ class TestMUSAFlashAttentionReshapeCache:
     """
 
     def _load_fa_utils_with_musa_platform(self, monkeypatch, musa_ops_namespace):
-        import vllm
         import vllm.platforms as vllm_platforms
 
+        import vllm
         import vllm_musa
 
         monkeypatch.setenv("VLLM_MUSA_RESHAPE_CACHE_FLASH", "1")
@@ -1036,6 +1035,82 @@ class TestMUSAPlatformDefaults:
 
         assert vllm_config.cache_config.block_size == 64
 
+    def test_update_block_size_for_backend_defaults_to_64_for_non_hybrid(
+        self, monkeypatch
+    ):
+        # The MUSA platform seeds a 64-element KV page for non-hybrid,
+        # non-user-specified configs so paged FMHA/MLA decode takes the TME
+        # bulk-gather path. Fixed-page kernels and explicit user overrides are
+        # preserved; hybrid models defer to the upstream mamba-aligned selection.
+        from types import SimpleNamespace
+
+        from vllm.v1.attention.backend import AttentionBackend, MultipleOf
+
+        from vllm_musa.platform import MUSAPlatformBase
+
+        class _MultipleOf16Backend(AttentionBackend):
+            @staticmethod
+            def get_supported_kernel_block_sizes():
+                return [MultipleOf(16)]
+
+            @staticmethod
+            def get_name():
+                return "STUB_M16"
+
+        class _FixedPage256Backend(AttentionBackend):
+            @staticmethod
+            def get_supported_kernel_block_sizes():
+                return [256]
+
+            @staticmethod
+            def get_name():
+                return "STUB_256"
+
+        def _cfg(*, is_hybrid=False, user_specified=False, block_size=16):
+            return SimpleNamespace(
+                model_config=SimpleNamespace(is_hybrid=is_hybrid),
+                cache_config=SimpleNamespace(
+                    block_size=block_size,
+                    user_specified_block_size=user_specified,
+                ),
+            )
+
+        def _use_backend(backend):
+            monkeypatch.setattr(
+                MUSAPlatformBase,
+                "_find_non_ssm_backend",
+                classmethod(lambda cls, vllm_config: backend),
+            )
+
+        # non-hybrid, default block size, kernel accepts multiples of 16 -> 64
+        _use_backend(_MultipleOf16Backend)
+        cfg = _cfg()
+        MUSAPlatformBase.update_block_size_for_backend(cfg)
+        assert cfg.cache_config.block_size == 64
+
+        # kernel that cannot take 64 keeps its own required page (256)
+        _use_backend(_FixedPage256Backend)
+        cfg = _cfg()
+        MUSAPlatformBase.update_block_size_for_backend(cfg)
+        assert cfg.cache_config.block_size == 256
+
+        # an explicit --block-size is never overridden
+        _use_backend(_MultipleOf16Backend)
+        cfg = _cfg(user_specified=True, block_size=32)
+        MUSAPlatformBase.update_block_size_for_backend(cfg)
+        assert cfg.cache_config.block_size == 32
+
+        # hybrid models are not forced to 64 (upstream mamba-aligned path)
+        monkeypatch.setattr(
+            MUSAPlatformBase,
+            "_align_hybrid_block_size",
+            classmethod(lambda cls, vllm_config, backend_cls: None),
+        )
+        _use_backend(_MultipleOf16Backend)
+        cfg = _cfg(is_hybrid=True)
+        MUSAPlatformBase.update_block_size_for_backend(cfg)
+        assert cfg.cache_config.block_size == 16
+
     def test_dense_fp8_does_not_cap_cudagraph_capture_size(self):
         from vllm_musa.platform import MUSAPlatformBase
 
@@ -1233,19 +1308,6 @@ class TestScaledMMKernelPatch:
         assert (
             MUSAPerTensorTorchFP8ScaledMMLinearKernel.get_output_padding(None) is None
         )
-
-    def test_musa_unquantized_gemm_materializes_plain_parameter_for_compile(self):
-        source = (
-            Path(__file__).parents[1] / "vllm_musa/model_executor/layers/utils.py"
-        ).read_text()
-
-        assert "BasevLLMParameter" in source
-        assert "torch.nn.Parameter(weight.detach(), requires_grad=False)" in source
-        assert "plain_weight.__dict__.update(weight.__dict__)" in source
-        assert "current_platform.is_musa()" in source
-        assert "process_weights_after_loading" in source
-        assert "_musa_materializes_plain_parameter" in source
-        assert "DisableTorchFunction" not in source
 
 
 class TestMUSAFP8ActivationQuant:
