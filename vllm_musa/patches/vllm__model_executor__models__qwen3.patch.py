@@ -8,6 +8,7 @@ backend keeps ``reshape_and_cache`` (no backend surgery)."""
 
 import os
 
+import torch
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -17,6 +18,11 @@ PATCHES: list = []
 
 def apply() -> None:
     if os.environ.get("VLLM_MUSA_QWEN3_FUSED_QKNORM", "0") != "1":
+        return
+    # MUSA: the fused op is a MUSA-only TileLang kernel; ignore the flag on any
+    # non-MUSA runtime so an accidentally-set env var cannot break CPU/CUDA runs.
+    if not (hasattr(torch.version, "musa") and torch.version.musa is not None):
+        logger.debug("Skipping Qwen3 fused qk-norm patch: MUSA unavailable")
         return
     try:
         from vllm.model_executor.models.qwen3 import Qwen3Attention
