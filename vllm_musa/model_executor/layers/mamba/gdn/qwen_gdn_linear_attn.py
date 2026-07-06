@@ -135,21 +135,30 @@ class MusaQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
         # MUSA: the mate fp32-VK decode kernel is unavailable in this toolchain,
         # so pure decode runs the fused recurrent update directly on the paged
-        # state pool (leaner than the upstream general prefill/decode path).
-        core_attn_out_non_spec, _ = fused_sigmoid_gating_delta_rule_update(
-            A_log=self.A_log,
-            a=a,
-            b=b,
-            dt_bias=self.dt_bias,
-            q=query,
-            k=key,
-            v=value,
-            initial_state=ssm_state,
-            inplace_final_state=True,
-            cu_seqlens=non_spec_query_start_loc[: attn_metadata.num_decodes + 1],
-            ssm_state_indices=state_indices,
-            use_qk_l2norm_in_kernel=True,
-        )
+        # state pool (leaner than the upstream general prefill/decode path). Fall
+        # back to the general decode path if this kernel ever fails at runtime.
+        try:
+            core_attn_out_non_spec, _ = fused_sigmoid_gating_delta_rule_update(
+                A_log=self.A_log,
+                a=a,
+                b=b,
+                dt_bias=self.dt_bias,
+                q=query,
+                k=key,
+                v=value,
+                initial_state=ssm_state,
+                inplace_final_state=True,
+                cu_seqlens=non_spec_query_start_loc[: attn_metadata.num_decodes + 1],
+                ssm_state_indices=state_indices,
+                use_qk_l2norm_in_kernel=True,
+            )
+        except Exception as exc:
+            _log_once(
+                "warning",
+                "fused decode update failed (%s); using the general decode path",
+                exc,
+            )
+            return False
         core_attn_out[:num_decode_tokens] = core_attn_out_non_spec.squeeze(0)
 
         return True
