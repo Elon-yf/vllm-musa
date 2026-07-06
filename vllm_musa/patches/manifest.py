@@ -209,6 +209,15 @@ _CAT6: list[DivSpec] = [
         required=False,
         intent="route vllm._custom_ops rms_norm/rotary to MUSA-safe dflash fallbacks",
     ),
+    DivSpec(
+        id="vllm__model_executor__models__qwen3",
+        category="6",
+        path="vllm_musa/patches/vllm__model_executor__models__qwen3.patch.py",
+        upstream_path="vllm/model_executor/models/qwen3.py",
+        apply_phase="runtime",
+        required=False,
+        intent="fuse Qwen3 dense-decode q-norm+RoPE into one kernel (opt-in VLLM_MUSA_QWEN3_FUSED_QKNORM)",
+    ),
 ]
 
 # census of the runtime-override / vendored shadow modules (vllm_musa
