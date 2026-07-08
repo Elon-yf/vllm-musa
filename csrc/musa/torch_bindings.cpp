@@ -40,6 +40,13 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _musa_ops), musa_ops) {
       "float fp8_max) -> ()");
   musa_ops.impl("silu_and_mul_per_token_group_fp8_quant", torch::kMUSA,
                 &silu_and_mul_per_token_group_fp8_quant);
+
+  musa_ops.def(
+      "per_token_group_quant_8bit_vec(Tensor input, Tensor! output_q, "
+      "Tensor! output_s, int group_size, float eps, float min_8bit, "
+      "float max_8bit) -> ()");
+  musa_ops.impl("per_token_group_quant_8bit_vec", torch::kMUSA,
+                &per_token_group_quant_8bit_vec);
   musa_ops.def(
       "musa_top_k_top_p_sampling_from_probs(Tensor probs, Tensor! output, Tensor? maybe_indices, Tensor? "
       "maybe_top_k_arr, "

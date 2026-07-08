@@ -50,6 +50,12 @@ void silu_and_mul_per_token_group_fp8_quant(
     int64_t group_size, double eps, double fp8_min,
     double fp8_max);
 
+void per_token_group_quant_8bit_vec(
+    const torch::Tensor& input,
+    torch::Tensor& output_q, torch::Tensor& output_s,
+    int64_t group_size, double eps, double min_8bit,
+    double max_8bit);
+
 void musa_top_k_top_p_sampling_from_probs(
     at::Tensor probs,
     at::Tensor output,
