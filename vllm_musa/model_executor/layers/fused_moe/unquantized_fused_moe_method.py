@@ -72,6 +72,10 @@ class MusaUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 quant_config=self.moe_quant_config,
             )
 
+    def process_weights_after_loading(self, layer: "FusedMoE") -> None:  # type: ignore[name-defined] # noqa: F821
+        super().process_weights_after_loading(layer)
+        _fold_shared_expert_weights(layer)
+
     def forward_oot(
         self,
         layer: "FusedMoE",  # type: ignore[name-defined] # noqa: F821
@@ -81,10 +85,28 @@ class MusaUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         shared_experts: object | None = None,
         shared_experts_input: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        # Shared experts are passed through the MoE runner, but the legacy
-        # fused_experts() helper only computes routed experts and does not accept
-        # shared_experts kwargs. Return routed output here; the runner computes
-        # and combines shared experts for non-overlapped MUSA paths.
+        # The legacy fused_experts() helper computes routed experts only. When a
+        # Qwen3.5 shared expert has been folded into the expert weights as one
+        # extra always-selected slot, extend the routing by a single column so
+        # the shared expert rides the same grouped GEMM instead of running as a
+        # separate serial MLP. Otherwise the shared expert is combined by the
+        # runner outside this call.
+        if getattr(layer, "_musa_shared_folded", False):
+            # The fold is only installed when the block passes shared_experts=None
+            # to FusedMoE, so the runner never supplies a separate
+            # shared_experts_input here; x is the shared expert's input, matching
+            # the routed experts it now rides with.
+            assert shared_experts_input is None, (
+                "folded shared expert expects shared_experts=None"
+            )
+            shared_logits, _ = layer._musa_shared_gate(x)
+            shared_weight = torch.sigmoid(shared_logits).to(topk_weights.dtype)
+            shared_ids = torch.zeros_like(topk_ids[:, :1]) + layer._musa_shared_expert_id
+            topk_weights = torch.cat([topk_weights, shared_weight], dim=-1)
+            topk_ids = torch.cat([topk_ids, shared_ids], dim=-1)
+            global_num_experts = layer._musa_shared_expert_id + 1
+        else:
+            global_num_experts = layer.global_num_experts
         return fused_experts(
             hidden_states=x,
             w1=layer.w13_weight,
@@ -94,6 +116,42 @@ class MusaUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             activation=layer.activation,
             quant_config=self.moe_quant_config,
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
-            global_num_experts=layer.global_num_experts,
+            global_num_experts=global_num_experts,
             expert_map=layer.expert_map,
         )
+
+
+def _fold_shared_expert_weights(layer: torch.nn.Module) -> None:
+    """Append a Qwen3.5 shared expert to the routed expert weights.
+
+    The MoE block stashes its shared MLP and gate on the routed-experts layer
+    when the shared and routed intermediate sizes match. Here the shared
+    gate_up/down projections are concatenated as one extra expert so a single
+    grouped GEMM covers routed + shared work. Runs once after load, before any
+    graph capture, and replaces the routed weights in place so no full copy of
+    the expert stack is kept alive.
+    """
+    # _musa_shared_mlp is stashed by the block on the same FusedMoE instance whose
+    # quant method runs this hook and forward_oot, so the fold that consumes it
+    # here and the routing extension there see the same layer. Absent it (any
+    # non-folded MoE), this is inert.
+    mlp = getattr(layer, "_musa_shared_mlp", None)
+    if mlp is None or getattr(layer, "_musa_shared_folded", False):
+        return
+    num_routed = layer.w13_weight.shape[0]
+    w13 = torch.cat(
+        [layer.w13_weight.data, mlp.gate_up_proj.weight.data.unsqueeze(0)], dim=0
+    ).contiguous()
+    w2 = torch.cat(
+        [layer.w2_weight.data, mlp.down_proj.weight.data.unsqueeze(0)], dim=0
+    ).contiguous()
+    layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
+    layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
+    layer._musa_shared_expert_id = int(num_routed)
+    layer._musa_shared_folded = True
+    logger.info_once(
+        "MUSA shared-expert fold active: shared expert folded into the routed "
+        "grouped GEMM as slot %d (%d routed + 1 shared).",
+        num_routed,
+        num_routed,
+    )

@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: musa <musa@local>
+Date: Sun, 06 Jul 2026 21:30:00 +0800
+Subject: [PATCH] MUSA(model): fold the Qwen3.5 shared expert into fused_moe
+
+On MUSA the Qwen3.5/Qwen3.6 shared expert runs as a separate serial MLP because
+the shared-expert overlap stream is unavailable, adding per-layer kernels to the
+decode path. When unquantized and the shared and routed intermediate sizes
+match, pass no shared expert to FusedMoE and stash the shared MLP and its gate
+on the routed-experts layer; the MUSA unquantized MoE method then folds the
+shared expert into the routed grouped GEMM as one extra always-selected slot,
+producing numerically equivalent output from a single kernel.
+---
+diff --git a/vllm/model_executor/models/qwen3_next.py b/vllm/model_executor/models/qwen3_next.py
+index acce2a767..b41bdccce 100644
+--- a/vllm/model_executor/models/qwen3_next.py
++++ b/vllm/model_executor/models/qwen3_next.py
+@@ -159,8 +159,18 @@ class Qwen3NextSparseMoeBlock(nn.Module):
+                 prefix=f"{prefix}.shared_expert",
+             )
+ 
++        # MUSA: fold the shared expert into the routed grouped GEMM as one extra
++        # always-selected slot instead of running it as a separate serial MLP.
++        # Only when unquantized and the shared/routed intermediate sizes match.
++        self._musa_shared_fold = (
++            self.shared_expert is not None
++            and quant_config is None
++            and config.shared_expert_intermediate_size == config.moe_intermediate_size
++            and getattr(torch.version, "musa", None) is not None
++        )
++
+         self.experts = FusedMoE(
+-            shared_experts=self.shared_expert,
++            shared_experts=None if self._musa_shared_fold else self.shared_expert,
+             gate=self.gate,
+             num_experts=self.n_routed_experts,
+             top_k=config.num_experts_per_tok,
+@@ -178,6 +188,11 @@ class Qwen3NextSparseMoeBlock(nn.Module):
+             else None,
+         )
+ 
++        if self._musa_shared_fold:
++            routed = getattr(self.experts, "routed_experts", self.experts)
++            routed._musa_shared_mlp = self.shared_expert
++            routed._musa_shared_gate = self.shared_expert_gate
++
+     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         # NOTE: hidden_states can have either 1D or 2D shape.
+         orig_shape = hidden_states.shape
