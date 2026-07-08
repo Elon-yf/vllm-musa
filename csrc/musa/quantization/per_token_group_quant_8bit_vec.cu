@@ -121,6 +121,12 @@ void per_token_group_quant_8bit_vec(const torch::Tensor& input,
                   input.scalar_type() == at::ScalarType::BFloat16,
               "per_token_group_quant_8bit_vec supports bf16/fp16 input.");
   TORCH_CHECK(input.numel() % group_size == 0);
+  TORCH_CHECK(output_s.scalar_type() == at::ScalarType::Float,
+              "per_token_group_quant_8bit_vec requires a float32 output_s.");
+  // The kernel loads each group with a 128-bit vector op, which needs a
+  // 16-byte aligned base; a contiguous view with an odd storage offset is not.
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(input.data_ptr()) % 16 == 0,
+              "per_token_group_quant_8bit_vec requires a 16-byte aligned input.");
 
   const int num_groups = static_cast<int>(input.numel() / group_size);
   if (num_groups == 0) return;

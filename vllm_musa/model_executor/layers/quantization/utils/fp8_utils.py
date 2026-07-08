@@ -111,11 +111,14 @@ def per_token_group_quant_fp8(
         # Register-resident vec kernel for the common group_size==128 bf16/fp16
         # activation-quant path (no shared-memory staging). Column-major and
         # TMA-aligned scale layouts are honored via output_s strides. Other
-        # configs (ue8m0, non-128 groups, fp32 input) use the stable kernel.
+        # configs (ue8m0, non-128 groups, fp32 input) use the stable kernel; so
+        # does a contiguous view whose base is not 16-byte aligned, which the
+        # kernel's 128-bit vector load requires.
         if (
             group_size == 128
             and not use_ue8m0
             and x_kernel.dtype in (torch.bfloat16, torch.float16)
+            and x_kernel.data_ptr() % 16 == 0
         ):
             torch.ops._C_musa_ops.per_token_group_quant_8bit_vec(
                 x_kernel,
