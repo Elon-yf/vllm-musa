@@ -1,5 +1,5 @@
 From d20ed7b5a4be7d48c8ab45c3bc6d817a79bae90d Mon Sep 17 00:00:00 2001
-From: Xiaodong Ye <Squirrelbes@salesperson.net>
+From: musa <musa@local>
 Date: Wed, 8 Jul 2026 16:37:47 +0800
 Subject: [PATCH] MUSA: vllm.v1.worker.gpu_model_runner
 
