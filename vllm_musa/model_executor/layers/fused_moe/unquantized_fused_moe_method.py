@@ -92,6 +92,13 @@ class MusaUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         # separate serial MLP. Otherwise the shared expert is combined by the
         # runner outside this call.
         if getattr(layer, "_musa_shared_folded", False):
+            # The fold is only installed when the block passes shared_experts=None
+            # to FusedMoE, so the runner never supplies a separate
+            # shared_experts_input here; x is the shared expert's input, matching
+            # the routed experts it now rides with.
+            assert shared_experts_input is None, (
+                "folded shared expert expects shared_experts=None"
+            )
             shared_logits, _ = layer._musa_shared_gate(x)
             shared_weight = torch.sigmoid(shared_logits).to(topk_weights.dtype)
             shared_ids = torch.zeros_like(topk_ids[:, :1]) + layer._musa_shared_expert_id
@@ -124,6 +131,10 @@ def _fold_shared_expert_weights(layer: torch.nn.Module) -> None:
     graph capture, and replaces the routed weights in place so no full copy of
     the expert stack is kept alive.
     """
+    # _musa_shared_mlp is stashed by the block on the same FusedMoE instance whose
+    # quant method runs this hook and forward_oot, so the fold that consumes it
+    # here and the routing extension there see the same layer. Absent it (any
+    # non-folded MoE), this is inert.
     mlp = getattr(layer, "_musa_shared_mlp", None)
     if mlp is None or getattr(layer, "_musa_shared_folded", False):
         return
