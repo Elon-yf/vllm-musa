@@ -193,6 +193,7 @@ def _get_backend_priorities(
     if use_mla:
         return [
             AttentionBackendEnum.FLASHMLA,
+            AttentionBackendEnum.FLASHMLA_SPARSE,
             AttentionBackendEnum.TRITON_MLA,
         ]
     else:
@@ -223,6 +224,13 @@ def register_attention_backends() -> None:
     register_backend(
         AttentionBackendEnum.FLASHMLA,
         class_path="vllm_musa.v1.attention.backends.mla.flashmla.MUSAFlashMLABackend",
+    )
+    register_backend(
+        AttentionBackendEnum.FLASHMLA_SPARSE,
+        class_path=(
+            "vllm_musa.v1.attention.backends.mla.flashmla_sparse."
+            "MUSAFlashMLASparseBackend"
+        ),
     )
     register_backend(
         AttentionBackendEnum.FLASH_ATTN,
@@ -633,6 +641,8 @@ class MUSAPlatformBase(Platform):
             or cache_config.user_specified_block_size
             or model_config.is_hybrid
         ):
+            return
+        if _is_deepseek_v4_model(model_config):
             return
         backend_cls = cls._find_non_ssm_backend(vllm_config)
         if backend_cls is None:
