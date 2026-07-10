@@ -479,6 +479,227 @@ class TestMUSAPlatformDefaults:
         assert vllm_config.compilation_config.max_cudagraph_capture_size == 512
         assert vllm_config.compilation_config.cudagraph_capture_sizes == [1, 2, 4, 8]
 
+    def _make_hybrid_spec_config(
+        self,
+        *,
+        method="qwen3_5_mtp",
+        num_speculative_tokens=2,
+        is_hybrid=True,
+        cudagraph_mode=None,
+        use_dflash=None,
+        compilation_mode=None,
+        enable_sp=False,
+        fuse_gemm_comms=False,
+        fuse_attn_quant=False,
+    ):
+        from types import SimpleNamespace
+
+        from vllm.config import CompilationMode
+
+        vllm_config = self._make_vllm_config(cudagraph_mode=cudagraph_mode)
+        vllm_config.model_config.is_hybrid = is_hybrid
+        # The real SpeculativeConfig.use_dflash is a method, so mock it as a
+        # callable (a plain value would not reproduce the always-truthy pitfall).
+        _dflash_flag = use_dflash if use_dflash is not None else (method == "dflash")
+        vllm_config.speculative_config = SimpleNamespace(
+            method=method,
+            num_speculative_tokens=num_speculative_tokens,
+            use_dflash=lambda flag=_dflash_flag: flag,
+        )
+        # The guard reads compilation_config.mode (piecewise needs VLLM_COMPILE)
+        # and clears the full-graph-only fusion flags on pass_config.
+        vllm_config.compilation_config.mode = (
+            CompilationMode.VLLM_COMPILE
+            if compilation_mode is None
+            else compilation_mode
+        )
+        vllm_config.compilation_config.pass_config = SimpleNamespace(
+            enable_sp=enable_sp,
+            fuse_gemm_comms=fuse_gemm_comms,
+            fuse_attn_quant=fuse_attn_quant,
+        )
+        return vllm_config
+
+    def test_hybrid_mtp_full_cudagraph_coerced_to_piecewise(self):
+        from vllm.config import CUDAGraphMode
+
+        from vllm_musa.platform import MUSAPlatformBase
+
+        os.environ.pop("VLLM_MUSA_HYBRID_SPEC_ALLOW_FULL", None)
+        vllm_config = self._make_hybrid_spec_config(
+            method="qwen3_5_mtp",
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        )
+
+        MUSAPlatformBase.check_and_update_config(vllm_config)
+
+        assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE
+
+    def test_hybrid_spec_coercion_is_method_agnostic(self):
+        # An unknown/renamed draft method must still be routed off the corrupt
+        # full-capture verify path.
+        from vllm.config import CUDAGraphMode
+
+        from vllm_musa.platform import MUSAPlatformBase
+
+        os.environ.pop("VLLM_MUSA_HYBRID_SPEC_ALLOW_FULL", None)
+        vllm_config = self._make_hybrid_spec_config(
+            method="some_unrecognized_future_method",
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        )
+
+        MUSAPlatformBase.check_and_update_config(vllm_config)
+
+        assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE
+
+    def test_hybrid_dflash_target_verify_coerced_to_piecewise(self):
+        # dFlash's target verify hits the same corruption and must be coerced too
+        # (the drafter graph is configured separately, earlier in the hook).
+        from vllm.config import CUDAGraphMode
+
+        from vllm_musa.platform import MUSAPlatformBase
+
+        os.environ.pop("VLLM_MUSA_HYBRID_SPEC_ALLOW_FULL", None)
+        os.environ.pop("VLLM_MUSA_DFLASH_FULL_WRAP", None)
+        vllm_config = self._make_hybrid_spec_config(
+            method="dflash",
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        )
+
+        MUSAPlatformBase.check_and_update_config(vllm_config)
+
+        assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE
+
+    def test_hybrid_spec_disables_full_graph_only_fusions(self):
+        # SP / fused-GEMM-comms / attn-quant fusion require full-graph compilation
+        # and set_splitting_ops_for_v1 would re-promote PIECEWISE to FULL; the guard
+        # clears them.
+        from vllm.config import CUDAGraphMode
+
+        from vllm_musa.platform import MUSAPlatformBase
+
+        os.environ.pop("VLLM_MUSA_HYBRID_SPEC_ALLOW_FULL", None)
+        vllm_config = self._make_hybrid_spec_config(
+            method="qwen3_5_mtp",
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+            enable_sp=True,
+            fuse_gemm_comms=True,
+            fuse_attn_quant=True,
+        )
+
+        MUSAPlatformBase.check_and_update_config(vllm_config)
+
+        pc = vllm_config.compilation_config.pass_config
+        assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE
+        assert pc.enable_sp is False
+        assert pc.fuse_gemm_comms is False
+        assert pc.fuse_attn_quant is False
+
+    def test_hybrid_spec_compilation_disabled_coerced_to_none(self):
+        # PIECEWISE requires VLLM_COMPILE; with compilation disabled the guard must
+        # fall back to NONE (PIECEWISE would trip the runtime dispatcher assertion).
+        from vllm.config import CompilationMode, CUDAGraphMode
+
+        from vllm_musa.platform import MUSAPlatformBase
+
+        os.environ.pop("VLLM_MUSA_HYBRID_SPEC_ALLOW_FULL", None)
+        vllm_config = self._make_hybrid_spec_config(
+            method="qwen3_5_mtp",
+            cudagraph_mode=CUDAGraphMode.FULL,
+            compilation_mode=CompilationMode.NONE,
+        )
+
+        MUSAPlatformBase.check_and_update_config(vllm_config)
+
+        assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+
+    def test_non_hybrid_spec_keeps_full_cudagraph(self):
+        from vllm.config import CUDAGraphMode
+
+        from vllm_musa.platform import MUSAPlatformBase
+
+        os.environ.pop("VLLM_MUSA_HYBRID_SPEC_ALLOW_FULL", None)
+        vllm_config = self._make_hybrid_spec_config(
+            method="qwen3_5_mtp",
+            is_hybrid=False,
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        )
+
+        MUSAPlatformBase.check_and_update_config(vllm_config)
+
+        assert (
+            vllm_config.compilation_config.cudagraph_mode
+            == CUDAGraphMode.FULL_AND_PIECEWISE
+        )
+
+    def test_non_spec_hybrid_keeps_full_cudagraph(self):
+        from vllm.config import CUDAGraphMode
+
+        from vllm_musa.platform import MUSAPlatformBase
+
+        os.environ.pop("VLLM_MUSA_HYBRID_SPEC_ALLOW_FULL", None)
+        vllm_config = self._make_vllm_config(
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        )
+        vllm_config.model_config.is_hybrid = True
+
+        MUSAPlatformBase.check_and_update_config(vllm_config)
+
+        assert (
+            vllm_config.compilation_config.cudagraph_mode
+            == CUDAGraphMode.FULL_AND_PIECEWISE
+        )
+
+    def test_hybrid_spec_full_cudagraph_env_override_keeps_full(self):
+        from vllm.config import CUDAGraphMode
+
+        from vllm_musa.platform import MUSAPlatformBase
+
+        vllm_config = self._make_hybrid_spec_config(
+            method="qwen3_5_mtp",
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        )
+
+        with patch.dict(os.environ, {"VLLM_MUSA_HYBRID_SPEC_ALLOW_FULL": "1"}):
+            MUSAPlatformBase.check_and_update_config(vllm_config)
+
+        assert (
+            vllm_config.compilation_config.cudagraph_mode
+            == CUDAGraphMode.FULL_AND_PIECEWISE
+        )
+
+    def test_set_splitting_ops_promotes_piecewise_with_sp(self):
+        # Control (finding 2): confirms the promotion the guard defends against is
+        # real — SP forces a piecewise mode back to FULL in set_splitting_ops_for_v1.
+        from vllm.config import CompilationConfig, CompilationMode, CUDAGraphMode
+
+        cc = CompilationConfig(
+            mode=CompilationMode.VLLM_COMPILE,
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        )
+        cc.pass_config.enable_sp = True
+
+        cc.set_splitting_ops_for_v1(all2all_backend="allgather_reducescatter")
+
+        assert cc.cudagraph_mode == CUDAGraphMode.FULL
+
+    def test_set_splitting_ops_preserves_piecewise_without_fusions(self):
+        # finding 2: with the full-graph-only fusions cleared (what the guard does),
+        # set_splitting_ops_for_v1 must NOT re-promote PIECEWISE to FULL.
+        from vllm.config import CompilationConfig, CompilationMode, CUDAGraphMode
+
+        cc = CompilationConfig(
+            mode=CompilationMode.VLLM_COMPILE,
+            cudagraph_mode=CUDAGraphMode.PIECEWISE,
+        )
+        cc.pass_config.enable_sp = False
+        cc.pass_config.fuse_gemm_comms = False
+        cc.pass_config.fuse_attn_quant = False
+
+        cc.set_splitting_ops_for_v1(all2all_backend="allgather_reducescatter")
+
+        assert cc.cudagraph_mode == CUDAGraphMode.PIECEWISE
+
     def test_deepseek_v4_defaults_moe_gemv_block32x8(self):
         from vllm_musa.platform import MUSAPlatformBase
 

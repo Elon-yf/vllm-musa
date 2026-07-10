@@ -502,6 +502,59 @@ class MUSAPlatformBase(Platform):
                         _block,
                     )
 
+        # MUSA: a full decode CUDAGraph corrupts the multi-query speculative verify
+        # of a hybrid (GatedDeltaNet / Mamba) target. The paged multi-query verify
+        # attention miscomputes when captured inside the full model graph at
+        # query_len = num_speculative_tokens + 1; query_len=1 decode in the same
+        # graph is correct. The defect is method-agnostic, so gate on any
+        # hybrid-model speculative decode, including dFlash's target verify — an
+        # unknown/renamed draft method must not slip back into the corrupt path.
+        #
+        # The verify must run piecewise (eager attention). Sequence parallelism,
+        # fused GEMM comms, and attn-quant fusion require full-graph compilation, so
+        # set_splitting_ops_for_v1() would otherwise promote PIECEWISE back to FULL;
+        # they are disabled here for this case. When compilation is not enabled,
+        # piecewise cudagraphs are unavailable, so fall back to NONE. This avoids the
+        # full-graph corruption and preserves the piecewise result (it does not claim
+        # bit-exactness versus non-spec decode).
+        import os as _spec_os
+
+        if (
+            spec_config is not None
+            and getattr(spec_config, "num_speculative_tokens", 0)
+            and getattr(getattr(vllm_config, "model_config", None), "is_hybrid", False)
+            and _spec_os.environ.get("VLLM_MUSA_HYBRID_SPEC_ALLOW_FULL", "0") != "1"
+        ):
+            _comp = getattr(vllm_config, "compilation_config", None)
+            if _comp is not None:
+                from vllm.config import CompilationMode as _CM
+                from vllm.config import CUDAGraphMode as _CGM
+
+                _cg = getattr(_comp, "cudagraph_mode", None)
+                # None == "not yet defaulted"; the v1 default is FULL_AND_PIECEWISE.
+                if _cg is None or _cg.has_full_cudagraphs():
+                    if getattr(_comp, "mode", None) == _CM.VLLM_COMPILE:
+                        _comp.cudagraph_mode = _CGM.PIECEWISE
+                        _pc = getattr(_comp, "pass_config", None)
+                        if _pc is not None:
+                            for _flag in (
+                                "enable_sp",
+                                "fuse_gemm_comms",
+                                "fuse_attn_quant",
+                            ):
+                                if hasattr(_pc, _flag):
+                                    setattr(_pc, _flag, False)
+                    else:
+                        _comp.cudagraph_mode = _CGM.NONE
+                    logger.warning(
+                        "MUSA: hybrid-model speculative decode corrupts the "
+                        "multi-query verify under a full decode CUDAGraph; setting "
+                        "cudagraph_mode=%s (and disabling SP / fused-GEMM-comms / "
+                        "attn-quant fusion, which would re-promote to FULL). Set "
+                        "VLLM_MUSA_HYBRID_SPEC_ALLOW_FULL=1 to override.",
+                        _comp.cudagraph_mode.name,
+                    )
+
         # FP8 correctness under torch.compile + PIECEWISE CUDAGraph capture: the
         # MUSA RMSNorm / SiluAndMul / per-token-group FP8-quant custom-op kernels
         # (forward_oot) are opaque to Inductor's quant fusion and leave the quant's
