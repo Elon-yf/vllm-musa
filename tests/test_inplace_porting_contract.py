@@ -18,6 +18,13 @@ def test_torchada_floor_is_consistent():
     assert "TORCHADA_REQUIREMENT," in (ROOT / "setup.py").read_text()
 
 
+def test_setup_finds_local_build_helpers_before_importing_them():
+    setup = (ROOT / "setup.py").read_text()
+    assert setup.index("sys.path.insert(0, str(root))") < setup.index(
+        "from build_utils.dependencies import"
+    )
+
+
 def test_stale_torchada_is_upgraded_before_import(monkeypatch):
     observed = []
     versions = iter(["0.1.70", "0.1.71"])

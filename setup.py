@@ -11,6 +11,9 @@ from pathlib import Path
 
 import torch
 
+root = Path(__file__).parent.resolve()
+sys.path.insert(0, str(root))
+
 from build_utils.dependencies import (
     TORCHADA_REQUIREMENT,
     ensure_torchada_installed,
@@ -28,9 +31,6 @@ ensure_torchada_installed()
 
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
-
-root = Path(__file__).parent.resolve()
-sys.path.insert(0, str(root))
 
 from build_utils.ccache import configure_compiler_cache
 

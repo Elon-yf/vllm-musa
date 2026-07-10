@@ -1,1 +1,1 @@
-"""Build-time helpers for vllm-musa setup.py."""
+"""Helpers imported while building vllm-musa from source."""
