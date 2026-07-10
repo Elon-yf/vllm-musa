@@ -25,6 +25,12 @@ def test_setup_finds_local_build_helpers_before_importing_them():
     )
 
 
+def test_archive_vllm_install_uses_upstream_version_override():
+    setup = (ROOT / "setup.py").read_text()
+    assert 'env.setdefault("VLLM_VERSION_OVERRIDE", "0.24.0")' in setup
+    assert "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM" not in setup
+
+
 def test_stale_torchada_is_upgraded_before_import(monkeypatch):
     observed = []
     versions = iter(["0.1.70", "0.1.71"])
