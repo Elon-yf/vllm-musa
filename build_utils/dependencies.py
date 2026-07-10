@@ -9,7 +9,7 @@ from typing import Optional
 
 from packaging.specifiers import SpecifierSet
 
-TORCHADA_MIN_VERSION = "0.1.71"
+TORCHADA_MIN_VERSION = "0.1.70"
 TORCHADA_REQUIREMENT = f"torchada>={TORCHADA_MIN_VERSION}"
 
 

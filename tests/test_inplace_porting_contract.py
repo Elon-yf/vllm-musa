@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 def test_torchada_floor_is_consistent():
     requirement = dependencies.TORCHADA_REQUIREMENT
-    assert requirement == "torchada>=0.1.71"
+    assert requirement == "torchada>=0.1.70"
     assert f'"{requirement}"' in (ROOT / "pyproject.toml").read_text()
     assert "TORCHADA_REQUIREMENT," in (ROOT / "setup.py").read_text()
 
@@ -33,7 +33,7 @@ def test_archive_vllm_install_uses_upstream_version_override():
 
 def test_stale_torchada_is_upgraded_before_import(monkeypatch):
     observed = []
-    versions = iter(["0.1.70", "0.1.71"])
+    versions = iter(["0.1.69", "0.1.70"])
 
     monkeypatch.setattr(
         dependencies, "_installed_version", lambda _name: next(versions)
@@ -53,13 +53,13 @@ def test_stale_torchada_is_upgraded_before_import(monkeypatch):
     dependencies.ensure_torchada_installed()
 
     assert observed == [
-        ("install", "torchada>=0.1.71"),
+        ("install", "torchada>=0.1.70"),
         ("import", "torchada"),
     ]
 
 
 def test_loaded_stale_torchada_fails_before_mixing_versions(monkeypatch):
-    monkeypatch.setattr(dependencies, "_installed_version", lambda _name: "0.1.70")
+    monkeypatch.setattr(dependencies, "_installed_version", lambda _name: "0.1.69")
     monkeypatch.setitem(sys.modules, "torchada", object())
 
     with pytest.raises(RuntimeError, match="restart the build process"):
