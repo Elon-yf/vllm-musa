@@ -10,12 +10,38 @@ checkout.
 
 import importlib.util
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _init_repo(repo: Path, content: str = "alpha\n") -> str:
+    repo.mkdir()
+    subprocess.run(
+        ["git", "init", "--quiet", str(repo)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    _git(repo, "config", "user.email", "musa-sync@example.invalid")
+    _git(repo, "config", "user.name", "musa-sync test")
+    (repo / "value.txt").write_text(content)
+    _git(repo, "add", "value.txt")
+    _git(repo, "commit", "--quiet", "-m", "fixture")
+    return _git(repo, "rev-parse", "HEAD").stdout.strip()
 
 
 @pytest.fixture(scope="module")
@@ -33,8 +59,8 @@ def test_report(ms, capsys):
     rc = ms.main(["report"])
     out = capsys.readouterr().out
     assert rc == 0
-    assert "112 divergences" in out
-    assert "'1': 57" in out and "'2': 19" in out and "'3': 1" in out
+    assert "113 divergences" in out
+    assert "'1': 58" in out and "'2': 19" in out and "'3': 1" in out
     assert "'4a': 2" in out and "'5': 25" in out and "'6': 8" in out
 
 
@@ -57,6 +83,122 @@ def test_probe_upstream(ms, tmp_path):
 def test_read_pin(ms):
     assert ms.read_pin("VLLM_TAG") == "v0.24.0"
     assert ms.read_pin("DOES_NOT_EXIST", "fallback") == "fallback"
+
+
+def test_default_target_prefers_exact_commit(ms, monkeypatch):
+    pins = {"VLLM_COMMIT": "0123456789abcdef", "VLLM_TAG": "v0.24.0"}
+    monkeypatch.setattr(
+        ms, "read_pin", lambda key, default=None: pins.get(key, default)
+    )
+    assert ms._default_target() == "0123456789abcdef"
+
+    pins.pop("VLLM_COMMIT")
+    assert ms._default_target() == "v0.24.0"
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git unavailable")
+def test_ensure_clone_accepts_exact_commit_sha(ms, tmp_path, monkeypatch):
+    origin = tmp_path / "origin"
+    first = _init_repo(origin)
+    (origin / "value.txt").write_text("second\n")
+    _git(origin, "commit", "--all", "--quiet", "-m", "second")
+    latest = _git(origin, "rev-parse", "HEAD").stdout.strip()
+    assert first != latest
+
+    monkeypatch.setattr(ms, "VLLM_URL", str(origin))
+    clone, temporary = ms._ensure_clone(first, None)
+    try:
+        assert temporary
+        assert _git(clone, "rev-parse", "HEAD").stdout.strip() == first
+        assert (clone / "value.txt").read_text() == "alpha\n"
+        assert _git(origin, "rev-parse", "HEAD").stdout.strip() == latest
+    finally:
+        shutil.rmtree(clone.parent, ignore_errors=True)
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git unavailable")
+def test_checkout_fetches_exact_commit_sha(ms, tmp_path, monkeypatch):
+    origin = tmp_path / "origin"
+    first = _init_repo(origin)
+    (origin / "value.txt").write_text("second\n")
+    _git(origin, "commit", "--all", "--quiet", "-m", "second")
+    latest = _git(origin, "rev-parse", "HEAD").stdout.strip()
+
+    workdir = tmp_path / "checkout"
+    monkeypatch.setattr(ms, "VLLM_URL", str(origin))
+    monkeypatch.setattr(ms, "WORKDIR", workdir)
+    assert ms._checkout(first) == 0
+    assert _git(workdir, "rev-parse", "HEAD").stdout.strip() == first
+    assert ms._checkout(latest) == 0
+    assert _git(workdir, "rev-parse", "HEAD").stdout.strip() == latest
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git unavailable")
+def test_verify_rows_applies_dependent_patches_cumulatively_without_mutating_repo(
+    ms, tmp_path, monkeypatch
+):
+    repo = tmp_path / "upstream"
+    _init_repo(repo)
+    project = tmp_path / "project"
+    patch_dir = project / "patches"
+    patch_dir.mkdir(parents=True)
+    first = patch_dir / "0001-add-beta.patch"
+    first.write_text(
+        """diff --git a/value.txt b/value.txt
+--- a/value.txt
++++ b/value.txt
+@@ -1 +1,2 @@
+ alpha
++beta
+"""
+    )
+    second = patch_dir / "0002-rewrite-beta.patch"
+    second.write_text(
+        """diff --git a/value.txt b/value.txt
+--- a/value.txt
++++ b/value.txt
+@@ -1,2 +1,2 @@
+ alpha
+-beta
++gamma
+"""
+    )
+    conflict = patch_dir / "0003-conflict.patch"
+    conflict.write_text(
+        """diff --git a/value.txt b/value.txt
+--- a/value.txt
++++ b/value.txt
+@@ -1 +1 @@
+-not-present
++still-not-present
+"""
+    )
+
+    entries = [
+        ms.manifest.DivSpec(
+            id=patch.stem,
+            category="1",
+            path=str(patch.relative_to(project)),
+            upstream_path="value.txt",
+        )
+        for patch in (first, second, conflict)
+    ]
+    monkeypatch.setattr(ms, "ROOT", project)
+    monkeypatch.setattr(ms.manifest, "ENTRIES", entries)
+
+    # The second patch cannot apply to pristine upstream; it only becomes valid
+    # after the first patch advances the disposable verification checkout.
+    assert ms.build_apply.apply_patch(repo, second, check_only=True) == "conflict"
+    before_status = _git(repo, "status", "--porcelain=v1").stdout
+    rows = ms._verify_rows(repo)
+
+    assert [(row[0], row[2]) for row in rows] == [
+        ("0001-add-beta", "clean"),
+        ("0002-rewrite-beta", "clean"),
+        ("0003-conflict", "conflict"),
+    ]
+    assert (repo / "value.txt").read_text() == "alpha\n"
+    assert _git(repo, "status", "--porcelain=v1").stdout == before_status
 
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="git unavailable")

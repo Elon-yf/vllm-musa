@@ -29,7 +29,7 @@ is fine for running but not for `regen`.
 
 | Path | Role |
 |---|---|
-| `third_party/PINS` | **single source of truth** for the upstream pins (`VLLM_TAG`, `FLASHINFER_COMMIT`); read by both `setup.py` and `Makefile.sync` so they can't desync |
+| `third_party/PINS` | **single source of truth** for upstream pins (`VLLM_TAG`, immutable `VLLM_COMMIT`, `FLASHINFER_COMMIT`); read by the build and sync tools so they can't desync |
 | `third_party/vllm` | the cloned upstream vLLM (gitignored); build + maintenance workspace |
 | `vllm_musa/patches/series/*.patch` | the build-time patch series (cat 1/2/3/4b), `git format-patch` output |
 | `vllm_musa/patches/manifest.py` | declarative census of every divergence (id, category, path, phase) |
@@ -54,7 +54,8 @@ pip install -e . --no-build-isolation -v
 pip install . --no-build-isolation -v
 ```
 
-Both run `setup.py`, which clones upstream vLLM at `third_party/PINS:VLLM_TAG` into
+Both run `setup.py`, which clones upstream vLLM at the immutable
+`third_party/PINS:VLLM_COMMIT` into
 `third_party/vllm`, `git apply`s the series, builds the MUSA extensions
 (`vllm._C`, `vllm._moe_C`, `vllm_musa._C`) from the patched csrc, and installs vLLM.
 
@@ -104,14 +105,14 @@ commits first:
 ```bash
 # 1. fresh pinned clone with the series replayed as commits (git am -3):
 make -f Makefile.sync clean apply-patches
-#    (under the hood: python tools/musa_sync.py rebase $VLLM_TAG)
+#    (under the hood: python tools/musa_sync.py rebase $VLLM_COMMIT)
 
 # 2. make your change in the clone and commit it:
 $EDITOR third_party/vllm/vllm/<file>.py
 git -C third_party/vllm add -A
 git -C third_party/vllm commit -m "MUSA(<category>): <what/why>"   # new divergence = new commit
 #    to MODIFY an existing divergence, edit its commit instead:
-#    git -C third_party/vllm rebase -i $VLLM_TAG    # mark the patch 'edit', amend, continue
+#    git -C third_party/vllm rebase -i $VLLM_COMMIT # mark the patch 'edit', amend, continue
 
 # 3. regenerate the series from the commits:
 make -f Makefile.sync format-patches
@@ -129,7 +130,7 @@ Then `pip install -e .` to run with the updated series.
 
 ```bash
 # 1. bump the pin (single source of truth):
-$EDITOR third_party/PINS                 # set VLLM_TAG=<new-tag>
+$EDITOR third_party/PINS                 # set VLLM_TAG + immutable VLLM_COMMIT
 
 # 2. replay the series onto the new tag (true 3-way merge):
 make -f Makefile.sync clean apply-patches
@@ -153,7 +154,7 @@ tools/musa_verify/verify.sh              # on-hardware model smokes (see §6)
 cat-5/6 (new modules + object patches) need no rebase — `verify` existence-probes
 their seams. cat-4a drift tripwires are regenerated separately (`musa_sync regen`,
 `module` area) and flagged by `verify` if the upstream original drifted. Bump
-`FLASHINFER_COMMIT` only deliberately — it's decoupled from `VLLM_TAG` on purpose
+`FLASHINFER_COMMIT` only deliberately — it is decoupled from the vLLM pins on purpose
 (upstream's choice breaks the MUSA csrc build path).
 
 ## 6. Verify
@@ -179,7 +180,7 @@ their seams. cat-4a drift tripwires are regenerated separately (`musa_sync regen
 | `regen` | regenerate `series/` from the clone's commits (`git format-patch`) |
 | `report` | print the manifest census |
 
-`make -f Makefile.sync <target>` (thin wrapper, reads `VLLM_TAG` from `third_party/PINS`):
+`make -f Makefile.sync <target>` (thin wrapper, prefers `VLLM_COMMIT` from `third_party/PINS`):
 
 | target | what it does |
 |---|---|

@@ -14,7 +14,7 @@
 #   make -f Makefile.sync apply-patches       # git am -3 the series onto it
 #   make -f Makefile.sync format-patches      # regenerate the series from commits
 #   make -f Makefile.sync clean apply-patches # fresh re-apply
-#   # version bump: edit VLLM_TAG in third_party/PINS, then:
+#   # version bump: edit VLLM_TAG + VLLM_COMMIT in third_party/PINS, then:
 #   make -f Makefile.sync clean apply-patches # resolve conflicts via `git am --continue`
 #   make -f Makefile.sync format-patches      # rewrite series onto the new base
 
@@ -22,6 +22,8 @@ UPSTREAM := https://github.com/vllm-project/vllm.git
 # Pinned upstream vLLM ref — single source of truth in third_party/PINS, read by
 # BOTH this Makefile and setup.py, so they cannot desync on a bump.
 VLLM_TAG := $(shell sed -n 's/^VLLM_TAG=//p' third_party/PINS)
+VLLM_COMMIT := $(shell sed -n 's/^VLLM_COMMIT=//p' third_party/PINS)
+VLLM_REF := $(if $(VLLM_COMMIT),$(VLLM_COMMIT),$(VLLM_TAG))
 WORKDIR := third_party/vllm
 PATCHES_DIR := vllm_musa/patches/series
 
@@ -33,20 +35,20 @@ PATCHED := $(join $(dir $(PATCHES)),$(addsuffix ed,$(addprefix .,$(notdir $(PATC
 .PHONY: checkout apply-patches format-patches clean help
 
 help:
-	@echo "checkout | apply-patches | format-patches | clean   (pin: VLLM_TAG=$(VLLM_TAG) from third_party/PINS)"
+	@echo "checkout | apply-patches | format-patches | clean   (pin: $(VLLM_REF) from third_party/PINS)"
 
 # --- fresh pinned checkout of upstream vLLM (a real git repo: 3-way works) ---
 $(WORKDIR):
 	git clone $(UPSTREAM) $(WORKDIR)
 
 checkout: $(WORKDIR)
-	git -C $(WORKDIR) fetch --tags
-	git -C $(WORKDIR) checkout -f $(VLLM_TAG)
+	git -C $(WORKDIR) fetch origin $(VLLM_REF)
+	git -C $(WORKDIR) checkout -f --detach FETCH_HEAD
 
 # --- replay the series as commits via `git am -3` (delegated to
 #     musa_sync — ONE git code path, manifest-ordered, true 3-way per patch) ---
 apply-patches:
-	python3 tools/musa_sync.py rebase $(VLLM_TAG)
+	python3 tools/musa_sync.py rebase $(VLLM_REF)
 
 # --- regenerate the series FROM the commits (delegated to musa_sync;
 #     --no-signature --no-numbered --zero-commit, KEEP blob index lines for 3-way) ---

@@ -214,7 +214,4 @@ __marimo__/
 # can re-include a file under the otherwise-ignored directory.
 third_party/*
 !third_party/PINS
-# Generated source files by torchada
-csrc_musa/
-csrc/**/*_musa/
 vllm/
