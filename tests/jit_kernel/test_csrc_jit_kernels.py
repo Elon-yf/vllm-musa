@@ -201,6 +201,7 @@ def test_qwen36_gemma_fused_policy_is_model_and_decode_safe() -> None:
     assert policy(5120, make_config(model_type="gemma3_text")) is None
     assert policy(5120, make_config(quantization="fp8")) is None
     assert policy(5120, make_config(tp_size=4)) is None
+    assert policy(5120, SimpleNamespace()) is None
 
 
 def _topk_softmax_ref(

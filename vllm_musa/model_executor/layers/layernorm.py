@@ -3,7 +3,7 @@
 
 import torch
 import torch.nn as nn
-from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config import VllmConfig, get_current_vllm_config_or_none
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
 
 try:
@@ -76,23 +76,35 @@ def _qwen3_5_dense_fused_add_rmsnorm_min_rows(
     gate, and keep every possible decode-only batch on the functional path.
     """
     if vllm_config is None:
-        vllm_config = get_current_vllm_config()
+        vllm_config = get_current_vllm_config_or_none()
+    if vllm_config is None:
+        return None
 
-    model_config = vllm_config.model_config
-    text_config = model_config.hf_text_config
+    model_config = getattr(vllm_config, "model_config", None)
+    text_config = getattr(model_config, "hf_text_config", None)
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    scheduler_config = getattr(vllm_config, "scheduler_config", None)
+    max_num_seqs = getattr(scheduler_config, "max_num_seqs", None)
     if (
         getattr(text_config, "model_type", None) != "qwen3_5_text"
         or hidden_size != 5120
         or getattr(model_config, "quantization", None) is not None
-        or vllm_config.parallel_config.tensor_parallel_size != 8
+        or getattr(parallel_config, "tensor_parallel_size", None) != 8
+        or not isinstance(max_num_seqs, int)
+        or max_num_seqs <= 0
     ):
         return None
 
     max_decode_query_len = 1
-    speculative_config = vllm_config.speculative_config
+    speculative_config = getattr(vllm_config, "speculative_config", None)
     if speculative_config is not None:
-        max_decode_query_len += int(speculative_config.num_speculative_tokens or 0)
-    max_decode_rows = vllm_config.scheduler_config.max_num_seqs * max_decode_query_len
+        num_speculative_tokens = getattr(
+            speculative_config, "num_speculative_tokens", None
+        )
+        if not isinstance(num_speculative_tokens, int) or num_speculative_tokens < 0:
+            return None
+        max_decode_query_len += num_speculative_tokens
+    max_decode_rows = max_num_seqs * max_decode_query_len
     return max_decode_rows + 64
 
 
