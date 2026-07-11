@@ -24,6 +24,35 @@ __version__ = "0.1.24"
 
 logger = logging.getLogger(__name__)
 
+
+def _register_musa_environment_variables() -> None:
+    """Make graph-affecting MUSA flags part of vLLM's compile-cache key."""
+    import os
+
+    import vllm.envs as vllm_envs
+
+    from vllm_musa.utils.environ import envs as musa_envs
+
+    graph_flags = {
+        "VLLM_MUSA_CUSTOM_OP_USE_NATIVE": (
+            musa_envs.VLLM_MUSA_CUSTOM_OP_USE_NATIVE.get
+        ),
+        "VLLM_MUSA_FUSED_ADD_RMSNORM": (
+            musa_envs.VLLM_MUSA_FUSED_ADD_RMSNORM.get
+        ),
+        "VLLM_MUSA_GEMMA_FUSED_ADD_RMSNORM": (
+            musa_envs.VLLM_MUSA_GEMMA_FUSED_ADD_RMSNORM.get
+        ),
+        # The installed vLLM patch treats exactly "1" as enabled. Keep the
+        # cache factor parser identical to that runtime branch.
+        "VLLM_MUSA_SPEC_DECODE_RANDOM_FALLBACK": (
+            lambda: os.getenv("VLLM_MUSA_SPEC_DECODE_RANDOM_FALLBACK", "1")
+            == "1"
+        ),
+    }
+    for name, getter in graph_flags.items():
+        vllm_envs.environment_variables.setdefault(name, getter)
+
 # Import torchada early to ensure torch.device patching happens before
 # any torch.device("cuda:X") calls in vLLM. This is critical for MUSA
 # to work correctly - it patches torch.cuda to redirect to MUSA.
@@ -142,8 +171,10 @@ def _register_patches() -> None:
 
 def _register_ops() -> None:
     """Register OOT custom ops (activation, layernorm, fused_moe, etc.)."""
+    # isort: off
     import vllm_musa.model_executor  # noqa: F401
     import vllm_musa.jit_kernel.csrc.moe as _moe  # noqa: F401
+    # isort: on
 
     _moe.prewarm()
 
@@ -164,6 +195,7 @@ def register_custom_ops() -> None:
     It applies the runtime object patches and registers all MUSA-specific ops,
     distributed connectors, and attention backends.
     """
+    _register_musa_environment_variables()
     _register_patches()
     _register_ops()
     _register_modules()

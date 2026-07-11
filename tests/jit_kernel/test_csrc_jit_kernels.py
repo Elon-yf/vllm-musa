@@ -57,6 +57,23 @@ def _rmsnorm_ref(
     return (normalized * scale_weight).to(x.dtype)
 
 
+def _fused_add_rmsnorm_ref(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    *,
+    gemma: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    residual_fp32 = x.float() + residual.float()
+    residual_out = residual_fp32.to(x.dtype)
+    scale_weight = weight.float() + (1.0 if gemma else 0.0)
+    normalized = residual_fp32 * torch.rsqrt(
+        residual_fp32.pow(2).mean(dim=-1, keepdim=True) + eps
+    )
+    return (normalized * scale_weight).to(x.dtype), residual_out
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_csrc_rmsnorm_kernels_match_reference(dtype: torch.dtype) -> None:
     from vllm_musa.jit_kernel.csrc.norm import (
@@ -75,6 +92,63 @@ def test_csrc_rmsnorm_kernels_match_reference(dtype: torch.dtype) -> None:
         gemma_rmsnorm(x, weight, eps),
         _rmsnorm_ref(x, weight, eps, gemma=True),
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("gemma", [False, True])
+@pytest.mark.parametrize("shape", [(1, 2048), (17, 2048), (100, 5120)])
+def test_csrc_fused_add_rmsnorm_matches_fp32_sum_reference(
+    dtype: torch.dtype,
+    gemma: bool,
+    shape: tuple[int, int],
+) -> None:
+    from vllm_musa.jit_kernel.csrc.norm import fused_add_rmsnorm
+
+    torch.manual_seed(321)
+    device = torch.device("musa")
+    eps = 1e-6
+    x = torch.randn(shape, device=device, dtype=dtype)
+    residual = torch.randn(shape, device=device, dtype=dtype)
+    weight = torch.randn((shape[-1],), device=device, dtype=dtype)
+    expected, expected_residual = _fused_add_rmsnorm_ref(
+        x, residual, weight, eps, gemma=gemma
+    )
+
+    output, residual_out = fused_add_rmsnorm(
+        x, residual, weight, eps, gemma=gemma
+    )
+
+    assert output.data_ptr() == x.data_ptr()
+    assert residual_out.data_ptr() == residual.data_ptr()
+    _assert_close(output, expected)
+    _assert_close(residual_out, expected_residual, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.parametrize(
+    ("rows", "hidden", "expected"),
+    [
+        (1, 2048, False),
+        (1, 5120, False),
+        (63, 5120, False),
+        (64, 5120, True),
+        (0, 5120, False),
+    ],
+)
+def test_gemma_fused_add_rmsnorm_dispatch_is_dense_only(
+    rows: int,
+    hidden: int,
+    expected: bool,
+) -> None:
+    from vllm_musa.model_executor.layers.layernorm import (
+        _can_use_musa_jit_fused_add_rmsnorm,
+    )
+
+    device = torch.device("musa")
+    x = torch.empty((rows, hidden), device=device, dtype=torch.bfloat16)
+    residual = torch.empty_like(x)
+    weight = torch.empty((hidden,), device=device, dtype=torch.bfloat16)
+
+    assert _can_use_musa_jit_fused_add_rmsnorm(x, residual, weight) is expected
 
 
 def _topk_softmax_ref(
