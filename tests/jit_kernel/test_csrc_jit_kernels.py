@@ -114,9 +114,7 @@ def test_csrc_fused_add_rmsnorm_matches_fp32_sum_reference(
         x, residual, weight, eps, gemma=gemma
     )
 
-    output, residual_out = fused_add_rmsnorm(
-        x, residual, weight, eps, gemma=gemma
-    )
+    output, residual_out = fused_add_rmsnorm(x, residual, weight, eps, gemma=gemma)
 
     assert output.data_ptr() == x.data_ptr()
     assert residual_out.data_ptr() == residual.data_ptr()
@@ -125,18 +123,20 @@ def test_csrc_fused_add_rmsnorm_matches_fp32_sum_reference(
 
 
 @pytest.mark.parametrize(
-    ("rows", "hidden", "expected"),
+    ("rows", "hidden", "dtype", "expected"),
     [
-        (1, 2048, False),
-        (1, 5120, False),
-        (63, 5120, False),
-        (64, 5120, True),
-        (0, 5120, False),
+        (1, 2048, torch.bfloat16, False),
+        (1, 5120, torch.bfloat16, False),
+        (63, 5120, torch.bfloat16, False),
+        (64, 5120, torch.bfloat16, True),
+        (0, 5120, torch.bfloat16, False),
+        (64, 5120, torch.float16, False),
     ],
 )
 def test_gemma_fused_add_rmsnorm_dispatch_is_dense_only(
     rows: int,
     hidden: int,
+    dtype: torch.dtype,
     expected: bool,
 ) -> None:
     from vllm_musa.model_executor.layers.layernorm import (
@@ -144,9 +144,9 @@ def test_gemma_fused_add_rmsnorm_dispatch_is_dense_only(
     )
 
     device = torch.device("musa")
-    x = torch.empty((rows, hidden), device=device, dtype=torch.bfloat16)
+    x = torch.empty((rows, hidden), device=device, dtype=dtype)
     residual = torch.empty_like(x)
-    weight = torch.empty((hidden,), device=device, dtype=torch.bfloat16)
+    weight = torch.empty((hidden,), device=device, dtype=dtype)
 
     assert _can_use_musa_jit_fused_add_rmsnorm(x, residual, weight) is expected
 

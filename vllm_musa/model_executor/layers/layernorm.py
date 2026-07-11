@@ -87,7 +87,9 @@ def _can_use_musa_jit_fused_add_rmsnorm(
         # H2048 regresses Qwen3.6-MoE E2E despite winning standalone. Keep
         # this path scoped to the measured dense-model width.
         and hidden_size == 5120
-        and x.dtype in (torch.float16, torch.bfloat16)
+        # The Qwen3.6 E2E gate was run in BF16. Keep FP16 available through
+        # the low-level kernel, but do not auto-dispatch it without an E2E A/B.
+        and x.dtype == torch.bfloat16
         and residual.dtype == x.dtype
         and weight.dtype == x.dtype
         and x.is_contiguous()
@@ -153,10 +155,7 @@ class MusaGemmaRMSNorm(GemmaRMSNorm):
 
         weight = self.weight.data
         if residual is not None:
-            if (
-                envs.VLLM_MUSA_GEMMA_FUSED_ADD_RMSNORM.get()
-                and _can_use_musa_jit_fused_add_rmsnorm(x, residual, weight)
-            ):
+            if _can_use_musa_jit_fused_add_rmsnorm(x, residual, weight):
                 return musa_jit_norm.fused_add_rmsnorm(
                     x,
                     residual,
