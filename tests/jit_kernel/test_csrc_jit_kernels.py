@@ -123,20 +123,24 @@ def test_csrc_fused_add_rmsnorm_matches_fp32_sum_reference(
 
 
 @pytest.mark.parametrize(
-    ("rows", "hidden", "dtype", "expected"),
+    ("rows", "hidden", "dtype", "min_rows", "expected"),
     [
-        (1, 2048, torch.bfloat16, False),
-        (1, 5120, torch.bfloat16, False),
-        (63, 5120, torch.bfloat16, False),
-        (64, 5120, torch.bfloat16, True),
-        (0, 5120, torch.bfloat16, False),
-        (64, 5120, torch.float16, False),
+        (1, 2048, torch.bfloat16, 64, False),
+        (1, 5120, torch.bfloat16, 64, False),
+        (67, 5120, torch.bfloat16, 68, False),
+        (68, 5120, torch.bfloat16, 68, True),
+        (319, 5120, torch.bfloat16, 320, False),
+        (320, 5120, torch.bfloat16, 320, True),
+        (64, 5120, torch.bfloat16, None, False),
+        (0, 5120, torch.bfloat16, 64, False),
+        (64, 5120, torch.float16, 64, False),
     ],
 )
 def test_gemma_fused_add_rmsnorm_dispatch_is_dense_only(
     rows: int,
     hidden: int,
     dtype: torch.dtype,
+    min_rows: int | None,
     expected: bool,
 ) -> None:
     from vllm_musa.model_executor.layers.layernorm import (
@@ -148,7 +152,55 @@ def test_gemma_fused_add_rmsnorm_dispatch_is_dense_only(
     residual = torch.empty_like(x)
     weight = torch.empty((hidden,), device=device, dtype=dtype)
 
-    assert _can_use_musa_jit_fused_add_rmsnorm(x, residual, weight) is expected
+    assert (
+        _can_use_musa_jit_fused_add_rmsnorm(x, residual, weight, min_rows) is expected
+    )
+
+
+def test_qwen36_gemma_fused_policy_is_model_and_decode_safe() -> None:
+    from types import SimpleNamespace
+
+    from vllm_musa.model_executor.layers.layernorm import (
+        _qwen3_5_dense_fused_add_rmsnorm_min_rows,
+    )
+
+    def make_config(
+        *,
+        model_type: str = "qwen3_5_text",
+        quantization: str | None = None,
+        tp_size: int = 8,
+        max_num_seqs: int = 4,
+        num_speculative_tokens: int | None = None,
+    ) -> SimpleNamespace:
+        speculative_config = (
+            None
+            if num_speculative_tokens is None
+            else SimpleNamespace(num_speculative_tokens=num_speculative_tokens)
+        )
+        return SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_text_config=SimpleNamespace(model_type=model_type),
+                quantization=quantization,
+            ),
+            parallel_config=SimpleNamespace(tensor_parallel_size=tp_size),
+            scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+            speculative_config=speculative_config,
+        )
+
+    policy = _qwen3_5_dense_fused_add_rmsnorm_min_rows
+    assert policy(5120, make_config()) == 68
+    assert policy(5120, make_config(max_num_seqs=256)) == 320
+    assert (
+        policy(
+            5120,
+            make_config(max_num_seqs=256, num_speculative_tokens=2),
+        )
+        == 832
+    )
+    assert policy(2048, make_config()) is None
+    assert policy(5120, make_config(model_type="gemma3_text")) is None
+    assert policy(5120, make_config(quantization="fp8")) is None
+    assert policy(5120, make_config(tp_size=4)) is None
 
 
 def _topk_softmax_ref(
