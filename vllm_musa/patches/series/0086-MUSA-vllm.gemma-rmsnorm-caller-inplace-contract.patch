@@ -14,6 +14,7 @@ can use an in-place implementation safely.
  3 files changed, 17 insertions(+), 5 deletions(-)
 
 diff --git a/vllm/model_executor/layers/layernorm.py b/vllm/model_executor/layers/layernorm.py
+index 8418245b8..c5bbb5f6f 100644
 --- a/vllm/model_executor/layers/layernorm.py
 +++ b/vllm/model_executor/layers/layernorm.py
 @@ -140,10 +140,13 @@ class GemmaRMSNorm(CustomOp):
@@ -45,6 +46,7 @@ diff --git a/vllm/model_executor/layers/layernorm.py b/vllm/model_executor/layer
      def forward_cuda(
          self,
 diff --git a/vllm/model_executor/models/qwen3_5.py b/vllm/model_executor/models/qwen3_5.py
+index 43b900463..ba98a0395 100644
 --- a/vllm/model_executor/models/qwen3_5.py
 +++ b/vllm/model_executor/models/qwen3_5.py
 @@ -174,10 +174,10 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
@@ -72,6 +74,7 @@ diff --git a/vllm/model_executor/models/qwen3_5.py b/vllm/model_executor/models/
              self.norm = PPMissingLayer()
  
 diff --git a/vllm/model_executor/models/qwen3_5_mtp.py b/vllm/model_executor/models/qwen3_5_mtp.py
+index 021462f3e..8ad910396 100644
 --- a/vllm/model_executor/models/qwen3_5_mtp.py
 +++ b/vllm/model_executor/models/qwen3_5_mtp.py
 @@ -111,7 +111,9 @@ class Qwen3_5MultiTokenPredictor(Qwen3NextMultiTokenPredictor):
