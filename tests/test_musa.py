@@ -152,7 +152,7 @@ class TestMUSAPlatformBase:
         assert _configure_fused_add_rmsnorm_compile_range(
             config, native_custom_ops=False
         )
-        assert sorted(config.compilation_config.compile_ranges_endpoints) == [63, 2048]
+        assert config.compilation_config.compile_ranges_endpoints == [63, 2048]
         assert not _configure_fused_add_rmsnorm_compile_range(
             config, native_custom_ops=False
         )

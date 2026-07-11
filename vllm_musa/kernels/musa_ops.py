@@ -95,6 +95,14 @@ def _fused_add_rms_norm_supports_args(
 ) -> bool:
     del epsilon
 
+    if (
+        weight is None
+        or x.dim() != 2
+        or x_residual.dim() != 2
+        or weight.dim() != 1
+    ):
+        return False
+
     # IR lowering selects one provider for an entire vLLM compile range. Do not
     # inspect a symbolic tensor's example-value hint here: vLLM deliberately
     # drops shape guards, so that choice would also be reused below the measured
@@ -110,13 +118,9 @@ def _fused_add_rms_norm_supports_args(
 
     return (
         variance_size is None
-        and weight is not None
         and x.device.type == "musa"
         and x_residual.device.type == "musa"
         and weight.device.type == "musa"
-        and x.dim() == 2
-        and x_residual.dim() == 2
-        and weight.dim() == 1
         and x.shape == x_residual.shape
         and profitable_rows
         and x.shape[1] == 5120
@@ -138,17 +142,21 @@ def _legacy_fused_add_rms_norm_supports_args(
     variance_size: int | None = None,
 ) -> bool:
     del epsilon
-    hidden_size = x.shape[-1]
+    if (
+        weight is None
+        or x.dim() != 2
+        or x_residual.dim() != 2
+        or weight.dim() != 1
+    ):
+        return False
+
+    hidden_size = x.shape[1]
     return (
         envs.VLLM_MUSA_FUSED_ADD_RMSNORM.get()
         and variance_size is None
-        and weight is not None
         and x.device.type == "musa"
         and x_residual.device.type == "musa"
         and weight.device.type == "musa"
-        and x.dim() == 2
-        and x_residual.dim() == 2
-        and weight.dim() == 1
         and x.shape == x_residual.shape
         and hidden_size == weight.numel()
         and hidden_size % 8 == 0

@@ -282,7 +282,7 @@ def _will_capture_piecewise_cudagraph(vllm_config: Any) -> bool:
 
 
 def _should_route_quantized_piecewise_ops_native(vllm_config: Any) -> bool:
-    """Whether the FP8 PIECEWISE correctness route applies to this model."""
+    """Whether the quantized PIECEWISE correctness route applies to this model."""
     return (
         getattr(vllm_config, "quant_config", None) is not None
         and _will_capture_piecewise_cudagraph(vllm_config)
@@ -325,8 +325,7 @@ def _configure_fused_add_rmsnorm_compile_range(
     endpoints = list(comp.compile_ranges_endpoints or [])
     if 63 in endpoints:
         return False
-    endpoints.append(63)
-    comp.compile_ranges_endpoints = endpoints
+    comp.compile_ranges_endpoints = sorted([*endpoints, 63])
     return True
 
 

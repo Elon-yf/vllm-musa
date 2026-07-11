@@ -190,9 +190,11 @@ def test_ir_fused_add_rmsnorm_dispatch_rejects_unsafe_inputs() -> None:
 
     device = torch.device("musa")
     weight = torch.empty((5120,), device=device, dtype=torch.bfloat16)
+    scalar = torch.empty((), device=device, dtype=torch.bfloat16)
     noncontiguous = torch.empty((5120, 64), device=device, dtype=torch.bfloat16).t()
     contiguous = torch.empty((64, 5120), device=device, dtype=torch.bfloat16)
 
+    assert not _fused_add_rms_norm_supports_args(scalar, scalar, weight, 1e-6)
     assert not _fused_add_rms_norm_supports_args(
         noncontiguous, noncontiguous, weight, 1e-6
     )
@@ -217,6 +219,10 @@ def test_ir_fused_add_rmsnorm_legacy_fallback_preserves_broad_shapes() -> None:
     residual = torch.empty_like(x)
     weight = torch.empty((5376,), device=device, dtype=torch.bfloat16)
 
+    scalar = torch.empty((), device=device, dtype=torch.bfloat16)
+    assert not _legacy_fused_add_rms_norm_supports_args(
+        scalar, scalar, weight, 1e-6
+    )
     assert not _fused_add_rms_norm_supports_args(x, residual, weight, 1e-6)
     assert _legacy_fused_add_rms_norm_supports_args(
         x, residual, weight, 1e-6
