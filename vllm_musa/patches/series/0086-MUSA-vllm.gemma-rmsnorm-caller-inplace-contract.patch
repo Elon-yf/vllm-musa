@@ -1,0 +1,89 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xiaodong Ye <yexiaodong60@mthreads.com>
+Date: Sat, 11 Jul 2026 13:30:00 +0800
+Subject: [PATCH] MUSA: let Qwen donate Gemma RMSNorm residual inputs
+
+Keep Gemma RMSNorm functional by default, but let audited callers explicitly
+declare that the residual inputs may be consumed in place. Qwen3.5/Qwen3.6
+decoder layers always replace both returned tensors, so their residual norms
+can use an in-place implementation safely.
+---
+ vllm/model_executor/layers/layernorm.py   | 10 +++++++++-
+ vllm/model_executor/models/qwen3_5.py     | 8 +++++---
+ vllm/model_executor/models/qwen3_5_mtp.py | 4 +++-
+ 3 files changed, 17 insertions(+), 5 deletions(-)
+
+diff --git a/vllm/model_executor/layers/layernorm.py b/vllm/model_executor/layers/layernorm.py
+--- a/vllm/model_executor/layers/layernorm.py
++++ b/vllm/model_executor/layers/layernorm.py
+@@ -140,10 +140,13 @@ class GemmaRMSNorm(CustomOp):
+         self,
+         hidden_size: int,
+         eps: float = 1e-6,
++        *,
++        allow_inplace: bool = False,
+     ) -> None:
+         super().__init__()
+         self.weight = nn.Parameter(torch.zeros(hidden_size))
+         self.variance_epsilon = eps
++        self.allow_inplace = allow_inplace
+ 
+     def forward_native(
+         self,
+@@ -154,7 +156,12 @@ class GemmaRMSNorm(CustomOp):
+         weight = self.weight.float() + 1.0
+         if residual is None:
+             return ir.ops.rms_norm(x, weight, self.variance_epsilon)
+-        return ir.ops.fused_add_rms_norm(x, residual, weight, self.variance_epsilon)
++        fused_add = (
++            ir.ops.fused_add_rms_norm.maybe_inplace
++            if self.allow_inplace
++            else ir.ops.fused_add_rms_norm
++        )
++        return fused_add(x, residual, weight, self.variance_epsilon)
+ 
+     def forward_cuda(
+         self,
+diff --git a/vllm/model_executor/models/qwen3_5.py b/vllm/model_executor/models/qwen3_5.py
+--- a/vllm/model_executor/models/qwen3_5.py
++++ b/vllm/model_executor/models/qwen3_5.py
+@@ -174,10 +174,10 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
+             raise ValueError(f"Invalid model_type {config.model_type}")
+ 
+         self.input_layernorm = Qwen3_5RMSNorm(
+-            config.hidden_size, eps=config.rms_norm_eps
++            config.hidden_size, eps=config.rms_norm_eps, allow_inplace=True
+         )
+         self.post_attention_layernorm = Qwen3_5RMSNorm(
+-            config.hidden_size, eps=config.rms_norm_eps
++            config.hidden_size, eps=config.rms_norm_eps, allow_inplace=True
+         )
+ 
+         self.layer_scale = getattr(config, "layer_scale", False)
+@@ -244,7 +244,9 @@ class Qwen3_5Model(Qwen3NextModel):
+         )
+ 
+         if get_pp_group().is_last_rank:
+-            self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
++            self.norm = Qwen3_5RMSNorm(
++                config.hidden_size, eps=config.rms_norm_eps, allow_inplace=True
++            )
+         else:
+             self.norm = PPMissingLayer()
+ 
+diff --git a/vllm/model_executor/models/qwen3_5_mtp.py b/vllm/model_executor/models/qwen3_5_mtp.py
+--- a/vllm/model_executor/models/qwen3_5_mtp.py
++++ b/vllm/model_executor/models/qwen3_5_mtp.py
+@@ -111,7 +111,9 @@ class Qwen3_5MultiTokenPredictor(Qwen3NextMultiTokenPredictor):
+             ["hidden_states", "residual"], config.hidden_size
+         )
+ 
+-        self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
++        self.norm = Qwen3_5RMSNorm(
++            config.hidden_size, eps=config.rms_norm_eps, allow_inplace=True
++        )
+         self.pre_fc_norm_hidden = Qwen3_5RMSNorm(
+             config.hidden_size, eps=config.rms_norm_eps
+         )
+-- 
+2.39.5

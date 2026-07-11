@@ -123,24 +123,21 @@ def test_csrc_fused_add_rmsnorm_matches_fp32_sum_reference(
 
 
 @pytest.mark.parametrize(
-    ("rows", "hidden", "dtype", "min_rows", "expected"),
+    ("rows", "hidden", "dtype", "expected"),
     [
-        (1, 2048, torch.bfloat16, 64, False),
-        (1, 5120, torch.bfloat16, 64, False),
-        (67, 5120, torch.bfloat16, 68, False),
-        (68, 5120, torch.bfloat16, 68, True),
-        (319, 5120, torch.bfloat16, 320, False),
-        (320, 5120, torch.bfloat16, 320, True),
-        (64, 5120, torch.bfloat16, None, False),
-        (0, 5120, torch.bfloat16, 64, False),
-        (64, 5120, torch.float16, 64, False),
+        (1, 2048, torch.bfloat16, False),
+        (1, 5120, torch.bfloat16, False),
+        (63, 5120, torch.bfloat16, False),
+        (64, 5120, torch.bfloat16, True),
+        (128, 5120, torch.bfloat16, True),
+        (0, 5120, torch.bfloat16, False),
+        (64, 5120, torch.float16, False),
     ],
 )
-def test_gemma_fused_add_rmsnorm_dispatch_is_dense_only(
+def test_gemma_fused_add_rmsnorm_dispatch_is_h5120_only(
     rows: int,
     hidden: int,
     dtype: torch.dtype,
-    min_rows: int | None,
     expected: bool,
 ) -> None:
     from vllm_musa.model_executor.layers.layernorm import (
@@ -152,56 +149,63 @@ def test_gemma_fused_add_rmsnorm_dispatch_is_dense_only(
     residual = torch.empty_like(x)
     weight = torch.empty((hidden,), device=device, dtype=dtype)
 
-    assert (
-        _can_use_musa_jit_fused_add_rmsnorm(x, residual, weight, min_rows) is expected
+    assert _can_use_musa_jit_fused_add_rmsnorm(x, residual, weight) is expected
+
+
+def test_gemma_fused_add_rmsnorm_dispatch_rejects_unsafe_layouts() -> None:
+    from vllm_musa.model_executor.layers.layernorm import (
+        _can_use_musa_jit_fused_add_rmsnorm,
+    )
+
+    device = torch.device("musa")
+    weight = torch.empty((5120,), device=device, dtype=torch.bfloat16)
+    noncontiguous = torch.empty((5120, 64), device=device, dtype=torch.bfloat16).t()
+    contiguous = torch.empty((64, 5120), device=device, dtype=torch.bfloat16)
+
+    assert not _can_use_musa_jit_fused_add_rmsnorm(noncontiguous, noncontiguous, weight)
+    assert not _can_use_musa_jit_fused_add_rmsnorm(
+        contiguous, contiguous.to(torch.float16), weight
     )
 
 
-def test_qwen36_gemma_fused_policy_is_model_and_decode_safe() -> None:
-    from types import SimpleNamespace
+def test_gemma_fused_add_rmsnorm_requires_caller_inplace_contract() -> None:
+    from vllm.config import VllmConfig, set_current_vllm_config
 
     from vllm_musa.model_executor.layers.layernorm import (
-        _qwen3_5_dense_fused_add_rmsnorm_min_rows,
+        MusaGemmaRMSNorm,
     )
 
-    def make_config(
-        *,
-        model_type: str = "qwen3_5_text",
-        quantization: str | None = None,
-        tp_size: int = 8,
-        max_num_seqs: int = 4,
-        num_speculative_tokens: int | None = None,
-    ) -> SimpleNamespace:
-        speculative_config = (
-            None
-            if num_speculative_tokens is None
-            else SimpleNamespace(num_speculative_tokens=num_speculative_tokens)
-        )
-        return SimpleNamespace(
-            model_config=SimpleNamespace(
-                hf_text_config=SimpleNamespace(model_type=model_type),
-                quantization=quantization,
-            ),
-            parallel_config=SimpleNamespace(tensor_parallel_size=tp_size),
-            scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
-            speculative_config=speculative_config,
+    torch.manual_seed(321)
+    device = torch.device("musa")
+    dtype = torch.bfloat16
+    eps = 1e-6
+    x = torch.randn((64, 5120), device=device, dtype=dtype)
+    residual = torch.randn_like(x)
+    x_before = x.clone()
+    residual_before = residual.clone()
+    expected, expected_residual = _fused_add_rmsnorm_ref(
+        x, residual, torch.zeros((5120,), device=device, dtype=dtype), eps, gemma=True
+    )
+
+    with set_current_vllm_config(VllmConfig()):
+        functional = MusaGemmaRMSNorm(5120, eps=eps).to(device=device, dtype=dtype)
+        inplace = MusaGemmaRMSNorm(5120, eps=eps, allow_inplace=True).to(
+            device=device, dtype=dtype
         )
 
-    policy = _qwen3_5_dense_fused_add_rmsnorm_min_rows
-    assert policy(5120, make_config()) == 68
-    assert policy(5120, make_config(max_num_seqs=256)) == 320
-    assert (
-        policy(
-            5120,
-            make_config(max_num_seqs=256, num_speculative_tokens=2),
-        )
-        == 832
-    )
-    assert policy(2048, make_config()) is None
-    assert policy(5120, make_config(model_type="gemma3_text")) is None
-    assert policy(5120, make_config(quantization="fp8")) is None
-    assert policy(5120, make_config(tp_size=4)) is None
-    assert policy(5120, SimpleNamespace()) is None
+    output, residual_out = functional.forward_oot(x, residual)
+    assert output.data_ptr() != x.data_ptr()
+    assert residual_out.data_ptr() != residual.data_ptr()
+    _assert_close(x, x_before, atol=0.0, rtol=0.0)
+    _assert_close(residual, residual_before, atol=0.0, rtol=0.0)
+    _assert_close(output, expected)
+    _assert_close(residual_out, expected_residual, atol=0.0, rtol=0.0)
+
+    output, residual_out = inplace.forward_oot(x, residual)
+    assert output.data_ptr() == x.data_ptr()
+    assert residual_out.data_ptr() == residual.data_ptr()
+    _assert_close(output, expected)
+    _assert_close(residual_out, expected_residual, atol=0.0, rtol=0.0)
 
 
 def _topk_softmax_ref(

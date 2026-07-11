@@ -1619,6 +1619,20 @@ class TestBuildTimeSeries:
         # With no quilt manifest, it must equal the sorted glob exactly.
         assert got == sorted(p.name for p in self._SERIES_DIR.glob("*.patch"))
 
+    def test_qwen35_gemma_norm_series_patch_declares_inplace_contract(self):
+        series = (
+            self._SERIES_DIR
+            / "0086-MUSA-vllm.gemma-rmsnorm-caller-inplace-contract.patch"
+        ).read_text()
+
+        # Generic Gemma callers remain functional unless construction explicitly
+        # donates both residual-path activation inputs.
+        assert "allow_inplace: bool = False" in series
+        assert "if self.allow_inplace" in series
+        assert series.count("allow_inplace=True") == 4
+        assert "vllm/model_executor/models/qwen3_5.py" in series
+        assert "vllm/model_executor/models/qwen3_5_mtp.py" in series
+
     def test_apply_patch_series_missing_dir_is_noop(self, tmp_path):
         ba = self._load_build_apply()
         assert ba.apply_patch_series(tmp_path, tmp_path / "nope") == []

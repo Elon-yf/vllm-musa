@@ -3,7 +3,6 @@
 
 import torch
 import torch.nn as nn
-from vllm.config import VllmConfig, get_current_vllm_config_or_none
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
 
 try:
@@ -65,69 +64,24 @@ def _can_use_musa_jit_rmsnorm(
     )
 
 
-def _qwen3_5_dense_fused_add_rmsnorm_min_rows(
-    hidden_size: int,
-    vllm_config: VllmConfig | None = None,
-) -> int | None:
-    """Return a row threshold guaranteeing at least 64 prefill tokens.
-
-    Qwen3.6 checkpoints use vLLM's Qwen3.5 text architecture.  Limit the
-    in-place specialization to the exact model configuration used for the E2E
-    gate, and keep every possible decode-only batch on the functional path.
-    """
-    if vllm_config is None:
-        vllm_config = get_current_vllm_config_or_none()
-    if vllm_config is None:
-        return None
-
-    model_config = getattr(vllm_config, "model_config", None)
-    text_config = getattr(model_config, "hf_text_config", None)
-    parallel_config = getattr(vllm_config, "parallel_config", None)
-    scheduler_config = getattr(vllm_config, "scheduler_config", None)
-    max_num_seqs = getattr(scheduler_config, "max_num_seqs", None)
-    if (
-        getattr(text_config, "model_type", None) != "qwen3_5_text"
-        or hidden_size != 5120
-        or getattr(model_config, "quantization", None) is not None
-        or getattr(parallel_config, "tensor_parallel_size", None) != 8
-        or not isinstance(max_num_seqs, int)
-        or max_num_seqs <= 0
-    ):
-        return None
-
-    max_decode_query_len = 1
-    speculative_config = getattr(vllm_config, "speculative_config", None)
-    if speculative_config is not None:
-        num_speculative_tokens = getattr(
-            speculative_config, "num_speculative_tokens", None
-        )
-        if not isinstance(num_speculative_tokens, int) or num_speculative_tokens < 0:
-            return None
-        max_decode_query_len += num_speculative_tokens
-    max_decode_rows = max_num_seqs * max_decode_query_len
-    return max_decode_rows + 64
-
-
 def _can_use_musa_jit_fused_add_rmsnorm(
     x: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
-    min_rows: int | None,
 ) -> bool:
-    """Whether the validated Qwen3.6-27B specialization is applicable."""
+    """Whether the measured H5120 specialization is profitable."""
     hidden_size = x.shape[-1]
     return (
-        min_rows is not None
-        and x.device.type == "musa"
+        x.device.type == "musa"
         and residual.device.type == "musa"
         and weight.device.type == "musa"
         and x.dim() == 2
         and residual.dim() == 2
         and weight.dim() == 1
         and x.shape == residual.shape
-        # The threshold is 64 rows above the configured decode-only ceiling,
-        # so this cannot accidentally select a high-concurrency decode batch.
-        and x.shape[0] >= min_rows
+        # Single-token work regresses behind an opaque custom-op boundary.
+        # Treat rows as actual kernel work, not as a proxy for batch phase.
+        and x.shape[0] >= 64
         and hidden_size == weight.numel()
         # H2048 regresses Qwen3.6-MoE E2E despite winning standalone. Keep
         # this path scoped to the measured dense-model width.
@@ -187,12 +141,6 @@ class MusaRMSNorm(RMSNorm):
 
 @GemmaRMSNorm.register_oot
 class MusaGemmaRMSNorm(GemmaRMSNorm):
-    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
-        super().__init__(hidden_size, eps)
-        self._musa_fused_add_rmsnorm_min_rows = (
-            _qwen3_5_dense_fused_add_rmsnorm_min_rows(hidden_size)
-        )
-
     def forward_oot(
         self,
         x: torch.Tensor,
@@ -206,12 +154,9 @@ class MusaGemmaRMSNorm(GemmaRMSNorm):
 
         weight = self.weight.data
         if residual is not None:
-            if _can_use_musa_jit_fused_add_rmsnorm(
-                x,
-                residual,
-                weight,
-                self._musa_fused_add_rmsnorm_min_rows,
-            ):
+            if getattr(
+                self, "allow_inplace", False
+            ) and _can_use_musa_jit_fused_add_rmsnorm(x, residual, weight):
                 return musa_jit_norm.fused_add_rmsnorm(
                     x,
                     residual,

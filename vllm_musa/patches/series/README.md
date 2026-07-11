@@ -11,7 +11,7 @@ series of MUSA's source modifications against the pinned `vllm@<tag>`
   (`git format-patch --no-signature --zero-commit`, keeping `index` blob lines so
   `git am -3` 3-way works across version bumps).
 
-Currently **81 patches** — the MUSA source edits against `vllm@v0.24.0`, applied at
+Currently **87 patches** — the MUSA source edits against `vllm@v0.24.0`, applied at
 build. Runtime object/registration patches (which patch live objects at import) are
 kept separately in `vllm_musa/patches/`, not in this build-time series. Verified:
 `git am -3` replays all 81 cleanly onto a fresh `vllm@v0.24.0`.
