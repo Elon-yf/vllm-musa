@@ -29,6 +29,7 @@ from torch import Tensor
 from vllm import ir
 from vllm.platforms import current_platform
 
+from vllm_musa.tuning import FUSED_ADD_RMSNORM_MIN_ROWS
 from vllm_musa.utils.environ import envs
 
 # vllm._C must be loaded before torch.ops._C.rms_norm is resolvable.
@@ -106,15 +107,19 @@ def _fused_add_rms_norm_supports_args(
     # IR lowering selects one provider for an entire vLLM compile range. Do not
     # inspect a symbolic tensor's example-value hint here: vLLM deliberately
     # drops shape guards, so that choice would also be reused below the measured
-    # 64-row profitability boundary. The platform inserts a range endpoint at
-    # 63 for eligible H5120/BF16 models, and the lowering pass exposes that
-    # range through its pass context. Eager dispatch has concrete shapes.
+    # profitability boundary. The platform inserts an endpoint immediately
+    # below FUSED_ADD_RMSNORM_MIN_ROWS for eligible H5120/BF16 models, and the
+    # lowering pass exposes that range through its pass context. Eager dispatch
+    # has concrete shapes.
     try:
         from vllm.compilation.passes.inductor_pass import get_pass_context
 
-        profitable_rows = get_pass_context().compile_range.start >= 64
+        profitable_rows = (
+            get_pass_context().compile_range.start
+            >= FUSED_ADD_RMSNORM_MIN_ROWS
+        )
     except AssertionError:
-        profitable_rows = x.shape[0] >= 64
+        profitable_rows = x.shape[0] >= FUSED_ADD_RMSNORM_MIN_ROWS
 
     return (
         variance_size is None

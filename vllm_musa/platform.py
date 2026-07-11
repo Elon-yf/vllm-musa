@@ -29,6 +29,8 @@ else:
 
 import pymtml as pynvml
 
+from vllm_musa.tuning import FUSED_ADD_RMSNORM_MIN_ROWS
+
 logger = init_logger(__name__)
 
 _P = ParamSpec("_P")
@@ -292,7 +294,7 @@ def _should_route_quantized_piecewise_ops_native(vllm_config: Any) -> bool:
 def _configure_fused_add_rmsnorm_compile_range(
     vllm_config: Any, *, native_custom_ops: bool
 ) -> bool:
-    """Split dynamic compilation at the measured 64-row profit boundary."""
+    """Split compilation at the measured fused-add RMSNorm profit boundary."""
     ir_priority = getattr(
         getattr(vllm_config, "kernel_config", None),
         "ir_op_priority",
@@ -317,15 +319,16 @@ def _configure_fused_add_rmsnorm_compile_range(
         or getattr(model_config, "dtype", None) != torch.bfloat16
         or getattr(model_config, "enforce_eager", False)
         or max_tokens is None
-        or max_tokens < 64
+        or max_tokens < FUSED_ADD_RMSNORM_MIN_ROWS
     ):
         return False
 
     comp = vllm_config.compilation_config
     endpoints = list(comp.compile_ranges_endpoints or [])
-    if 63 in endpoints:
+    fallback_endpoint = FUSED_ADD_RMSNORM_MIN_ROWS - 1
+    if fallback_endpoint in endpoints:
         return False
-    comp.compile_ranges_endpoints = sorted([*endpoints, 63])
+    comp.compile_ranges_endpoints = sorted([*endpoints, fallback_endpoint])
     return True
 
 
@@ -598,16 +601,20 @@ class MUSAPlatformBase(Platform):
         parallel_config = vllm_config.parallel_config
         model_config = vllm_config.model_config
 
-        # The fused-add provider is profitable from 64 rows onward. vLLM picks
-        # IR implementations once per dynamic compile range and drops shape
-        # guards, so split the eligible shape into [1, 63] and [64, max] rather
-        # than freezing a decision from a symbolic example-value hint. This is
-        # shape/dtype based and applies to any model exposing the IR op.
+        # The fused-add provider is profitable from
+        # FUSED_ADD_RMSNORM_MIN_ROWS onward. vLLM picks IR implementations once
+        # per dynamic compile range and drops shape guards, so split immediately
+        # below that threshold rather than freezing a decision from a symbolic
+        # example-value hint. This is shape/dtype based and applies to any model
+        # exposing the IR op.
         if _configure_fused_add_rmsnorm_compile_range(
             vllm_config,
             native_custom_ops=musa_envs.VLLM_MUSA_CUSTOM_OP_USE_NATIVE.get(),
         ):
-            logger.info("Splitting MUSA fused-add RMSNorm compile ranges at 63 rows")
+            logger.info(
+                "Splitting MUSA fused-add RMSNorm compile ranges at %d rows",
+                FUSED_ADD_RMSNORM_MIN_ROWS - 1,
+            )
 
         if _is_deepseek_v4_model(model_config):
             _apply_deepseek_v4_tp8_profile(

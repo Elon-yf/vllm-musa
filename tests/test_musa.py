@@ -139,6 +139,7 @@ class TestMUSAPlatformBase:
         from vllm_musa.platform import (
             _configure_fused_add_rmsnorm_compile_range,
         )
+        from vllm_musa.tuning import FUSED_ADD_RMSNORM_MIN_ROWS
 
         config = SimpleNamespace(
             model_config=SimpleNamespace(
@@ -152,7 +153,10 @@ class TestMUSAPlatformBase:
         assert _configure_fused_add_rmsnorm_compile_range(
             config, native_custom_ops=False
         )
-        assert config.compilation_config.compile_ranges_endpoints == [63, 2048]
+        assert config.compilation_config.compile_ranges_endpoints == [
+            FUSED_ADD_RMSNORM_MIN_ROWS - 1,
+            2048,
+        ]
         assert not _configure_fused_add_rmsnorm_compile_range(
             config, native_custom_ops=False
         )
