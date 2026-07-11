@@ -281,6 +281,55 @@ def _will_capture_piecewise_cudagraph(vllm_config: Any) -> bool:
     return True
 
 
+def _should_route_quantized_piecewise_ops_native(vllm_config: Any) -> bool:
+    """Whether the FP8 PIECEWISE correctness route applies to this model."""
+    return (
+        getattr(vllm_config, "quant_config", None) is not None
+        and _will_capture_piecewise_cudagraph(vllm_config)
+    )
+
+
+def _configure_fused_add_rmsnorm_compile_range(
+    vllm_config: Any, *, native_custom_ops: bool
+) -> bool:
+    """Split dynamic compilation at the measured 64-row profit boundary."""
+    ir_priority = getattr(
+        getattr(vllm_config, "kernel_config", None),
+        "ir_op_priority",
+        None,
+    )
+    fused_priority = getattr(ir_priority, "fused_add_rms_norm", None)
+    native_custom_ops = native_custom_ops or bool(
+        fused_priority and fused_priority[0] == "native"
+    )
+    model_config = getattr(vllm_config, "model_config", None)
+    get_hidden_size = getattr(model_config, "get_hidden_size", None)
+    max_tokens = getattr(
+        getattr(vllm_config, "scheduler_config", None),
+        "max_num_batched_tokens",
+        0,
+    )
+    if (
+        native_custom_ops
+        or model_config is None
+        or not callable(get_hidden_size)
+        or get_hidden_size() != 5120
+        or getattr(model_config, "dtype", None) != torch.bfloat16
+        or getattr(model_config, "enforce_eager", False)
+        or max_tokens is None
+        or max_tokens < 64
+    ):
+        return False
+
+    comp = vllm_config.compilation_config
+    endpoints = list(comp.compile_ranges_endpoints or [])
+    if 63 in endpoints:
+        return False
+    endpoints.append(63)
+    comp.compile_ranges_endpoints = endpoints
+    return True
+
+
 class MUSAPlatformBase(Platform):
     _enum = PlatformEnum.OOT  # Out-of-tree platform
     device_name: str = "musa"
@@ -348,7 +397,10 @@ class MUSAPlatformBase(Platform):
         """Platform-default priority list for vllm.ir.ops on MUSA.
 
         When compiling with Inductor, prefer the `native` (pure-PyTorch)
-        IR impl; in the eager path, prefer the `musa` rms_norm provider.
+        rms_norm implementation. Prefer the measured in-place `musa`
+        fused_add_rms_norm implementation in both compiled and eager paths,
+        followed by the broad pre-existing `musa_legacy` kernel and native;
+        IR functionalization owns activation donation.
         This mirrors the upstream `cuda.py` pattern
         (`default = ["native"] if using_inductor else ["vllm_c", "native"]`):
         under Inductor the native rms_norm is a handful of
@@ -357,10 +409,8 @@ class MUSAPlatformBase(Platform):
         fusion barrier; in eager mode there is no fusion to lose so the
         kernel provider is taken directly.
 
-        NOTE: this is a correctness / upstream-consistency choice, not a
-        perf change — `["native"]` and `["musa", "native"]` measure the
-        same batch1 throughput. The `musa` provider stays registered (see
-        `vllm_musa/kernels/musa_ops.py`) for the eager / explicit opt-in path.
+        The non-fused rms_norm choice remains upstream-consistent; the fused
+        provider is independently gated by its measured supports_args scope.
         """
         from vllm.config.compilation import CompilationMode
         from vllm.config.kernel import IrOpPriorityConfig
@@ -376,12 +426,25 @@ class MUSAPlatformBase(Platform):
             rms_norm = ["native"]
         else:
             # Eager path: no Inductor fusion to lose, so take the rms_norm
-            # kernel. Keep the default native because v0.22 adds
-            # fused_add_rms_norm and MUSA has not registered an IR provider
-            # for that op.
+            # kernel. Keep other IR ops native by default.
             default = ["native"]
             rms_norm = ["musa", "native"]
-        return IrOpPriorityConfig.with_default(default, rms_norm=rms_norm)
+        # VLLM_MUSA_CUSTOM_OP_USE_NATIVE is a correctness route for quantized
+        # models under piecewise CUDAGraph capture. It must remain authoritative
+        # for the IR provider too; unlike supports_args, this is global provider
+        # enablement and therefore belongs in the priority policy.
+        from vllm_musa.utils.environ import envs as musa_envs
+
+        fused_add_rms_norm = (
+            ["native"]
+            if musa_envs.VLLM_MUSA_CUSTOM_OP_USE_NATIVE.get()
+            else ["musa", "musa_legacy", "native"]
+        )
+        return IrOpPriorityConfig.with_default(
+            default,
+            rms_norm=rms_norm,
+            fused_add_rms_norm=fused_add_rms_norm,
+        )
 
     @classmethod
     def support_deep_gemm(cls) -> bool:
@@ -513,8 +576,13 @@ class MUSAPlatformBase(Platform):
         # deep_gemm linear path (it fuses quant+GEMM, so its buffers never escape).
         from vllm_musa.utils.environ import envs as musa_envs
 
-        route_native = _will_capture_piecewise_cudagraph(vllm_config)
-        logger.debug("MUSA custom-op native-routing: piecewise=%s", route_native)
+        # Only quantized models can enter the FP8 quant path described above.
+        # Keeping this process-wide route enabled for unquantized BF16 models
+        # unnecessarily disables their safe normalization kernels.
+        route_native = _should_route_quantized_piecewise_ops_native(vllm_config)
+        logger.debug(
+            "MUSA custom-op native-routing: quantized_piecewise=%s", route_native
+        )
         # Set the flag process-wide (not on the config): the op forward_oot paths read
         # this env live and spawn workers inherit os.environ. First-writer-wins (the
         # is_set() guard) is safe -- the native path is correct in every cudagraph mode,
@@ -530,6 +598,17 @@ class MUSAPlatformBase(Platform):
 
         parallel_config = vllm_config.parallel_config
         model_config = vllm_config.model_config
+
+        # The fused-add provider is profitable from 64 rows onward. vLLM picks
+        # IR implementations once per dynamic compile range and drops shape
+        # guards, so split the eligible shape into [1, 63] and [64, max] rather
+        # than freezing a decision from a symbolic example-value hint. This is
+        # shape/dtype based and applies to any model exposing the IR op.
+        if _configure_fused_add_rmsnorm_compile_range(
+            vllm_config,
+            native_custom_ops=musa_envs.VLLM_MUSA_CUSTOM_OP_USE_NATIVE.get(),
+        ):
+            logger.info("Splitting MUSA fused-add RMSNorm compile ranges at 63 rows")
 
         if _is_deepseek_v4_model(model_config):
             _apply_deepseek_v4_tp8_profile(

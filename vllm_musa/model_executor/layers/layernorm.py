@@ -5,43 +5,8 @@ import torch
 import torch.nn as nn
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
 
-try:
-    from vllm.model_executor.layers.layernorm import fused_add_rms_norm
-except ImportError:
-    fused_add_rms_norm = None
-
-from vllm_musa import _custom_ops as musa_ops
 from vllm_musa.jit_kernel.csrc import norm as musa_jit_norm
 from vllm_musa.utils.environ import envs
-
-
-def _can_use_musa_fused_add_rms_norm(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-) -> bool:
-    hidden_size = x.shape[-1]
-    return (
-        envs.VLLM_MUSA_FUSED_ADD_RMSNORM.get()
-        and x.device.type == "musa"
-        and residual.device.type == "musa"
-        and weight.device.type == "musa"
-        and x.dim() == 2
-        and residual.dim() == 2
-        and weight.dim() == 1
-        and x.shape == residual.shape
-        and hidden_size == weight.numel()
-        and hidden_size % 8 == 0
-        and hidden_size <= 16384
-        and x.dtype in (torch.float16, torch.bfloat16)
-        and residual.dtype == x.dtype
-        and weight.dtype == x.dtype
-        and x.is_contiguous()
-        and residual.is_contiguous()
-        and weight.is_contiguous()
-        and hasattr(torch.ops, "_C_musa_ops")
-        and hasattr(torch.ops._C_musa_ops, "musa_fused_add_rms_norm")
-    )
 
 
 def _can_use_musa_jit_rmsnorm(
@@ -64,53 +29,6 @@ def _can_use_musa_jit_rmsnorm(
     )
 
 
-def _can_use_musa_jit_fused_add_rmsnorm(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-) -> bool:
-    """Whether the measured H5120 specialization is profitable."""
-    hidden_size = x.shape[-1]
-    return (
-        x.device.type == "musa"
-        and residual.device.type == "musa"
-        and weight.device.type == "musa"
-        and x.dim() == 2
-        and residual.dim() == 2
-        and weight.dim() == 1
-        and x.shape == residual.shape
-        # Single-token work regresses behind an opaque custom-op boundary.
-        # Treat rows as actual kernel work, not as a proxy for batch phase.
-        and x.shape[0] >= 64
-        and hidden_size == weight.numel()
-        # H2048 regresses Qwen3.6-MoE E2E despite winning standalone. Keep
-        # this path scoped to the measured dense-model width.
-        and hidden_size == 5120
-        # The Qwen3.6 E2E gate was run in BF16. Keep FP16 available through
-        # the low-level kernel, but do not auto-dispatch it without an E2E A/B.
-        and x.dtype == torch.bfloat16
-        and residual.dtype == x.dtype
-        and weight.dtype == x.dtype
-        and x.is_contiguous()
-        and residual.is_contiguous()
-        and weight.is_contiguous()
-    )
-
-
-def _musa_fused_add_rmsnorm(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float,
-) -> tuple[torch.Tensor, torch.Tensor] | None:
-    if _can_use_musa_fused_add_rms_norm(x, residual, weight):
-        musa_ops.musa_fused_add_rms_norm(x, residual, weight, eps)
-        return x, residual
-    if fused_add_rms_norm is not None:
-        return fused_add_rms_norm(x, residual, weight, eps)
-    return None
-
-
 @RMSNorm.register_oot
 class MusaRMSNorm(RMSNorm):
     def forward_oot(
@@ -124,15 +42,13 @@ class MusaRMSNorm(RMSNorm):
         ):
             return self.forward_native(x, residual)
 
-        weight = self.weight.data
-        eps = self.variance_epsilon
-
         if residual is not None:
-            out = _musa_fused_add_rmsnorm(x, residual, weight, eps)
-            if out is not None:
-                return out
+            # All residual calls use IR. It validates donation and selects the
+            # measured JIT provider, the broad legacy provider, or native.
             return self.forward_native(x, residual)
 
+        weight = self.weight.data
+        eps = self.variance_epsilon
         if _can_use_musa_jit_rmsnorm(x, weight):
             return musa_jit_norm.rmsnorm(x, weight, eps)
 
@@ -152,20 +68,13 @@ class MusaGemmaRMSNorm(GemmaRMSNorm):
         ):
             return self.forward_native(x, residual)
 
-        weight = self.weight.data
         if residual is not None:
-            if getattr(
-                self, "allow_inplace", False
-            ) and _can_use_musa_jit_fused_add_rmsnorm(x, residual, weight):
-                return musa_jit_norm.fused_add_rmsnorm(
-                    x,
-                    residual,
-                    weight,
-                    self.variance_epsilon,
-                    gemma=True,
-                )
+            # Residual calls flow through vLLM IR so its maybe_inplace contract
+            # validates donation. The MUSA provider owns only capability and
+            # measured profitability.
             return self.forward_native(x, residual)
 
+        weight = self.weight.data
         if _can_use_musa_jit_rmsnorm(x, weight):
             return musa_jit_norm.gemma_rmsnorm(x, weight, self.variance_epsilon)
 

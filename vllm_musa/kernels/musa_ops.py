@@ -8,6 +8,11 @@ Currently registers:
   to _C_stable_libtorch; vllm-musa builds that extension as a schema-only
   compatibility shim, so this provider self-disables until a real MUSA kernel
   is present.
+- fused_add_rms_norm: uses the exact FP32-sum MUSA JIT kernel for measured
+  H5120 BF16 work. It is registered as in-place so vLLM's IR functionalization
+  pass, rather than a model-name check, owns activation donation.
+  A broader ``musa_legacy`` provider preserves the existing libtorch kernel
+  fallback for other standard RMSNorm shapes.
 
 Engine log from baseline confirms:
     ir_op_priority=IrOpPriorityConfig(rms_norm=['native'])
@@ -23,6 +28,8 @@ import torch
 from torch import Tensor
 from vllm import ir
 from vllm.platforms import current_platform
+
+from vllm_musa.utils.environ import envs
 
 # vllm._C must be loaded before torch.ops._C.rms_norm is resolvable.
 current_platform.import_kernels()
@@ -77,3 +84,124 @@ def rms_norm(
     output = torch.empty_like(x)
     torch.ops._C.rms_norm(output, x, weight, epsilon)
     return output
+
+
+def _fused_add_rms_norm_supports_args(
+    x: Tensor,
+    x_residual: Tensor,
+    weight: Tensor | None,
+    epsilon: float,
+    variance_size: int | None = None,
+) -> bool:
+    del epsilon
+
+    # IR lowering selects one provider for an entire vLLM compile range. Do not
+    # inspect a symbolic tensor's example-value hint here: vLLM deliberately
+    # drops shape guards, so that choice would also be reused below the measured
+    # 64-row profitability boundary. The platform inserts a range endpoint at
+    # 63 for eligible H5120/BF16 models, and the lowering pass exposes that
+    # range through its pass context. Eager dispatch has concrete shapes.
+    try:
+        from vllm.compilation.passes.inductor_pass import get_pass_context
+
+        profitable_rows = get_pass_context().compile_range.start >= 64
+    except AssertionError:
+        profitable_rows = x.shape[0] >= 64
+
+    return (
+        variance_size is None
+        and weight is not None
+        and x.device.type == "musa"
+        and x_residual.device.type == "musa"
+        and weight.device.type == "musa"
+        and x.dim() == 2
+        and x_residual.dim() == 2
+        and weight.dim() == 1
+        and x.shape == x_residual.shape
+        and profitable_rows
+        and x.shape[1] == 5120
+        and weight.numel() == 5120
+        and x.dtype == torch.bfloat16
+        and x_residual.dtype == x.dtype
+        and weight.dtype in (x.dtype, torch.float32)
+        and x.is_contiguous()
+        and x_residual.is_contiguous()
+        and weight.is_contiguous()
+    )
+
+
+def _legacy_fused_add_rms_norm_supports_args(
+    x: Tensor,
+    x_residual: Tensor,
+    weight: Tensor | None,
+    epsilon: float,
+    variance_size: int | None = None,
+) -> bool:
+    del epsilon
+    hidden_size = x.shape[-1]
+    return (
+        envs.VLLM_MUSA_FUSED_ADD_RMSNORM.get()
+        and variance_size is None
+        and weight is not None
+        and x.device.type == "musa"
+        and x_residual.device.type == "musa"
+        and weight.device.type == "musa"
+        and x.dim() == 2
+        and x_residual.dim() == 2
+        and weight.dim() == 1
+        and x.shape == x_residual.shape
+        and hidden_size == weight.numel()
+        and hidden_size % 8 == 0
+        and hidden_size <= 16384
+        and x.dtype in (torch.float16, torch.bfloat16)
+        and x_residual.dtype == x.dtype
+        and weight.dtype == x.dtype
+        and x.is_contiguous()
+        and x_residual.is_contiguous()
+        and weight.is_contiguous()
+    )
+
+
+@ir.ops.fused_add_rms_norm.register_impl(
+    "musa",
+    inplace=True,
+    supports_args=_fused_add_rms_norm_supports_args,
+    supported=current_platform.is_musa(),
+)
+def fused_add_rms_norm(
+    x: Tensor,
+    x_residual: Tensor,
+    weight: Tensor | None,
+    epsilon: float,
+    variance_size: int | None = None,
+) -> tuple[Tensor, Tensor]:
+    """MUSA in-place provider for ``vllm.ir.ops.fused_add_rms_norm``."""
+    assert variance_size is None
+    assert weight is not None
+    from vllm_musa.jit_kernel.csrc.norm import fused_add_rmsnorm
+
+    # IR supplies the effective scale. Gemma has already materialized
+    # ``parameter.float() + 1``, so applying Gemma's offset here would double it.
+    return fused_add_rmsnorm(x, x_residual, weight, epsilon, gemma=False)
+
+
+@ir.ops.fused_add_rms_norm.register_impl(
+    "musa_legacy",
+    inplace=True,
+    supports_args=_legacy_fused_add_rms_norm_supports_args,
+    supported=current_platform.is_musa(),
+)
+def legacy_fused_add_rms_norm(
+    x: Tensor,
+    x_residual: Tensor,
+    weight: Tensor | None,
+    epsilon: float,
+    variance_size: int | None = None,
+) -> tuple[Tensor, Tensor]:
+    """Broad MUSA fallback matching the pre-IR OOT fused kernel path."""
+    assert variance_size is None
+    assert weight is not None
+    from vllm_musa import _custom_ops as musa_ops
+
+    musa_ops.musa_fused_add_rms_norm(x, x_residual, weight, epsilon)
+    return x, x_residual

@@ -326,25 +326,22 @@ __global__ void rmsnorm_small_h_one_vec_register_kernel(
     const float weight_value = to_float<T>(w.val.elem[i]) + (GEMMA ? 1.0f : 0.0f);
     dst.val.elem[i] = from_float<T>(x_float.val.elem[i] * scale * weight_value);
   }
-  *(Vec8<T>*)(out + out_base + col) = dst;
+  *(Vec8<T> *)(out + out_base + col) = dst;
 }
 
-template <typename T, bool GEMMA, bool CACHE>
-__launch_bounds__(1024, 1)
-__global__ void fused_add_rmsnorm_vec8_kernel(
-    T* __restrict__ input,
-    T* __restrict__ residual,
-    const T* __restrict__ weight,
-    int rows,
-    int hidden,
-    int64_t input_row_stride,
-    int64_t residual_row_stride,
-    float inv_hidden,
-    float eps) {
+template <typename T, typename WeightT, bool GEMMA, bool CACHE>
+__launch_bounds__(1024, 1) __global__
+    void fused_add_rmsnorm_vec8_kernel(T *__restrict__ input,
+                                       T *__restrict__ residual,
+                                       const WeightT *__restrict__ weight,
+                                       int rows, int hidden,
+                                       int64_t input_row_stride,
+                                       int64_t residual_row_stride,
+                                       float inv_hidden, float eps) {
   constexpr int kVec = 8;
   extern __shared__ __align__(16) float smem[];
-  float* cached = smem;
-  float* warp_sums = smem + (CACHE ? hidden : 0);
+  float *cached = smem;
+  float *warp_sums = smem + (CACHE ? hidden : 0);
 
   const int row = (int)blockIdx.x;
   const int tid = (int)threadIdx.x;
@@ -361,14 +358,15 @@ __global__ void fused_add_rmsnorm_vec8_kernel(
     Float8 sum_float;
 #pragma unroll
     for (int i = 0; i < kVec; ++i) {
-      const float value = to_float<T>(x.val.elem[i]) + to_float<T>(r.val.elem[i]);
+      const float value =
+          to_float<T>(x.val.elem[i]) + to_float<T>(r.val.elem[i]);
       sum += value * value;
       residual_out.val.elem[i] = from_float<T>(value);
       sum_float.val.elem[i] = value;
     }
-    *(Vec8<T>*)(residual + residual_base + col) = residual_out;
+    *(Vec8<T> *)(residual + residual_base + col) = residual_out;
     if constexpr (CACHE) {
-      *(Float8*)(cached + col) = sum_float;
+      *(Float8 *)(cached + col) = sum_float;
     }
   }
 
@@ -379,7 +377,7 @@ __global__ void fused_add_rmsnorm_vec8_kernel(
     const int col = vec_idx * kVec;
     Float8 sum_float;
     if constexpr (CACHE) {
-      sum_float = *(Float8*)(cached + col);
+      sum_float = *(Float8 *)(cached + col);
     } else {
       Vec8<T> r = Vec8<T>::load(residual + residual_base, col);
 #pragma unroll
@@ -387,14 +385,16 @@ __global__ void fused_add_rmsnorm_vec8_kernel(
         sum_float.val.elem[i] = to_float<T>(r.val.elem[i]);
       }
     }
-    Vec8<T> w = Vec8<T>::load(weight, col);
+    Vec8<WeightT> w = Vec8<WeightT>::load(weight, col);
     Vec8<T> dst;
 #pragma unroll
     for (int i = 0; i < kVec; ++i) {
-      const float weight_value = to_float<T>(w.val.elem[i]) + (GEMMA ? 1.0f : 0.0f);
-      dst.val.elem[i] = from_float<T>(sum_float.val.elem[i] * scale * weight_value);
+      const float weight_value =
+          to_float<WeightT>(w.val.elem[i]) + (GEMMA ? 1.0f : 0.0f);
+      dst.val.elem[i] =
+          from_float<T>(sum_float.val.elem[i] * scale * weight_value);
     }
-    *(Vec8<T>*)(input + input_base + col) = dst;
+    *(Vec8<T> *)(input + input_base + col) = dst;
   }
 }
 
@@ -429,17 +429,13 @@ __global__ void rmsnorm_scalar_kernel(
   }
 }
 
-template <typename T, bool GEMMA>
-__global__ void fused_add_rmsnorm_scalar_kernel(
-    T* __restrict__ input,
-    T* __restrict__ residual,
-    const T* __restrict__ weight,
-    int rows,
-    int hidden,
-    int64_t input_row_stride,
-    int64_t residual_row_stride,
-    float inv_hidden,
-    float eps) {
+template <typename T, typename WeightT, bool GEMMA>
+__global__ void
+fused_add_rmsnorm_scalar_kernel(T *__restrict__ input, T *__restrict__ residual,
+                                const WeightT *__restrict__ weight, int rows,
+                                int hidden, int64_t input_row_stride,
+                                int64_t residual_row_stride, float inv_hidden,
+                                float eps) {
   extern __shared__ float warp_sums[];
   const int row = (int)blockIdx.x;
   const int tid = (int)threadIdx.x;
@@ -448,7 +444,8 @@ __global__ void fused_add_rmsnorm_scalar_kernel(
   float sum = 0.0f;
 
   for (int col = tid; col < hidden; col += (int)blockDim.x) {
-    const float value = to_float<T>(input[input_base + col]) + to_float<T>(residual[residual_base + col]);
+    const float value = to_float<T>(input[input_base + col]) +
+                        to_float<T>(residual[residual_base + col]);
     residual[residual_base + col] = from_float<T>(value);
     sum += value * value;
   }
@@ -456,8 +453,10 @@ __global__ void fused_add_rmsnorm_scalar_kernel(
 
   const float scale = fast_rsqrt(sum * inv_hidden + eps);
   for (int col = tid; col < hidden; col += (int)blockDim.x) {
-    const float weight_value = to_float<T>(weight[col]) + (GEMMA ? 1.0f : 0.0f);
-    input[input_base + col] = from_float<T>(to_float<T>(residual[residual_base + col]) * scale * weight_value);
+    const float weight_value =
+        to_float<WeightT>(weight[col]) + (GEMMA ? 1.0f : 0.0f);
+    input[input_base + col] = from_float<T>(
+        to_float<T>(residual[residual_base + col]) * scale * weight_value);
   }
 }
 
@@ -540,7 +539,8 @@ void check_fused_inputs(ffi::TensorView input, ffi::TensorView residual, ffi::Te
   TVM_FFI_ICHECK_EQ(input.device().device_id, residual.device().device_id);
   TVM_FFI_ICHECK_EQ(input.device().device_id, weight.device().device_id);
   TVM_FFI_ICHECK(dtype_equal(input.dtype(), residual.dtype()));
-  TVM_FFI_ICHECK(dtype_equal(input.dtype(), weight.dtype()));
+  TVM_FFI_ICHECK(dtype_equal(input.dtype(), weight.dtype()) ||
+                 dtype_equal(weight.dtype(), dl_float32));
 }
 
 template <typename T, bool GEMMA>
@@ -623,8 +623,9 @@ void launch_rmsnorm(ffi::TensorView input, ffi::TensorView weight, ffi::TensorVi
   }
 }
 
-template <typename T, bool GEMMA>
-void launch_fused_add_rmsnorm(ffi::TensorView input, ffi::TensorView residual, ffi::TensorView weight, float eps) {
+template <typename T, typename WeightT, bool GEMMA>
+void launch_fused_add_rmsnorm(ffi::TensorView input, ffi::TensorView residual,
+                              ffi::TensorView weight, float eps) {
   const int rows = static_cast<int>(input.size(0));
   const int hidden = static_cast<int>(input.size(1));
   const int64_t input_row_stride = static_cast<int64_t>(input.stride(0));
@@ -635,41 +636,32 @@ void launch_fused_add_rmsnorm(ffi::TensorView input, ffi::TensorView residual, f
   if ((hidden % 8) == 0 && hidden <= 32768) {
     const int threads = fused_block_threads(hidden);
     if (hidden <= 32768) {
-      fused_add_rmsnorm_vec8_kernel<T, GEMMA, true><<<rows, threads, cached_vec8_shared_bytes(hidden, threads, 32768), stream>>>(
-          static_cast<T*>(input.data_ptr()),
-          static_cast<T*>(residual.data_ptr()),
-          static_cast<const T*>(weight.data_ptr()),
-          rows,
-          hidden,
-          input_row_stride,
-          residual_row_stride,
-          inv_hidden,
-          eps);
+      fused_add_rmsnorm_vec8_kernel<T, WeightT, GEMMA, true>
+          <<<rows, threads, cached_vec8_shared_bytes(hidden, threads, 32768),
+             stream>>>(static_cast<T *>(input.data_ptr()),
+                       static_cast<T *>(residual.data_ptr()),
+                       static_cast<const WeightT *>(weight.data_ptr()), rows,
+                       hidden, input_row_stride, residual_row_stride,
+                       inv_hidden, eps);
     } else {
-      fused_add_rmsnorm_vec8_kernel<T, GEMMA, false><<<rows, threads, cached_vec8_shared_bytes(hidden, threads, 32768), stream>>>(
-          static_cast<T*>(input.data_ptr()),
-          static_cast<T*>(residual.data_ptr()),
-          static_cast<const T*>(weight.data_ptr()),
-          rows,
-          hidden,
-          input_row_stride,
-          residual_row_stride,
-          inv_hidden,
-          eps);
+      fused_add_rmsnorm_vec8_kernel<T, WeightT, GEMMA, false>
+          <<<rows, threads, cached_vec8_shared_bytes(hidden, threads, 32768),
+             stream>>>(static_cast<T *>(input.data_ptr()),
+                       static_cast<T *>(residual.data_ptr()),
+                       static_cast<const WeightT *>(weight.data_ptr()), rows,
+                       hidden, input_row_stride, residual_row_stride,
+                       inv_hidden, eps);
     }
   } else {
     constexpr int threads = 256;
-    constexpr int smem_bytes = ((threads + 31) / 32) * static_cast<int>(sizeof(float));
-    fused_add_rmsnorm_scalar_kernel<T, GEMMA><<<rows, threads, smem_bytes, stream>>>(
-        static_cast<T*>(input.data_ptr()),
-        static_cast<T*>(residual.data_ptr()),
-        static_cast<const T*>(weight.data_ptr()),
-        rows,
-        hidden,
-        input_row_stride,
-        residual_row_stride,
-        inv_hidden,
-        eps);
+    constexpr int smem_bytes =
+        ((threads + 31) / 32) * static_cast<int>(sizeof(float));
+    fused_add_rmsnorm_scalar_kernel<T, WeightT, GEMMA>
+        <<<rows, threads, smem_bytes, stream>>>(
+            static_cast<T *>(input.data_ptr()),
+            static_cast<T *>(residual.data_ptr()),
+            static_cast<const WeightT *>(weight.data_ptr()), rows, hidden,
+            input_row_stride, residual_row_stride, inv_hidden, eps);
   }
 }
 
@@ -700,23 +692,46 @@ void sgl_musa_fused_add_rmsnorm(
   check_fused_inputs(input, residual, weight);
   ffi::MUSADeviceGuard device_guard(input.device().device_id);
   if (dtype_equal(input.dtype(), dl_float16)) {
-    if (gemma) {
-      launch_fused_add_rmsnorm<half, true>(input, residual, weight, static_cast<float>(eps));
+    if (dtype_equal(weight.dtype(), dl_float32)) {
+      if (gemma) {
+        launch_fused_add_rmsnorm<half, float, true>(input, residual, weight,
+                                                    static_cast<float>(eps));
+      } else {
+        launch_fused_add_rmsnorm<half, float, false>(input, residual, weight,
+                                                     static_cast<float>(eps));
+      }
+    } else if (gemma) {
+      launch_fused_add_rmsnorm<half, half, true>(input, residual, weight,
+                                                 static_cast<float>(eps));
     } else {
-      launch_fused_add_rmsnorm<half, false>(input, residual, weight, static_cast<float>(eps));
+      launch_fused_add_rmsnorm<half, half, false>(input, residual, weight,
+                                                  static_cast<float>(eps));
     }
   } else if (dtype_equal(input.dtype(), dl_bfloat16)) {
-    if (gemma) {
-      launch_fused_add_rmsnorm<__mt_bfloat16, true>(input, residual, weight, static_cast<float>(eps));
+    if (dtype_equal(weight.dtype(), dl_float32)) {
+      if (gemma) {
+        launch_fused_add_rmsnorm<__mt_bfloat16, float, true>(
+            input, residual, weight, static_cast<float>(eps));
+      } else {
+        launch_fused_add_rmsnorm<__mt_bfloat16, float, false>(
+            input, residual, weight, static_cast<float>(eps));
+      }
+    } else if (gemma) {
+      launch_fused_add_rmsnorm<__mt_bfloat16, __mt_bfloat16, true>(
+          input, residual, weight, static_cast<float>(eps));
     } else {
-      launch_fused_add_rmsnorm<__mt_bfloat16, false>(input, residual, weight, static_cast<float>(eps));
+      launch_fused_add_rmsnorm<__mt_bfloat16, __mt_bfloat16, false>(
+          input, residual, weight, static_cast<float>(eps));
     }
   } else {
-    TVM_FFI_THROW(ValueError) << "sgl_musa_fused_add_rmsnorm only supports fp16/bf16";
+    TVM_FFI_THROW(ValueError)
+        << "sgl_musa_fused_add_rmsnorm only supports fp16/bf16";
   }
   const musaError_t err = musaGetLastError();
-  TVM_FFI_ICHECK_EQ(err, musaSuccess) << "MUSA fused_add_rmsnorm kernel failed: " << musaGetErrorString(err);
+  TVM_FFI_ICHECK_EQ(err, musaSuccess)
+      << "MUSA fused_add_rmsnorm kernel failed: " << musaGetErrorString(err);
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sgl_musa_rmsnorm, sgl_musa_rmsnorm);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(sgl_musa_fused_add_rmsnorm, sgl_musa_fused_add_rmsnorm);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(sgl_musa_fused_add_rmsnorm,
+                              sgl_musa_fused_add_rmsnorm);

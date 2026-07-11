@@ -80,10 +80,13 @@ def fused_add_rmsnorm(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """In-place fused residual add and RMSNorm using the JIT MUSA kernel.
 
-    The returned tensors alias ``input`` and ``residual`` respectively.  The
-    Gemma vec8/cache specialization computes the variance and normalized value
+    The returned tensors alias ``input`` and ``residual`` respectively. The
+    vec8/cache specialization computes the variance and normalized value
     from the unrounded FP32 residual sum while storing the updated residual in
-    the input dtype, matching ``vllm.ir.ops.fused_add_rms_norm``.
+    the input dtype, matching ``vllm.ir.ops.fused_add_rms_norm``. ``weight`` may
+    match the activation dtype or be FP32. Set ``gemma=True`` only for a raw
+    zero-centered Gemma parameter; generic IR supplies an effective FP32 scale
+    with Gemma's ``+1`` already applied and therefore uses ``gemma=False``.
     """
     torch.ops.vllm.musa_csrc_fused_add_rmsnorm(
         input, residual, weight, float(eps), bool(gemma)

@@ -4,6 +4,7 @@
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -86,6 +87,89 @@ class TestMUSAPlatformBase:
         from vllm_musa.platform import MUSAPlatformBase
 
         assert MUSAPlatformBase.use_custom_allreduce() is True
+
+    def test_fused_add_ir_priority_honors_native_safety_route(self):
+        from vllm.config.compilation import CompilationMode
+
+        from vllm_musa.platform import MUSAPlatformBase
+        from vllm_musa.utils.environ import envs
+
+        config = SimpleNamespace(
+            compilation_config=SimpleNamespace(
+                backend="inductor",
+                mode=CompilationMode.VLLM_COMPILE,
+            )
+        )
+        with envs.VLLM_MUSA_CUSTOM_OP_USE_NATIVE.override(False):
+            priority = MUSAPlatformBase.get_default_ir_op_priority(config)
+            assert priority.fused_add_rms_norm == [
+                "musa",
+                "musa_legacy",
+                "native",
+            ]
+        with envs.VLLM_MUSA_CUSTOM_OP_USE_NATIVE.override(True):
+            priority = MUSAPlatformBase.get_default_ir_op_priority(config)
+            assert priority.fused_add_rms_norm == ["native"]
+
+    def test_native_safety_route_is_quantized_piecewise_only(self):
+        from vllm.config import CUDAGraphMode
+        from vllm.config.compilation import CompilationMode
+
+        from vllm_musa.platform import (
+            _should_route_quantized_piecewise_ops_native,
+        )
+
+        config = SimpleNamespace(
+            model_config=SimpleNamespace(enforce_eager=False),
+            compilation_config=SimpleNamespace(
+                mode=CompilationMode.VLLM_COMPILE,
+                cudagraph_mode=CUDAGraphMode.PIECEWISE,
+            ),
+            quant_config=None,
+        )
+        assert not _should_route_quantized_piecewise_ops_native(config)
+        config.quant_config = object()
+        assert _should_route_quantized_piecewise_ops_native(config)
+        config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
+        assert not _should_route_quantized_piecewise_ops_native(config)
+
+    def test_fused_add_profit_boundary_splits_eligible_compile_range(self):
+        import torch
+
+        from vllm_musa.platform import (
+            _configure_fused_add_rmsnorm_compile_range,
+        )
+
+        config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                get_hidden_size=lambda: 5120,
+                dtype=torch.bfloat16,
+                enforce_eager=False,
+            ),
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=4096),
+            compilation_config=SimpleNamespace(compile_ranges_endpoints=[2048]),
+        )
+        assert _configure_fused_add_rmsnorm_compile_range(
+            config, native_custom_ops=False
+        )
+        assert sorted(config.compilation_config.compile_ranges_endpoints) == [63, 2048]
+        assert not _configure_fused_add_rmsnorm_compile_range(
+            config, native_custom_ops=False
+        )
+
+        config.compilation_config.compile_ranges_endpoints = []
+        assert not _configure_fused_add_rmsnorm_compile_range(
+            config, native_custom_ops=True
+        )
+        assert config.compilation_config.compile_ranges_endpoints == []
+
+        config.kernel_config = SimpleNamespace(
+            ir_op_priority=SimpleNamespace(fused_add_rms_norm=["native"])
+        )
+        assert not _configure_fused_add_rmsnorm_compile_range(
+            config, native_custom_ops=False
+        )
+        assert config.compilation_config.compile_ranges_endpoints == []
 
     def test_supports_fp8_for_musa_3_1(self):
         """Test that FP8 is supported on MUSA capability 3.1."""
