@@ -626,6 +626,10 @@ void launch_rmsnorm(ffi::TensorView input, ffi::TensorView weight, ffi::TensorVi
 template <typename T, typename WeightT, bool GEMMA>
 void launch_fused_add_rmsnorm(ffi::TensorView input, ffi::TensorView residual,
                               ffi::TensorView weight, float eps) {
+  // Match the proven plain-RMSNorm cache limit: at H8192 this uses about 33 KiB
+  // of dynamic shared memory. Larger vec8 shapes re-read the stored residual
+  // and need only the block-reduction workspace.
+  constexpr int kCachedHiddenLimit = 8192;
   const int rows = static_cast<int>(input.size(0));
   const int hidden = static_cast<int>(input.size(1));
   const int64_t input_row_stride = static_cast<int64_t>(input.stride(0));
@@ -635,9 +639,10 @@ void launch_fused_add_rmsnorm(ffi::TensorView input, ffi::TensorView residual,
 
   if ((hidden % 8) == 0 && hidden <= 32768) {
     const int threads = fused_block_threads(hidden);
-    if (hidden <= 32768) {
+    if (hidden <= kCachedHiddenLimit) {
       fused_add_rmsnorm_vec8_kernel<T, WeightT, GEMMA, true>
-          <<<rows, threads, cached_vec8_shared_bytes(hidden, threads, 32768),
+          <<<rows, threads,
+             cached_vec8_shared_bytes(hidden, threads, kCachedHiddenLimit),
              stream>>>(static_cast<T *>(input.data_ptr()),
                        static_cast<T *>(residual.data_ptr()),
                        static_cast<const WeightT *>(weight.data_ptr()), rows,
@@ -645,7 +650,8 @@ void launch_fused_add_rmsnorm(ffi::TensorView input, ffi::TensorView residual,
                        inv_hidden, eps);
     } else {
       fused_add_rmsnorm_vec8_kernel<T, WeightT, GEMMA, false>
-          <<<rows, threads, cached_vec8_shared_bytes(hidden, threads, 32768),
+          <<<rows, threads,
+             cached_vec8_shared_bytes(hidden, threads, kCachedHiddenLimit),
              stream>>>(static_cast<T *>(input.data_ptr()),
                        static_cast<T *>(residual.data_ptr()),
                        static_cast<const WeightT *>(weight.data_ptr()), rows,

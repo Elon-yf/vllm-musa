@@ -96,7 +96,9 @@ def test_csrc_rmsnorm_kernels_match_reference(dtype: torch.dtype) -> None:
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("gemma", [False, True])
-@pytest.mark.parametrize("shape", [(1, 2048), (17, 2048), (100, 5120)])
+@pytest.mark.parametrize(
+    "shape", [(1, 2048), (17, 2048), (100, 5120), (1, 8192), (1, 32768)]
+)
 def test_csrc_fused_add_rmsnorm_matches_fp32_sum_reference(
     dtype: torch.dtype,
     gemma: bool,
@@ -123,7 +125,7 @@ def test_csrc_fused_add_rmsnorm_matches_fp32_sum_reference(
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("shape", [(17, 2049), (64, 5120)])
+@pytest.mark.parametrize("shape", [(17, 2049), (64, 5120), (1, 16384)])
 def test_csrc_fused_add_rmsnorm_accepts_effective_fp32_weight(
     dtype: torch.dtype,
     shape: tuple[int, int],
