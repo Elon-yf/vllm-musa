@@ -1629,6 +1629,23 @@ class TestBuildTimeSeries:
         assert "vllm/model_executor/models/qwen3_5.py" not in series
         assert "vllm/model_executor/models/qwen3_5_mtp.py" not in series
 
+    def test_gated_qkv_series_patch_uses_generic_ir_contract(self):
+        series = (
+            self._SERIES_DIR
+            / "0087-MUSA-vllm.gated-qkv-rmsnorm-mrope-IR.patch"
+        ).read_text()
+
+        assert '@register_op(activations=["packed_qkv"])' in series
+        assert "def gated_qkv_rms_norm_rope(" in series
+        assert "ir.ops.gated_qkv_rms_norm_rope(" in series
+        assert "q, k = ir.ops.gated_qkv_rms_norm_rope(" in series
+        assert "q, k, gate = ir.ops.gated_qkv_rms_norm_rope(" not in series
+        assert "attn_output.view_as(gate) * torch.sigmoid(gate)" in series
+        assert "gate = gate.reshape(*orig_shape, -1)" not in series
+        assert "vllm/model_executor/models/qwen3_next.py" in series
+        assert "VLLM_MUSA_EXPERIMENTAL_GATED_QKV_MROPE" not in series
+        assert "current_platform.is_musa()" not in series
+
     def test_apply_patch_series_missing_dir_is_noop(self, tmp_path):
         ba = self._load_build_apply()
         assert ba.apply_patch_series(tmp_path, tmp_path / "nope") == []
