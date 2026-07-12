@@ -1645,6 +1645,7 @@ class TestBuildTimeSeries:
         assert "vllm/model_executor/models/qwen3_next.py" in series
         assert "VLLM_MUSA_EXPERIMENTAL_GATED_QKV_MROPE" not in series
         assert "current_platform.is_musa()" not in series
+        assert "override_tolerance(torch.bfloat16, atol=2e-2, rtol=1.6e-2)" in series
 
     def test_apply_patch_series_missing_dir_is_noop(self, tmp_path):
         ba = self._load_build_apply()

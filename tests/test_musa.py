@@ -111,6 +111,58 @@ class TestMUSAPlatformBase:
             priority = MUSAPlatformBase.get_default_ir_op_priority(config)
             assert priority.fused_add_rms_norm == ["native"]
 
+    def test_gated_qkv_inductor_priority_excludes_routed_moe(self):
+        from vllm.config.compilation import CompilationMode
+
+        from vllm_musa.platform import MUSAPlatformBase, _has_routed_experts
+
+        compilation_config = SimpleNamespace(
+            backend="inductor",
+            mode=CompilationMode.VLLM_COMPILE,
+        )
+        dense_model = SimpleNamespace(
+            hf_text_config=SimpleNamespace(model_type="example_dense")
+        )
+        dense_config = SimpleNamespace(
+            compilation_config=compilation_config,
+            model_config=dense_model,
+        )
+        priority = MUSAPlatformBase.get_default_ir_op_priority(dense_config)
+        assert priority.gated_qkv_rms_norm_rope == ["musa_inductor", "native"]
+        assert not _has_routed_experts(dense_model)
+
+        authoritative_moe = SimpleNamespace(
+            is_moe=True,
+            hf_text_config=SimpleNamespace(model_type="heterogeneous_blocks"),
+        )
+        assert _has_routed_experts(authoritative_moe)
+        authoritative_dense = SimpleNamespace(
+            is_moe=False,
+            hf_text_config=SimpleNamespace(num_experts=8),
+        )
+        assert not _has_routed_experts(authoritative_dense)
+
+        for expert_count_name in (
+            "num_experts",
+            "moe_num_experts",
+            "n_routed_experts",
+            "num_local_experts",
+        ):
+            moe_model = SimpleNamespace(
+                hf_text_config=SimpleNamespace(**{expert_count_name: 8})
+            )
+            moe_config = SimpleNamespace(
+                compilation_config=compilation_config,
+                model_config=moe_model,
+            )
+            priority = MUSAPlatformBase.get_default_ir_op_priority(moe_config)
+            assert priority.gated_qkv_rms_norm_rope == ["native"]
+            assert _has_routed_experts(moe_model)
+
+        compilation_config.mode = CompilationMode.NONE
+        priority = MUSAPlatformBase.get_default_ir_op_priority(dense_config)
+        assert priority.gated_qkv_rms_norm_rope == ["native"]
+
     def test_native_safety_route_is_quantized_piecewise_only(self):
         from vllm.config import CUDAGraphMode
         from vllm.config.compilation import CompilationMode

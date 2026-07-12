@@ -122,6 +122,41 @@ def _is_deepseek_v4_model(model_config: Any | None) -> bool:
     return any("DeepseekV4" in str(arch) for arch in architectures or ())
 
 
+def _has_routed_experts(model_config: Any | None) -> bool:
+    """Return whether the text model uses routed MoE experts.
+
+    Real vLLM ``ModelConfig`` objects expose the authoritative ``is_moe``
+    property, including heterogeneous ``block_configs``. The remaining checks
+    only support lightweight config doubles and older integrations.
+    """
+    if model_config is None:
+        return False
+
+    is_moe = getattr(model_config, "is_moe", None)
+    if is_moe is not None:
+        return bool(is_moe)
+
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    if hf_text_config is None:
+        hf_config = getattr(model_config, "hf_config", None)
+        hf_text_config = getattr(hf_config, "text_config", hf_config)
+    for name in (
+        "num_experts",
+        "moe_num_experts",
+        "n_routed_experts",
+        "num_local_experts",
+    ):
+        if getattr(hf_text_config, name, 0):
+            return True
+
+    architectures = getattr(model_config, "architectures", None)
+    if architectures is None:
+        architectures = getattr(hf_text_config, "architectures", None)
+    return any(
+        "moe" in str(architecture).lower() for architecture in architectures or ()
+    )
+
+
 def _deepseek_v4_flashmla_sparse_block_size(model_config: Any | None) -> int:
     value = os.getenv(_DEEPSEEK_V4_FLASHMLA_SPARSE_BLOCK_ENV)
     if value is None or not _is_deepseek_v4_model(model_config):
@@ -285,10 +320,9 @@ def _will_capture_piecewise_cudagraph(vllm_config: Any) -> bool:
 
 def _should_route_quantized_piecewise_ops_native(vllm_config: Any) -> bool:
     """Whether the quantized PIECEWISE correctness route applies to this model."""
-    return (
-        getattr(vllm_config, "quant_config", None) is not None
-        and _will_capture_piecewise_cudagraph(vllm_config)
-    )
+    return getattr(
+        vllm_config, "quant_config", None
+    ) is not None and _will_capture_piecewise_cudagraph(vllm_config)
 
 
 def _configure_fused_add_rmsnorm_compile_range(
@@ -442,10 +476,22 @@ class MUSAPlatformBase(Platform):
             if musa_envs.VLLM_MUSA_CUSTOM_OP_USE_NATIVE.get()
             else ["musa", "musa_legacy", "native"]
         )
+        # The direct Triton HOP is profitable for every validated dense shape
+        # family; supports_args remains the semantic/shape guard. Keep routed
+        # MoE on native by default because a 100-prompt Qwen3.6 TP8 sweep
+        # regressed 2.81% as eager-faithful BF16 rounding changed expert routes.
+        # Users can still explicitly select the generic provider for A/B work.
+        gated_qkv_rms_norm_rope = (
+            ["musa_inductor", "native"]
+            if using_inductor
+            and not _has_routed_experts(getattr(vllm_config, "model_config", None))
+            else ["native"]
+        )
         return IrOpPriorityConfig.with_default(
             default,
             rms_norm=rms_norm,
             fused_add_rms_norm=fused_add_rms_norm,
+            gated_qkv_rms_norm_rope=gated_qkv_rms_norm_rope,
         )
 
     @classmethod
@@ -912,7 +958,9 @@ class MUSAPlatformBase(Platform):
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:
-        return "vllm.distributed.device_communicators.cuda_communicator.CudaCommunicator"  # noqa
+        return (
+            "vllm.distributed.device_communicators.cuda_communicator.CudaCommunicator"  # noqa
+        )
 
     @classmethod
     def supports_fp8(cls) -> bool:

@@ -8,12 +8,12 @@ Subject: [PATCH] MUSA: add gated QKV RMSNorm MRoPE IR
  tests/test_config.py                     |   2 +
  vllm/config/kernel.py                    |   3 +
  vllm/ir/ops/__init__.py                  |   3 +-
- vllm/ir/ops/gated_qkv.py                 | 213 +++++++++++++++++++++++
+ vllm/ir/ops/gated_qkv.py                 | 218 ++++++++++++++++++++++++
  vllm/model_executor/models/qwen3_next.py |  55 +++++-
  vllm/platforms/cuda.py                   |   5 +-
  vllm/platforms/rocm.py                   |   5 +-
  vllm/platforms/xpu.py                    |   4 +-
- 9 files changed, 441 insertions(+), 8 deletions(-)
+ 9 files changed, 446 insertions(+), 8 deletions(-)
  create mode 100644 tests/kernels/ir/test_gated_qkv.py
  create mode 100644 vllm/ir/ops/gated_qkv.py
 
@@ -230,10 +230,10 @@ index d4d71afef..ce6a2d315 100644
 +__all__ = ["rms_norm", "fused_add_rms_norm", "gated_qkv_rms_norm_rope"]
 diff --git a/vllm/ir/ops/gated_qkv.py b/vllm/ir/ops/gated_qkv.py
 new file mode 100644
-index 000000000..b54620c61
+index 000000000..a293942fb
 --- /dev/null
 +++ b/vllm/ir/ops/gated_qkv.py
-@@ -0,0 +1,213 @@
+@@ -0,0 +1,218 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""IR operations for gated packed-QKV projection post-processing."""
@@ -401,6 +401,11 @@ index 000000000..b54620c61
 +        num_tokens, num_kv_heads * head_dim
 +    )
 +    return query, key
++
++
++# Provider implementations may fuse reductions and BF16 RoPE, changing
++# accumulation order; cancellation can exceed the default elementwise tolerance.
++gated_qkv_rms_norm_rope.override_tolerance(torch.bfloat16, atol=2e-2, rtol=1.6e-2)
 +
 +
 +@gated_qkv_rms_norm_rope.register_input_generator
