@@ -1,49 +1,14 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: musa <musa@local>
 Date: Wed, 01 Jul 2026 16:30:00 +0800
-Subject: [PATCH] MUSA(csrc): compile the libtorch_stable layernorm-quant
- kernels on mcc
+Subject: [PATCH] MUSA(csrc): use boxable strides in stable layernorm-quant
+ kernels
 
-Normalize the relocated layernorm-quant kernels' includes so they build under
-the MUSA porter's per-file _musa tree:
-
-- layernorm_quant_kernels.cu: the ".." relative parents do not resolve after
-  the porter relocates the file; use the csrc-root-relative forms (as the
-  already-built cache/layernorm kernels do). Route vectorization_utils through
-  the libtorch_stable/ tree so vec_n_t/q8_n_t coalesce with the copy pulled
-  transitively by fp8/common.cuh (a "#pragma once" is path-based and would not
-  dedupe two ported-tree copies -> redefinition on mcc).
-- fused_layernorm_dynamic_per_token_quant.cu: replace the int[]-arg
-  torch::stable::view(input, {-1, hidden}).stride(0) (unboxable on torch_musa's
-  stable ABI) with input.stride(-2), matching the static-quant kernel.
+Replace the int[]-arg torch::stable::view(input, {-1, hidden}).stride(0)
+(unboxable on torch_musa's stable ABI) with input.stride(-2), matching the
+static-quant kernel.
 
 ---
-diff --git a/csrc/libtorch_stable/layernorm_quant_kernels.cu b/csrc/libtorch_stable/layernorm_quant_kernels.cu
-index 26ffa76d6..5b80c6dce 100644
---- a/csrc/libtorch_stable/layernorm_quant_kernels.cu
-+++ b/csrc/libtorch_stable/layernorm_quant_kernels.cu
-@@ -11,10 +11,18 @@
- 
- #include "../cub_helpers.h"
- #include "../core/batch_invariant.hpp"
--#include "../quantization/w8a8/fp8/common.cuh"
--#include "../type_convert.cuh"
-+// MUSA: the porter emits this file into a per-file _musa tree where the ".."
-+// relative parents do not resolve; use the csrc-root-relative forms (the same
-+// ones the already-built cache/layernorm kernels use) so they resolve via the
-+// vllm/csrc include root.
-+#include "quantization/w8a8/fp8/common.cuh"
-+#include "type_convert.cuh"
- #include "dispatch_utils.h"
--#include "quantization/vectorization_utils.cuh"
-+// MUSA: route through the libtorch_stable/ tree so the vec_n_t/q8_n_t defs
-+// coalesce with the copy pulled transitively by fp8/common.cuh (a relative
-+// "quantization/..." here resolves into a second ported tree and #pragma once,
-+// being path-based, does not dedupe it -> vec_n_t/q8_n_t ODR on mcc).
-+#include "libtorch_stable/quantization/vectorization_utils.cuh"
- 
- namespace vllm {
- 
 diff --git a/csrc/libtorch_stable/quantization/fused_kernels/fused_layernorm_dynamic_per_token_quant.cu b/csrc/libtorch_stable/quantization/fused_kernels/fused_layernorm_dynamic_per_token_quant.cu
 index 2152e64dc..6ac5d922b 100644
 --- a/csrc/libtorch_stable/quantization/fused_kernels/fused_layernorm_dynamic_per_token_quant.cu
@@ -76,4 +41,3 @@ index 2152e64dc..6ac5d922b 100644
                    "Hidden size must be divisible by 4 for vectorized access");
 -- 
 2.34.1
-

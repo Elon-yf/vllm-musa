@@ -3,9 +3,12 @@
 # bump edits ONE place and the generation base can never desync from the build
 # base. KEY=VALUE only — NOT TOML (tomllib is 3.11+, the build box is py3.10,
 # the package floor is 3.9), so the build needs no parser dependency.
-# Pinned to the released v0.24.0 tag (commit 217c64a976869883fcf0c52a8cf8bc3c954d285b).
+# Human-readable release label plus the immutable source commit used by builds.
+# The public v0.24.0 tag moved after this branch was created, so never build from
+# the mutable tag alone.
 VLLM_TAG=v0.24.0
-# FlashInfer is intentionally DECOUPLED from upstream vLLM's choice: vLLM v0.22.0
-# uses v0.6.11.post2, which breaks the MUSA csrc_musa/include_musa build path.
-# Bump this consciously, not in lockstep with VLLM_TAG.
+VLLM_COMMIT=ee0da84ab9e04ac7610e28580af62c365e898389
+# FlashInfer is intentionally DECOUPLED from upstream vLLM's choice. This is the
+# validated sampling/norm source revision; bump it consciously, not in lockstep
+# with VLLM_TAG/VLLM_COMMIT.
 FLASHINFER_COMMIT=bc29697ba20b7e6bdb728ded98f04788e16ee021

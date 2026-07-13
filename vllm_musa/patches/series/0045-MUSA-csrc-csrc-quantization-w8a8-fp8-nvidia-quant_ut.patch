@@ -14,9 +14,8 @@ index 6e95d72ed..342067c34 100644
 @@ -1,7 +1,6 @@
  #pragma once
  
--#include "../../../../attention/attention_dtypes.h"
+ #include "../../../../attention/attention_dtypes.h"
 -#include <torch/headeronly/core/ScalarType.h>
-+#include "../../../../../csrc_musa/attention_musa/attention_dtypes.h"
  #include <assert.h>
  #include <float.h>
  #include <stdint.h>

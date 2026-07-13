@@ -12,16 +12,17 @@ Subcommands::
         Build-time: apply the build-applied diff series (categories 1/2/3/4b) to
         the cloned vLLM at <repo>, honoring apply_phase order. (setup.py calls this.)
 
-    verify [--target TAG] [--repo PATH]
-        OFFLINE pre-bump gate (no MUSA hardware). Fresh clone of vllm@TAG (or
+    verify [--target REF] [--repo PATH]
+        OFFLINE pre-bump gate (no MUSA hardware). Fresh checkout of vllm@REF (or
         --repo for an existing checkout), then for EVERY divergence emit one
-        status row: build-applied diffs are git-apply --check'd
+        status row: build-applied diffs are cumulatively applied to a disposable
+        copy (the supplied repo is never modified) and classified as
         (clean/obsolete/conflict); cat-5/cat-6 existence-probe their upstream
         target. Exits non-zero on any conflict / missing / orphaned divergence —
         the bounded review surface a version bump needs.
 
-    rebase <tag>
-        Checkout the clone at <tag> and ``git am -3`` the series in order (true
+    rebase <ref>
+        Checkout the clone at <ref> and ``git am -3`` the series in order (true
         3-way; trivial upstream drift auto-merges, real conflicts halt).
 
     regen
@@ -46,6 +47,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent  # tools/ -> repo root
@@ -82,6 +84,11 @@ def read_pin(key: str, default: str | None = None) -> str | None:
     return default
 
 
+def _default_target() -> str | None:
+    """Return the exact upstream ref when available, otherwise the release tag."""
+    return read_pin("VLLM_COMMIT") or read_pin("VLLM_TAG")
+
+
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["git", "-C", str(repo), *args], capture_output=True, text=True
@@ -96,7 +103,7 @@ def _probe_upstream(clone: Path, upstream_path: str | None) -> bool:
     return (Path(clone) / upstream_path).is_file()
 
 
-def _module_tripwire(clone: Path, entry) -> "str | None":
+def _module_tripwire(clone: Path, entry) -> str | None:
     """cat-4a drift tripwire: the stable unified diff of the upstream file (in the
     clone) vs the MUSA shadow copy. Returns None if the upstream file is gone.
     difflib (no timestamps) so the stored tripwire is byte-stable across runs."""
@@ -106,7 +113,13 @@ def _module_tripwire(clone: Path, entry) -> "str | None":
         return None
     a = up.read_text(errors="replace").splitlines(keepends=True)
     b = shadow.read_text(errors="replace").splitlines(keepends=True)
-    return "".join(difflib.unified_diff(a, b, fromfile="upstream", tofile="musa", n=3))
+    diff = difflib.unified_diff(a, b, fromfile="upstream", tofile="musa", n=3)
+    # Keep stored .diff files friendly to git diff --check even when either
+    # source contains whitespace-only or trailing-whitespace lines.
+    return "".join(
+        line.rstrip(" \t\r\n") + ("\n" if line.endswith(("\n", "\r")) else "")
+        for line in diff
+    )
 
 
 def _tripwire_path(entry) -> Path:
@@ -131,9 +144,10 @@ def cmd_apply(args) -> int:
 
 
 # -------------------------------------------------------------------------- verify
-# Map a build_apply check_only status (vs a pristine clone) to a verify verdict.
+# Map a build_apply status from the cumulative disposable copy to a verdict.
 _VERIFY_STATUS = {
     "would-apply": "clean",  # applies cleanly to pristine upstream
+    "applied": "clean",  # applied to the disposable cumulative checkout
     "already-applied": "obsolete",  # already in upstream -> candidate for removal
     "conflict": "conflict",  # drifted -> needs re-anchor/retire
 }
@@ -142,80 +156,123 @@ _BAD = {"conflict", "missing-symbol", "missing-target", "orphaned", "drifted-cop
 
 def _ensure_clone(target: str, repo_arg: str | None):
     """Return (checkout_path, is_temporary). Uses --repo if given, else a fresh
-    shallow clone of vllm@target."""
+    shallow checkout of vllm@target. Fetching the ref explicitly supports both
+    advertised tags and exact commit SHAs."""
     if repo_arg:
         return Path(repo_arg), False
     tmp = Path(tempfile.mkdtemp(prefix="musa-verify-"))
     clone = tmp / "vllm"
-    subprocess.run(
-        ["git", "clone", "--depth", "1", "--branch", target, VLLM_URL, str(clone)],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        subprocess.run(
+            ["git", "init", "--quiet", str(clone)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        _git(clone, "remote", "add", "origin", VLLM_URL).check_returncode()
+        _git(clone, "fetch", "--depth", "1", "origin", target).check_returncode()
+        _git(clone, "checkout", "--force", "--detach", "FETCH_HEAD").check_returncode()
+    except Exception:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
     return clone, True
+
+
+@contextmanager
+def _disposable_checkout(source: Path):
+    """Yield an independent copy of ``source`` suitable for cumulative patching.
+
+    Verification may receive a caller-owned checkout via ``--repo``. A real copy
+    (including symlinks as symlinks, but excluding repository metadata) ensures
+    neither its worktree nor its Git metadata can be modified while later patches
+    are evaluated against the results of earlier patches.
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="musa-verify-series-"))
+    checkout = tmp / "vllm"
+    try:
+        shutil.copytree(
+            source,
+            checkout,
+            symlinks=True,
+            ignore=shutil.ignore_patterns(".git"),
+        )
+        subprocess.run(
+            ["git", "init", "--quiet", str(checkout)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        yield checkout
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def _verify_rows(clone: Path) -> list[tuple]:
     rows: list[tuple] = []
-    for e in manifest.ENTRIES:
-        if e.category in manifest.BUILD_APPLIED_CATEGORIES:
-            patch = ROOT / e.path
-            if not patch.is_file():
-                rows.append((e.id, e.category, "orphaned", "patch file missing"))
-                continue
-            status = build_apply.apply_patch(clone, patch, check_only=True)
-            rows.append((e.id, e.category, _VERIFY_STATUS.get(status, status), ""))
-        elif e.category == "4a":
-            # drift tripwire: re-diff the upstream-vs-shadow and compare to the
-            # stored tripwire. A mismatch means upstream changed under the copy.
-            cur = _module_tripwire(clone, e)
-            stored = _tripwire_path(e)
-            if cur is None:
-                rows.append((e.id, e.category, "missing-target", e.upstream_path or ""))
-            elif not stored.is_file():
-                rows.append(
-                    (e.id, e.category, "no-tripwire", "run `regen --area module`")
-                )
-            elif stored.read_text() == cur:
-                rows.append((e.id, e.category, "clean", "tripwire matches upstream"))
-            else:
+    with _disposable_checkout(clone) as cumulative:
+        for e in manifest.ENTRIES:
+            if e.category in manifest.BUILD_APPLIED_CATEGORIES:
+                patch = ROOT / e.path
+                if not patch.is_file():
+                    rows.append((e.id, e.category, "orphaned", "patch file missing"))
+                    continue
+                status = build_apply.apply_patch(cumulative, patch, check_only=False)
+                rows.append((e.id, e.category, _VERIFY_STATUS.get(status, status), ""))
+            elif e.category == "4a":
+                # Probes intentionally use the caller's pristine checkout, not
+                # the cumulative series copy whose upstream files are changing.
+                cur = _module_tripwire(clone, e)
+                stored = _tripwire_path(e)
+                if cur is None:
+                    rows.append(
+                        (e.id, e.category, "missing-target", e.upstream_path or "")
+                    )
+                elif not stored.is_file():
+                    rows.append(
+                        (e.id, e.category, "no-tripwire", "run `regen --area module`")
+                    )
+                elif stored.read_text() == cur:
+                    rows.append(
+                        (e.id, e.category, "clean", "tripwire matches upstream")
+                    )
+                else:
+                    rows.append(
+                        (
+                            e.id,
+                            e.category,
+                            "drifted-copy",
+                            "upstream changed under the copy",
+                        )
+                    )
+            elif e.category == "5":
+                ok = _probe_upstream(clone, e.upstream_path)
                 rows.append(
                     (
                         e.id,
                         e.category,
-                        "drifted-copy",
-                        "upstream changed under the copy",
+                        "present" if ok else "missing-symbol",
+                        e.upstream_path or "",
                     )
                 )
-        elif e.category == "5":
-            ok = _probe_upstream(clone, e.upstream_path)
-            rows.append(
-                (
-                    e.id,
-                    e.category,
-                    "present" if ok else "missing-symbol",
-                    e.upstream_path or "",
+            elif e.category == "6":
+                ok = _probe_upstream(clone, e.upstream_path)
+                rows.append(
+                    (
+                        e.id,
+                        e.category,
+                        "present" if ok else "missing-target",
+                        e.upstream_path or "",
+                    )
                 )
-            )
-        elif e.category == "6":
-            ok = _probe_upstream(clone, e.upstream_path)
-            rows.append(
-                (
-                    e.id,
-                    e.category,
-                    "present" if ok else "missing-target",
-                    e.upstream_path or "",
-                )
-            )
     return rows
 
 
 def cmd_verify(args) -> int:
-    target = args.target or read_pin("VLLM_TAG")
+    target = args.target or _default_target()
     if not target:
         print(
-            "ERROR: no target tag (pass --target or set VLLM_TAG in third_party/PINS)"
+            "ERROR: no target ref (pass --target or set VLLM_COMMIT/VLLM_TAG "
+            "in third_party/PINS)"
         )
         return 2
     clone, temp = _ensure_clone(target, args.repo)
@@ -242,14 +299,22 @@ def cmd_verify(args) -> int:
 # -------------------------------------------------------------------- rebase / regen
 def _checkout(target: str) -> int:
     if not WORKDIR.exists():
+        WORKDIR.parent.mkdir(parents=True, exist_ok=True)
         r = subprocess.run(
-            ["git", "clone", VLLM_URL, str(WORKDIR)], capture_output=True, text=True
+            ["git", "init", "--quiet", str(WORKDIR)], capture_output=True, text=True
         )
         if r.returncode:
             print(r.stderr)
             return 1
-    _git(WORKDIR, "fetch", "--tags")
-    r = _git(WORKDIR, "checkout", "-f", target)
+        r = _git(WORKDIR, "remote", "add", "origin", VLLM_URL)
+        if r.returncode:
+            print(r.stderr)
+            return 1
+    r = _git(WORKDIR, "fetch", "--depth", "1", "origin", target)
+    if r.returncode:
+        print(r.stderr)
+        return 1
+    r = _git(WORKDIR, "checkout", "--force", "--detach", "FETCH_HEAD")
     if r.returncode:
         print(r.stderr)
         return 1
@@ -257,7 +322,7 @@ def _checkout(target: str) -> int:
 
 
 def cmd_rebase(args) -> int:
-    target = args.tag or read_pin("VLLM_TAG")
+    target = args.tag or _default_target()
     if _checkout(target):
         return 1
     order = manifest.series_apply_order()
@@ -278,7 +343,7 @@ def cmd_rebase(args) -> int:
 def _regen_module_tripwires() -> int:
     """(re)generate the cat-4a drift tripwires from a PRISTINE upstream
     checkout (the tripwire is the MUSA shadow's delta vs the pinned upstream)."""
-    target = read_pin("VLLM_TAG")
+    target = _default_target()
     if _checkout(target):  # reset WORKDIR to pristine vllm@<pin>
         return 1
     MODULE_DRIFT_DIR.mkdir(parents=True, exist_ok=True)
@@ -300,7 +365,7 @@ def _regen_module_tripwires() -> int:
 def cmd_regen(args) -> int:
     if args.area == "module":
         return _regen_module_tripwires()
-    target = read_pin("VLLM_TAG")
+    target = _default_target()
     SERIES_DIR.mkdir(parents=True, exist_ok=True)
     r = _git(
         WORKDIR,
@@ -361,7 +426,9 @@ def main(argv: list[str] | None = None) -> int:
         "verify", help="offline pre-bump gate: status of every divergence"
     )
     p.add_argument(
-        "--target", default=None, help="vLLM tag (default: VLLM_TAG from PINS)"
+        "--target",
+        default=None,
+        help="vLLM ref (default: VLLM_COMMIT, falling back to VLLM_TAG from PINS)",
     )
     p.add_argument(
         "--repo", default=None, help="use an existing checkout instead of cloning"
@@ -369,9 +436,9 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(func=cmd_verify)
 
     p = sub.add_parser(
-        "rebase", help="git am -3 the series onto vllm@<tag> in third_party/vllm"
+        "rebase", help="git am -3 the series onto vllm@<ref> in third_party/vllm"
     )
-    p.add_argument("tag", nargs="?", default=None)
+    p.add_argument("tag", metavar="ref", nargs="?", default=None)
     p.set_defaults(func=cmd_rebase)
 
     p = sub.add_parser("regen", help="regenerate the series from the clone's commits")

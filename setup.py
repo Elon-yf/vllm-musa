@@ -11,33 +11,26 @@ from pathlib import Path
 
 import torch
 
+root = Path(__file__).parent.resolve()
+sys.path.insert(0, str(root))
+
+from build_utils.dependencies import (
+    TORCHADA_REQUIREMENT,
+    ensure_torchada_installed,
+)
+
 
 def _ensure_numpy_compatible():
     """Ensure numpy<2 (MUSA/torch requirement); the vLLM install can pull numpy>=2."""
     subprocess.check_call([sys.executable, "-m", "pip", "install", "numpy<2", "-q"])
 
 
-def _ensure_torchada_installed():
-    """Ensure torchada is installed (needed for torch.cuda patching)."""
-    try:
-        import torchada  # noqa: F401
-    except ImportError:
-        print("Installing torchada...")
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "torchada", "--upgrade", "-q"]
-        )
-        import torchada  # noqa: F401
-
-
 # Run dependency checks at setup start
 _ensure_numpy_compatible()
-_ensure_torchada_installed()
+ensure_torchada_installed()
 
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
-
-root = Path(__file__).parent.resolve()
-sys.path.insert(0, str(root))
 
 from build_utils.ccache import configure_compiler_cache
 
@@ -119,7 +112,7 @@ class _RepoInfo:
 _VLLM_REPO = _RepoInfo(
     name="vllm",
     git_repository="https://github.com/vllm-project/vllm.git",
-    git_tag=_PINS["VLLM_TAG"],
+    git_tag=_PINS.get("VLLM_COMMIT", _PINS["VLLM_TAG"]),
     git_shallow=False,
 )
 
@@ -383,12 +376,11 @@ class _CustomBuildExt(BuildExtension):
         env = os.environ.copy()
         env["VLLM_TARGET_DEVICE"] = "empty"
 
-        # When third_party/vllm is synced via `git archive | tar` (the transfer
-        # used when GitHub is unreachable from the build host) it carries no .git,
-        # so vLLM's setuptools-scm cannot derive a version and metadata generation
-        # fails. Supply the version explicitly in that case.
+        # When third_party/vllm is synced via `git archive | tar` it carries no
+        # .git, so vLLM's setuptools-scm cannot derive a version. vLLM's setup.py
+        # consumes VLLM_VERSION_OVERRIDE and forwards it to setuptools-scm.
         if not (source_dir / ".git").exists():
-            env.setdefault("SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM", "0.24.0")
+            env.setdefault("VLLM_VERSION_OVERRIDE", "0.24.0")
 
         # always editable; compat (path-based .pth) -- the default PEP 660 finder
         # mis-resolves vLLM's submodules and loses to a system vLLM.
@@ -503,7 +495,7 @@ setup(
     include_package_data=False,
     # pinned here because --no-build-isolation skips pyproject.toml deps
     install_requires=[
-        "torchada>=0.1.69",
+        TORCHADA_REQUIREMENT,
         "mthreads-ml-py>=2.2.11",
         "numpy<2",
         "openai>=2.24.0",

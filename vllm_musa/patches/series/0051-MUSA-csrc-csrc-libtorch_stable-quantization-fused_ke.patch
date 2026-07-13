@@ -1,11 +1,10 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: musa <musa@local>
 Date: Thu, 4 Jun 2026 02:46:36 +0000
-Subject: [PATCH] MUSA(csrc):
- csrc/libtorch_stable/quantization/fused_kernels/quant_conversions.cuh
+Subject: [PATCH] MUSA(csrc): use portable int8 rounding in stable quant
+ conversions
 
-Normalize the relocated fp8 common.cuh include for the porter's _musa tree, and
-route float_to_int8_rn off the NVIDIA-only cvt PTX (mcc emits wrong int8s) onto
+Route float_to_int8_rn off the NVIDIA-only cvt PTX (mcc emits wrong int8s) onto
 the portable nearbyint+saturate path ROCm uses -- otherwise the fused
 rms_norm_dynamic_per_token_quant int8 output is wrong on mcc.
 
@@ -14,15 +13,7 @@ diff --git a/csrc/libtorch_stable/quantization/fused_kernels/quant_conversions.c
 index dbe38092f..843fd95f3 100644
 --- a/csrc/libtorch_stable/quantization/fused_kernels/quant_conversions.cuh
 +++ b/csrc/libtorch_stable/quantization/fused_kernels/quant_conversions.cuh
-@@ -6,14 +6,16 @@
- 
- #include "libtorch_stable/quantization/vectorization.cuh"
- // TODO(luka/varun):refactor common.cuh to use this file instead
--#include "../../../quantization/w8a8/fp8/common.cuh"
-+#include "quantization/w8a8/fp8/common.cuh"
- 
- namespace vllm {
- 
+@@ -13,7 +13,9 @@ namespace vllm {
  // TODO(luka/varun): combine into common utilities for int8
  //  (with int8_quant_kernels.cu)
  static __device__ __forceinline__ int8_t float_to_int8_rn(float const x) {
