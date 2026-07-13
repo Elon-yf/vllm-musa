@@ -154,6 +154,15 @@ def _supports_gated_qkv(
     )
     expected_width = (2 * num_q_heads + 2 * num_kv_heads) * head_dim
     tensors = (packed_qkv, q_weight, k_weight, cos_sin_cache, positions)
+    if not all(tensor.device.type == "musa" for tensor in tensors):
+        return False
+    if not all(tensor.device == packed_qkv.device for tensor in tensors):
+        return False
+
+    device_id = packed_qkv.device.index or 0
+    if device_id < 0 or device_id >= torch.musa.device_count():
+        return False
+
     return (
         num_q_heads in (2, 3)
         and num_kv_heads == 1
@@ -163,11 +172,7 @@ def _supports_gated_qkv(
         and mrope_interleaved
         and is_neox_style
         and weight_offset == 1.0
-        and current_platform.is_device_capability(
-            (3, 1), device_id=packed_qkv.device.index or 0
-        )
-        and all(tensor.device.type == "musa" for tensor in tensors)
-        and all(tensor.device == packed_qkv.device for tensor in tensors)
+        and current_platform.is_device_capability((3, 1), device_id=device_id)
         and packed_qkv.dtype == torch.bfloat16
         and q_weight.dtype == packed_qkv.dtype
         and k_weight.dtype == packed_qkv.dtype

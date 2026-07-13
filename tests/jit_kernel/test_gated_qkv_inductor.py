@@ -2,6 +2,7 @@
 
 import copy
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -253,8 +254,10 @@ def test_gated_qkv_vllm_ir_lowers_to_triton_hop() -> None:
             )
 
 
-def test_gated_qkv_inductor_support_scope() -> None:
-    from vllm_musa.kernels.gated_qkv import _supports_gated_qkv
+def test_gated_qkv_inductor_support_scope(monkeypatch) -> None:
+    from vllm_musa.kernels import gated_qkv
+
+    _supports_gated_qkv = gated_qkv._supports_gated_qkv
 
     args = _inputs(64, 3)
     assert _supports_gated_qkv(*args)
@@ -265,6 +268,19 @@ def test_gated_qkv_inductor_support_scope() -> None:
 
     unsupported = list(args)
     unsupported[13] = 0.0
+    assert not _supports_gated_qkv(*unsupported)
+
+    unsupported = list(args)
+    unsupported[0] = unsupported[0].cpu()
+
+    def fail_capability_query(*args, **kwargs):
+        pytest.fail("non-MUSA inputs must not query MUSA device capability")
+
+    monkeypatch.setattr(
+        gated_qkv,
+        "current_platform",
+        SimpleNamespace(is_device_capability=fail_capability_query),
+    )
     assert not _supports_gated_qkv(*unsupported)
 
     if torch.musa.device_count() > 1:
