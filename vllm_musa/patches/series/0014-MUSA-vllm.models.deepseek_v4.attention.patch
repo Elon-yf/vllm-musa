@@ -4,11 +4,11 @@ Date: Wed, 3 Jun 2026 11:47:35 +0000
 Subject: [PATCH] MUSA: vllm.models.deepseek_v4.attention
 
 ---
- vllm/models/deepseek_v4/attention.py | 83 +++++++++++++++++++++++++---
- 1 file changed, 77 insertions(+), 6 deletions(-)
+ vllm/models/deepseek_v4/attention.py | 84 ++++++++++++++++++++++++++--
+ 1 file changed, 78 insertions(+), 6 deletions(-)
 
 diff --git a/vllm/models/deepseek_v4/attention.py b/vllm/models/deepseek_v4/attention.py
-index 29a19d9..1f39ffa 100644
+index 29a19d902..1f39ffa8c 100644
 --- a/vllm/models/deepseek_v4/attention.py
 +++ b/vllm/models/deepseek_v4/attention.py
 @@ -61,6 +61,65 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec

@@ -1621,7 +1621,7 @@ class TestBuildTimeSeries:
 
     def test_gemma_norm_series_patch_uses_generic_inplace_ir_contract(self):
         series = (
-            self._SERIES_DIR / "0086-MUSA-vllm.gemma-rmsnorm-use-inplace-IR.patch"
+            self._SERIES_DIR / "0079-MUSA-allow-Gemma-RMSNorm-residual-donation.patch"
         ).read_text()
 
         assert "fused_add_rms_norm.maybe_inplace" in series
@@ -1631,8 +1631,7 @@ class TestBuildTimeSeries:
 
     def test_gated_qkv_series_patch_uses_generic_ir_contract(self):
         series = (
-            self._SERIES_DIR
-            / "0087-MUSA-vllm.gated-qkv-rmsnorm-mrope-IR.patch"
+            self._SERIES_DIR / "0080-MUSA-add-gated-QKV-RMSNorm-MRoPE-IR.patch"
         ).read_text()
 
         assert '@register_op(activations=["packed_qkv"])' in series

@@ -4,15 +4,17 @@ Date: Thu, 4 Jun 2026 02:46:36 +0000
 Subject: [PATCH] MUSA(csrc): libtorch_stable torch_bindings PrivateUse1 impls
 
 ---
- csrc/libtorch_stable/ops.h              |  6 ++++++
+ csrc/libtorch_stable/ops.h              |  6 +++++
  csrc/libtorch_stable/torch_bindings.cpp | 35 +++++++++++++++++++++++++
  2 files changed, 41 insertions(+)
 
 diff --git a/csrc/libtorch_stable/ops.h b/csrc/libtorch_stable/ops.h
-index d60b68a5..11b44dfb 100644
+index d60b68a58..11b44dfb0 100644
 --- a/csrc/libtorch_stable/ops.h
 +++ b/csrc/libtorch_stable/ops.h
-@@ -13,6 +13,12 @@
+@@ -11,8 +11,14 @@
+ #include <torch/csrc/stable/ops.h>
+ 
  inline torch::stable::Tensor weak_ref_tensor(torch::stable::Tensor& tensor) {
 +#if defined(USE_MUSA)
 +  // Ensure tensor is on MUSA
@@ -22,15 +24,14 @@ index d60b68a5..11b44dfb 100644
    // Ensure tensor is on CUDA
    STD_TORCH_CHECK(tensor.device().is_cuda(), "Tensor must be on CUDA device");
 +#endif
--
-+
+ 
    // Get the raw data pointer
    void* data_ptr = tensor.mutable_data_ptr();
 diff --git a/csrc/libtorch_stable/torch_bindings.cpp b/csrc/libtorch_stable/torch_bindings.cpp
-index d55c12d38..7a40bb355 100644
+index 1be7217ce..3133243c4 100644
 --- a/csrc/libtorch_stable/torch_bindings.cpp
 +++ b/csrc/libtorch_stable/torch_bindings.cpp
-@@ -626,6 +626,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
+@@ -632,6 +632,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
        "    int blocksparse_head_sliding_step) -> ()");
  }
  
@@ -38,7 +39,7 @@ index d55c12d38..7a40bb355 100644
  STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
    // Per-token group quantization
    ops.impl("per_token_group_fp8_quant", TORCH_BOX(&per_token_group_quant_fp8));
-@@ -761,6 +762,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cuda_utils, cuda_utils) {
+@@ -770,6 +771,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cuda_utils, cuda_utils) {
    cuda_utils.def(
        "get_max_shared_memory_per_block_device_attribute(int device_id) -> int");
  }
@@ -46,7 +47,7 @@ index d55c12d38..7a40bb355 100644
  
  STABLE_TORCH_LIBRARY_IMPL(_C_cuda_utils, CompositeExplicitAutograd,
                            cuda_utils) {
-@@ -775,6 +777,7 @@ STABLE_TORCH_LIBRARY_IMPL(_C_cuda_utils, CompositeExplicitAutograd,
+@@ -784,6 +786,7 @@ STABLE_TORCH_LIBRARY_IMPL(_C_cuda_utils, CompositeExplicitAutograd,
  // there is no device to dispatch on. CompositeExplicitAutograd makes them
  // available for all backends. This is the stable ABI equivalent of calling
  // ops.impl("op_name", &func) without a dispatch key in the non-stable API.
@@ -54,7 +55,7 @@ index d55c12d38..7a40bb355 100644
  STABLE_TORCH_LIBRARY_IMPL(_C, CompositeExplicitAutograd, ops) {
  #ifndef USE_ROCM
    ops.impl("cutlass_scaled_mm_supports_fp8",
-@@ -937,5 +940,37 @@ STABLE_TORCH_LIBRARY_IMPL(_C_cache_ops, CUDA, ops) {
+@@ -946,5 +949,37 @@ STABLE_TORCH_LIBRARY_IMPL(_C_cache_ops, CUDA, ops) {
    ops.impl("cp_gather_indexer_k_quant_cache",
             TORCH_BOX(&cp_gather_indexer_k_quant_cache));
  }

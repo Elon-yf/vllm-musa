@@ -8,10 +8,10 @@ Subject: [PATCH] MUSA: vllm.model_executor.kernels.linear
  1 file changed, 28 insertions(+), 1 deletion(-)
 
 diff --git a/vllm/model_executor/kernels/linear/__init__.py b/vllm/model_executor/kernels/linear/__init__.py
-index 58ba7c8cb..884f527f5 100644
+index 4ac8d49cd..a75521f33 100644
 --- a/vllm/model_executor/kernels/linear/__init__.py
 +++ b/vllm/model_executor/kernels/linear/__init__.py
-@@ -506,7 +506,34 @@ def choose_scaled_mm_linear_kernel(
+@@ -509,7 +509,34 @@ def choose_scaled_mm_linear_kernel(
              scope="global",
          )
  

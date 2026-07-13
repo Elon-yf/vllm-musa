@@ -8,7 +8,7 @@ Subject: [PATCH] MUSA: vllm.model_executor.layers.sparse_attn_indexer
  1 file changed, 1013 insertions(+)
 
 diff --git a/vllm/model_executor/layers/sparse_attn_indexer.py b/vllm/model_executor/layers/sparse_attn_indexer.py
-index 45c5d5f78..3f3a68013 100644
+index fe2b268cd..eadc6f533 100644
 --- a/vllm/model_executor/layers/sparse_attn_indexer.py
 +++ b/vllm/model_executor/layers/sparse_attn_indexer.py
 @@ -2,9 +2,12 @@
@@ -1007,7 +1007,7 @@ index 45c5d5f78..3f3a68013 100644
  RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
  
  # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
-@@ -457,6 +1436,40 @@ class SparseAttnIndexer(CustomOp):
+@@ -482,6 +1461,40 @@ class SparseAttnIndexer(CustomOp):
              return self.forward_cuda(hidden_states, q_quant, k, weights)
          elif current_platform.is_rocm():
              return self.forward_hip(hidden_states, q_quant, k, weights)

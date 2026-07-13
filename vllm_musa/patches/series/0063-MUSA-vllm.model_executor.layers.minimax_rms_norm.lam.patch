@@ -1,10 +1,11 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: musa <musa@local>
-Date: Wed, 25 Jun 2026 00:00:00 +0000
-Subject: [PATCH] MUSA: vllm.model_executor.layers.minimax_rms_norm.lamport_workspace
+Date: Thu, 25 Jun 2026 00:00:00 +0000
+Subject: [PATCH] MUSA:
+ vllm.model_executor.layers.minimax_rms_norm.lamport_workspace
 
 ---
- .../layers/minimax_rms_norm/lamport_workspace.py          | 15 ++++++++++++++-
+ .../layers/minimax_rms_norm/lamport_workspace.py  | 15 ++++++++++++++-
  1 file changed, 14 insertions(+), 1 deletion(-)
 
 diff --git a/vllm/model_executor/layers/minimax_rms_norm/lamport_workspace.py b/vllm/model_executor/layers/minimax_rms_norm/lamport_workspace.py

@@ -1,5 +1,5 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Joey-gvwal <joey_gvwal@yeah.net>
+From: musa <musa@local>
 Date: Mon, 29 Jun 2026 17:23:00 +0800
 Subject: [PATCH] MUSA: load weak tensor ref kernels lazily
 
@@ -8,7 +8,7 @@ Subject: [PATCH] MUSA: load weak tensor ref kernels lazily
  1 file changed, 6 insertions(+)
 
 diff --git a/vllm/utils/torch_utils.py b/vllm/utils/torch_utils.py
-index 9269fbb44..5cae3bed9 100644
+index 9269fbb44..c1ac453e1 100644
 --- a/vllm/utils/torch_utils.py
 +++ b/vllm/utils/torch_utils.py
 @@ -763,6 +763,12 @@ def weak_ref_tensor(tensor: Any) -> Any:

@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: musa <musa@local>
-Date: Tue, 01 Jul 2026 17:30:00 +0800
+Date: Wed, 1 Jul 2026 17:30:00 +0800
 Subject: [PATCH] MUSA(csrc): use portable rounding in stable int8 quant
  kernels
 
@@ -12,15 +12,17 @@ already uses.
 These kernels define dynamic_scaled_fp8_quant, dynamic_per_token_scaled_fp8_quant
 and the static/dynamic int8 quant ops (all Tensor-arg, boxable), plus
 static_scaled_fp8_quant (kept CUDA-only -- its int[] group_shape is unboxable).
-
 ---
+ .../quantization/w8a8/int8/scaled_quant.cu             | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
 diff --git a/csrc/libtorch_stable/quantization/w8a8/int8/scaled_quant.cu b/csrc/libtorch_stable/quantization/w8a8/int8/scaled_quant.cu
-index ede7913a3..c5708cacc 100644
+index ede7913a3..25e8592c5 100644
 --- a/csrc/libtorch_stable/quantization/w8a8/int8/scaled_quant.cu
 +++ b/csrc/libtorch_stable/quantization/w8a8/int8/scaled_quant.cu
 @@ -8,7 +8,9 @@
  #include "../../../../cub_helpers.h"
-
+ 
  static inline __device__ int8_t float_to_int8_rn(float x) {
 -#ifdef USE_ROCM
 +// MUSA: mcc cannot assemble the NVIDIA-only `cvt.rni.sat.s8.f32` PTX below
@@ -49,5 +51,3 @@ index ede7913a3..c5708cacc 100644
    static constexpr auto i8_min =
        static_cast<int32_t>(std::numeric_limits<int8_t>::min());
    static constexpr auto i8_max =
--- 
-2.34.1
