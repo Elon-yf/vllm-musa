@@ -59,7 +59,7 @@ MODULE_DRIFT_DIR = (
 WORKDIR = ROOT / "third_party" / "vllm"
 PINS = ROOT / "third_party" / "PINS"
 VLLM_URL = "https://github.com/vllm-project/vllm.git"
-_CANONICAL_PATCH_AUTHOR = "From: musa <musa@local>"
+_CANONICAL_PATCH_AUTHOR = b"From: musa <musa@local>"
 
 
 def _load(name: str, path: Path):
@@ -92,14 +92,14 @@ def _default_target() -> str | None:
 
 def _normalize_patch_author(path: Path) -> None:
     """Give generated patches the repository's canonical synthetic author."""
-    lines = path.read_text().splitlines(keepends=True)
-    if len(lines) < 2 or not lines[1].startswith("From: "):
+    lines = path.read_bytes().splitlines(keepends=True)
+    if len(lines) < 2 or not lines[1].startswith(b"From: "):
         return
-    author = lines[1].rstrip("\r\n")
+    author = lines[1].rstrip(b"\r\n")
     if author == _CANONICAL_PATCH_AUTHOR:
         return
     lines[1] = _CANONICAL_PATCH_AUTHOR + lines[1][len(author) :]
-    path.write_text("".join(lines))
+    path.write_bytes(b"".join(lines))
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
@@ -379,6 +379,9 @@ def cmd_regen(args) -> int:
     if args.area == "module":
         return _regen_module_tripwires()
     target = _default_target()
+    if not target:
+        print("ERROR: VLLM_COMMIT or VLLM_TAG is required in third_party/PINS")
+        return 1
     with tempfile.TemporaryDirectory(prefix="musa-regen-series-") as tmp:
         staged = Path(tmp)
         r = _git(

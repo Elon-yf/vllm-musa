@@ -116,6 +116,32 @@ def test_series_is_contiguous_and_uses_canonical_headers_and_authors():
     assert set(authors) == {"From: musa <musa@local>"}
 
 
+def test_normalize_patch_author_preserves_non_utf8_bytes(ms, tmp_path):
+    patch = tmp_path / "0001-non-utf8.patch"
+    patch.write_bytes(
+        b"From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001\n"
+        b"From: contributor <contributor@example.com>\n"
+        b"Subject: [PATCH] preserve bytes\n\n"
+        b"non-utf8 payload: \xff\xfe\n"
+    )
+
+    ms._normalize_patch_author(patch)
+
+    assert patch.read_bytes() == (
+        b"From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001\n"
+        b"From: musa <musa@local>\n"
+        b"Subject: [PATCH] preserve bytes\n\n"
+        b"non-utf8 payload: \xff\xfe\n"
+    )
+
+
+def test_regen_requires_pinned_target(ms, monkeypatch, capsys):
+    monkeypatch.setattr(ms, "_default_target", lambda: None)
+
+    assert ms.main(["regen"]) == 1
+    assert "VLLM_COMMIT or VLLM_TAG is required" in capsys.readouterr().out
+
+
 @pytest.mark.skipif(shutil.which("git") is None, reason="git unavailable")
 def test_ensure_clone_accepts_exact_commit_sha(ms, tmp_path, monkeypatch):
     origin = tmp_path / "origin"
