@@ -7,10 +7,12 @@ Subject: [PATCH] MUSA(csrc): use portable int8 rounding in stable quant
 Route float_to_int8_rn off the NVIDIA-only cvt PTX (mcc emits wrong int8s) onto
 the portable nearbyint+saturate path ROCm uses -- otherwise the fused
 rms_norm_dynamic_per_token_quant int8 output is wrong on mcc.
-
 ---
+ .../quantization/fused_kernels/quant_conversions.cuh          | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
 diff --git a/csrc/libtorch_stable/quantization/fused_kernels/quant_conversions.cuh b/csrc/libtorch_stable/quantization/fused_kernels/quant_conversions.cuh
-index dbe38092f..843fd95f3 100644
+index dbe38092f..0bb6bbd35 100644
 --- a/csrc/libtorch_stable/quantization/fused_kernels/quant_conversions.cuh
 +++ b/csrc/libtorch_stable/quantization/fused_kernels/quant_conversions.cuh
 @@ -13,7 +13,9 @@ namespace vllm {
@@ -24,5 +26,3 @@ index dbe38092f..843fd95f3 100644
    static const float i8_min =
        static_cast<float>(std::numeric_limits<int8_t>::min());
    static const float i8_max =
--- 
-2.34.1

@@ -9,8 +9,11 @@ is pre-patched.
 - **Applied at build** by `setup.py::_apply_musa_patch_series` → `build_apply.py`
   (`git apply`, idempotent `--reverse --check`).
 - **Generated/regenerated** by `make -f Makefile.sync format-patches`
-  (`git format-patch --no-signature --zero-commit`, keeping `index` blob lines so
-  `git am -3` 3-way works across version bumps).
+  (`git format-patch --no-signature --no-numbered --zero-commit`, keeping `index`
+  blob lines so `git am -3` 3-way works across version bumps). Regeneration stages
+  a complete replacement, so filenames always form one contiguous `0001`–`NNNN`
+  sequence and patches removed from the commit stack cannot leave stale files.
+  Author headers are normalized to the synthetic `musa <musa@local>` identity.
 
 Currently **80 patches** — the MUSA source edits against the immutable vLLM commit
 recorded as `VLLM_COMMIT` in `third_party/PINS` (release label `v0.24.0`), applied

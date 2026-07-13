@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: musa <musa@local>
-Date: Wed, 25 Jun 2026 12:00:00 +0000
+Date: Thu, 25 Jun 2026 12:00:00 +0000
 Subject: [PATCH] MUSA: vllm.model_executor.kernels.mhc.tilelang
 
 ---
@@ -8,7 +8,7 @@ Subject: [PATCH] MUSA: vllm.model_executor.kernels.mhc.tilelang
  1 file changed, 49 insertions(+)
 
 diff --git a/vllm/model_executor/kernels/mhc/tilelang.py b/vllm/model_executor/kernels/mhc/tilelang.py
-index e000714..40be813 100644
+index e0007141d..40be813b3 100644
 --- a/vllm/model_executor/kernels/mhc/tilelang.py
 +++ b/vllm/model_executor/kernels/mhc/tilelang.py
 @@ -126,6 +126,26 @@ def mhc_pre_tilelang(

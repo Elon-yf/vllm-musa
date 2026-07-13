@@ -7,11 +7,11 @@ Subject: [PATCH] MUSA(csrc): drop unboxable stable ops, guard non-core
 ---
  csrc/libtorch_stable/activation_kernels.cu    |  6 +-
  .../quantization/activation_kernels.cu        |  6 +-
- csrc/libtorch_stable/torch_bindings.cpp       | 57 +++++++++++++++++++
- 3 files changed, 64 insertions(+), 5 deletions(-)
+ csrc/libtorch_stable/torch_bindings.cpp       | 73 +++++++++++++++++++
+ 3 files changed, 80 insertions(+), 5 deletions(-)
 
 diff --git a/csrc/libtorch_stable/activation_kernels.cu b/csrc/libtorch_stable/activation_kernels.cu
-index e1dc013..5364138 100644
+index e1dc01346..53641380d 100644
 --- a/csrc/libtorch_stable/activation_kernels.cu
 +++ b/csrc/libtorch_stable/activation_kernels.cu
 @@ -259,7 +259,7 @@ packed_gelu_tanh_kernel(const packed_t& val, const float /*alpha*/) {
@@ -49,7 +49,7 @@ index e1dc013..5364138 100644
                                           input.const_data_ptr<scalar_t>(), d); \
        });                                                                      \
 diff --git a/csrc/libtorch_stable/quantization/activation_kernels.cu b/csrc/libtorch_stable/quantization/activation_kernels.cu
-index a140a04..7facea1 100644
+index a140a043c..7facea171 100644
 --- a/csrc/libtorch_stable/quantization/activation_kernels.cu
 +++ b/csrc/libtorch_stable/quantization/activation_kernels.cu
 @@ -304,10 +304,10 @@ __global__ void silu_mul_fp8_quant_deep_gemm_kernel(
@@ -67,7 +67,7 @@ index a140a04..7facea1 100644
    int warp_id = tid >> 5;
    int lane_id = tid & 0x1f;
 diff --git a/csrc/libtorch_stable/torch_bindings.cpp b/csrc/libtorch_stable/torch_bindings.cpp
-index 3133243..b334e2b 100644
+index 3133243c4..1ca216c0d 100644
 --- a/csrc/libtorch_stable/torch_bindings.cpp
 +++ b/csrc/libtorch_stable/torch_bindings.cpp
 @@ -185,10 +185,12 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
@@ -323,7 +323,7 @@ index 3133243..b334e2b 100644
    ops.impl("rotary_embedding", TORCH_BOX(&rotary_embedding));
    // w8a8 per-token-group quant (MUSA-0/Option-3 consolidation): the upstream
    // stable kernels replace the native csrc/musa non-fused re-impl. The MUSA-only
-@@ -982,4 +1038,5 @@ STABLE_TORCH_LIBRARY_IMPL(_C, PrivateUse1, ops) {
+@@ -982,4 +1054,5 @@ STABLE_TORCH_LIBRARY_IMPL(_C, PrivateUse1, ops) {
    ops.impl("per_token_group_quant_int8", TORCH_BOX(&per_token_group_quant_int8));
  }
  #endif

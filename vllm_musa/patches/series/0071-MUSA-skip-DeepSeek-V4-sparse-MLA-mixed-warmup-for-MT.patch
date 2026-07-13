@@ -1,17 +1,17 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Joey-gvwal <joey_gvwal@yeah.net>
+From: musa <musa@local>
 Date: Mon, 29 Jun 2026 16:35:00 +0800
 Subject: [PATCH] MUSA: skip DeepSeek-V4 sparse MLA mixed warmup for MTP
 
 ---
- vllm/model_executor/warmup/flashinfer_sparse_mla_warmup.py | 11 +++++++++++
+ .../warmup/flashinfer_sparse_mla_warmup.py            | 11 +++++++++++
  1 file changed, 11 insertions(+)
 
 diff --git a/vllm/model_executor/warmup/flashinfer_sparse_mla_warmup.py b/vllm/model_executor/warmup/flashinfer_sparse_mla_warmup.py
-index 0fa14c7ee..bb5641757 100644
+index 44be769e2..fc2851cdd 100644
 --- a/vllm/model_executor/warmup/flashinfer_sparse_mla_warmup.py
 +++ b/vllm/model_executor/warmup/flashinfer_sparse_mla_warmup.py
-@@ -227,6 +227,17 @@ def deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
+@@ -225,6 +225,17 @@ def deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
      if runner.is_pooling_model or not _has_deepseek_v4_sparse_mla_backend(runner):
          return
  

@@ -1,5 +1,5 @@
-From ad473308bce9aa40db5bb2ccca02be96c53a3b0d Mon Sep 17 00:00:00 2001
-From: Xiaodong Ye <xiaodong.ye@mthreads.com>
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: musa <musa@local>
 Date: Sun, 12 Jul 2026 13:37:22 +0800
 Subject: [PATCH] MUSA: add gated QKV RMSNorm MRoPE IR
 
@@ -8,7 +8,7 @@ Subject: [PATCH] MUSA: add gated QKV RMSNorm MRoPE IR
  tests/test_config.py                     |   2 +
  vllm/config/kernel.py                    |   3 +
  vllm/ir/ops/__init__.py                  |   3 +-
- vllm/ir/ops/gated_qkv.py                 | 218 ++++++++++++++++++++++++
+ vllm/ir/ops/gated_qkv.py                 | 218 +++++++++++++++++++++++
  vllm/model_executor/models/qwen3_next.py |  55 +++++-
  vllm/platforms/cuda.py                   |   5 +-
  vllm/platforms/rocm.py                   |   5 +-

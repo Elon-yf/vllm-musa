@@ -2,10 +2,9 @@
 """the musa_sync driver (report / verify plumbing).
 
 Stdlib-only (musa_sync loads manifest.py + build_apply.py by file path) → runs
-locally. The clone-dependent paths (`verify --target`, `rebase`, `regen`) are
-exercised on the MUSA container against a real vLLM checkout; here we
-cover `report`, the probe helper, and the verify row-builder against a synthetic
-checkout.
+locally. Network-dependent paths are exercised on the MUSA container against a
+real vLLM checkout; here we cover `report`, `regen`, the probe helper, and the
+verify row-builder against synthetic checkouts.
 """
 
 import importlib.util
@@ -103,6 +102,62 @@ def test_series_readme_count_matches_directory():
     assert f"Currently **{patch_count} patches**" in readme
 
 
+def test_series_is_contiguous_and_uses_canonical_headers_and_authors():
+    series_dir = ROOT / "vllm_musa" / "patches" / "series"
+    patches = sorted(series_dir.glob("*.patch"))
+    assert [p.name.split("-", 1)[0] for p in patches] == [
+        f"{i:04d}" for i in range(1, len(patches) + 1)
+    ]
+    headers = [p.read_bytes().splitlines()[:2] for p in patches]
+    zero_commit_header = (
+        b"From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001"
+    )
+    assert all(lines[0] == zero_commit_header for lines in headers)
+    assert {lines[1] for lines in headers} == {b"From: musa <musa@local>"}
+
+
+def test_normalize_patch_author_preserves_non_utf8_bytes(ms, tmp_path):
+    patch = tmp_path / "0001-non-utf8.patch"
+    patch.write_bytes(
+        b"From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001\n"
+        b"From: contributor <contributor@example.com>\n"
+        b"Subject: [PATCH] preserve bytes\n\n"
+        b"non-utf8 payload: \xff\xfe\n"
+    )
+
+    ms._normalize_patch_author(patch)
+
+    assert patch.read_bytes() == (
+        b"From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001\n"
+        b"From: musa <musa@local>\n"
+        b"Subject: [PATCH] preserve bytes\n\n"
+        b"non-utf8 payload: \xff\xfe\n"
+    )
+
+
+def test_regen_requires_pinned_target(ms, monkeypatch, capsys):
+    monkeypatch.setattr(ms, "_default_target", lambda: None)
+
+    assert ms.main(["regen"]) == 1
+    assert "VLLM_COMMIT or VLLM_TAG is required" in capsys.readouterr().out
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git unavailable")
+def test_regen_rejects_noncanonical_author(ms, tmp_path, monkeypatch, capsys):
+    workdir = tmp_path / "vllm"
+    base = _init_repo(workdir)
+    (workdir / "value.txt").write_text("beta\n")
+    _git(workdir, "commit", "--all", "--quiet", "-m", "change")
+
+    monkeypatch.setattr(ms, "WORKDIR", workdir)
+    monkeypatch.setattr(ms, "SERIES_DIR", tmp_path / "series")
+    monkeypatch.setattr(ms, "_default_target", lambda: base)
+    monkeypatch.setattr(ms, "_normalize_patch_author", lambda _path: None)
+
+    assert ms.main(["regen"]) == 1
+    assert "non-canonical patch author headers" in capsys.readouterr().out
+
+
 @pytest.mark.skipif(shutil.which("git") is None, reason="git unavailable")
 def test_ensure_clone_accepts_exact_commit_sha(ms, tmp_path, monkeypatch):
     origin = tmp_path / "origin"
@@ -138,6 +193,47 @@ def test_checkout_fetches_exact_commit_sha(ms, tmp_path, monkeypatch):
     assert _git(workdir, "rev-parse", "HEAD").stdout.strip() == first
     assert ms._checkout(latest) == 0
     assert _git(workdir, "rev-parse", "HEAD").stdout.strip() == latest
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git unavailable")
+def test_regen_replaces_series_and_prunes_stale_files(
+    ms, tmp_path, monkeypatch, capsys
+):
+    workdir = tmp_path / "vllm"
+    base = _init_repo(workdir)
+    _git(workdir, "config", "user.name", "Xiaodong Ye")
+    _git(workdir, "config", "user.email", "xiaodong.ye@mthreads.com")
+    (workdir / "value.txt").write_text("beta\n")
+    _git(workdir, "commit", "--all", "--quiet", "-m", "first change")
+    _git(workdir, "config", "user.name", "musa-sync test")
+    _git(workdir, "config", "user.email", "musa-sync@example.invalid")
+    (workdir / "extra.txt").write_text("extra\n")
+    _git(workdir, "add", "extra.txt")
+    _git(workdir, "commit", "--quiet", "-m", "second change")
+
+    series_dir = tmp_path / "series"
+    series_dir.mkdir()
+    (series_dir / "README.md").write_text("keep me\n")
+    (series_dir / "0099-stale.patch").write_text("stale\n")
+    monkeypatch.setattr(ms, "WORKDIR", workdir)
+    monkeypatch.setattr(ms, "SERIES_DIR", series_dir)
+    monkeypatch.setattr(ms, "_default_target", lambda: base)
+
+    assert ms.main(["regen"]) == 0
+    out = capsys.readouterr().out
+    patches = sorted(series_dir.glob("*.patch"))
+    assert [p.name for p in patches] == [
+        "0001-first-change.patch",
+        "0002-second-change.patch",
+    ]
+    headers = [p.read_bytes().splitlines()[:2] for p in patches]
+    assert all(
+        lines[0].startswith(b"From 0000000000000000000000000000000000000000 ")
+        for lines in headers
+    )
+    assert all(lines[1] == b"From: musa <musa@local>" for lines in headers)
+    assert (series_dir / "README.md").read_text() == "keep me\n"
+    assert "pruned 1 stale files" in out
 
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="git unavailable")

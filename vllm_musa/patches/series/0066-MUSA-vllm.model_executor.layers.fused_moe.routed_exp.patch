@@ -1,11 +1,12 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: musa <musa@local>
-Date: Wed, 25 Jun 2026 00:00:00 +0000
+Date: Thu, 25 Jun 2026 00:00:00 +0000
 Subject: [PATCH] MUSA: vllm.model_executor.layers.fused_moe.routed_experts
 
 ---
- vllm/model_executor/layers/fused_moe/routed_experts.py | 64 ++++++++++++++++++++++++++++++++++++++++++++++------------------
+ .../layers/fused_moe/routed_experts.py        | 64 +++++++++++++------
  1 file changed, 46 insertions(+), 18 deletions(-)
+
 diff --git a/vllm/model_executor/layers/fused_moe/routed_experts.py b/vllm/model_executor/layers/fused_moe/routed_experts.py
 index 99a481cf6..145f9f926 100644
 --- a/vllm/model_executor/layers/fused_moe/routed_experts.py

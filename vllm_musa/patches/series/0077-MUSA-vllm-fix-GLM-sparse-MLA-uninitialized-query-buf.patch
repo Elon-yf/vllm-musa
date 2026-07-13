@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: musa <musa@local>
-Date: Wed, 08 Jul 2026 12:00:00 +0800
+Date: Wed, 8 Jul 2026 12:00:00 +0800
 Subject: [PATCH] MUSA(vllm): fix GLM sparse MLA uninitialized query buffers
 
 GLM-5.2 TP8 exposes two uninitialized-buffer paths in the sparse MLA BF16
@@ -8,10 +8,12 @@ prefill path: head padding used new_empty for padded heads, and concat_mla_q
 left stale values in the reused q_concat_buffer. Zero the padded heads and use
 a fresh full-write torch.cat for the MQA query concatenation so padded/stale
 NaNs cannot leak into the TileLang sparse attention kernel.
-
 ---
+ vllm/v1/attention/backends/mla/flashmla_sparse.py | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
 diff --git a/vllm/v1/attention/backends/mla/flashmla_sparse.py b/vllm/v1/attention/backends/mla/flashmla_sparse.py
-index 19381efd73..cf3a9304f3 100644
+index 19381efd7..cf3a9304f 100644
 --- a/vllm/v1/attention/backends/mla/flashmla_sparse.py
 +++ b/vllm/v1/attention/backends/mla/flashmla_sparse.py
 @@ -838,7 +838,7 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):

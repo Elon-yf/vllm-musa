@@ -1,5 +1,5 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Xiaodong Ye <yexiaodong60@mthreads.com>
+From: musa <musa@local>
 Date: Sat, 11 Jul 2026 13:30:00 +0800
 Subject: [PATCH] MUSA: allow Gemma RMSNorm residual donation
 
@@ -22,7 +22,6 @@ index 8418245b8..197c66f98 100644
 +        return ir.ops.fused_add_rms_norm.maybe_inplace(
 +            x, residual, weight, self.variance_epsilon
 +        )
--
-+
+ 
      def forward_cuda(
          self,

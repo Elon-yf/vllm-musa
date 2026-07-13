@@ -4,11 +4,11 @@ Date: Thu, 4 Jun 2026 02:46:36 +0000
 Subject: [PATCH] MUSA(csrc): csrc/attention/merge_attn_states.cu
 
 ---
- .../attention/merge_attn_states.cu            | 105 ++++++++----------
- 1 file changed, 49 insertions(+), 56 deletions(-)
+ .../attention/merge_attn_states.cu            | 103 ++++++++----------
+ 1 file changed, 48 insertions(+), 55 deletions(-)
 
 diff --git a/csrc/libtorch_stable/attention/merge_attn_states.cu b/csrc/libtorch_stable/attention/merge_attn_states.cu
-index b132e82e2..fc01c1297 100644
+index b132e82e2..7dedf1727 100644
 --- a/csrc/libtorch_stable/attention/merge_attn_states.cu
 +++ b/csrc/libtorch_stable/attention/merge_attn_states.cu
 @@ -1,14 +1,14 @@
@@ -20,16 +20,14 @@ index b132e82e2..fc01c1297 100644
  #include <limits>
  
 -#include "../torch_utils.h"
-+#include "../../attention/attention_dtypes.h"
-+#include "attention_utils.cuh"
-+#include "quantization/w8a8/fp8/common.cuh"
 -#include "../dispatch_utils.h"
-+#include "../../dispatch_utils.h"
 -#include <torch/headeronly/core/ScalarType.h>
 -
--#include "../../attention/attention_dtypes.h"
--#include "attention_utils.cuh"
+ #include "../../attention/attention_dtypes.h"
+ #include "attention_utils.cuh"
 -#include "../../quantization/w8a8/fp8/common.cuh"
++#include "quantization/w8a8/fp8/common.cuh"
++#include "../../dispatch_utils.h"
  
  namespace vllm {
  

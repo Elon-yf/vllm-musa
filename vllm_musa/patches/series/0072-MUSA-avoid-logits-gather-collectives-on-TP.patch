@@ -1,11 +1,11 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Joey-gvwal <joey_gvwal@yeah.net>
+From: musa <musa@local>
 Date: Mon, 29 Jun 2026 16:55:00 +0800
 Subject: [PATCH] MUSA: avoid logits gather collectives on TP
 
 ---
- vllm/model_executor/layers/logits_processor.py | 51 +++++++++++++++++++++++---
- 1 file changed, 47 insertions(+), 4 deletions(-)
+ .../model_executor/layers/logits_processor.py | 49 +++++++++++++++++--
+ 1 file changed, 46 insertions(+), 3 deletions(-)
 
 diff --git a/vllm/model_executor/layers/logits_processor.py b/vllm/model_executor/layers/logits_processor.py
 index 3541b9706..651505ab0 100644

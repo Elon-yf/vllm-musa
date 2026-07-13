@@ -1,5 +1,5 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Joey-gvwal <joey_gvwal@yeah.net>
+From: musa <musa@local>
 Date: Mon, 29 Jun 2026 16:00:00 +0800
 Subject: [PATCH] MUSA: keep DeepSeek-V4 MTP RMSNorm branch dtypes stable
 
@@ -8,7 +8,7 @@ Subject: [PATCH] MUSA: keep DeepSeek-V4 MTP RMSNorm branch dtypes stable
  1 file changed, 3 insertions(+), 1 deletion(-)
 
 diff --git a/vllm/models/deepseek_v4/common/ops/fused_mtp_input_rmsnorm.py b/vllm/models/deepseek_v4/common/ops/fused_mtp_input_rmsnorm.py
-index 422a6c86b..07ad5f06c 100644
+index 874b4f607..5680eaeba 100644
 --- a/vllm/models/deepseek_v4/common/ops/fused_mtp_input_rmsnorm.py
 +++ b/vllm/models/deepseek_v4/common/ops/fused_mtp_input_rmsnorm.py
 @@ -85,7 +85,9 @@ def _fused_mtp_input_rmsnorm_kernel(

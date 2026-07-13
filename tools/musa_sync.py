@@ -59,6 +59,10 @@ MODULE_DRIFT_DIR = (
 WORKDIR = ROOT / "third_party" / "vllm"
 PINS = ROOT / "third_party" / "PINS"
 VLLM_URL = "https://github.com/vllm-project/vllm.git"
+_ZERO_COMMIT_HEADER = (
+    b"From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001"
+)
+_CANONICAL_PATCH_AUTHOR = b"From: musa <musa@local>"
 
 
 def _load(name: str, path: Path):
@@ -87,6 +91,18 @@ def read_pin(key: str, default: str | None = None) -> str | None:
 def _default_target() -> str | None:
     """Return the exact upstream ref when available, otherwise the release tag."""
     return read_pin("VLLM_COMMIT") or read_pin("VLLM_TAG")
+
+
+def _normalize_patch_author(path: Path) -> None:
+    """Give generated patches the repository's canonical synthetic author."""
+    lines = path.read_bytes().splitlines(keepends=True)
+    if len(lines) < 2 or not lines[1].startswith(b"From: "):
+        return
+    author = lines[1].rstrip(b"\r\n")
+    if author == _CANONICAL_PATCH_AUTHOR:
+        return
+    lines[1] = _CANONICAL_PATCH_AUTHOR + lines[1][len(author) :]
+    path.write_bytes(b"".join(lines))
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
@@ -366,23 +382,78 @@ def cmd_regen(args) -> int:
     if args.area == "module":
         return _regen_module_tripwires()
     target = _default_target()
-    SERIES_DIR.mkdir(parents=True, exist_ok=True)
-    r = _git(
-        WORKDIR,
-        "format-patch",
-        "--no-signature",
-        "--no-numbered",
-        "--zero-commit",
-        "-o",
-        str(SERIES_DIR.resolve()),
-        target,
-    )
-    if r.returncode:
-        print(r.stderr)
+    if not target:
+        print("ERROR: VLLM_COMMIT or VLLM_TAG is required in third_party/PINS")
         return 1
+    with tempfile.TemporaryDirectory(prefix="musa-regen-series-") as tmp:
+        staged = Path(tmp)
+        r = _git(
+            WORKDIR,
+            "format-patch",
+            "--no-signature",
+            "--no-numbered",
+            "--zero-commit",
+            "-o",
+            str(staged),
+            target,
+        )
+        if r.returncode:
+            print(r.stderr)
+            return 1
+
+        generated = sorted(staged.glob("*.patch"))
+        if not generated:
+            print(f"ERROR: no patches generated from vllm@{target}..HEAD")
+            return 1
+
+        for patch in generated:
+            _normalize_patch_author(patch)
+
+        numbers = [p.name.split("-", 1)[0] for p in generated]
+        expected = [f"{i:04d}" for i in range(1, len(generated) + 1)]
+        if numbers != expected:
+            print(
+                "ERROR: git format-patch produced a non-contiguous series: "
+                f"expected {expected}, got {numbers}"
+            )
+            return 1
+
+        headers = {p: p.read_bytes().splitlines()[:2] for p in generated}
+        noncanonical_commits = [
+            p.name
+            for p, lines in headers.items()
+            if not lines or lines[0] != _ZERO_COMMIT_HEADER
+        ]
+        if noncanonical_commits:
+            print(
+                "ERROR: non-canonical patch commit headers: "
+                f"{', '.join(noncanonical_commits)}"
+            )
+            return 1
+        noncanonical_authors = [
+            p.name
+            for p, lines in headers.items()
+            if len(lines) < 2 or lines[1] != _CANONICAL_PATCH_AUTHOR
+        ]
+        if noncanonical_authors:
+            print(
+                "ERROR: non-canonical patch author headers: "
+                f"{', '.join(noncanonical_authors)}"
+            )
+            return 1
+
+        SERIES_DIR.mkdir(parents=True, exist_ok=True)
+        existing = list(SERIES_DIR.glob("*.patch"))
+        generated_names = {p.name for p in generated}
+        for patch in generated:
+            shutil.copyfile(patch, SERIES_DIR / patch.name)
+        stale = [p for p in existing if p.name not in generated_names]
+        for patch in stale:
+            patch.unlink()
+
     print(
-        r.stdout.strip()
-        or f"regenerated series in {SERIES_DIR} from vllm@{target}..HEAD"
+        f"regenerated {len(generated)} contiguous patches in {SERIES_DIR} "
+        f"from vllm@{target}..HEAD; pruned {len(stale)} stale files"
     )
     return 0
 

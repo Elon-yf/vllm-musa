@@ -1,14 +1,14 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: musa <musa@local>
-Date: Wed, 25 Jun 2026 12:00:00 +0000
+Date: Thu, 25 Jun 2026 12:00:00 +0000
 Subject: [PATCH] MUSA: vllm.models.deepseek_v4.nvidia.ops.o_proj
 
 ---
- vllm/models/deepseek_v4/nvidia/ops/o_proj.py | 32 ++++++++++++++++----
- 1 file changed, 26 insertions(+), 6 deletions(-)
+ vllm/models/deepseek_v4/nvidia/ops/o_proj.py | 34 ++++++++++++++++----
+ 1 file changed, 27 insertions(+), 7 deletions(-)
 
 diff --git a/vllm/models/deepseek_v4/nvidia/ops/o_proj.py b/vllm/models/deepseek_v4/nvidia/ops/o_proj.py
-index 18e3b10..ec5f550 100644
+index 18e3b1056..ec5f55015 100644
 --- a/vllm/models/deepseek_v4/nvidia/ops/o_proj.py
 +++ b/vllm/models/deepseek_v4/nvidia/ops/o_proj.py
 @@ -60,11 +60,31 @@ def deep_gemm_fp8_o_proj(

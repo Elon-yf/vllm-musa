@@ -8,7 +8,7 @@ Subject: [PATCH] MUSA: vllm.v1.attention.ops.triton_attention_helpers
  1 file changed, 1 insertion(+), 1 deletion(-)
 
 diff --git a/vllm/v1/attention/ops/triton_attention_helpers.py b/vllm/v1/attention/ops/triton_attention_helpers.py
-index ed9a38ad6..99dc1a889 100644
+index 520911e4e..75efad037 100644
 --- a/vllm/v1/attention/ops/triton_attention_helpers.py
 +++ b/vllm/v1/attention/ops/triton_attention_helpers.py
 @@ -182,7 +182,7 @@ def compute_tile_loop_bounds(

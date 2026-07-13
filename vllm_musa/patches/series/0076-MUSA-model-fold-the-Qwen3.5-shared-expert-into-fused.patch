@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: musa <musa@local>
-Date: Sun, 06 Jul 2026 21:30:00 +0800
+Date: Mon, 6 Jul 2026 21:30:00 +0800
 Subject: [PATCH] MUSA(model): fold the Qwen3.5 shared expert into fused_moe
 
 On MUSA the Qwen3.5/Qwen3.6 shared expert runs as a separate serial MLP because
@@ -11,6 +11,9 @@ on the routed-experts layer; the MUSA unquantized MoE method then folds the
 shared expert into the routed grouped GEMM as one extra always-selected slot,
 producing numerically equivalent output from a single kernel.
 ---
+ vllm/model_executor/models/qwen3_next.py | 17 ++++++++++++++++-
+ 1 file changed, 16 insertions(+), 1 deletion(-)
+
 diff --git a/vllm/model_executor/models/qwen3_next.py b/vllm/model_executor/models/qwen3_next.py
 index acce2a767..b41bdccce 100644
 --- a/vllm/model_executor/models/qwen3_next.py
