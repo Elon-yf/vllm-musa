@@ -88,18 +88,39 @@ class TestMUSAPlatformBase:
 
         assert MUSAPlatformBase.use_custom_allreduce() is True
 
-    def test_fused_add_ir_priority_honors_native_safety_route(self):
+    def test_fused_add_ir_priority_honors_native_safety_route(self, monkeypatch):
+        from vllm.config import CUDAGraphMode
         from vllm.config.compilation import CompilationMode
 
         from vllm_musa.platform import MUSAPlatformBase
         from vllm_musa.utils.environ import envs
 
         config = SimpleNamespace(
+            model_config=SimpleNamespace(enforce_eager=False),
+            quant_config=None,
             compilation_config=SimpleNamespace(
                 backend="inductor",
                 mode=CompilationMode.VLLM_COMPILE,
-            )
+                cudagraph_mode=CUDAGraphMode.PIECEWISE,
+            ),
         )
+        monkeypatch.delenv(envs.VLLM_MUSA_CUSTOM_OP_USE_NATIVE.name, raising=False)
+
+        priority = MUSAPlatformBase.get_default_ir_op_priority(config)
+        assert priority.fused_add_rms_norm == [
+            "musa",
+            "musa_legacy",
+            "native",
+        ]
+
+        # Priority is installed before check_and_update_config(). The safety
+        # route must therefore be derived directly from the quantized PIECEWISE
+        # config while the process-wide env is still unset.
+        config.quant_config = object()
+        priority = MUSAPlatformBase.get_default_ir_op_priority(config)
+        assert priority.fused_add_rms_norm == ["native"]
+
+        # Explicit 0 remains the documented force-kernel escape hatch.
         with envs.VLLM_MUSA_CUSTOM_OP_USE_NATIVE.override(False):
             priority = MUSAPlatformBase.get_default_ir_op_priority(config)
             assert priority.fused_add_rms_norm == [

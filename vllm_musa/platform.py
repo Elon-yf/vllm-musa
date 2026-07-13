@@ -471,10 +471,18 @@ class MUSAPlatformBase(Platform):
         # enablement and therefore belongs in the priority policy.
         from vllm_musa.utils.environ import envs as musa_envs
 
+        native_custom_ops = musa_envs.VLLM_MUSA_CUSTOM_OP_USE_NATIVE.get()
+        if not musa_envs.VLLM_MUSA_CUSTOM_OP_USE_NATIVE.is_set():
+            # VllmConfig installs platform IR priorities before invoking
+            # check_and_update_config(), where the process-wide safety route is
+            # normally published for custom-op forward paths. Derive the same
+            # policy from this config here so quantized PIECEWISE compilation
+            # cannot retain an unsafe fused-add provider in its frozen priority.
+            native_custom_ops = _should_route_quantized_piecewise_ops_native(
+                vllm_config
+            )
         fused_add_rms_norm = (
-            ["native"]
-            if musa_envs.VLLM_MUSA_CUSTOM_OP_USE_NATIVE.get()
-            else ["musa", "musa_legacy", "native"]
+            ["native"] if native_custom_ops else ["musa", "musa_legacy", "native"]
         )
         # The direct Triton HOP is profitable for every validated dense shape
         # family; supports_args remains the semantic/shape guard. Keep routed

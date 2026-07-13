@@ -119,6 +119,12 @@ def _fused_add_rms_norm_supports_args(
             >= FUSED_ADD_RMSNORM_MIN_ROWS
         )
     except AssertionError:
+        # Eager dispatch has concrete shapes. A direct compiled invocation
+        # without vLLM's pass context may have a symbolic row dimension, whose
+        # comparison cannot be evaluated as a Python bool. Fail closed and let
+        # the next provider handle that unsupported integration path.
+        if torch.compiler.is_compiling():
+            return False
         profitable_rows = x.shape[0] >= FUSED_ADD_RMSNORM_MIN_ROWS
 
     return (

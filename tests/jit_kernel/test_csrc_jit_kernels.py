@@ -261,6 +261,22 @@ def test_ir_fused_add_rmsnorm_dispatch_uses_compile_range_not_shape_hint() -> No
         assert _fused_add_rms_norm_supports_args(x, residual, weight, 1e-6)
 
 
+def test_ir_fused_add_rmsnorm_dispatch_fails_closed_without_compile_range(
+    monkeypatch,
+) -> None:
+    from vllm_musa.kernels.musa_ops import (
+        _fused_add_rms_norm_supports_args,
+    )
+
+    device = torch.device("musa")
+    x = torch.empty((64, 5120), device=device, dtype=torch.bfloat16)
+    residual = torch.empty_like(x)
+    weight = torch.empty((5120,), device=device, dtype=torch.float32)
+
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    assert not _fused_add_rms_norm_supports_args(x, residual, weight, 1e-6)
+
+
 def test_ir_fused_add_rmsnorm_preserves_functional_and_inplace_contracts() -> None:
     from vllm_musa.kernels.musa_ops import (
         fused_add_rms_norm as musa_fused_add_rms_norm,
