@@ -57,6 +57,23 @@ def _rmsnorm_ref(
     return (normalized * scale_weight).to(x.dtype)
 
 
+def _fused_add_rmsnorm_ref(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    *,
+    gemma: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    residual_fp32 = x.float() + residual.float()
+    residual_out = residual_fp32.to(x.dtype)
+    scale_weight = weight.float() + (1.0 if gemma else 0.0)
+    normalized = residual_fp32 * torch.rsqrt(
+        residual_fp32.pow(2).mean(dim=-1, keepdim=True) + eps
+    )
+    return (normalized * scale_weight).to(x.dtype), residual_out
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_csrc_rmsnorm_kernels_match_reference(dtype: torch.dtype) -> None:
     from vllm_musa.jit_kernel.csrc.norm import (
@@ -75,6 +92,307 @@ def test_csrc_rmsnorm_kernels_match_reference(dtype: torch.dtype) -> None:
         gemma_rmsnorm(x, weight, eps),
         _rmsnorm_ref(x, weight, eps, gemma=True),
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("gemma", [False, True])
+@pytest.mark.parametrize(
+    "shape", [(1, 2048), (17, 2048), (100, 5120), (1, 8192), (1, 32768)]
+)
+def test_csrc_fused_add_rmsnorm_matches_fp32_sum_reference(
+    dtype: torch.dtype,
+    gemma: bool,
+    shape: tuple[int, int],
+) -> None:
+    from vllm_musa.jit_kernel.csrc.norm import fused_add_rmsnorm
+
+    torch.manual_seed(321)
+    device = torch.device("musa")
+    eps = 1e-6
+    x = torch.randn(shape, device=device, dtype=dtype)
+    residual = torch.randn(shape, device=device, dtype=dtype)
+    weight = torch.randn((shape[-1],), device=device, dtype=dtype)
+    expected, expected_residual = _fused_add_rmsnorm_ref(
+        x, residual, weight, eps, gemma=gemma
+    )
+
+    output, residual_out = fused_add_rmsnorm(x, residual, weight, eps, gemma=gemma)
+
+    assert output.data_ptr() == x.data_ptr()
+    assert residual_out.data_ptr() == residual.data_ptr()
+    _assert_close(output, expected)
+    _assert_close(residual_out, expected_residual, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("shape", [(17, 2049), (64, 5120), (1, 16384)])
+def test_csrc_fused_add_rmsnorm_accepts_effective_fp32_weight(
+    dtype: torch.dtype,
+    shape: tuple[int, int],
+) -> None:
+    from vllm_musa.jit_kernel.csrc.norm import fused_add_rmsnorm
+
+    torch.manual_seed(654)
+    device = torch.device("musa")
+    eps = 1e-6
+    x = torch.randn(shape, device=device, dtype=dtype)
+    residual = torch.randn(shape, device=device, dtype=dtype)
+    effective_weight = torch.randn((shape[-1],), device=device, dtype=torch.float32)
+    expected, expected_residual = _fused_add_rmsnorm_ref(
+        x, residual, effective_weight, eps
+    )
+
+    output, residual_out = fused_add_rmsnorm(
+        x, residual, effective_weight, eps, gemma=False
+    )
+
+    assert output.data_ptr() == x.data_ptr()
+    assert residual_out.data_ptr() == residual.data_ptr()
+    _assert_close(output, expected)
+    _assert_close(residual_out, expected_residual, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.parametrize(
+    ("rows", "hidden", "dtype", "weight_dtype", "expected"),
+    [
+        (1, 2048, torch.bfloat16, torch.bfloat16, False),
+        (1, 5120, torch.bfloat16, torch.bfloat16, False),
+        (63, 5120, torch.bfloat16, torch.bfloat16, False),
+        (64, 5120, torch.bfloat16, torch.bfloat16, True),
+        (64, 5120, torch.bfloat16, torch.float32, True),
+        (64, 5120, torch.bfloat16, torch.float16, False),
+        (128, 5120, torch.bfloat16, torch.bfloat16, True),
+        (0, 5120, torch.bfloat16, torch.bfloat16, False),
+        (64, 5120, torch.float16, torch.float16, False),
+    ],
+)
+def test_ir_fused_add_rmsnorm_jit_dispatch_is_h5120_only(
+    rows: int,
+    hidden: int,
+    dtype: torch.dtype,
+    weight_dtype: torch.dtype,
+    expected: bool,
+) -> None:
+    from vllm_musa.kernels.musa_ops import (
+        _jit_fused_add_rms_norm_supports_args,
+    )
+
+    device = torch.device("musa")
+    x = torch.empty((rows, hidden), device=device, dtype=dtype)
+    residual = torch.empty_like(x)
+    weight = torch.empty((hidden,), device=device, dtype=weight_dtype)
+
+    assert _jit_fused_add_rms_norm_supports_args(x, residual, weight, 1e-6) is expected
+
+
+def test_ir_fused_add_rmsnorm_dispatch_rejects_unsafe_inputs() -> None:
+    from vllm_musa.kernels.musa_ops import (
+        _fused_add_rms_norm_supports_args,
+    )
+
+    device = torch.device("musa")
+    weight = torch.empty((5120,), device=device, dtype=torch.bfloat16)
+    scalar = torch.empty((), device=device, dtype=torch.bfloat16)
+    noncontiguous = torch.empty((5120, 64), device=device, dtype=torch.bfloat16).t()
+    contiguous = torch.empty((64, 5120), device=device, dtype=torch.bfloat16)
+
+    assert not _fused_add_rms_norm_supports_args(scalar, scalar, weight, 1e-6)
+    assert not _fused_add_rms_norm_supports_args(
+        noncontiguous, noncontiguous, weight, 1e-6
+    )
+    assert not _fused_add_rms_norm_supports_args(
+        contiguous, contiguous.to(torch.float16), weight, 1e-6
+    )
+    assert not _fused_add_rms_norm_supports_args(contiguous, contiguous, None, 1e-6)
+    assert not _fused_add_rms_norm_supports_args(
+        contiguous, contiguous, weight, 1e-6, variance_size=4096
+    )
+
+
+def test_ir_fused_add_rmsnorm_c_ext_branch_preserves_broad_shapes() -> None:
+    from vllm_musa.kernels.musa_ops import (
+        _c_ext_fused_add_rms_norm_supports_args,
+        _fused_add_rms_norm_supports_args,
+        _select_musa_fused_add_rms_norm_impl,
+    )
+    from vllm_musa.utils.environ import envs
+
+    device = torch.device("musa")
+    x = torch.empty((1, 5376), device=device, dtype=torch.bfloat16)
+    residual = torch.empty_like(x)
+    weight = torch.empty((5376,), device=device, dtype=torch.bfloat16)
+
+    scalar = torch.empty((), device=device, dtype=torch.bfloat16)
+    assert not _c_ext_fused_add_rms_norm_supports_args(scalar, scalar, weight, 1e-6)
+    assert _c_ext_fused_add_rms_norm_supports_args(x, residual, weight, 1e-6)
+    assert _fused_add_rms_norm_supports_args(x, residual, weight, 1e-6)
+    assert _select_musa_fused_add_rms_norm_impl(x, residual, weight, 1e-6) == "c_ext"
+    assert not _c_ext_fused_add_rms_norm_supports_args(
+        x, residual, weight.float(), 1e-6
+    )
+    with envs.VLLM_MUSA_FUSED_ADD_RMSNORM.override(False):
+        assert not _c_ext_fused_add_rms_norm_supports_args(x, residual, weight, 1e-6)
+        assert not _fused_add_rms_norm_supports_args(x, residual, weight, 1e-6)
+
+
+def test_ir_fused_add_rmsnorm_dispatch_uses_compile_range_not_shape_hint() -> None:
+    from vllm.compilation.passes.inductor_pass import pass_context
+    from vllm.config.utils import Range
+
+    from vllm_musa.kernels.musa_ops import (
+        _fused_add_rms_norm_supports_args,
+        _select_musa_fused_add_rms_norm_impl,
+    )
+
+    device = torch.device("musa")
+    # The fake tensor hint can be one row for both dynamic compilations. The
+    # provider decision must instead follow the guarded vLLM compile range.
+    x = torch.empty((1, 5120), device=device, dtype=torch.bfloat16)
+    residual = torch.empty_like(x)
+    bf16_weight = torch.empty((5120,), device=device, dtype=torch.bfloat16)
+    fp32_weight = bf16_weight.float()
+
+    with pass_context(Range(1, 63)):
+        assert (
+            _select_musa_fused_add_rms_norm_impl(x, residual, bf16_weight, 1e-6)
+            == "c_ext"
+        )
+        assert not _fused_add_rms_norm_supports_args(x, residual, fp32_weight, 1e-6)
+    with pass_context(Range(64, 4096)):
+        assert (
+            _select_musa_fused_add_rms_norm_impl(x, residual, bf16_weight, 1e-6)
+            == "jit"
+        )
+        assert (
+            _select_musa_fused_add_rms_norm_impl(x, residual, fp32_weight, 1e-6)
+            == "jit"
+        )
+
+
+def test_ir_fused_add_rmsnorm_single_provider_covers_standard_rmsnorm() -> None:
+    from vllm import ir
+
+    from vllm_musa.kernels.musa_ops import (
+        _select_musa_fused_add_rms_norm_impl,
+    )
+
+    device = torch.device("musa")
+    bf16_x = torch.empty((1, 2048), device=device, dtype=torch.bfloat16)
+    bf16_residual = torch.empty_like(bf16_x)
+    bf16_weight = torch.empty((2048,), device=device, dtype=torch.bfloat16)
+
+    assert (
+        _select_musa_fused_add_rms_norm_impl(bf16_x, bf16_residual, bf16_weight, 1e-6)
+        == "c_ext"
+    )
+    assert (
+        _select_musa_fused_add_rms_norm_impl(
+            bf16_x, bf16_residual, bf16_weight.float(), 1e-6
+        )
+        is None
+    )
+
+    fp16_x = bf16_x.to(torch.float16)
+    fp16_residual = bf16_residual.to(torch.float16)
+    fp16_weight = bf16_weight.to(torch.float16)
+    assert (
+        _select_musa_fused_add_rms_norm_impl(fp16_x, fp16_residual, fp16_weight, 1e-6)
+        == "c_ext"
+    )
+    assert "musa" in ir.ops.fused_add_rms_norm.impls
+    assert "musa_legacy" not in ir.ops.fused_add_rms_norm.impls
+
+
+def test_ir_fused_add_rmsnorm_dispatch_fails_closed_without_compile_range(
+    monkeypatch,
+) -> None:
+    from vllm_musa.kernels.musa_ops import (
+        _fused_add_rms_norm_supports_args,
+    )
+
+    device = torch.device("musa")
+    x = torch.empty((64, 5120), device=device, dtype=torch.bfloat16)
+    residual = torch.empty_like(x)
+    weight = torch.empty((5120,), device=device, dtype=torch.float32)
+
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    assert not _fused_add_rms_norm_supports_args(x, residual, weight, 1e-6)
+
+
+def test_ir_fused_add_rmsnorm_provider_invokes_selected_kernel(monkeypatch) -> None:
+    from vllm_musa import _custom_ops as musa_ops
+    from vllm_musa.jit_kernel.csrc import norm as musa_jit_norm
+    from vllm_musa.kernels import musa_ops as ir_musa_ops
+
+    device = torch.device("musa")
+    x = torch.empty((1, 5120), device=device, dtype=torch.bfloat16)
+    residual = torch.empty_like(x)
+    weight = torch.empty((5120,), device=device, dtype=torch.bfloat16)
+    calls: list[str] = []
+
+    def fake_jit(*args, **kwargs):
+        calls.append("jit")
+        return args[0], args[1]
+
+    def fake_c_ext(*args, **kwargs):
+        calls.append("c_ext")
+
+    monkeypatch.setattr(musa_jit_norm, "fused_add_rmsnorm", fake_jit)
+    monkeypatch.setattr(musa_ops, "musa_fused_add_rms_norm", fake_c_ext)
+
+    monkeypatch.setattr(
+        ir_musa_ops,
+        "_select_musa_fused_add_rms_norm_impl",
+        lambda *args, **kwargs: "jit",
+    )
+    ir_musa_ops.fused_add_rms_norm.impl_fn(x, residual, weight, 1e-6)
+    assert calls == ["jit"]
+
+    calls.clear()
+    monkeypatch.setattr(
+        ir_musa_ops,
+        "_select_musa_fused_add_rms_norm_impl",
+        lambda *args, **kwargs: "c_ext",
+    )
+    ir_musa_ops.fused_add_rms_norm.impl_fn(x, residual, weight, 1e-6)
+    assert calls == ["c_ext"]
+
+
+def test_ir_fused_add_rmsnorm_preserves_functional_and_inplace_contracts() -> None:
+    from vllm_musa.kernels.musa_ops import (
+        fused_add_rms_norm as musa_fused_add_rms_norm,
+    )
+
+    torch.manual_seed(321)
+    device = torch.device("musa")
+    dtype = torch.bfloat16
+    eps = 1e-6
+    x = torch.randn((64, 5120), device=device, dtype=dtype)
+    residual = torch.randn_like(x)
+    effective_weight = torch.ones((5120,), device=device, dtype=torch.float32)
+    expected, expected_residual = _fused_add_rmsnorm_ref(
+        x, residual, effective_weight, eps
+    )
+
+    x_before = x.clone()
+    residual_before = residual.clone()
+    output, residual_out = musa_fused_add_rms_norm.func_impl_fn(
+        x, residual, effective_weight, eps
+    )
+    assert output.data_ptr() != x.data_ptr()
+    assert residual_out.data_ptr() != residual.data_ptr()
+    _assert_close(x, x_before, atol=0.0, rtol=0.0)
+    _assert_close(residual, residual_before, atol=0.0, rtol=0.0)
+    _assert_close(output, expected)
+    _assert_close(residual_out, expected_residual, atol=0.0, rtol=0.0)
+
+    output, residual_out = musa_fused_add_rms_norm.impl_fn(
+        x, residual, effective_weight, eps
+    )
+    assert output.data_ptr() == x.data_ptr()
+    assert residual_out.data_ptr() == residual.data_ptr()
+    _assert_close(output, expected)
+    _assert_close(residual_out, expected_residual, atol=0.0, rtol=0.0)
 
 
 def _topk_softmax_ref(

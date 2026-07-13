@@ -4,6 +4,7 @@
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -86,6 +87,164 @@ class TestMUSAPlatformBase:
         from vllm_musa.platform import MUSAPlatformBase
 
         assert MUSAPlatformBase.use_custom_allreduce() is True
+
+    def test_fused_add_ir_priority_honors_native_safety_route(self, monkeypatch):
+        from vllm.config import CUDAGraphMode
+        from vllm.config.compilation import CompilationMode
+
+        from vllm_musa.platform import MUSAPlatformBase
+        from vllm_musa.utils.environ import envs
+
+        config = SimpleNamespace(
+            model_config=SimpleNamespace(enforce_eager=False),
+            quant_config=None,
+            compilation_config=SimpleNamespace(
+                backend="inductor",
+                mode=CompilationMode.VLLM_COMPILE,
+                cudagraph_mode=CUDAGraphMode.PIECEWISE,
+            ),
+        )
+        monkeypatch.delenv(envs.VLLM_MUSA_CUSTOM_OP_USE_NATIVE.name, raising=False)
+
+        priority = MUSAPlatformBase.get_default_ir_op_priority(config)
+        assert priority.fused_add_rms_norm == [
+            "musa",
+            "native",
+        ]
+
+        # Priority is installed before check_and_update_config(). The safety
+        # route must therefore be derived directly from the quantized PIECEWISE
+        # config while the process-wide env is still unset.
+        config.quant_config = object()
+        priority = MUSAPlatformBase.get_default_ir_op_priority(config)
+        assert priority.fused_add_rms_norm == ["native"]
+
+        # Explicit 0 remains the documented force-kernel escape hatch.
+        with envs.VLLM_MUSA_CUSTOM_OP_USE_NATIVE.override(False):
+            priority = MUSAPlatformBase.get_default_ir_op_priority(config)
+            assert priority.fused_add_rms_norm == [
+                "musa",
+                "native",
+            ]
+        with envs.VLLM_MUSA_CUSTOM_OP_USE_NATIVE.override(True):
+            priority = MUSAPlatformBase.get_default_ir_op_priority(config)
+            assert priority.fused_add_rms_norm == ["native"]
+
+    def test_gated_qkv_inductor_priority_excludes_routed_moe(self):
+        from vllm.config.compilation import CompilationMode
+
+        from vllm_musa.platform import MUSAPlatformBase, _has_routed_experts
+
+        compilation_config = SimpleNamespace(
+            backend="inductor",
+            mode=CompilationMode.VLLM_COMPILE,
+        )
+        dense_model = SimpleNamespace(
+            hf_text_config=SimpleNamespace(model_type="example_dense")
+        )
+        dense_config = SimpleNamespace(
+            compilation_config=compilation_config,
+            model_config=dense_model,
+        )
+        priority = MUSAPlatformBase.get_default_ir_op_priority(dense_config)
+        assert priority.gated_qkv_rms_norm_rope == ["musa_inductor", "native"]
+        assert not _has_routed_experts(dense_model)
+
+        authoritative_moe = SimpleNamespace(
+            is_moe=True,
+            hf_text_config=SimpleNamespace(model_type="heterogeneous_blocks"),
+        )
+        assert _has_routed_experts(authoritative_moe)
+        authoritative_dense = SimpleNamespace(
+            is_moe=False,
+            hf_text_config=SimpleNamespace(num_experts=8),
+        )
+        assert not _has_routed_experts(authoritative_dense)
+
+        for expert_count_name in (
+            "num_experts",
+            "moe_num_experts",
+            "n_routed_experts",
+            "num_local_experts",
+        ):
+            moe_model = SimpleNamespace(
+                hf_text_config=SimpleNamespace(**{expert_count_name: 8})
+            )
+            moe_config = SimpleNamespace(
+                compilation_config=compilation_config,
+                model_config=moe_model,
+            )
+            priority = MUSAPlatformBase.get_default_ir_op_priority(moe_config)
+            assert priority.gated_qkv_rms_norm_rope == ["native"]
+            assert _has_routed_experts(moe_model)
+
+        compilation_config.mode = CompilationMode.NONE
+        priority = MUSAPlatformBase.get_default_ir_op_priority(dense_config)
+        assert priority.gated_qkv_rms_norm_rope == ["native"]
+
+    def test_native_safety_route_is_quantized_piecewise_only(self):
+        from vllm.config import CUDAGraphMode
+        from vllm.config.compilation import CompilationMode
+
+        from vllm_musa.platform import (
+            _should_route_quantized_piecewise_ops_native,
+        )
+
+        config = SimpleNamespace(
+            model_config=SimpleNamespace(enforce_eager=False),
+            compilation_config=SimpleNamespace(
+                mode=CompilationMode.VLLM_COMPILE,
+                cudagraph_mode=CUDAGraphMode.PIECEWISE,
+            ),
+            quant_config=None,
+        )
+        assert not _should_route_quantized_piecewise_ops_native(config)
+        config.quant_config = object()
+        assert _should_route_quantized_piecewise_ops_native(config)
+        config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
+        assert not _should_route_quantized_piecewise_ops_native(config)
+
+    def test_fused_add_profit_boundary_splits_eligible_compile_range(self):
+        import torch
+
+        from vllm_musa.platform import (
+            _configure_fused_add_rmsnorm_compile_range,
+        )
+        from vllm_musa.tuning import FUSED_ADD_RMSNORM_MIN_ROWS
+
+        config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                get_hidden_size=lambda: 5120,
+                dtype=torch.bfloat16,
+                enforce_eager=False,
+            ),
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=4096),
+            compilation_config=SimpleNamespace(compile_ranges_endpoints=[2048]),
+        )
+        assert _configure_fused_add_rmsnorm_compile_range(
+            config, native_custom_ops=False
+        )
+        assert config.compilation_config.compile_ranges_endpoints == [
+            FUSED_ADD_RMSNORM_MIN_ROWS - 1,
+            2048,
+        ]
+        assert not _configure_fused_add_rmsnorm_compile_range(
+            config, native_custom_ops=False
+        )
+
+        config.compilation_config.compile_ranges_endpoints = []
+        assert not _configure_fused_add_rmsnorm_compile_range(
+            config, native_custom_ops=True
+        )
+        assert config.compilation_config.compile_ranges_endpoints == []
+
+        config.kernel_config = SimpleNamespace(
+            ir_op_priority=SimpleNamespace(fused_add_rms_norm=["native"])
+        )
+        assert not _configure_fused_add_rmsnorm_compile_range(
+            config, native_custom_ops=False
+        )
+        assert config.compilation_config.compile_ranges_endpoints == []
 
     def test_supports_fp8_for_musa_3_1(self):
         """Test that FP8 is supported on MUSA capability 3.1."""

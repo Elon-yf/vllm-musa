@@ -29,6 +29,8 @@ else:
 
 import pymtml as pynvml
 
+from vllm_musa.tuning import FUSED_ADD_RMSNORM_MIN_ROWS
+
 logger = init_logger(__name__)
 
 _P = ParamSpec("_P")
@@ -118,6 +120,41 @@ def _is_deepseek_v4_model(model_config: Any | None) -> bool:
     if architectures is None and hf_config is not None:
         architectures = getattr(hf_config, "architectures", None)
     return any("DeepseekV4" in str(arch) for arch in architectures or ())
+
+
+def _has_routed_experts(model_config: Any | None) -> bool:
+    """Return whether the text model uses routed MoE experts.
+
+    Real vLLM ``ModelConfig`` objects expose the authoritative ``is_moe``
+    property, including heterogeneous ``block_configs``. The remaining checks
+    only support lightweight config doubles and older integrations.
+    """
+    if model_config is None:
+        return False
+
+    is_moe = getattr(model_config, "is_moe", None)
+    if is_moe is not None:
+        return bool(is_moe)
+
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    if hf_text_config is None:
+        hf_config = getattr(model_config, "hf_config", None)
+        hf_text_config = getattr(hf_config, "text_config", hf_config)
+    for name in (
+        "num_experts",
+        "moe_num_experts",
+        "n_routed_experts",
+        "num_local_experts",
+    ):
+        if getattr(hf_text_config, name, 0):
+            return True
+
+    architectures = getattr(model_config, "architectures", None)
+    if architectures is None:
+        architectures = getattr(hf_text_config, "architectures", None)
+    return any(
+        "moe" in str(architecture).lower() for architecture in architectures or ()
+    )
 
 
 def _deepseek_v4_flashmla_sparse_block_size(model_config: Any | None) -> int:
@@ -281,6 +318,54 @@ def _will_capture_piecewise_cudagraph(vllm_config: Any) -> bool:
     return True
 
 
+def _should_route_quantized_piecewise_ops_native(vllm_config: Any) -> bool:
+    """Whether the quantized PIECEWISE correctness route applies to this model."""
+    return getattr(
+        vllm_config, "quant_config", None
+    ) is not None and _will_capture_piecewise_cudagraph(vllm_config)
+
+
+def _configure_fused_add_rmsnorm_compile_range(
+    vllm_config: Any, *, native_custom_ops: bool
+) -> bool:
+    """Split compilation at the measured fused-add RMSNorm profit boundary."""
+    ir_priority = getattr(
+        getattr(vllm_config, "kernel_config", None),
+        "ir_op_priority",
+        None,
+    )
+    fused_priority = getattr(ir_priority, "fused_add_rms_norm", None)
+    native_custom_ops = native_custom_ops or bool(
+        fused_priority and fused_priority[0] == "native"
+    )
+    model_config = getattr(vllm_config, "model_config", None)
+    get_hidden_size = getattr(model_config, "get_hidden_size", None)
+    max_tokens = getattr(
+        getattr(vllm_config, "scheduler_config", None),
+        "max_num_batched_tokens",
+        0,
+    )
+    if (
+        native_custom_ops
+        or model_config is None
+        or not callable(get_hidden_size)
+        or get_hidden_size() != 5120
+        or getattr(model_config, "dtype", None) != torch.bfloat16
+        or getattr(model_config, "enforce_eager", False)
+        or max_tokens is None
+        or max_tokens < FUSED_ADD_RMSNORM_MIN_ROWS
+    ):
+        return False
+
+    comp = vllm_config.compilation_config
+    endpoints = list(comp.compile_ranges_endpoints or [])
+    fallback_endpoint = FUSED_ADD_RMSNORM_MIN_ROWS - 1
+    if fallback_endpoint in endpoints:
+        return False
+    comp.compile_ranges_endpoints = sorted([*endpoints, fallback_endpoint])
+    return True
+
+
 class MUSAPlatformBase(Platform):
     _enum = PlatformEnum.OOT  # Out-of-tree platform
     device_name: str = "musa"
@@ -348,7 +433,12 @@ class MUSAPlatformBase(Platform):
         """Platform-default priority list for vllm.ir.ops on MUSA.
 
         When compiling with Inductor, prefer the `native` (pure-PyTorch)
-        IR impl; in the eager path, prefer the `musa` rms_norm provider.
+        rms_norm implementation. Prefer the measured in-place `musa`
+        fused_add_rms_norm implementation in both compiled and eager paths.
+        That single provider dispatches internally between the measured JIT
+        kernel and the broad pre-existing C-extension kernel, then falls back
+        to native through normal IR priority; IR functionalization owns
+        activation donation.
         This mirrors the upstream `cuda.py` pattern
         (`default = ["native"] if using_inductor else ["vllm_c", "native"]`):
         under Inductor the native rms_norm is a handful of
@@ -357,10 +447,8 @@ class MUSAPlatformBase(Platform):
         fusion barrier; in eager mode there is no fusion to lose so the
         kernel provider is taken directly.
 
-        NOTE: this is a correctness / upstream-consistency choice, not a
-        perf change — `["native"]` and `["musa", "native"]` measure the
-        same batch1 throughput. The `musa` provider stays registered (see
-        `vllm_musa/kernels/musa_ops.py`) for the eager / explicit opt-in path.
+        The non-fused rms_norm choice remains upstream-consistent; the fused
+        provider is independently gated by its measured supports_args scope.
         """
         from vllm.config.compilation import CompilationMode
         from vllm.config.kernel import IrOpPriorityConfig
@@ -376,12 +464,43 @@ class MUSAPlatformBase(Platform):
             rms_norm = ["native"]
         else:
             # Eager path: no Inductor fusion to lose, so take the rms_norm
-            # kernel. Keep the default native because v0.22 adds
-            # fused_add_rms_norm and MUSA has not registered an IR provider
-            # for that op.
+            # kernel. Keep other IR ops native by default.
             default = ["native"]
             rms_norm = ["musa", "native"]
-        return IrOpPriorityConfig.with_default(default, rms_norm=rms_norm)
+        # VLLM_MUSA_CUSTOM_OP_USE_NATIVE is a correctness route for quantized
+        # models under piecewise CUDAGraph capture. It must remain authoritative
+        # for the IR provider too; unlike supports_args, this is global provider
+        # enablement and therefore belongs in the priority policy.
+        from vllm_musa.utils.environ import envs as musa_envs
+
+        native_custom_ops = musa_envs.VLLM_MUSA_CUSTOM_OP_USE_NATIVE.get()
+        if not musa_envs.VLLM_MUSA_CUSTOM_OP_USE_NATIVE.is_set():
+            # VllmConfig installs platform IR priorities before invoking
+            # check_and_update_config(), where the process-wide safety route is
+            # normally published for custom-op forward paths. Derive the same
+            # policy from this config here so quantized PIECEWISE compilation
+            # cannot retain an unsafe fused-add provider in its frozen priority.
+            native_custom_ops = _should_route_quantized_piecewise_ops_native(
+                vllm_config
+            )
+        fused_add_rms_norm = ["native"] if native_custom_ops else ["musa", "native"]
+        # The direct Triton HOP is profitable for every validated dense shape
+        # family; supports_args remains the semantic/shape guard. Keep routed
+        # MoE on native by default because a 100-prompt Qwen3.6 TP8 sweep
+        # regressed 2.81% as eager-faithful BF16 rounding changed expert routes.
+        # Users can still explicitly select the generic provider for A/B work.
+        gated_qkv_rms_norm_rope = (
+            ["musa_inductor", "native"]
+            if using_inductor
+            and not _has_routed_experts(getattr(vllm_config, "model_config", None))
+            else ["native"]
+        )
+        return IrOpPriorityConfig.with_default(
+            default,
+            rms_norm=rms_norm,
+            fused_add_rms_norm=fused_add_rms_norm,
+            gated_qkv_rms_norm_rope=gated_qkv_rms_norm_rope,
+        )
 
     @classmethod
     def support_deep_gemm(cls) -> bool:
@@ -513,8 +632,13 @@ class MUSAPlatformBase(Platform):
         # deep_gemm linear path (it fuses quant+GEMM, so its buffers never escape).
         from vllm_musa.utils.environ import envs as musa_envs
 
-        route_native = _will_capture_piecewise_cudagraph(vllm_config)
-        logger.debug("MUSA custom-op native-routing: piecewise=%s", route_native)
+        # Only quantized models can enter the FP8 quant path described above.
+        # Keeping this process-wide route enabled for unquantized BF16 models
+        # unnecessarily disables their safe normalization kernels.
+        route_native = _should_route_quantized_piecewise_ops_native(vllm_config)
+        logger.debug(
+            "MUSA custom-op native-routing: quantized_piecewise=%s", route_native
+        )
         # Set the flag process-wide (not on the config): the op forward_oot paths read
         # this env live and spawn workers inherit os.environ. First-writer-wins (the
         # is_set() guard) is safe -- the native path is correct in every cudagraph mode,
@@ -530,6 +654,21 @@ class MUSAPlatformBase(Platform):
 
         parallel_config = vllm_config.parallel_config
         model_config = vllm_config.model_config
+
+        # The fused-add provider is profitable from
+        # FUSED_ADD_RMSNORM_MIN_ROWS onward. vLLM picks IR implementations once
+        # per dynamic compile range and drops shape guards, so split immediately
+        # below that threshold rather than freezing a decision from a symbolic
+        # example-value hint. This is shape/dtype based and applies to any model
+        # exposing the IR op.
+        if _configure_fused_add_rmsnorm_compile_range(
+            vllm_config,
+            native_custom_ops=musa_envs.VLLM_MUSA_CUSTOM_OP_USE_NATIVE.get(),
+        ):
+            logger.info(
+                "Splitting MUSA fused-add RMSNorm compile ranges at %d rows",
+                FUSED_ADD_RMSNORM_MIN_ROWS - 1,
+            )
 
         if _is_deepseek_v4_model(model_config):
             _apply_deepseek_v4_tp8_profile(
@@ -827,7 +966,9 @@ class MUSAPlatformBase(Platform):
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:
-        return "vllm.distributed.device_communicators.cuda_communicator.CudaCommunicator"  # noqa
+        return (
+            "vllm.distributed.device_communicators.cuda_communicator.CudaCommunicator"  # noqa
+        )
 
     @classmethod
     def supports_fp8(cls) -> bool:

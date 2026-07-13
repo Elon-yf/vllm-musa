@@ -8,6 +8,6 @@ vllm_c / oink / aiter / xpu_kernels) register first; MUSA providers
 appear alongside.
 """
 
-from . import musa_ops  # noqa: F401
+from . import gated_qkv, musa_ops  # noqa: F401
 
-__all__ = ["musa_ops"]
+__all__ = ["gated_qkv", "musa_ops"]

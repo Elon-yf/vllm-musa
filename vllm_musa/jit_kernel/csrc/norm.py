@@ -70,6 +70,30 @@ def gemma_rmsnorm(
     return out
 
 
+def fused_add_rmsnorm(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    *,
+    gemma: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """In-place fused residual add and RMSNorm using the JIT MUSA kernel.
+
+    The returned tensors alias ``input`` and ``residual`` respectively. The
+    vec8/cache specialization computes the variance and normalized value
+    from the unrounded FP32 residual sum while storing the updated residual in
+    the input dtype, matching ``vllm.ir.ops.fused_add_rms_norm``. ``weight`` may
+    match the activation dtype or be FP32. Set ``gemma=True`` only for a raw
+    zero-centered Gemma parameter; generic IR supplies an effective FP32 scale
+    with Gemma's ``+1`` already applied and therefore uses ``gemma=False``.
+    """
+    torch.ops.vllm.musa_csrc_fused_add_rmsnorm(
+        input, residual, weight, float(eps), bool(gemma)
+    )
+    return input, residual
+
+
 def _rmsnorm_custom(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -95,4 +119,34 @@ direct_register_custom_op(
     op_func=_rmsnorm_custom,
     mutates_args=["out"],
     fake_impl=_rmsnorm_custom_fake,
+)
+
+
+def _fused_add_rmsnorm_custom(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    gemma: bool,
+) -> None:
+    _norm_module().sgl_musa_fused_add_rmsnorm(
+        input, residual, weight, float(eps), bool(gemma)
+    )
+
+
+def _fused_add_rmsnorm_custom_fake(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    gemma: bool,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="musa_csrc_fused_add_rmsnorm",
+    op_func=_fused_add_rmsnorm_custom,
+    mutates_args=["input", "residual"],
+    fake_impl=_fused_add_rmsnorm_custom_fake,
 )
