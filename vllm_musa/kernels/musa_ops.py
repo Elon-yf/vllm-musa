@@ -8,11 +8,11 @@ Currently registers:
   to _C_stable_libtorch; vllm-musa builds that extension as a schema-only
   compatibility shim, so this provider self-disables until a real MUSA kernel
   is present.
-- fused_add_rms_norm: uses the exact FP32-sum MUSA JIT kernel for measured
-  H5120 BF16 work. It is registered as in-place so vLLM's IR functionalization
-  pass, rather than a model-name check, owns activation donation.
-  A broader ``musa_legacy`` provider preserves the existing libtorch kernel
-  fallback for other standard RMSNorm shapes.
+- fused_add_rms_norm: exposes one ``musa`` provider whose internal capability
+  dispatch uses the exact FP32-sum JIT kernel for measured H5120 BF16 work and
+  the pre-existing C-extension kernel for broader standard RMSNorm shapes. It
+  is registered as in-place so vLLM's IR functionalization pass, rather than a
+  model-name check, owns activation donation.
 
 Engine log from baseline confirms:
     ir_op_priority=IrOpPriorityConfig(rms_norm=['native'])
@@ -87,7 +87,7 @@ def rms_norm(
     return output
 
 
-def _fused_add_rms_norm_supports_args(
+def _jit_fused_add_rms_norm_supports_args(
     x: Tensor,
     x_residual: Tensor,
     weight: Tensor | None,
@@ -96,12 +96,7 @@ def _fused_add_rms_norm_supports_args(
 ) -> bool:
     del epsilon
 
-    if (
-        weight is None
-        or x.dim() != 2
-        or x_residual.dim() != 2
-        or weight.dim() != 1
-    ):
+    if weight is None or x.dim() != 2 or x_residual.dim() != 2 or weight.dim() != 1:
         return False
 
     # IR lowering selects one provider for an entire vLLM compile range. Do not
@@ -115,8 +110,7 @@ def _fused_add_rms_norm_supports_args(
         from vllm.compilation.passes.inductor_pass import get_pass_context
 
         profitable_rows = (
-            get_pass_context().compile_range.start
-            >= FUSED_ADD_RMSNORM_MIN_ROWS
+            get_pass_context().compile_range.start >= FUSED_ADD_RMSNORM_MIN_ROWS
         )
     except AssertionError:
         # Eager dispatch has concrete shapes. A direct compiled invocation
@@ -145,7 +139,7 @@ def _fused_add_rms_norm_supports_args(
     )
 
 
-def _legacy_fused_add_rms_norm_supports_args(
+def _c_ext_fused_add_rms_norm_supports_args(
     x: Tensor,
     x_residual: Tensor,
     weight: Tensor | None,
@@ -153,12 +147,7 @@ def _legacy_fused_add_rms_norm_supports_args(
     variance_size: int | None = None,
 ) -> bool:
     del epsilon
-    if (
-        weight is None
-        or x.dim() != 2
-        or x_residual.dim() != 2
-        or weight.dim() != 1
-    ):
+    if weight is None or x.dim() != 2 or x_residual.dim() != 2 or weight.dim() != 1:
         return False
 
     hidden_size = x.shape[1]
@@ -181,6 +170,46 @@ def _legacy_fused_add_rms_norm_supports_args(
     )
 
 
+def _select_musa_fused_add_rms_norm_impl(
+    x: Tensor,
+    x_residual: Tensor,
+    weight: Tensor | None,
+    epsilon: float,
+    variance_size: int | None = None,
+) -> str | None:
+    """Select the concrete kernel hidden behind the public ``musa`` provider.
+
+    The JIT capability check is compile-range aware. Calling the same selector
+    from both IR dispatch and the registered implementation keeps lowering on
+    the kernel chosen for that entire range; it must not branch on a symbolic
+    example tensor's row-count hint.
+    """
+    if _jit_fused_add_rms_norm_supports_args(
+        x, x_residual, weight, epsilon, variance_size
+    ):
+        return "jit"
+    if _c_ext_fused_add_rms_norm_supports_args(
+        x, x_residual, weight, epsilon, variance_size
+    ):
+        return "c_ext"
+    return None
+
+
+def _fused_add_rms_norm_supports_args(
+    x: Tensor,
+    x_residual: Tensor,
+    weight: Tensor | None,
+    epsilon: float,
+    variance_size: int | None = None,
+) -> bool:
+    return (
+        _select_musa_fused_add_rms_norm_impl(
+            x, x_residual, weight, epsilon, variance_size
+        )
+        is not None
+    )
+
+
 @ir.ops.fused_add_rms_norm.register_impl(
     "musa",
     inplace=True,
@@ -197,30 +226,19 @@ def fused_add_rms_norm(
     """MUSA in-place provider for ``vllm.ir.ops.fused_add_rms_norm``."""
     assert variance_size is None
     assert weight is not None
-    from vllm_musa.jit_kernel.csrc.norm import fused_add_rmsnorm
+    selected = _select_musa_fused_add_rms_norm_impl(
+        x, x_residual, weight, epsilon, variance_size
+    )
+    if selected == "jit":
+        from vllm_musa.jit_kernel.csrc.norm import fused_add_rmsnorm
 
-    # IR supplies the effective scale. Gemma has already materialized
-    # ``parameter.float() + 1``, so applying Gemma's offset here would double it.
-    return fused_add_rmsnorm(x, x_residual, weight, epsilon, gemma=False)
+        # IR supplies the effective scale. Gemma has already materialized
+        # ``parameter.float() + 1``, so applying Gemma's offset here would
+        # double it.
+        return fused_add_rmsnorm(x, x_residual, weight, epsilon, gemma=False)
+    if selected == "c_ext":
+        from vllm_musa import _custom_ops as musa_ops
 
-
-@ir.ops.fused_add_rms_norm.register_impl(
-    "musa_legacy",
-    inplace=True,
-    supports_args=_legacy_fused_add_rms_norm_supports_args,
-    supported=current_platform.is_musa(),
-)
-def legacy_fused_add_rms_norm(
-    x: Tensor,
-    x_residual: Tensor,
-    weight: Tensor | None,
-    epsilon: float,
-    variance_size: int | None = None,
-) -> tuple[Tensor, Tensor]:
-    """Broad MUSA fallback matching the pre-IR OOT fused kernel path."""
-    assert variance_size is None
-    assert weight is not None
-    from vllm_musa import _custom_ops as musa_ops
-
-    musa_ops.musa_fused_add_rms_norm(x, x_residual, weight, epsilon)
-    return x, x_residual
+        musa_ops.musa_fused_add_rms_norm(x, x_residual, weight, epsilon)
+        return x, x_residual
+    raise AssertionError("musa provider invoked with unsupported arguments")

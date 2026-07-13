@@ -109,7 +109,6 @@ class TestMUSAPlatformBase:
         priority = MUSAPlatformBase.get_default_ir_op_priority(config)
         assert priority.fused_add_rms_norm == [
             "musa",
-            "musa_legacy",
             "native",
         ]
 
@@ -125,7 +124,6 @@ class TestMUSAPlatformBase:
             priority = MUSAPlatformBase.get_default_ir_op_priority(config)
             assert priority.fused_add_rms_norm == [
                 "musa",
-                "musa_legacy",
                 "native",
             ]
         with envs.VLLM_MUSA_CUSTOM_OP_USE_NATIVE.override(True):

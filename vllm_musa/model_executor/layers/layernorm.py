@@ -44,7 +44,7 @@ class MusaRMSNorm(RMSNorm):
 
         if residual is not None:
             # All residual calls use IR. It validates donation and selects the
-            # measured JIT provider, the broad legacy provider, or native.
+            # measured JIT kernel, the broad C-extension kernel, or native.
             return self.forward_native(x, residual)
 
         weight = self.weight.data

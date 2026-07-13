@@ -166,7 +166,7 @@ def test_csrc_fused_add_rmsnorm_accepts_effective_fp32_weight(
         (64, 5120, torch.float16, torch.float16, False),
     ],
 )
-def test_ir_fused_add_rmsnorm_dispatch_is_h5120_only(
+def test_ir_fused_add_rmsnorm_jit_dispatch_is_h5120_only(
     rows: int,
     hidden: int,
     dtype: torch.dtype,
@@ -174,7 +174,7 @@ def test_ir_fused_add_rmsnorm_dispatch_is_h5120_only(
     expected: bool,
 ) -> None:
     from vllm_musa.kernels.musa_ops import (
-        _fused_add_rms_norm_supports_args,
+        _jit_fused_add_rms_norm_supports_args,
     )
 
     device = torch.device("musa")
@@ -182,7 +182,7 @@ def test_ir_fused_add_rmsnorm_dispatch_is_h5120_only(
     residual = torch.empty_like(x)
     weight = torch.empty((hidden,), device=device, dtype=weight_dtype)
 
-    assert _fused_add_rms_norm_supports_args(x, residual, weight, 1e-6) is expected
+    assert _jit_fused_add_rms_norm_supports_args(x, residual, weight, 1e-6) is expected
 
 
 def test_ir_fused_add_rmsnorm_dispatch_rejects_unsafe_inputs() -> None:
@@ -209,10 +209,11 @@ def test_ir_fused_add_rmsnorm_dispatch_rejects_unsafe_inputs() -> None:
     )
 
 
-def test_ir_fused_add_rmsnorm_legacy_fallback_preserves_broad_shapes() -> None:
+def test_ir_fused_add_rmsnorm_c_ext_branch_preserves_broad_shapes() -> None:
     from vllm_musa.kernels.musa_ops import (
+        _c_ext_fused_add_rms_norm_supports_args,
         _fused_add_rms_norm_supports_args,
-        _legacy_fused_add_rms_norm_supports_args,
+        _select_musa_fused_add_rms_norm_impl,
     )
     from vllm_musa.utils.environ import envs
 
@@ -222,20 +223,16 @@ def test_ir_fused_add_rmsnorm_legacy_fallback_preserves_broad_shapes() -> None:
     weight = torch.empty((5376,), device=device, dtype=torch.bfloat16)
 
     scalar = torch.empty((), device=device, dtype=torch.bfloat16)
-    assert not _legacy_fused_add_rms_norm_supports_args(
-        scalar, scalar, weight, 1e-6
-    )
-    assert not _fused_add_rms_norm_supports_args(x, residual, weight, 1e-6)
-    assert _legacy_fused_add_rms_norm_supports_args(
-        x, residual, weight, 1e-6
-    )
-    assert not _legacy_fused_add_rms_norm_supports_args(
+    assert not _c_ext_fused_add_rms_norm_supports_args(scalar, scalar, weight, 1e-6)
+    assert _c_ext_fused_add_rms_norm_supports_args(x, residual, weight, 1e-6)
+    assert _fused_add_rms_norm_supports_args(x, residual, weight, 1e-6)
+    assert _select_musa_fused_add_rms_norm_impl(x, residual, weight, 1e-6) == "c_ext"
+    assert not _c_ext_fused_add_rms_norm_supports_args(
         x, residual, weight.float(), 1e-6
     )
     with envs.VLLM_MUSA_FUSED_ADD_RMSNORM.override(False):
-        assert not _legacy_fused_add_rms_norm_supports_args(
-            x, residual, weight, 1e-6
-        )
+        assert not _c_ext_fused_add_rms_norm_supports_args(x, residual, weight, 1e-6)
+        assert not _fused_add_rms_norm_supports_args(x, residual, weight, 1e-6)
 
 
 def test_ir_fused_add_rmsnorm_dispatch_uses_compile_range_not_shape_hint() -> None:
@@ -244,6 +241,7 @@ def test_ir_fused_add_rmsnorm_dispatch_uses_compile_range_not_shape_hint() -> No
 
     from vllm_musa.kernels.musa_ops import (
         _fused_add_rms_norm_supports_args,
+        _select_musa_fused_add_rms_norm_impl,
     )
 
     device = torch.device("musa")
@@ -251,14 +249,58 @@ def test_ir_fused_add_rmsnorm_dispatch_uses_compile_range_not_shape_hint() -> No
     # provider decision must instead follow the guarded vLLM compile range.
     x = torch.empty((1, 5120), device=device, dtype=torch.bfloat16)
     residual = torch.empty_like(x)
-    weight = torch.empty((5120,), device=device, dtype=torch.float32)
+    bf16_weight = torch.empty((5120,), device=device, dtype=torch.bfloat16)
+    fp32_weight = bf16_weight.float()
 
     with pass_context(Range(1, 63)):
-        assert not _fused_add_rms_norm_supports_args(
-            x, residual, weight, 1e-6
+        assert (
+            _select_musa_fused_add_rms_norm_impl(x, residual, bf16_weight, 1e-6)
+            == "c_ext"
         )
+        assert not _fused_add_rms_norm_supports_args(x, residual, fp32_weight, 1e-6)
     with pass_context(Range(64, 4096)):
-        assert _fused_add_rms_norm_supports_args(x, residual, weight, 1e-6)
+        assert (
+            _select_musa_fused_add_rms_norm_impl(x, residual, bf16_weight, 1e-6)
+            == "jit"
+        )
+        assert (
+            _select_musa_fused_add_rms_norm_impl(x, residual, fp32_weight, 1e-6)
+            == "jit"
+        )
+
+
+def test_ir_fused_add_rmsnorm_single_provider_covers_standard_rmsnorm() -> None:
+    from vllm import ir
+
+    from vllm_musa.kernels.musa_ops import (
+        _select_musa_fused_add_rms_norm_impl,
+    )
+
+    device = torch.device("musa")
+    bf16_x = torch.empty((1, 2048), device=device, dtype=torch.bfloat16)
+    bf16_residual = torch.empty_like(bf16_x)
+    bf16_weight = torch.empty((2048,), device=device, dtype=torch.bfloat16)
+
+    assert (
+        _select_musa_fused_add_rms_norm_impl(bf16_x, bf16_residual, bf16_weight, 1e-6)
+        == "c_ext"
+    )
+    assert (
+        _select_musa_fused_add_rms_norm_impl(
+            bf16_x, bf16_residual, bf16_weight.float(), 1e-6
+        )
+        is None
+    )
+
+    fp16_x = bf16_x.to(torch.float16)
+    fp16_residual = bf16_residual.to(torch.float16)
+    fp16_weight = bf16_weight.to(torch.float16)
+    assert (
+        _select_musa_fused_add_rms_norm_impl(fp16_x, fp16_residual, fp16_weight, 1e-6)
+        == "c_ext"
+    )
+    assert "musa" in ir.ops.fused_add_rms_norm.impls
+    assert "musa_legacy" not in ir.ops.fused_add_rms_norm.impls
 
 
 def test_ir_fused_add_rmsnorm_dispatch_fails_closed_without_compile_range(
@@ -275,6 +317,45 @@ def test_ir_fused_add_rmsnorm_dispatch_fails_closed_without_compile_range(
 
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
     assert not _fused_add_rms_norm_supports_args(x, residual, weight, 1e-6)
+
+
+def test_ir_fused_add_rmsnorm_provider_invokes_selected_kernel(monkeypatch) -> None:
+    from vllm_musa import _custom_ops as musa_ops
+    from vllm_musa.jit_kernel.csrc import norm as musa_jit_norm
+    from vllm_musa.kernels import musa_ops as ir_musa_ops
+
+    device = torch.device("musa")
+    x = torch.empty((1, 5120), device=device, dtype=torch.bfloat16)
+    residual = torch.empty_like(x)
+    weight = torch.empty((5120,), device=device, dtype=torch.bfloat16)
+    calls: list[str] = []
+
+    def fake_jit(*args, **kwargs):
+        calls.append("jit")
+        return args[0], args[1]
+
+    def fake_c_ext(*args, **kwargs):
+        calls.append("c_ext")
+
+    monkeypatch.setattr(musa_jit_norm, "fused_add_rmsnorm", fake_jit)
+    monkeypatch.setattr(musa_ops, "musa_fused_add_rms_norm", fake_c_ext)
+
+    monkeypatch.setattr(
+        ir_musa_ops,
+        "_select_musa_fused_add_rms_norm_impl",
+        lambda *args, **kwargs: "jit",
+    )
+    ir_musa_ops.fused_add_rms_norm.impl_fn(x, residual, weight, 1e-6)
+    assert calls == ["jit"]
+
+    calls.clear()
+    monkeypatch.setattr(
+        ir_musa_ops,
+        "_select_musa_fused_add_rms_norm_impl",
+        lambda *args, **kwargs: "c_ext",
+    )
+    ir_musa_ops.fused_add_rms_norm.impl_fn(x, residual, weight, 1e-6)
+    assert calls == ["c_ext"]
 
 
 def test_ir_fused_add_rmsnorm_preserves_functional_and_inplace_contracts() -> None:

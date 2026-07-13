@@ -59,8 +59,8 @@ def test_report(ms, capsys):
     rc = ms.main(["report"])
     out = capsys.readouterr().out
     assert rc == 0
-    assert "113 divergences" in out
-    assert "'1': 58" in out and "'2': 19" in out and "'3': 1" in out
+    assert "115 divergences" in out
+    assert "'1': 60" in out and "'2': 19" in out and "'3': 1" in out
     assert "'4a': 2" in out and "'5': 25" in out and "'6': 8" in out
 
 
@@ -94,6 +94,13 @@ def test_default_target_prefers_exact_commit(ms, monkeypatch):
 
     pins.pop("VLLM_COMMIT")
     assert ms._default_target() == "v0.24.0"
+
+
+def test_series_readme_count_matches_directory():
+    series_dir = ROOT / "vllm_musa" / "patches" / "series"
+    patch_count = len(list(series_dir.glob("*.patch")))
+    readme = (series_dir / "README.md").read_text()
+    assert f"Currently **{patch_count} patches**" in readme
 
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="git unavailable")

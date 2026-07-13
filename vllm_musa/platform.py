@@ -434,9 +434,11 @@ class MUSAPlatformBase(Platform):
 
         When compiling with Inductor, prefer the `native` (pure-PyTorch)
         rms_norm implementation. Prefer the measured in-place `musa`
-        fused_add_rms_norm implementation in both compiled and eager paths,
-        followed by the broad pre-existing `musa_legacy` kernel and native;
-        IR functionalization owns activation donation.
+        fused_add_rms_norm implementation in both compiled and eager paths.
+        That single provider dispatches internally between the measured JIT
+        kernel and the broad pre-existing C-extension kernel, then falls back
+        to native through normal IR priority; IR functionalization owns
+        activation donation.
         This mirrors the upstream `cuda.py` pattern
         (`default = ["native"] if using_inductor else ["vllm_c", "native"]`):
         under Inductor the native rms_norm is a handful of
@@ -481,9 +483,7 @@ class MUSAPlatformBase(Platform):
             native_custom_ops = _should_route_quantized_piecewise_ops_native(
                 vllm_config
             )
-        fused_add_rms_norm = (
-            ["native"] if native_custom_ops else ["musa", "musa_legacy", "native"]
-        )
+        fused_add_rms_norm = ["native"] if native_custom_ops else ["musa", "native"]
         # The direct Triton HOP is profitable for every validated dense shape
         # family; supports_args remains the semantic/shape guard. Keep routed
         # MoE on native by default because a 100-prompt Qwen3.6 TP8 sweep
