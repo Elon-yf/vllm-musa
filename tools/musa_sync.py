@@ -418,13 +418,28 @@ def cmd_regen(args) -> int:
             )
             return 1
 
-        noncanonical = [
+        headers = {p: p.read_bytes().splitlines()[:2] for p in generated}
+        noncanonical_commits = [
             p.name
-            for p in generated
-            if p.read_bytes().splitlines()[0] != _ZERO_COMMIT_HEADER
+            for p, lines in headers.items()
+            if not lines or lines[0] != _ZERO_COMMIT_HEADER
         ]
-        if noncanonical:
-            print(f"ERROR: non-canonical patch headers: {', '.join(noncanonical)}")
+        if noncanonical_commits:
+            print(
+                "ERROR: non-canonical patch commit headers: "
+                f"{', '.join(noncanonical_commits)}"
+            )
+            return 1
+        noncanonical_authors = [
+            p.name
+            for p, lines in headers.items()
+            if len(lines) < 2 or lines[1] != _CANONICAL_PATCH_AUTHOR
+        ]
+        if noncanonical_authors:
+            print(
+                "ERROR: non-canonical patch author headers: "
+                f"{', '.join(noncanonical_authors)}"
+            )
             return 1
 
         SERIES_DIR.mkdir(parents=True, exist_ok=True)

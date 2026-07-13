@@ -1585,6 +1585,19 @@ class TestBuildTimeSeries:
     _PATCHES_DIR = Path(__file__).parent.parent / "vllm_musa" / "patches"
     _SERIES_DIR = _PATCHES_DIR / "series"
 
+    @staticmethod
+    def _read_patch(path: Path) -> str:
+        return path.read_bytes().decode("utf-8", errors="surrogateescape")
+
+    def test_read_patch_tolerates_non_utf8_payload(self, tmp_path):
+        patch = tmp_path / "non-utf8.patch"
+        patch.write_bytes(b"From: musa <musa@local>\ninvalid: \xff\xfe\n")
+
+        text = self._read_patch(patch)
+
+        assert text.startswith("From: musa <musa@local>")
+        assert text.encode("utf-8", errors="surrogateescape") == patch.read_bytes()
+
     def _load_build_apply(self):
         # Load by file path exactly as setup.py does: build_apply is stdlib-only
         # so this needs neither a vllm nor a vllm_musa import.
@@ -1601,7 +1614,7 @@ class TestBuildTimeSeries:
 
     def test_series_files_are_wellformed_format_patches(self):
         for p in sorted(self._SERIES_DIR.glob("*.patch")):
-            text = p.read_text()
+            text = self._read_patch(p)
             assert text.startswith("From "), f"{p.name}: not a git format-patch"
             assert "Subject:" in text, f"{p.name}: missing Subject line"
             assert "diff --git" in text, f"{p.name}: no diff hunk"
@@ -1622,7 +1635,8 @@ class TestBuildTimeSeries:
     def test_gemma_norm_series_patch_uses_generic_inplace_ir_contract(self):
         series = (
             self._SERIES_DIR / "0079-MUSA-allow-Gemma-RMSNorm-residual-donation.patch"
-        ).read_text()
+        )
+        series = self._read_patch(series)
 
         assert "fused_add_rms_norm.maybe_inplace" in series
         assert "allow_inplace" not in series
@@ -1630,9 +1644,8 @@ class TestBuildTimeSeries:
         assert "vllm/model_executor/models/qwen3_5_mtp.py" not in series
 
     def test_gated_qkv_series_patch_uses_generic_ir_contract(self):
-        series = (
-            self._SERIES_DIR / "0080-MUSA-add-gated-QKV-RMSNorm-MRoPE-IR.patch"
-        ).read_text()
+        series = self._SERIES_DIR / "0080-MUSA-add-gated-QKV-RMSNorm-MRoPE-IR.patch"
+        series = self._read_patch(series)
 
         assert '@register_op(activations=["packed_qkv"])' in series
         assert "def gated_qkv_rms_norm_rope(" in series
@@ -1651,9 +1664,8 @@ class TestBuildTimeSeries:
         assert ba.apply_patch_series(tmp_path, tmp_path / "nope") == []
 
     def test_deepseek_v4_spec_metadata_upload_series_patch_present(self):
-        series = (
-            self._SERIES_DIR / "0035-MUSA-vllm.v1.worker.gpu_model_runner.patch"
-        ).read_text()
+        series = self._SERIES_DIR / "0035-MUSA-vllm.v1.worker.gpu_model_runner.patch"
+        series = self._read_patch(series)
 
         assert "_spec_cu_num_draft_tokens" in series
         assert "_spec_cu_num_sampled_tokens" in series
@@ -1678,7 +1690,8 @@ class TestBuildTimeSeries:
         series = (
             self._SERIES_DIR
             / "0013-MUSA-vllm.model_executor.layers.sparse_attn_indexer.patch"
-        ).read_text()
+        )
+        series = self._read_patch(series)
 
         assert (
             "VLLM_MUSA_DEEPSEEK_V4_INDEXER_TOPK_PREFILL_MATERIALIZED_LOGITS" in series

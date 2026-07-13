@@ -143,6 +143,22 @@ def test_regen_requires_pinned_target(ms, monkeypatch, capsys):
 
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="git unavailable")
+def test_regen_rejects_noncanonical_author(ms, tmp_path, monkeypatch, capsys):
+    workdir = tmp_path / "vllm"
+    base = _init_repo(workdir)
+    (workdir / "value.txt").write_text("beta\n")
+    _git(workdir, "commit", "--all", "--quiet", "-m", "change")
+
+    monkeypatch.setattr(ms, "WORKDIR", workdir)
+    monkeypatch.setattr(ms, "SERIES_DIR", tmp_path / "series")
+    monkeypatch.setattr(ms, "_default_target", lambda: base)
+    monkeypatch.setattr(ms, "_normalize_patch_author", lambda _path: None)
+
+    assert ms.main(["regen"]) == 1
+    assert "non-canonical patch author headers" in capsys.readouterr().out
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git unavailable")
 def test_ensure_clone_accepts_exact_commit_sha(ms, tmp_path, monkeypatch):
     origin = tmp_path / "origin"
     first = _init_repo(origin)
