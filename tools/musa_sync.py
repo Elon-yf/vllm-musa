@@ -59,6 +59,9 @@ MODULE_DRIFT_DIR = (
 WORKDIR = ROOT / "third_party" / "vllm"
 PINS = ROOT / "third_party" / "PINS"
 VLLM_URL = "https://github.com/vllm-project/vllm.git"
+_ZERO_COMMIT_HEADER = (
+    b"From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001"
+)
 _CANONICAL_PATCH_AUTHOR = b"From: musa <musa@local>"
 
 
@@ -415,13 +418,10 @@ def cmd_regen(args) -> int:
             )
             return 1
 
-        zero_commit_header = (
-            "From 0000000000000000000000000000000000000000 " "Mon Sep 17 00:00:00 2001"
-        )
         noncanonical = [
             p.name
             for p in generated
-            if p.read_text(errors="replace").splitlines()[0] != zero_commit_header
+            if p.read_bytes().splitlines()[0] != _ZERO_COMMIT_HEADER
         ]
         if noncanonical:
             print(f"ERROR: non-canonical patch headers: {', '.join(noncanonical)}")

@@ -108,12 +108,12 @@ def test_series_is_contiguous_and_uses_canonical_headers_and_authors():
     assert [p.name.split("-", 1)[0] for p in patches] == [
         f"{i:04d}" for i in range(1, len(patches) + 1)
     ]
+    headers = [p.read_bytes().splitlines()[:2] for p in patches]
     zero_commit_header = (
-        "From 0000000000000000000000000000000000000000 " "Mon Sep 17 00:00:00 2001"
+        b"From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001"
     )
-    assert all(p.read_text().splitlines()[0] == zero_commit_header for p in patches)
-    authors = [p.read_text().splitlines()[1] for p in patches]
-    assert set(authors) == {"From: musa <musa@local>"}
+    assert all(lines[0] == zero_commit_header for lines in headers)
+    assert {lines[1] for lines in headers} == {b"From: musa <musa@local>"}
 
 
 def test_normalize_patch_author_preserves_non_utf8_bytes(ms, tmp_path):
@@ -210,13 +210,12 @@ def test_regen_replaces_series_and_prunes_stale_files(
         "0001-first-change.patch",
         "0002-second-change.patch",
     ]
+    headers = [p.read_bytes().splitlines()[:2] for p in patches]
     assert all(
-        p.read_text().startswith("From 0000000000000000000000000000000000000000 ")
-        for p in patches
+        lines[0].startswith(b"From 0000000000000000000000000000000000000000 ")
+        for lines in headers
     )
-    assert all(
-        p.read_text().splitlines()[1] == "From: musa <musa@local>" for p in patches
-    )
+    assert all(lines[1] == b"From: musa <musa@local>" for lines in headers)
     assert (series_dir / "README.md").read_text() == "keep me\n"
     assert "pruned 1 stale files" in out
 
