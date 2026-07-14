@@ -112,8 +112,9 @@ def get_flash_attn_version(
 
 
 def flash_attn_supports_fp8() -> bool:
-    logger.info_once("Cannot use FLASH_ATTN with FP8 on MUSA platform")
-    return False
+    # mate's FMHA takes fp8 e4m3 q/k/v with per-(batch, kv-head) descale, which is
+    # the shape vllm builds for an fp8 KV cache. e5m2 has no mate kernel.
+    return True
 
 
 def flash_attn_supports_sinks() -> bool:

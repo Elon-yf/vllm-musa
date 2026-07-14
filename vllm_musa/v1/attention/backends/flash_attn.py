@@ -197,12 +197,9 @@ class MUSAFlashAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_per_head_quant_scales(cls) -> bool:
-        # mate flash_attn_varlen_func rejects fp8 Q/K inputs
-        # ("inputs must be float16 or bfloat16"), so per-head FP8 quant-scale
-        # attention is NOT supported on MUSA — consistent with
-        # flash_attn_supports_fp8()=False and get_fp8_dtype_for_flashattn raising
-        # NotImplementedError. Probe: generated/musa0400/probe_fa_caps.py.
-        return False
+        # mate applies q/k/v descale per (batch, kv-head), so distinct per-head
+        # scales are honoured rather than broadcast from head 0.
+        return True
 
     @staticmethod
     def get_impl_cls() -> type["FlashAttentionImpl"]:
@@ -247,8 +244,11 @@ class MUSAFlashAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_fp8_dtype_for_flashattn(kv_cache_dtype: str) -> torch.dtype:
+        if kv_cache_dtype in ("fp8", "fp8_e4m3"):
+            return torch.float8_e4m3fn
         raise NotImplementedError(
-            "FP8 dtype is not supported for FlashAttention on MUSA."
+            f"kv_cache_dtype {kv_cache_dtype!r} is not supported for "
+            "FlashAttention on MUSA; mate provides an e4m3 FMHA kernel only."
         )
 
     @classmethod
@@ -259,7 +259,8 @@ class MUSAFlashAttentionBackend(AttentionBackend):
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
         if kv_cache_dtype is None:
             return True
-        if kv_cache_dtype.startswith("fp8"):
+        # MUSA: e4m3 only — mate has no e5m2 FMHA kernel.
+        if kv_cache_dtype in ("fp8", "fp8_e4m3"):
             return flash_attn_supports_fp8()
         return kv_cache_dtype in ["auto", "float16", "bfloat16"]
 
