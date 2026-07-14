@@ -862,7 +862,10 @@ class FlashAttentionImpl(AttentionImpl):
             and not self.kv_cache_dtype.startswith("fp8")
         )
 
-        self.supports_quant_query_input = False
+        # mate's FMHA requires q, k and v to share a dtype, so an fp8 KV cache needs an
+        # fp8 query. Letting the layer quantize Q keeps the two in step; on a non-fp8
+        # cache the layer leaves the query untouched.
+        self.supports_quant_query_input = True
 
         vllm_config = get_current_vllm_config_or_none()
         dcp_a2a = (
@@ -1020,6 +1023,7 @@ class FlashAttentionImpl(AttentionImpl):
                         causal=attn_metadata.causal,
                         window_size=sliding_window_size,
                         softcap=self.logits_soft_cap,
+                        q_descale=layer._q_scale.expand(decode_descale_shape),
                         k_descale=layer._k_scale.expand(decode_descale_shape),
                         v_descale=layer._v_scale.expand(decode_descale_shape),
                         scheduler_metadata=attn_metadata.scheduler_metadata,
