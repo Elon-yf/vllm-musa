@@ -101,6 +101,19 @@ def test_musa_image_provenance_labels_are_derived_from_source():
         assert f'--build-arg {name}="${{{name}}}"' in build_script
 
 
+def test_vllm_rs_uses_rsproxy_for_cargo_without_overriding_upstream_toolchain():
+    dockerfile = (ROOT / "docker" / "musa.Dockerfile").read_text()
+    cargo_config = (ROOT / "docker" / "cargo-config.toml").read_text()
+
+    assert "https://sh.rustup.rs" in dockerfile
+    assert "--default-toolchain none" in dockerfile
+    assert "--default-toolchain 1.86.0" not in dockerfile
+    assert "CARGO_NET_RETRY=10" in dockerfile
+    assert "COPY docker/cargo-config.toml /root/.cargo/config.toml" in dockerfile
+    assert 'replace-with = "rsproxy-sparse"' in cargo_config
+    assert 'registry = "sparse+https://rsproxy.cn/index/"' in cargo_config
+
+
 def test_setup_finds_local_build_helpers_before_importing_them():
     setup = (ROOT / "setup.py").read_text()
     assert setup.index("sys.path.insert(0, str(root))") < setup.index(

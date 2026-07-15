@@ -33,7 +33,7 @@ VLLM_MUSA_COMMIT="$(git rev-parse HEAD)"
 VLLM_MUSA_REF="$(git describe --tags --exact-match 2>/dev/null || git branch --show-current)"
 VLLM_TAG="$(awk -F= '$1 == "VLLM_TAG" {print $2; exit}' third_party/PINS)"
 
-BUILD_MOONCAKE="${BUILD_MOONCAKE:-0}"
+BUILD_MOONCAKE="${BUILD_MOONCAKE:-1}"
 MOONCAKE_REPO="${MOONCAKE_REPO:-https://github.com/kvcache-ai/Mooncake.git}"
 MOONCAKE_COMMIT="${MOONCAKE_COMMIT:-b6a841dc78c707ec655a563453277d969fb8f38d}"
 BUILD_VLLM_RS="${BUILD_VLLM_RS:-1}"

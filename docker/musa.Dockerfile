@@ -356,7 +356,10 @@ RUN if [[ "${BUILD_VLLM_RS}" == "1" ]]; then \
 
 ENV PATH=/root/.cargo/bin:${PATH}
 ENV CARGO_BUILD_JOBS=4
-ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true \
+    CARGO_NET_RETRY=10
+
+COPY docker/cargo-config.toml /root/.cargo/config.toml
 
 RUN mkdir -p /tmp/vllm-rs-artifacts && \
     printf '%s\n' "${BUILD_VLLM_RS}" > /tmp/vllm-rs-artifacts/build-mode && \
