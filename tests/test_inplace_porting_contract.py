@@ -77,6 +77,27 @@ def test_musa_image_stage_and_optional_component_contract():
     assert '--build-arg BUILD_VLLM_RS="${BUILD_VLLM_RS}"' in build_script
 
 
+def test_musa_image_provenance_labels_are_derived_from_source():
+    dockerfile = (ROOT / "docker" / "musa.Dockerfile").read_text()
+    build_script = (ROOT / "docker" / "build_image.sh").read_text()
+
+    expected_labels = (
+        'org.opencontainers.image.source="https://github.com/MooreThreads/vllm-musa"',
+        'org.opencontainers.image.revision="${VLLM_MUSA_COMMIT}"',
+        'org.opencontainers.image.version="${VLLM_MUSA_REF}"',
+        'com.mthreads.vllm.version="${VLLM_TAG}"',
+    )
+    for label in expected_labels:
+        assert label in dockerfile
+    assert "org.opencontainers.image.created" not in dockerfile
+
+    assert "git rev-parse HEAD" in build_script
+    assert "git branch --show-current" in build_script
+    assert 'awk -F= \'$1 == "VLLM_TAG"' in build_script
+    for name in ("VLLM_MUSA_COMMIT", "VLLM_MUSA_REF", "VLLM_TAG"):
+        assert f'--build-arg {name}="${{{name}}}"' in build_script
+
+
 def test_setup_finds_local_build_helpers_before_importing_them():
     setup = (ROOT / "setup.py").read_text()
     assert setup.index("sys.path.insert(0, str(root))") < setup.index(

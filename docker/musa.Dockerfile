@@ -444,4 +444,13 @@ RUN rm -rf \
         /root/.cache/vllm-musa \
         /tmp/pip-*
 
+ARG VLLM_MUSA_COMMIT
+ARG VLLM_MUSA_REF
+ARG VLLM_TAG
+
+LABEL org.opencontainers.image.source="https://github.com/MooreThreads/vllm-musa" \
+      org.opencontainers.image.revision="${VLLM_MUSA_COMMIT}" \
+      org.opencontainers.image.version="${VLLM_MUSA_REF}" \
+      com.mthreads.vllm.version="${VLLM_TAG}"
+
 CMD ["/bin/bash"]
