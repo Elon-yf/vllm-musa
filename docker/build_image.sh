@@ -30,7 +30,7 @@ fi
 PYTORCH_RELEASE_TAG="$(printf '%s' "${PYTORCH_RELEASE}" | sed 's/[^A-Za-z0-9_.-]/_/g')"
 
 VLLM_MUSA_COMMIT="$(git rev-parse HEAD)"
-VLLM_MUSA_REF="$(git branch --show-current)"
+VLLM_MUSA_REF="$(git describe --tags --exact-match 2>/dev/null || git branch --show-current)"
 VLLM_TAG="$(awk -F= '$1 == "VLLM_TAG" {print $2; exit}' third_party/PINS)"
 
 BUILD_MOONCAKE="${BUILD_MOONCAKE:-0}"
