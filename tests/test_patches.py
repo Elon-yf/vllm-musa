@@ -435,15 +435,18 @@ class TestMUSAPlatformDefaults:
         assert vllm_config.compilation_config.max_cudagraph_capture_size is None
         assert vllm_config.compilation_config.cudagraph_capture_sizes == [1, 2, 4, 8]
 
-    @pytest.mark.xfail(
-        reason="v0.22 platform.py apply_config_platform_defaults no "
-        "longer forces cudagraph_mode=NONE at tp=4 (no such code path remains). "
-        "Open behavioral question: does large-TP cudagraph capture need disabling "
-        "on MUSA v0.22? Potential dropped-safety regression -- flagged, not "
-        "resolved here.",
-        strict=False,
-    )
-    def test_tp4_disables_musa_cudagraph_capture(self):
+    def test_tp4_keeps_musa_cudagraph_capture(self):
+        """Tensor parallelism alone must not turn cudagraph capture off.
+
+        An earlier platform default forced ``cudagraph_mode=NONE`` above TP=2,
+        on the reading that MCCL collectives could not run under stream
+        capture. That reading was wrong: capture broke because collectives fell
+        back to ``torch.distributed.all_reduce``, whose MCCL ProcessGroup
+        watchdog called into the driver inside the capture window. Routing them
+        through the captureable, stream-bound custom all-reduce fixed the cause
+        and the TP guard came out with it. Capture stays on at TP=4, so a
+        reintroduced TP gate fails here.
+        """
         from vllm.config import CUDAGraphMode
 
         from vllm_musa.platform import MUSAPlatformBase
@@ -457,9 +460,9 @@ class TestMUSAPlatformDefaults:
 
         MUSAPlatformBase.check_and_update_config(vllm_config)
 
-        assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
-        assert vllm_config.compilation_config.max_cudagraph_capture_size == 0
-        assert vllm_config.compilation_config.cudagraph_capture_sizes == []
+        assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE
+        assert vllm_config.compilation_config.max_cudagraph_capture_size == 512
+        assert vllm_config.compilation_config.cudagraph_capture_sizes == [1, 2, 4, 8]
 
     def test_tp2_keeps_musa_cudagraph_capture(self):
         from vllm.config import CUDAGraphMode
@@ -1349,9 +1352,11 @@ class TestMUSAFP8ActivationQuant:
                 dispatch_key="MUSA",
             ),
         )
+        # float32 input takes the fallback branch, which calls the op out of
+        # the _C namespace rather than _C_musa_ops.
         monkeypatch.setattr(
             torch.ops,
-            "_C_musa_ops",
+            "_C",
             SimpleNamespace(per_token_group_fp8_quant=fake_quant),
             raising=False,
         )

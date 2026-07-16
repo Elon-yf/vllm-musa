@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Cross-repository contract checks for torchada's in-place source porter."""
 
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -112,6 +113,29 @@ def test_vllm_rs_uses_rsproxy_for_cargo_without_overriding_upstream_toolchain():
     assert "COPY docker/cargo-config.toml /root/.cargo/config.toml" in dockerfile
     assert 'replace-with = "rsproxy-sparse"' in cargo_config
     assert 'registry = "sparse+https://rsproxy.cn/index/"' in cargo_config
+
+
+def test_musa_image_does_not_bake_a_device_id_list():
+    """The image selects GPUs through the container runtime, not the driver.
+
+    MUSA_VISIBLE_DEVICES is a device-id list for both the MUSA driver and vLLM.
+    Baking "all" leaves the driver on every device (it ignores what it cannot
+    parse) but makes vLLM fail engine start on int("all"), so the image must
+    leave the variable alone and let the caller set it.
+    """
+    dockerfile = (ROOT / "docker" / "musa.Dockerfile").read_text()
+    # Drop comments, then fold backslash continuations so that a multi-line
+    # `ENV A=1 \ <newline> B=2` block reads as the single instruction it is.
+    body = "\n".join(
+        line for line in dockerfile.splitlines() if not line.lstrip().startswith("#")
+    )
+    env_instructions = [
+        line
+        for line in re.sub(r"\\\s*\n\s*", " ", body).splitlines()
+        if line.lstrip().startswith(("ENV", "ARG"))
+    ]
+    assert not any("MUSA_VISIBLE_DEVICES" in line for line in env_instructions)
+    assert any("MTHREADS_VISIBLE_DEVICES=all" in line for line in env_instructions)
 
 
 def test_setup_finds_local_build_helpers_before_importing_them():
