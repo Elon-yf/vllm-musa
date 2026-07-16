@@ -372,6 +372,7 @@ class TestMUSAPlatformBase:
             use_mla=False,
             has_sink=False,
             use_sparse=False,
+            use_mm_prefix=False,
             device_capability=DeviceCapability(3, 1),
         )
 
