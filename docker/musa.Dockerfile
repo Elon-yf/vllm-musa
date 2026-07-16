@@ -419,8 +419,7 @@ FROM mooncake AS final
 
 ARG BUILD_VLLM_RS=1
 
-ENV MTHREADS_VISIBLE_DEVICES=all \
-    MUSA_VISIBLE_DEVICES=all
+ENV MTHREADS_VISIBLE_DEVICES=all
 
 COPY --from=vllm_rs_build /tmp/vllm-rs-artifacts/ /tmp/vllm-rs-artifacts/
 
