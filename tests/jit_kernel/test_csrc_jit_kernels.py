@@ -6,7 +6,6 @@ from dataclasses import dataclass
 import pytest
 import torch
 
-os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
 os.environ.setdefault("VLLM_MUSA_JIT_CACHE_DIR", "/tmp/vllm_musa_pytest_jit_cache")
@@ -24,6 +23,17 @@ def _require_musa() -> None:
 @pytest.fixture(scope="module", autouse=True)
 def _musa_device():
     _require_musa()
+
+
+@pytest.fixture(autouse=True)
+def _eager_only(monkeypatch):
+    """Keep these kernel tests off the compiled path.
+
+    torch.compile reads TORCHDYNAMO_DISABLE when it is called, not when torch is
+    imported, so setting it at module scope would follow pytest's import of this
+    file into sibling modules whose tests must actually compile.
+    """
+    monkeypatch.setenv("TORCHDYNAMO_DISABLE", "1")
 
 
 def _sync() -> None:
