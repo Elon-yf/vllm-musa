@@ -12,7 +12,7 @@ vLLM Hardware Plugin for Moore Threads MUSA
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License"></a>
-  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.9+-blue.svg" alt="Python 3.9+"></a>
+  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10-blue.svg" alt="Python 3.10"></a>
 </p>
 
 ---
@@ -30,7 +30,8 @@ The plugin leverages the following key components:
 
 ## Requirements
 
-- **Python**: 3.9 or higher
+- **Python**: 3.10 — the pinned MUSA wheels are published for CPython 3.10 on
+  x86_64, so other versions cannot resolve them
 - **Hardware**: Moore Threads (MUSA) GPU with MUSA toolkit installed
 - **Dependencies**:
   - [torchada](https://github.com/MooreThreads/torchada) — CUDA→MUSA compatibility layer
@@ -48,6 +49,40 @@ The plugin leverages the following key components:
 
 > **Note**: This plugin uses vLLM's V1 engine architecture (the V0 engine is not supported). Within the V1 engine, vLLM v0.24.0 auto-selects its **Model Runner V2** for certain architectures (e.g. Qwen3, DeepSeek-V2, Llama) and the V1 model runner for others; both are supported on MUSA. Set `VLLM_USE_V2_MODEL_RUNNER=1` or `0` to force one.
 
+### Docker image
+
+The Docker flow installs the MUSA SDK, the MUSA wheels, `vllm-musa`, and the
+vendored vLLM into one image, and is the least error-prone way to get a working
+environment:
+
+```bash
+bash docker/build_image.sh
+```
+
+See [docker/README.md](docker/README.md) for the build options. To install onto
+a host that already has the MUSA SDK, use the source install below.
+
+### Package indexes
+
+`vllm-musa` resolves its dependencies from **two** indexes:
+
+| Index | URL | Provides |
+|---|---|---|
+| Moore Threads | `https://dl.mthreads.com/repo/api/pypi/pypi/simple` | the MUSA wheels pinned in `requirements/musa_private.txt` — `torch`, `torch_musa`, `mate`, `flash_attn_3`, `flash_mla`, `deep-gemm`, `tilelang_musa`, `triton`, `apache-tvm-ffi`, … |
+| Public PyPI | `https://pypi.org/simple`, or a mirror | the ordinary third-party wheels in `requirements/build.txt` and `requirements/common.txt` |
+
+Most of the MUSA wheels are not published on public PyPI, so installing
+`requirements/musa.txt` with pip's default index fails with
+`No matching distribution found for torch==2.9.1.post1+musa5.2.0s5000`.
+
+The MUSA wheels must be **resolved** with the Moore Threads index as the sole
+`--index-url`, which is why the install below starts with a pass that installs
+only them.
+
+Pass 3 below does pass both indexes. That is safe only because pass 1 has already
+installed every MUSA wheel at its pinned version, so nothing MUSA is re-resolved
+there and the merged index only supplies the ordinary dependencies.
+
 ### Install from Source
 
 1. Clone the repository:
@@ -57,17 +92,41 @@ The plugin leverages the following key components:
     cd vllm-musa
     ```
 
-2. Install Python dependencies before installing `vllm-musa`. The MUSA
-   requirements entrypoint includes common dependencies and MUSA-private pins
-   such as `torch` and `torch_musa`.
+2. Select the two indexes:
 
     ```bash
-    pip install -r requirements/build.txt -r requirements/musa.txt
+    export MUSA_PIP_INDEX_URL=https://dl.mthreads.com/repo/api/pypi/pypi/simple
+    export PYPI_INDEX_URL=https://pypi.org/simple
     ```
 
-3. Install vLLM Hardware Plugin for Moore Threads MUSA:
+3. Install the Python dependencies in three passes:
 
     ```bash
+    # 1. The MUSA wheels, from the Moore Threads index only. This pass runs
+    #    first and with --no-deps because torchada and transformers declare an
+    #    unpinned `torch`: resolving them first would pull the public CUDA torch
+    #    and the multi-GB nvidia-cuda-* stack over the MUSA one.
+    pip install --no-deps --index-url "${MUSA_PIP_INDEX_URL}" \
+        -r requirements/musa_private.txt
+
+    # 2. The ordinary third-party wheels, from public PyPI. Pass 1 already
+    #    satisfies `torch`.
+    pip install --index-url "${PYPI_INDEX_URL}" \
+        -r requirements/build.txt -r requirements/common.txt
+
+    # 3. The MUSA wheels' own ordinary dependencies (sympy, networkx, ...).
+    #    Pass 1 pinned every MUSA wheel, so none are re-resolved here.
+    pip install --index-url "${MUSA_PIP_INDEX_URL}" \
+        --extra-index-url "${PYPI_INDEX_URL}" \
+        -r requirements/musa_private.txt
+    ```
+
+4. Install vLLM Hardware Plugin for Moore Threads MUSA. The vendored vLLM takes
+   its dependencies from public PyPI, so keep that index selected here:
+
+    ```bash
+    export PIP_INDEX_URL="${PYPI_INDEX_URL}"
+
     # Standard installation (installs vLLM MUSA plugin and vLLM)
     pip install . --no-build-isolation -v
 
@@ -75,7 +134,7 @@ The plugin leverages the following key components:
     pip install -e . --no-build-isolation -v
     ```
 
-4. Verify the installation:
+5. Verify the installation:
 
     ```bash
     # Check plugin registration
@@ -113,7 +172,6 @@ Useful commands:
 
 ```bash
 ccache --zero-stats
-pip install -r requirements/build.txt -r requirements/musa.txt
 pip install -e . --no-build-isolation -v
 ccache --show-stats
 ```
@@ -176,24 +234,36 @@ vllm-musa/
 ├── README.md                   # Documentation (English)
 ├── README_CN.md                # Documentation (中文)
 ├── LICENSE                     # Apache 2.0 License
+├── requirements/               # Dependency pins (build, common, musa_private)
+├── docker/                     # Image build flow (musa.Dockerfile, build_image.sh)
+├── third_party/                # PINS + the upstream vLLM cloned at build time
+├── build_utils/                # Build helpers (ccache wrapper)
+├── tools/                      # Sync, verify, and patch-validation utilities
 ├── example/                    # Usage examples
 ├── csrc/                       # C/C++ source files
 ├── docs/                       # Additional documentation
 ├── vllm_musa/                  # Main package
 │   ├── __init__.py             # Plugin entry point
 │   ├── platform.py             # MUSA platform implementation
-│   └── patches/                # Runtime compatibility patches
+│   └── patches/                # Patches against upstream vLLM
 │       ├── __init__.py         # Patch application logic
-│       └── *.patch.py          # Individual patch files
+│       ├── series/             # Build-time source patch series
+│       └── *.patch.py          # Import-time object patches
 └── tests/                      # Test suite
     ├── conftest.py             # Pytest fixtures
     ├── test_musa.py            # Platform tests
     └── test_patches.py         # Patch system tests
 ```
 
-## Runtime Patches
+## Patches
 
-The plugin includes runtime patches to ensure compatibility with upstream vLLM. For details on the patching mechanism, see [patches/README.md](vllm_musa/patches/README.md).
+The plugin carries two kinds of change to upstream vLLM. Source edits — the vast
+majority — are applied to the pinned vLLM clone **at build time** as a
+`git format-patch` series under `vllm_musa/patches/series/`, so the installed
+vLLM is already patched. A small set of live-object monkey-patches that have no
+source-diff form run **at import time** (`vllm_musa/patches/*.patch.py`); these
+are the only runtime patches. For details on both mechanisms, see
+[patches/README.md](vllm_musa/patches/README.md).
 
 ## Contributing
 

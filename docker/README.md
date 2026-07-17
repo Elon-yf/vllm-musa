@@ -12,14 +12,15 @@ The resulting image contains:
   `flash_mla`, `deep-gemm`, `tilelang_musa`, `apache-tvm-ffi`,
   `torch_c_dlpack_ext`),
 - `vllm-musa` and the vendored upstream vLLM, built from source,
-- `vllm-rs` and its Python tool-parser extension when `BUILD_VLLM_RS=1`.
+- `vllm-rs` and its Python tool-parser extension when `BUILD_VLLM_RS=1`,
+- Mooncake (KV transfer engine) when `BUILD_MOONCAKE=1`.
 
 ## Prerequisites
 
 - **Docker** on the build host.
 - **Network access** from the build to:
-  - the internal Moore Threads pip index (`MUSA_PIP_INDEX_URL`) — reachable only
-    inside the MT network; hosts the MUSA/MT wheels,
+  - the Moore Threads pip index (`MUSA_PIP_INDEX_URL`) — hosts the MUSA/MT
+    wheels,
   - a public PyPI index/mirror (`PYPI_INDEX_URL`) — ordinary third-party wheels
     and the vendored vLLM's dependencies,
   - the MUSA apt source (`MUSA_APT_SOURCE`) — the runtime SDK,
@@ -61,14 +62,14 @@ bash docker/build_image.sh --no-cache --build-arg http_proxy=http://proxy:8118
 | Variable | Default | Purpose |
 |---|---|---|
 | `BASE_IMAGE` | `ubuntu:22.04` | Base image. Point at a local/mirror image if Docker Hub is unreachable, or an `mthreads/musa:*-devel` image to reuse its runtime. |
-| `PYTHON_VERSION` | `3.10` | Python version (apt `python3.X`). MUSA 5.2.0 wheels cover 3.10 and 3.12. |
+| `PYTHON_VERSION` | `3.10` | Python version (apt `python3.X`). The wheels pinned in `requirements/musa_private.txt` are published for 3.10 on x86_64 only, so other values fail the dependency install. |
 | `MUSA_APT_SOURCE` | `https://dl.mthreads.com/repo/repository/ubuntu2204/` | apt repo for the MUSA runtime SDK. |
 | `INSTALL_MUSA_STACK` | `auto` | `auto`: install the MUSA apt stack unless the base already provides `mcc`; `0`: skip (base image supplies the runtime). |
 | `MUSA_RUNTIME_VERSION` | `5.2` | MUSA runtime line as `major.minor`; derives apt package names (e.g. `musa-toolkit-5-2`). |
 | `MCCL_VERSION` | `2.4.0` | MCCL (collective communication library) version. |
 | `PYPI_INDEX_URL` | `https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple` | Public index for ordinary third-party wheels **and** the vendored vLLM's dependencies. |
-| `MUSA_PIP_INDEX_URL` | `https://xxx/simple` | Internal MT index for the MUSA/MT wheels. |
-| `BUILD_MOONCAKE` | `0` | `1`: build Mooncake (KV transfer engine) from source; `0`: skip. |
+| `MUSA_PIP_INDEX_URL` | `https://dl.mthreads.com/repo/api/pypi/pypi/simple` | Moore Threads index for the MUSA/MT wheels. |
+| `BUILD_MOONCAKE` | `1` | `1`: build Mooncake (KV transfer engine) from source; `0`: skip. |
 | `MOONCAKE_REPO` / `MOONCAKE_COMMIT` | GitHub / pinned SHA | Mooncake source (only used when `BUILD_MOONCAKE=1`). |
 | `BUILD_VLLM_RS` | `1` | `1`: build and install `vllm-rs` plus `_rust_tool_parser`; `0`: omit both and skip Rust/protoc setup. |
 | `IMAGE_REPOSITORY` | `vllm-musa` | Image repository name. |
@@ -93,8 +94,8 @@ bash docker/build_image.sh \
   --build-arg no_proxy=.mthreads.com
 ```
 
-Keep `no_proxy=.mthreads.com` so the internal MUSA wheel index stays on a direct
-connection.
+Keep `no_proxy=.mthreads.com` so the MUSA wheel index and apt source stay on a
+direct connection.
 
 **Docker Hub not reachable** — build from a locally-present base:
 
@@ -108,15 +109,15 @@ BASE_IMAGE=<local-ubuntu-22.04-image> bash docker/build_image.sh
 MUSA_RUNTIME_VERSION=5.2 MUSA_APT_SOURCE=<5.2-apt-repo> bash docker/build_image.sh
 ```
 
-**Include Mooncake:**
+**Skip Mooncake:**
 
 ```bash
-BUILD_MOONCAKE=1 bash docker/build_image.sh
+BUILD_MOONCAKE=0 bash docker/build_image.sh
 ```
 
-Mooncake is built after the torch and vLLM stacks are installed so EP-related
-components can import or link against them. The image builds Mooncake with
-`USE_MUSA=ON` and `USE_ETCD=OFF`, then installs the CMake targets directly.
+Mooncake is built by default, after the torch and vLLM stacks are installed so
+EP-related components can import or link against them. The image builds Mooncake
+with `USE_MUSA=ON` and `USE_ETCD=OFF`, then installs the CMake targets directly.
 
 **Skip the Rust frontend:**
 
@@ -184,8 +185,8 @@ On a MUSA GPU you should see `musa available: True`.
    vLLM, re-pins numpy, installs runtime dependencies, and runs import checks.
 6. **vllm_rs_build** — optionally builds Rust artifacts (`BUILD_VLLM_RS`) without
    carrying Rust/protoc into the final image.
-7. **mooncake** — optionally builds Mooncake (`BUILD_MOONCAKE`) on top of the
-   installed torch/vLLM stack.
+7. **mooncake** — builds Mooncake on top of the installed torch/vLLM stack
+   unless `BUILD_MOONCAKE=0`.
 8. **final** — installs optional Rust artifacts, enables MUSA device visibility,
    and removes build caches.
 
