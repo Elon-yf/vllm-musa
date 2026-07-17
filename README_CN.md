@@ -75,13 +75,15 @@ bash docker/build_image.sh
 `No matching distribution found for torch==2.9.1.post1+musa5.2.0s5000`。
 
 MUSA wheel 必须在摩尔线程索引作为**唯一** `--index-url` 的前提下解析，因此下面的
-安装步骤以“只装 MUSA wheel”的一步开始。绝不要在合并索引
-（`--index-url … --extra-index-url …`）的情况下解析它们：`triton` 和
-`torch_c_dlpack_ext` 在两个索引上都存在且**版本号相同**，但内容不同，而 pip 没有
-索引优先级 —— 它按 wheel tag 排序候选，公共版 `triton`
-（`manylinux_2_17_x86_64`）的优先级高于摩尔线程版（`linux_x86_64`）。因此合并解析
-会装上公共版本，而只有摩尔线程版 `triton` 带有 `mtgpu` 后端；公共版本面向 NVIDIA
-和 AMD，会导致 MUSA 完全没有可用的 Triton 后端。
+安装步骤以“只装 MUSA wheel”的一步开始。
+
+`--extra-index-url` 在这里不是捷径。pip 会把所有索引的候选合并到一起，并且**没有
+索引优先级**：最终选中哪个构建由 wheel tag 决定，而不是由哪个索引被指定为
+`--index-url` 决定。`triton` 和 `torch_c_dlpack_ext` 在两个索引上都存在且**版本号
+相同**，但内容不同；无论两个索引以何种顺序传入，公共版 `triton`
+（`manylinux_2_17_x86_64`）的 tag 优先级都高于摩尔线程版（`linux_x86_64`）。因此
+合并解析会装上公共版 `triton`，它面向 NVIDIA 和 AMD，会导致 MUSA 完全没有可用的
+`mtgpu` 后端。
 
 下面的第 3 步确实同时传入了两个索引。这样做是安全的，因为第 1 步已经按固定版本装好
 了所有 MUSA wheel，该步不会重新解析任何 MUSA wheel，合并索引只用于补齐普通依赖。

@@ -77,14 +77,16 @@ Most of the MUSA wheels are not published on public PyPI, so installing
 
 The MUSA wheels must be **resolved** with the Moore Threads index as the sole
 `--index-url`, which is why the install below starts with a pass that installs
-only them. Never resolve them from a merged
-`--index-url … --extra-index-url …`: `triton` and `torch_c_dlpack_ext` are
-published on both indexes at the *same version* but with different contents, and
-pip has no index priority — it ranks the candidates by wheel tag, and the public
-`triton` (`manylinux_2_17_x86_64`) outranks the Moore Threads one
-(`linux_x86_64`). A merged resolve therefore installs the public build, and only
-the Moore Threads `triton` carries the `mtgpu` backend; the public one targets
-NVIDIA and AMD and leaves MUSA with no Triton backend at all.
+only them.
+
+`--extra-index-url` is not a shortcut here. pip pools the candidates from every
+index it is given and has **no index priority**, so which build wins is decided
+by wheel tag, not by which index you named `--index-url`. `triton` and
+`torch_c_dlpack_ext` are published on both indexes at the *same version* with
+different contents, and the public `triton` (`manylinux_2_17_x86_64`) outranks
+the Moore Threads one (`linux_x86_64`) whichever way round the two indexes are
+passed. A merged resolve installs the public `triton`, which targets NVIDIA and
+AMD and leaves MUSA with no `mtgpu` backend at all.
 
 Pass 3 below does pass both indexes. That is safe only because pass 1 has already
 installed every MUSA wheel at its pinned version, so nothing MUSA is re-resolved
