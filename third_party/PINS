@@ -2,7 +2,7 @@
 # Read by BOTH setup.py (regex) and Makefile.sync ($(shell sed)) so a version
 # bump edits ONE place and the generation base can never desync from the build
 # base. KEY=VALUE only — NOT TOML (tomllib is 3.11+, the build box is py3.10,
-# the package floor is 3.9), so the build needs no parser dependency.
+# the package floor is 3.10), so the build needs no parser dependency.
 # Human-readable release label plus the immutable source commit used by builds.
 # The public v0.24.0 tag moved after this branch was created, so never build from
 # the mutable tag alone.

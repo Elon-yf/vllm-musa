@@ -12,7 +12,7 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License"></a>
-  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.9+-blue.svg" alt="Python 3.9+"></a>
+  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10-blue.svg" alt="Python 3.10"></a>
 </p>
 
 ---
@@ -30,7 +30,8 @@
 
 ## 环境要求
 
-- **Python**：3.9 或更高版本
+- **Python**：3.10 — 本套件所固定的 MUSA wheel 仅发布了 x86_64 上的 CPython 3.10
+  版本，其他 Python 版本无法解析这些依赖
 - **硬件**：安装了 MUSA 工具包的摩尔线程 (MUSA) GPU
 - **依赖项**：
   - [torchada](https://github.com/MooreThreads/torchada) — CUDA→MUSA 兼容层
@@ -48,6 +49,37 @@
 
 > **注意**：本插件使用 vLLM 的 V1 引擎架构（不支持 V0 引擎）。在 V1 引擎内部，vLLM v0.24.0 会为部分架构（如 Qwen3、DeepSeek-V2、Llama）自动选用 **Model Runner V2**，其余架构使用 V1 model runner；两者在 MUSA 上均受支持。设置 `VLLM_USE_V2_MODEL_RUNNER=1` 或 `0` 可强制指定其一。
 
+### Docker 镜像
+
+Docker 流程会把 MUSA SDK、MUSA wheel、`vllm-musa` 以及内置的 vLLM 一次性装入同一
+镜像，是最不容易出错的方式：
+
+```bash
+bash docker/build_image.sh
+```
+
+构建选项参见 [docker/README.md](docker/README.md)。若要安装到已具备 MUSA SDK 的
+主机上，请使用下面的源码安装。
+
+### 软件包索引
+
+`vllm-musa` 的依赖来自**两个**索引：
+
+| 索引 | URL | 提供内容 |
+|---|---|---|
+| 摩尔线程 | `https://dl.mthreads.com/repo/api/pypi/pypi/simple` | `requirements/musa_private.txt` 中约束的 MUSA wheel — `torch`、`torch_musa`、`mate`、`flash_attn_3`、`flash_mla`、`deep-gemm`、`tilelang_musa`、`triton`、`apache-tvm-ffi` 等 |
+| 公共 PyPI | `https://pypi.org/simple` 或其镜像 | `requirements/build.txt` 与 `requirements/common.txt` 中的普通第三方 wheel |
+
+大部分 MUSA wheel 并未发布到公共 PyPI，因此用 pip 默认索引安装
+`requirements/musa.txt` 会失败并报
+`No matching distribution found for torch==2.9.1.post1+musa5.2.0s5000`。
+
+两个索引要分别用**各自独立**的 pip 命令安装，并且摩尔线程索引必须作为唯一的
+`--index-url`。不要用 `--extra-index-url` 把两者合并：`triton` 和
+`torch_c_dlpack_ext` 在两个索引上都存在且**版本号相同**，但内容不同，而 pip 没有
+索引优先级，可能会静默装上公共版本。只有摩尔线程版 `triton` 带有 `mtgpu` 后端；
+公共版本面向 NVIDIA 和 AMD，装上它会导致 MUSA 完全没有可用的 Triton 后端。
+
 ### 从源码安装
 
 1. 克隆仓库：
@@ -57,16 +89,39 @@
     cd vllm-musa
     ```
 
-2. 安装 `vllm-musa` 前先安装 Python 依赖。MUSA requirements 入口包含通用依赖
-   和 `torch`、`torch_musa` 等 MUSA private 版本约束：
+2. 选定两个索引：
 
     ```bash
-    pip install -r requirements/build.txt -r requirements/musa.txt
+    export MUSA_PIP_INDEX_URL=https://dl.mthreads.com/repo/api/pypi/pypi/simple
+    export PYPI_INDEX_URL=https://pypi.org/simple
     ```
 
-3. 安装摩尔线程 MUSA 的 vLLM 硬件插件：
+3. 分三步安装 Python 依赖：
 
     ```bash
+    # 1. MUSA wheel，仅从摩尔线程索引安装。该步必须最先执行且带 --no-deps：
+    #    torchada 和 transformers 声明的 `torch` 没有版本约束，若先解析它们会拉取
+    #    公共 CUDA 版 torch 及数 GB 的 nvidia-cuda-* 依赖，覆盖 MUSA 版。
+    pip install --no-deps --index-url "${MUSA_PIP_INDEX_URL}" \
+        -r requirements/musa_private.txt
+
+    # 2. 普通第三方 wheel，从公共 PyPI 安装。第 1 步已满足 `torch`。
+    pip install --index-url "${PYPI_INDEX_URL}" \
+        -r requirements/build.txt -r requirements/common.txt
+
+    # 3. 补齐 MUSA wheel 自身的普通依赖（sympy、networkx 等）。第 1 步已固定所有
+    #    MUSA wheel，这里不会重新解析它们。
+    pip install --index-url "${MUSA_PIP_INDEX_URL}" \
+        --extra-index-url "${PYPI_INDEX_URL}" \
+        -r requirements/musa_private.txt
+    ```
+
+4. 安装摩尔线程 MUSA 的 vLLM 硬件插件。内置 vLLM 的依赖来自公共 PyPI，因此这里
+   保持选用该索引：
+
+    ```bash
+    export PIP_INDEX_URL="${PYPI_INDEX_URL}"
+
     # 标准安装（安装 vLLM MUSA 插件和 vLLM）
     pip install . --no-build-isolation -v
 
@@ -74,7 +129,7 @@
     pip install -e . --no-build-isolation -v
     ```
 
-4. 验证安装：
+5. 验证安装：
 
     ```bash
     # 检查插件注册
@@ -92,6 +147,28 @@
 | `VLLM_WORKER_MULTIPROC_METHOD=spawn` | 多进程 worker 推荐设置 |
 | `VLLM_MUSA_CUSTOM_OP_USE_NATIVE` | 使用 vLLM 自定义算子的原生实现（默认：`False`） |
 | `VLLM_MUSA_WORKER_TERMINATION_TIMEOUT_S` | 控制 vLLM v1 worker 关闭超时时间（默认： `4s`） |
+| `VLLM_MUSA_USE_CCACHE` | 当系统安装了 `ccache` 时，为原生扩展构建启用 ccache（默认：`1`） |
+| `VLLM_MUSA_CCACHE` | 覆盖 `setup.py` 所使用的 ccache 可执行文件（默认：`PATH` 中的第一个 `ccache`） |
+| `VLLM_MUSA_CCACHE_DIR` | 覆盖 `setup.py` 所使用的 ccache 目录（默认：`<repo>/.ccache`） |
+| `VLLM_MUSA_CCACHE_MAXSIZE` | 可选的 ccache 最大容量，将作为 `CCACHE_MAXSIZE` 透传 |
+| `VLLM_MUSA_REAL_MCC` | 覆盖被 ccache 包装的真实 MUSA 编译器（默认：自动探测到的 `mcc`） |
+
+### 用于原生重新构建的 ccache
+
+当 `PATH` 中存在 `ccache` 时，源码安装会自动让宿主 C++ 编译器和 MUSA `mcc` 走
+ccache。生成的 `mcc` wrapper 会把 `.mu` 等 MUSA 专有输入规范化为可缓存的 `.cu`
+副本，并对 ccache 隐藏 `-x musa`，同时仍将其传给 `mcc`。默认缓存目录为
+`<repo>/.ccache`，因此在同一份检出中第二次执行
+`pip install -e . --no-build-isolation -v` 可以复用已缓存的 `.cu`、`.mu` 和 C++
+目标文件。
+
+常用命令：
+
+```bash
+ccache --zero-stats
+pip install -e . --no-build-isolation -v
+ccache --show-stats
+```
 
 ## 使用方法
 
@@ -151,24 +228,35 @@ vllm-musa/
 ├── README.md                   # 文档（英文）
 ├── README_CN.md                # 文档（中文）
 ├── LICENSE                     # Apache 2.0 许可证
+├── requirements/               # 依赖版本约束（build、common、musa_private）
+├── docker/                     # 镜像构建流程（musa.Dockerfile、build_image.sh）
+├── third_party/                # PINS 及构建时克隆的上游 vLLM
+├── build_utils/                # 构建辅助（ccache wrapper）
+├── tools/                      # 同步、校验与补丁验证工具
 ├── example/                    # 使用示例
 ├── csrc/                       # C/C++ 源文件
 ├── docs/                       # 附加文档
 ├── vllm_musa/                  # 主包
 │   ├── __init__.py             # 插件入口
 │   ├── platform.py             # MUSA 平台实现
-│   └── patches/                # 运行时兼容性补丁
+│   └── patches/                # 针对上游 vLLM 的补丁
 │       ├── __init__.py         # 补丁应用逻辑
-│       └── *.patch.py          # 单独的补丁文件
+│       ├── series/             # 构建时的源码补丁序列
+│       └── *.patch.py          # 导入时的对象补丁
 └── tests/                      # 测试套件
     ├── conftest.py             # Pytest fixtures
     ├── test_musa.py            # 平台测试
     └── test_patches.py         # 补丁系统测试
 ```
 
-## 运行时补丁
+## 补丁
 
-本插件包含运行时补丁以确保与上游 vLLM 的兼容性。有关补丁机制的详情，请参阅 [patches/README.md](vllm_musa/patches/README.md)。
+本插件对上游 vLLM 的改动分为两类。绝大多数是源码改动，它们以
+`git format-patch` 序列的形式存放在 `vllm_musa/patches/series/`，并在**构建时**
+应用到固定版本的 vLLM 克隆上，因此安装完成的 vLLM 已经是打好补丁的。另有少量无法
+表示为源码 diff 的实时对象 monkey-patch，在**导入时**运行
+（`vllm_musa/patches/*.patch.py`），它们是仅有的运行时补丁。两种机制的详情请参阅
+[patches/README.md](vllm_musa/patches/README.md)。
 
 ## 贡献
 
