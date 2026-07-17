@@ -12,7 +12,8 @@ The resulting image contains:
   `flash_mla`, `deep-gemm`, `tilelang_musa`, `apache-tvm-ffi`,
   `torch_c_dlpack_ext`),
 - `vllm-musa` and the vendored upstream vLLM, built from source,
-- `vllm-rs` and its Python tool-parser extension when `BUILD_VLLM_RS=1`.
+- `vllm-rs` and its Python tool-parser extension when `BUILD_VLLM_RS=1`,
+- Mooncake (KV transfer engine) when `BUILD_MOONCAKE=1`.
 
 ## Prerequisites
 
@@ -68,7 +69,7 @@ bash docker/build_image.sh --no-cache --build-arg http_proxy=http://proxy:8118
 | `MCCL_VERSION` | `2.4.0` | MCCL (collective communication library) version. |
 | `PYPI_INDEX_URL` | `https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple` | Public index for ordinary third-party wheels **and** the vendored vLLM's dependencies. |
 | `MUSA_PIP_INDEX_URL` | `https://dl.mthreads.com/repo/api/pypi/pypi/simple` | Moore Threads index for the MUSA/MT wheels. |
-| `BUILD_MOONCAKE` | `0` | `1`: build Mooncake (KV transfer engine) from source; `0`: skip. |
+| `BUILD_MOONCAKE` | `1` | `1`: build Mooncake (KV transfer engine) from source; `0`: skip. |
 | `MOONCAKE_REPO` / `MOONCAKE_COMMIT` | GitHub / pinned SHA | Mooncake source (only used when `BUILD_MOONCAKE=1`). |
 | `BUILD_VLLM_RS` | `1` | `1`: build and install `vllm-rs` plus `_rust_tool_parser`; `0`: omit both and skip Rust/protoc setup. |
 | `IMAGE_REPOSITORY` | `vllm-musa` | Image repository name. |
@@ -108,15 +109,15 @@ BASE_IMAGE=<local-ubuntu-22.04-image> bash docker/build_image.sh
 MUSA_RUNTIME_VERSION=5.2 MUSA_APT_SOURCE=<5.2-apt-repo> bash docker/build_image.sh
 ```
 
-**Include Mooncake:**
+**Skip Mooncake:**
 
 ```bash
-BUILD_MOONCAKE=1 bash docker/build_image.sh
+BUILD_MOONCAKE=0 bash docker/build_image.sh
 ```
 
-Mooncake is built after the torch and vLLM stacks are installed so EP-related
-components can import or link against them. The image builds Mooncake with
-`USE_MUSA=ON` and `USE_ETCD=OFF`, then installs the CMake targets directly.
+Mooncake is built by default, after the torch and vLLM stacks are installed so
+EP-related components can import or link against them. The image builds Mooncake
+with `USE_MUSA=ON` and `USE_ETCD=OFF`, then installs the CMake targets directly.
 
 **Skip the Rust frontend:**
 
