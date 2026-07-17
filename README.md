@@ -75,13 +75,20 @@ Most of the MUSA wheels are not published on public PyPI, so installing
 `requirements/musa.txt` with pip's default index fails with
 `No matching distribution found for torch==2.9.1.post1+musa5.2.0s5000`.
 
-Give each index its own pip invocation, with the Moore Threads index as the sole
-`--index-url`. Do not merge the two with `--extra-index-url`: `triton` and
-`torch_c_dlpack_ext` are published on both indexes at the *same version* but with
-different contents, and pip has no index priority, so it may silently install the
-public build instead. Only the Moore Threads `triton` carries the `mtgpu`
-backend — the public one targets NVIDIA and AMD, and leaves MUSA with no Triton
-backend at all.
+The MUSA wheels must be **resolved** with the Moore Threads index as the sole
+`--index-url`, which is why the install below starts with a pass that installs
+only them. Never resolve them from a merged
+`--index-url … --extra-index-url …`: `triton` and `torch_c_dlpack_ext` are
+published on both indexes at the *same version* but with different contents, and
+pip has no index priority — it ranks the candidates by wheel tag, and the public
+`triton` (`manylinux_2_17_x86_64`) outranks the Moore Threads one
+(`linux_x86_64`). A merged resolve therefore installs the public build, and only
+the Moore Threads `triton` carries the `mtgpu` backend; the public one targets
+NVIDIA and AMD and leaves MUSA with no Triton backend at all.
+
+Pass 3 below does pass both indexes. That is safe only because pass 1 has already
+installed every MUSA wheel at its pinned version, so nothing MUSA is re-resolved
+there and the merged index only supplies the ordinary dependencies.
 
 ### Install from Source
 
