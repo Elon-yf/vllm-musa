@@ -185,8 +185,8 @@ On a MUSA GPU you should see `musa available: True`.
    vLLM, re-pins numpy, installs runtime dependencies, and runs import checks.
 6. **vllm_rs_build** — optionally builds Rust artifacts (`BUILD_VLLM_RS`) without
    carrying Rust/protoc into the final image.
-7. **mooncake** — optionally builds Mooncake (`BUILD_MOONCAKE`) on top of the
-   installed torch/vLLM stack.
+7. **mooncake** — builds Mooncake on top of the installed torch/vLLM stack
+   unless `BUILD_MOONCAKE=0`.
 8. **final** — installs optional Rust artifacts, enables MUSA device visibility,
    and removes build caches.
 

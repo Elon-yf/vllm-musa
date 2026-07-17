@@ -378,7 +378,7 @@ RUN mkdir -p /tmp/vllm-rs-artifacts && \
 # its apt dependencies are installed; the final image enables it below.
 FROM vllm_musa_installed AS mooncake
 
-ARG BUILD_MOONCAKE=0
+ARG BUILD_MOONCAKE=1
 ARG MOONCAKE_REPO=https://github.com/kvcache-ai/Mooncake.git
 ARG MOONCAKE_COMMIT=b6a841dc78c707ec655a563453277d969fb8f38d
 
