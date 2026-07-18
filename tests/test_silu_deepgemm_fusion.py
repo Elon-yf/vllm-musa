@@ -104,9 +104,62 @@ def test_dense_model_gate_uses_model_config_api(is_moe: bool, expected: bool) ->
     assert _is_dense_model(config) is expected
 
 
+def _validated_qwen3_config(**overrides):
+    hf_config = SimpleNamespace(
+        architectures=["Qwen3ForCausalLM"],
+        model_type="qwen3",
+        hidden_size=4096,
+        intermediate_size=12288,
+        num_hidden_layers=36,
+    )
+    model_config = SimpleNamespace(
+        architectures=["Qwen3ForCausalLM"],
+        hf_text_config=hf_config,
+        quantization="fp8",
+        dtype=torch.bfloat16,
+    )
+    parallel_config = SimpleNamespace(
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
+        data_parallel_size=1,
+    )
+    config = SimpleNamespace(
+        model_config=model_config,
+        parallel_config=parallel_config,
+        speculative_config=None,
+    )
+    for dotted_name, value in overrides.items():
+        owner_name, attribute = dotted_name.split("__", maxsplit=1)
+        setattr(getattr(config, owner_name), attribute, value)
+    return config
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"model_config__architectures": ["Qwen3MoeForCausalLM"]},
+        {"model_config__quantization": None},
+        {"model_config__dtype": torch.float16},
+        {"parallel_config__tensor_parallel_size": 2},
+        {"parallel_config__pipeline_parallel_size": 2},
+    ],
+)
+def test_validated_qwen3_8b_auto_scope(overrides) -> None:
+    from vllm_musa.platform import _is_validated_qwen3_8b_fp8_single_gpu
+
+    assert _is_validated_qwen3_8b_fp8_single_gpu(_validated_qwen3_config())
+    assert not _is_validated_qwen3_8b_fp8_single_gpu(
+        _validated_qwen3_config(**overrides)
+    )
+
+
 def test_custom_op_schema_fake_and_aot_dynamic() -> None:
     x, weight, weight_scale = _small_deepgemm_inputs()
     op = torch.ops.vllm.musa_silu_deepgemm_fp8_op.default
+
+    input_bits = x.view(torch.uint16).cpu().clone()
+    weight_bits = weight.view(torch.uint8).cpu().clone()
+    weight_scale_bits = weight_scale.view(torch.int32).cpu().clone()
 
     schema = str(op._schema)
     assert "!" not in schema
@@ -118,11 +171,14 @@ def test_custom_op_schema_fake_and_aot_dynamic() -> None:
     assert output.untyped_storage().data_ptr() not in {
         tensor.untyped_storage().data_ptr() for tensor in (x, weight, weight_scale)
     }
+    assert torch.equal(input_bits, x.view(torch.uint16).cpu())
+    assert torch.equal(weight_bits, weight.view(torch.uint8).cpu())
+    assert torch.equal(weight_scale_bits, weight_scale.view(torch.int32).cpu())
 
     # MUSA's muDNN cannot compare FP8 tensors, so opcheck's schema checker
     # fails while trying to prove that the FP8 weight was not mutated. The
-    # functional schema and storage checks above cover that contract without
-    # invoking unsupported FP8 EQ; keep the FakeTensor and AOT-dynamic checks.
+    # raw-byte checks above cover that contract without invoking unsupported
+    # FP8 EQ; keep the FakeTensor and AOT-dynamic checks.
     torch.library.opcheck(
         op,
         (x, weight, weight_scale, 128, False),

@@ -1,4 +1,5 @@
 import os
+from functools import lru_cache
 from typing import ClassVar
 
 import torch
@@ -32,6 +33,11 @@ def _use_row_major_activation_scales(use_deep_gemm_e8m0: bool) -> bool:
         return False
     value = os.getenv("VLLM_MUSA_DEEPGEMM_ROW_MAJOR_ACT_SCALES", "1").lower()
     return value not in ("0", "false", "no", "off")
+
+
+@lru_cache(maxsize=1)
+def _supports_silu_group_quant_kernel() -> bool:
+    return current_platform.is_musa() and current_platform.is_device_capability((3, 1))
 
 
 def _read_int_env(name: str, default: int) -> int:
@@ -233,7 +239,8 @@ def _musa_silu_deepgemm_fp8_op(
     """
     hidden_size = input.shape[-1] // 2 if input.dim() == 2 else 0
     if (
-        group_size != 128
+        not _supports_silu_group_quant_kernel()
+        or group_size != 128
         or use_deep_gemm_e8m0
         or not _use_row_major_activation_scales(use_deep_gemm_e8m0)
         or input.dim() != 2

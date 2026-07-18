@@ -157,6 +157,48 @@ def _has_routed_experts(model_config: Any | None) -> bool:
     )
 
 
+def _is_validated_qwen3_8b_fp8_single_gpu(vllm_config: Any) -> bool:
+    """Return whether the exact MUSA-0759 serving scope is selected."""
+    model_config = getattr(vllm_config, "model_config", None)
+    if model_config is None or _has_routed_experts(model_config):
+        return False
+
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    if hf_text_config is None:
+        hf_config = getattr(model_config, "hf_config", None)
+        hf_text_config = getattr(hf_config, "text_config", hf_config)
+    architectures = getattr(model_config, "architectures", None)
+    if architectures is None:
+        architectures = getattr(hf_text_config, "architectures", None)
+
+    quantization = getattr(model_config, "quantization", None)
+    if quantization is None:
+        quantization_config = getattr(hf_text_config, "quantization_config", {})
+        if isinstance(quantization_config, dict):
+            quantization = quantization_config.get("quant_method")
+
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    single_gpu = all(
+        getattr(parallel_config, name, 1) == 1
+        for name in (
+            "tensor_parallel_size",
+            "pipeline_parallel_size",
+            "data_parallel_size",
+        )
+    )
+    return (
+        tuple(architectures or ()) == ("Qwen3ForCausalLM",)
+        and getattr(hf_text_config, "model_type", None) == "qwen3"
+        and getattr(hf_text_config, "hidden_size", None) == 4096
+        and getattr(hf_text_config, "intermediate_size", None) == 12288
+        and getattr(hf_text_config, "num_hidden_layers", None) == 36
+        and quantization == "fp8"
+        and getattr(model_config, "dtype", None) == torch.bfloat16
+        and single_gpu
+        and getattr(vllm_config, "speculative_config", None) is None
+    )
+
+
 def _deepseek_v4_flashmla_sparse_block_size(model_config: Any | None) -> int:
     value = os.getenv(_DEEPSEEK_V4_FLASHMLA_SPARSE_BLOCK_ENV)
     if value is None or not _is_deepseek_v4_model(model_config):
@@ -654,6 +696,17 @@ class MUSAPlatformBase(Platform):
                 "(Inductor-fused) path: the custom-op kernels corrupt FP8 output "
                 "under piecewise CUDAGraph capture. Set "
                 "VLLM_MUSA_CUSTOM_OP_USE_NATIVE=0 to force the kernels."
+            )
+
+        auto_silu_deepgemm = cls.is_device_capability(
+            (3, 1)
+        ) and _is_validated_qwen3_8b_fp8_single_gpu(vllm_config)
+        if auto_silu_deepgemm and not musa_envs.VLLM_MUSA_SILU_DEEPGEMM_FUSION.is_set():
+            musa_envs.VLLM_MUSA_SILU_DEEPGEMM_FUSION.set(True)
+            logger.info(
+                "Auto-enabling the validated S5000 Qwen3-8B-FP8 "
+                "SwiGLU+DeepGEMM fusion. Set "
+                "VLLM_MUSA_SILU_DEEPGEMM_FUSION=0 to disable it."
             )
 
         parallel_config = vllm_config.parallel_config

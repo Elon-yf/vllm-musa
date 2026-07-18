@@ -48,3 +48,27 @@ def test_pass_manager_keeps_the_experimental_scope_narrow():
     assert "_use_row_major_activation_scales(False)" in source
     assert "self.pass_config.fuse_act_quant" in source
     assert "self.passes.append(MusaSiluDeepGemmFusionPass(config))" in source
+
+
+def test_platform_auto_enablement_is_limited_to_the_validated_scope():
+    source = (ROOT / "vllm_musa" / "platform.py").read_text()
+
+    assert "def _is_validated_qwen3_8b_fp8_single_gpu(" in source
+    assert 'tuple(architectures or ()) == ("Qwen3ForCausalLM",)' in source
+    assert 'getattr(hf_text_config, "hidden_size", None) == 4096' in source
+    assert 'getattr(hf_text_config, "intermediate_size", None) == 12288' in source
+    assert "cls.is_device_capability(" in source
+    assert "VLLM_MUSA_SILU_DEEPGEMM_FUSION.is_set()" in source
+    assert "VLLM_MUSA_SILU_DEEPGEMM_FUSION.set(True)" in source
+
+    deepgemm_source = (
+        ROOT
+        / "vllm_musa"
+        / "model_executor"
+        / "kernels"
+        / "linear"
+        / "scaled_mm"
+        / "deep_gemm.py"
+    ).read_text()
+    assert "def _supports_silu_group_quant_kernel()" in deepgemm_source
+    assert "current_platform.is_device_capability(" in deepgemm_source
