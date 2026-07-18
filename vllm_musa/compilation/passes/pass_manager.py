@@ -4,6 +4,7 @@
 from vllm.compilation.passes.pass_manager import PostGradPassManager
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 
 from vllm_musa.model_executor.kernels.linear.scaled_mm.deep_gemm import (
     _use_row_major_activation_scales,
@@ -34,6 +35,7 @@ class MusaPostGradPassManager(PostGradPassManager):
             envs.VLLM_MUSA_SILU_DEEPGEMM_FUSION.get()
             and envs.VLLM_MUSA_CUSTOM_OP_USE_NATIVE.get()
             and _is_dense_model(config)
+            and current_platform.is_device_capability((3, 1))
             and _use_row_major_activation_scales(False)
             and self.pass_config.fuse_act_quant
         ):

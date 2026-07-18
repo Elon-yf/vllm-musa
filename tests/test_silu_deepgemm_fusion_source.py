@@ -61,14 +61,7 @@ def test_platform_auto_enablement_is_limited_to_the_validated_scope():
     assert "VLLM_MUSA_SILU_DEEPGEMM_FUSION.is_set()" in source
     assert "VLLM_MUSA_SILU_DEEPGEMM_FUSION.set(True)" in source
 
-    deepgemm_source = (
-        ROOT
-        / "vllm_musa"
-        / "model_executor"
-        / "kernels"
-        / "linear"
-        / "scaled_mm"
-        / "deep_gemm.py"
+    pass_manager_source = (
+        ROOT / "vllm_musa" / "compilation" / "passes" / "pass_manager.py"
     ).read_text()
-    assert "def _supports_silu_group_quant_kernel()" in deepgemm_source
-    assert "current_platform.is_device_capability(" in deepgemm_source
+    assert "current_platform.is_device_capability((3, 1))" in pass_manager_source
