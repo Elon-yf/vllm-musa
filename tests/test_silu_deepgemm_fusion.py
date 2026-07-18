@@ -24,10 +24,12 @@ def _musa_device() -> Iterator[None]:
     from vllm.platforms import current_platform
 
     import vllm_musa
+    from vllm_musa.model_executor.kernels.linear.scaled_mm import deep_gemm
 
     if not current_platform.is_device_capability((3, 1)):
         pytest.skip("the fused SiLU group-quant kernel requires S5000/mp31")
     vllm_musa.register_custom_ops()
+    assert deep_gemm is not None  # Import registers the two DeepGEMM custom ops.
     yield
 
 
@@ -106,15 +108,32 @@ def test_custom_op_schema_fake_and_aot_dynamic() -> None:
     x, weight, weight_scale = _small_deepgemm_inputs()
     op = torch.ops.vllm.musa_silu_deepgemm_fp8_op.default
 
+    schema = str(op._schema)
+    assert "!" not in schema
+    assert schema.endswith("-> Tensor")
+    output = op(x, weight, weight_scale, 128, False)
+    assert output.shape == (x.shape[0], weight.shape[0])
+    assert output.dtype == torch.bfloat16
+    assert output.device == x.device
+    assert output.untyped_storage().data_ptr() not in {
+        tensor.untyped_storage().data_ptr() for tensor in (x, weight, weight_scale)
+    }
+
+    # MUSA's muDNN cannot compare FP8 tensors, so opcheck's schema checker
+    # fails while trying to prove that the FP8 weight was not mutated. The
+    # functional schema and storage checks above cover that contract without
+    # invoking unsupported FP8 EQ; keep the FakeTensor and AOT-dynamic checks.
     torch.library.opcheck(
         op,
         (x, weight, weight_scale, 128, False),
-        test_utils=("test_schema", "test_faketensor", "test_aot_dispatch_dynamic"),
+        test_utils=("test_faketensor", "test_aot_dispatch_dynamic"),
     )
 
 
 def test_rewrites_the_native_production_graph() -> None:
-    from torch.fx.experimental.proxy_tensor import make_fx
+    from copy import deepcopy
+
+    from torch._inductor.compile_fx import compile_fx
     from vllm.config import (
         CompilationConfig,
         CompilationMode,
@@ -122,6 +141,7 @@ def test_rewrites_the_native_production_graph() -> None:
         VllmConfig,
         set_current_vllm_config,
     )
+    from vllm.model_executor.layers.activation import SiluAndMul
 
     from vllm_musa.compilation.passes.silu_deepgemm_fusion import (
         MusaSiluDeepGemmFusionPass,
@@ -130,8 +150,7 @@ def test_rewrites_the_native_production_graph() -> None:
     x, weight, weight_scale = _small_deepgemm_inputs()
 
     def model(x, weight, weight_scale):
-        d = x.shape[-1] // 2
-        activated = F.silu(x[..., :d]) * x[..., d:]
+        activated = SiluAndMul.forward_native(x)
         return torch.ops.vllm.musa_deepgemm_fp8_op(
             activated, weight, weight_scale, 128, False
         )
@@ -139,25 +158,58 @@ def test_rewrites_the_native_production_graph() -> None:
     config = VllmConfig(
         compilation_config=CompilationConfig(
             mode=CompilationMode.VLLM_COMPILE,
-            backend="eager",
+            backend="inductor",
             custom_ops=["all"],
             pass_config=PassConfig(fuse_act_quant=True, eliminate_noops=True),
         )
     )
-    expected = model(x, weight, weight_scale)
-    with set_current_vllm_config(config, check_compile=False):
-        graph_module = make_fx(model, tracing_mode="fake")(x, weight, weight_scale)
-        fusion = MusaSiluDeepGemmFusionPass(config)
-        targets_before = {node.target for node in graph_module.graph.nodes}
-        fusion(graph_module.graph)
-        graph_module.recompile()
 
-    targets_after = {node.target for node in graph_module.graph.nodes}
-    assert torch.ops.vllm.musa_deepgemm_fp8_op.default in targets_before
-    assert torch.ops.vllm.musa_silu_deepgemm_fp8_op.default not in targets_before
-    assert torch.ops.vllm.musa_deepgemm_fp8_op.default not in targets_after
-    assert torch.ops.vllm.musa_silu_deepgemm_fp8_op.default in targets_after
+    class FusionBackend:
+        def __init__(self, fusion=None):
+            self.fusion = fusion
+            self.targets_before = set()
+            self.targets_after = set()
+            self.inductor_config = deepcopy(
+                config.compilation_config.inductor_compile_config
+            )
+            self.inductor_config["force_disable_caches"] = True
+            self.inductor_config["post_grad_custom_post_pass"] = self.post_pass
+
+        def post_pass(self, graph):
+            self.targets_before = {node.target for node in graph.nodes}
+            if self.fusion is not None:
+                self.fusion(graph)
+            self.targets_after = {node.target for node in graph.nodes}
+
+        def __call__(self, graph_module, example_inputs):
+            return compile_fx(
+                graph_module,
+                example_inputs,
+                config_patches=self.inductor_config,
+            )
+
+    with set_current_vllm_config(config, check_compile=False):
+        control_backend = FusionBackend()
+        compiled_control = torch.compile(model, backend=control_backend, fullgraph=True)
+        expected = compiled_control(x, weight, weight_scale)
+
+        torch._dynamo.reset()
+        fusion = MusaSiluDeepGemmFusionPass(config)
+        backend = FusionBackend(fusion)
+        compiled = torch.compile(model, backend=backend, fullgraph=True)
+        actual = compiled(x, weight, weight_scale)
+
+    assert torch.ops.vllm.musa_deepgemm_fp8_op.default in control_backend.targets_after
+    assert (
+        torch.ops.vllm.musa_silu_deepgemm_fp8_op.default
+        not in control_backend.targets_after
+    )
+    assert torch.ops.vllm.musa_deepgemm_fp8_op.default in backend.targets_before
+    assert (
+        torch.ops.vllm.musa_silu_deepgemm_fp8_op.default not in backend.targets_before
+    )
+    assert torch.ops.vllm.musa_deepgemm_fp8_op.default not in backend.targets_after
+    assert torch.ops.vllm.musa_silu_deepgemm_fp8_op.default in backend.targets_after
     assert fusion.matched_count == 1
 
-    actual = graph_module(x, weight, weight_scale)
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
