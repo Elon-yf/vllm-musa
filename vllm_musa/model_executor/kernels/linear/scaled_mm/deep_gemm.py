@@ -2,6 +2,7 @@ import os
 from typing import ClassVar
 
 import torch
+import torch.nn.functional as F
 import vllm.envs as envs
 from vllm.model_executor.kernels.linear import (
     Fp8BlockScaledMMLinearKernel,
@@ -13,6 +14,9 @@ from vllm.model_executor.kernels.linear.scaled_mm.deep_gemm import (
     should_use_deepgemm_for_fp8_linear,
 )
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    get_fp8_min_max,
+)
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -212,6 +216,77 @@ def _musa_deepgemm_fp8_op(
     return output
 
 
+def _musa_silu_deepgemm_fp8_op(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    group_size: int,
+    use_deep_gemm_e8m0: bool,
+) -> torch.Tensor:
+    """Fuse dense SwiGLU activation with DeepGEMM input quantization.
+
+    The existing dense path materializes a BF16 SwiGLU tensor and then reads it
+    again in ``per_token_group_quant_8bit_vec``.  For the supported Qwen FP8
+    path, use the shipped SiLU+mul+group-quant kernel and feed its outputs to
+    the unchanged DeepGEMM call.  Keep a semantic fallback so direct callers do
+    not inherit the compiler pattern's narrower preconditions.
+    """
+    hidden_size = input.shape[-1] // 2 if input.dim() == 2 else 0
+    if (
+        group_size != 128
+        or use_deep_gemm_e8m0
+        or not _use_row_major_activation_scales(use_deep_gemm_e8m0)
+        or input.dim() != 2
+        or input.shape[-1] % (2 * group_size) != 0
+        or hidden_size != weight.shape[-1]
+        or input.dtype not in (torch.bfloat16, torch.float16)
+        or not input.is_contiguous()
+    ):
+        d = input.shape[-1] // 2
+        activated = F.silu(input[..., :d]) * input[..., d:]
+        return _musa_deepgemm_fp8_op(
+            activated,
+            weight,
+            weight_scale,
+            group_size,
+            use_deep_gemm_e8m0,
+        )
+
+    q_input = torch.empty(
+        (input.shape[0], hidden_size),
+        dtype=current_platform.fp8_dtype(),
+        device=input.device,
+    )
+    input_scale = torch.empty(
+        (input.shape[0], hidden_size // group_size),
+        dtype=torch.float32,
+        device=input.device,
+    )
+    fp8_min, fp8_max = get_fp8_min_max()
+    torch.ops._C_musa_ops.silu_and_mul_per_token_group_fp8_quant(
+        input,
+        q_input,
+        input_scale,
+        group_size,
+        1e-10,
+        fp8_min,
+        fp8_max,
+    )
+
+    output = torch.empty(
+        (q_input.shape[0], weight.shape[0]),
+        dtype=torch.bfloat16,
+        device=q_input.device,
+    )
+    fp8_gemm_nt(
+        (q_input, input_scale),
+        (weight, weight_scale),
+        output,
+        is_deep_gemm_e8m0_used=use_deep_gemm_e8m0,
+    )
+    return output
+
+
 def _musa_fp8_small_m_gemv_op(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -264,6 +339,21 @@ def _musa_deepgemm_fp8_op_fake(
     )
 
 
+def _musa_silu_deepgemm_fp8_op_fake(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    group_size: int,
+    use_deep_gemm_e8m0: bool,
+) -> torch.Tensor:
+    del weight_scale, group_size, use_deep_gemm_e8m0
+    return torch.empty(
+        (input.shape[0], weight.shape[0]),
+        dtype=torch.bfloat16,
+        device=input.device,
+    )
+
+
 direct_register_custom_op(
     "musa_fp8_small_m_gemv_op",
     _musa_fp8_small_m_gemv_op,
@@ -274,4 +364,10 @@ direct_register_custom_op(
     "musa_deepgemm_fp8_op",
     _musa_deepgemm_fp8_op,
     fake_impl=_musa_deepgemm_fp8_op_fake,
+)
+
+direct_register_custom_op(
+    "musa_silu_deepgemm_fp8_op",
+    _musa_silu_deepgemm_fp8_op,
+    fake_impl=_musa_silu_deepgemm_fp8_op_fake,
 )

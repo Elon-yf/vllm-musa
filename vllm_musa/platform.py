@@ -378,6 +378,10 @@ class MUSAPlatformBase(Platform):
         "RAY_EXPERIMENTAL_NOSET_MUSA_VISIBLE_DEVICES",
     ]
 
+    @classmethod
+    def get_pass_manager_cls(cls) -> str:
+        return "vllm_musa.compilation.passes.MusaPostGradPassManager"
+
     @property
     def supported_dtypes(self) -> list[torch.dtype]:
         # MUSA GPUs support BF16 and FP16
