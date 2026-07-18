@@ -158,7 +158,7 @@ def _has_routed_experts(model_config: Any | None) -> bool:
 
 
 def _is_validated_qwen3_8b_fp8_single_gpu(vllm_config: Any) -> bool:
-    """Return whether the exact MUSA-0759 serving scope is selected."""
+    """Return whether the validated Qwen3-8B FP8 single-GPU scope is selected."""
     model_config = getattr(vllm_config, "model_config", None)
     if model_config is None or _has_routed_experts(model_config):
         return False
