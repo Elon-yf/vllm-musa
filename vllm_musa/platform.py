@@ -698,17 +698,6 @@ class MUSAPlatformBase(Platform):
                 "VLLM_MUSA_CUSTOM_OP_USE_NATIVE=0 to force the kernels."
             )
 
-        auto_silu_deepgemm = cls.is_device_capability(
-            (3, 1)
-        ) and _is_validated_qwen3_8b_fp8_single_gpu(vllm_config)
-        if auto_silu_deepgemm and not musa_envs.VLLM_MUSA_SILU_DEEPGEMM_FUSION.is_set():
-            musa_envs.VLLM_MUSA_SILU_DEEPGEMM_FUSION.set(True)
-            logger.info(
-                "Auto-enabling the validated S5000 Qwen3-8B-FP8 "
-                "SwiGLU+DeepGEMM fusion. Set "
-                "VLLM_MUSA_SILU_DEEPGEMM_FUSION=0 to disable it."
-            )
-
         parallel_config = vllm_config.parallel_config
         model_config = vllm_config.model_config
 

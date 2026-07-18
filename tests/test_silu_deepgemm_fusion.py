@@ -153,6 +153,32 @@ def test_validated_qwen3_8b_auto_scope(overrides) -> None:
     )
 
 
+def test_default_auto_scope_is_evaluated_per_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_musa.compilation.passes.pass_manager import (
+        _silu_deepgemm_fusion_requested,
+    )
+    from vllm_musa.utils.environ import envs
+
+    setting = envs.VLLM_MUSA_SILU_DEEPGEMM_FUSION
+    monkeypatch.delenv(setting.name, raising=False)
+    assert not setting.is_set()
+    validated = _validated_qwen3_config()
+    other = _validated_qwen3_config(
+        model_config__architectures=["Qwen3ForSequenceClassification"]
+    )
+
+    assert _silu_deepgemm_fusion_requested(validated)
+    assert not _silu_deepgemm_fusion_requested(other)
+    assert not setting.is_set()
+
+    with setting.override(False):
+        assert not _silu_deepgemm_fusion_requested(validated)
+    with setting.override(True):
+        assert _silu_deepgemm_fusion_requested(other)
+
+
 def test_custom_op_schema_fake_and_aot_dynamic() -> None:
     x, weight, weight_scale = _small_deepgemm_inputs()
     op = torch.ops.vllm.musa_silu_deepgemm_fp8_op.default

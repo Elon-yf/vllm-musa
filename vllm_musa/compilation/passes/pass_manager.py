@@ -26,13 +26,23 @@ def _is_dense_model(config: VllmConfig) -> bool:
     return not bool(getattr(model_config, "is_moe", False))
 
 
+def _silu_deepgemm_fusion_requested(config: VllmConfig) -> bool:
+    setting = envs.VLLM_MUSA_SILU_DEEPGEMM_FUSION
+    if setting.is_set():
+        return setting.get()
+
+    from vllm_musa.platform import _is_validated_qwen3_8b_fp8_single_gpu
+
+    return _is_validated_qwen3_8b_fp8_single_gpu(config)
+
+
 class MusaPostGradPassManager(PostGradPassManager):
     """Add MUSA-only graph fusions to vLLM's standard post-grad pipeline."""
 
     def configure(self, config: VllmConfig) -> None:
         super().configure(config)
         if (
-            envs.VLLM_MUSA_SILU_DEEPGEMM_FUSION.get()
+            _silu_deepgemm_fusion_requested(config)
             and envs.VLLM_MUSA_CUSTOM_OP_USE_NATIVE.get()
             and _is_dense_model(config)
             and current_platform.is_device_capability((3, 1))
