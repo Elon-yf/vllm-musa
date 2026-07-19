@@ -60,6 +60,13 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _musa_ops), musa_ops) {
       "float top_k_val, Tensor? maybe_top_p_arr, float top_p_val, bool deterministic, Generator? gen) -> ()");
   musa_ops.impl("musa_top_k_top_p_sampling_from_probs", torch::kMUSA, &musa_top_k_top_p_sampling_from_probs);
 
+  musa_ops.def(
+      "musa_chunked_min_p_sampling_from_probs(Tensor probs, Tensor! output, "
+      "Tensor? maybe_indices, Tensor? maybe_min_p_arr, float min_p_val, "
+      "bool deterministic, Generator? gen) -> ()");
+  musa_ops.impl("musa_chunked_min_p_sampling_from_probs", torch::kMUSA,
+                &musa_chunked_min_p_sampling_from_probs);
+
 /*
 * From FlashInfer
 */

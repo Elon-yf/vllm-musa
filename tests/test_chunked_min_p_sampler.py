@@ -1,0 +1,167 @@
+# SPDX-License-Identifier: Apache-2.0
+"""S5000 contract checks for the chunked Qwen min-p sampler."""
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+
+import pytest
+
+pytest.importorskip("torchada")
+torch = pytest.importorskip("torch")
+pytest.importorskip("torch_musa")
+
+VOCAB = 151936
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _musa_device() -> Iterator[None]:
+    if not hasattr(torch, "musa") or not torch.musa.is_available():
+        pytest.skip("MUSA device is not available")
+    torch.musa.set_device(0)
+
+    from vllm.platforms import current_platform
+
+    import vllm_musa
+
+    if not current_platform.is_device_capability((3, 1)):
+        pytest.skip("the chunked min-p sampler requires S5000/mp31")
+    vllm_musa.register_custom_ops()
+    yield
+
+
+def _probs(batch: int) -> torch.Tensor:
+    generator = torch.Generator(device="cpu").manual_seed(763000 + batch)
+    logits = torch.randn((batch, VOCAB), generator=generator, dtype=torch.float32)
+    return torch.softmax(logits.mul_(1.5), dim=-1).contiguous().to("musa")
+
+
+def _candidate(
+    probs: torch.Tensor,
+    min_p: float | torch.Tensor,
+    *,
+    indices: torch.Tensor | None = None,
+    seed: int = 763,
+) -> torch.Tensor:
+    output = torch.empty(probs.size(0), dtype=torch.int32, device="musa")
+    generator = torch.Generator(device="musa").manual_seed(seed)
+    min_p_arr = min_p if isinstance(min_p, torch.Tensor) else None
+    min_p_val = 0.0 if min_p_arr is not None else min_p
+    torch.ops._C_musa_ops.musa_chunked_min_p_sampling_from_probs(
+        probs,
+        output,
+        indices,
+        min_p_arr,
+        min_p_val,
+        True,
+        generator,
+    )
+    return output
+
+
+def _assert_support(
+    probs: torch.Tensor,
+    samples: torch.Tensor,
+    min_p: float | torch.Tensor,
+    indices: torch.Tensor | None = None,
+) -> None:
+    rows = (
+        torch.arange(probs.size(0), dtype=torch.int32, device="musa")
+        if indices is None
+        else indices
+    )
+    row_probs = probs[rows.long()]
+    chosen = row_probs.gather(1, samples.long()[:, None]).view(-1)
+    threshold = row_probs.amax(dim=1) * min_p
+    assert bool((chosen + 1.0e-12 >= threshold).all().item())
+
+
+@pytest.mark.parametrize("batch", [1, 4, 16, 64])
+def test_seeded_candidate_is_repeatable_and_in_support(batch: int) -> None:
+    probs = _probs(batch)
+    first = _candidate(probs, 0.05, seed=1000 + batch)
+    second = _candidate(probs, 0.05, seed=1000 + batch)
+    torch.musa.synchronize()
+
+    assert first.dtype == torch.int32
+    assert first.shape == (batch,)
+    assert torch.equal(first, second)
+    assert bool(((first >= 0) & (first < VOCAB)).all().item())
+    _assert_support(probs, first, 0.05)
+
+
+def test_per_row_threshold_and_row_indices_contract() -> None:
+    batch = 16
+    probs = _probs(batch)
+    indices = torch.arange(batch - 1, -1, -1, dtype=torch.int32, device="musa")
+    min_p = torch.linspace(0.01, 0.20, batch, dtype=torch.float32, device="musa")
+    first = _candidate(probs, min_p, indices=indices, seed=9001)
+    second = _candidate(probs, min_p, indices=indices, seed=9001)
+    torch.musa.synchronize()
+
+    assert torch.equal(first, second)
+    _assert_support(probs, first, min_p, indices)
+
+
+@pytest.mark.parametrize("batch", [1, 4, 16, 64])
+def test_candidate_matches_production_philox_contract(batch: int) -> None:
+    probs = _probs(batch)
+    current_output = torch.empty(batch, dtype=torch.int32, device="musa")
+    candidate_output = torch.empty(batch, dtype=torch.int32, device="musa")
+    current_generator = torch.Generator(device="musa").manual_seed(763100 + batch)
+    candidate_generator = torch.Generator(device="musa").manual_seed(763100 + batch)
+
+    torch.ops._C_musa_ops.min_p_sampling_from_probs(
+        probs, current_output, None, None, 0.05, True, current_generator
+    )
+    torch.ops._C_musa_ops.musa_chunked_min_p_sampling_from_probs(
+        probs, candidate_output, None, None, 0.05, True, candidate_generator
+    )
+    assert torch.equal(current_generator.get_state(), candidate_generator.get_state())
+    current_next = torch.rand(8, generator=current_generator, device="musa")
+    candidate_next = torch.rand(8, generator=candidate_generator, device="musa")
+    torch.musa.synchronize()
+
+    assert torch.equal(current_output, candidate_output)
+    assert torch.equal(current_next, candidate_next)
+
+
+@pytest.mark.parametrize("min_p", [0.0, 1.0])
+def test_min_p_edge_values(min_p: float) -> None:
+    probs = _probs(4)
+    samples = _candidate(probs, min_p, seed=1234)
+    torch.musa.synchronize()
+    _assert_support(probs, samples, min_p)
+    if min_p == 1.0:
+        selected = probs.gather(1, samples.long()[:, None]).view(-1)
+        torch.testing.assert_close(selected, probs.amax(dim=1), rtol=0, atol=0)
+
+
+def test_custom_op_wrapper_falls_back_outside_qwen_shape(monkeypatch) -> None:
+    from vllm_musa import _custom_ops
+    from vllm_musa.utils.environ import envs
+
+    probs = torch.softmax(torch.randn((4, 1024), device="musa"), dim=-1)
+    with envs.VLLM_MUSA_CHUNKED_MIN_P_SAMPLER.override(True):
+        samples = _custom_ops.min_p_sampling_from_probs(probs, 0.05)
+    torch.musa.synchronize()
+
+    assert samples.dtype == torch.int32
+    assert samples.shape == (4,)
+    assert not envs.VLLM_MUSA_CHUNKED_MIN_P_SAMPLER.is_set()
+    _assert_support(probs, samples, 0.05)
+
+
+def test_candidate_captures_and_replays() -> None:
+    probs = _probs(4)
+    output = torch.empty(4, dtype=torch.int32, device="musa")
+    graph = torch.musa.MUSAGraph()
+    with torch.musa.graph(graph):
+        torch.ops._C_musa_ops.musa_chunked_min_p_sampling_from_probs(
+            probs, output, None, None, 0.05, True, None
+        )
+    graph.replay()
+    torch.musa.synchronize()
+
+    assert bool(((output >= 0) & (output < VOCAB)).all().item())
+    _assert_support(probs, output, 0.05)

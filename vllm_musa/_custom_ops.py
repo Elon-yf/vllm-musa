@@ -3,6 +3,8 @@ from typing import Optional, Union
 
 import torch
 
+from vllm_musa.utils.environ import envs
+
 try:
     import vllm_musa._C  # noqa: F401
 except ImportError as e:
@@ -326,7 +328,39 @@ def _min_p_sampling_from_probs_internal(
     probs = probs.float()
     maybe_min_p_arr = maybe_min_p_arr.float() if maybe_min_p_arr is not None else None
     samples = torch.empty(probs.size(0), dtype=torch.int32, device=device)
-    torch.ops._C_musa_ops.min_p_sampling_from_probs.default(
+    use_chunked = (
+        envs.VLLM_MUSA_CHUNKED_MIN_P_SAMPLER.get()
+        and deterministic
+        and probs.ndim == 2
+        and 0 < probs.shape[0] <= 64
+        and probs.shape[1] == 151936
+        and probs.device.type == "musa"
+        and probs.is_contiguous()
+        and (
+            indices is None
+            or (
+                indices.dtype == torch.int32
+                and indices.device == probs.device
+                and indices.is_contiguous()
+                and indices.numel() >= probs.shape[0]
+            )
+        )
+        and (
+            maybe_min_p_arr is None
+            or (
+                maybe_min_p_arr.device == probs.device
+                and maybe_min_p_arr.dtype == torch.float32
+                and maybe_min_p_arr.is_contiguous()
+                and maybe_min_p_arr.numel() >= probs.shape[0]
+            )
+        )
+    )
+    op = (
+        torch.ops._C_musa_ops.musa_chunked_min_p_sampling_from_probs.default
+        if use_chunked
+        else torch.ops._C_musa_ops.min_p_sampling_from_probs.default
+    )
+    op(
         probs,
         samples,
         indices,

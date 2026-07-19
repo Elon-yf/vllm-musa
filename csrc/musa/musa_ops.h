@@ -72,6 +72,12 @@ void musa_top_k_top_p_sampling_from_probs(
     bool deterministic,
     std::optional<at::Generator> gen_);
 
+void musa_chunked_min_p_sampling_from_probs(
+    at::Tensor probs, at::Tensor output,
+    std::optional<at::Tensor> maybe_indices,
+    std::optional<at::Tensor> maybe_min_p_arr, double min_p_val,
+    bool deterministic, std::optional<at::Generator> gen_);
+
     /*
 * From FlashInfer
 */
