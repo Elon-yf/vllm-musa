@@ -11,7 +11,9 @@ pytest.importorskip("torchada")
 torch = pytest.importorskip("torch")
 pytest.importorskip("torch_musa")
 
-VOCAB = 151936
+QWEN3_VOCAB = 151936
+QWEN35_VOCAB = 248320
+SUPPORTED_VOCABS = (QWEN3_VOCAB, QWEN35_VOCAB)
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -30,9 +32,9 @@ def _musa_device() -> Iterator[None]:
     yield
 
 
-def _probs(batch: int) -> torch.Tensor:
-    generator = torch.Generator(device="cpu").manual_seed(763000 + batch)
-    logits = torch.randn((batch, VOCAB), generator=generator, dtype=torch.float32)
+def _probs(batch: int, vocab: int = QWEN3_VOCAB) -> torch.Tensor:
+    generator = torch.Generator(device="cpu").manual_seed(763000 + batch + vocab)
+    logits = torch.randn((batch, vocab), generator=generator, dtype=torch.float32)
     return torch.softmax(logits.mul_(1.5), dim=-1).contiguous().to("musa")
 
 
@@ -76,9 +78,12 @@ def _assert_support(
     assert bool((chosen + 1.0e-12 >= threshold).all().item())
 
 
+@pytest.mark.parametrize("vocab", SUPPORTED_VOCABS)
 @pytest.mark.parametrize("batch", [1, 4, 16, 64])
-def test_seeded_candidate_is_repeatable_and_in_support(batch: int) -> None:
-    probs = _probs(batch)
+def test_seeded_candidate_is_repeatable_and_in_support(
+    batch: int, vocab: int
+) -> None:
+    probs = _probs(batch, vocab)
     first = _candidate(probs, 0.05, seed=1000 + batch)
     second = _candidate(probs, 0.05, seed=1000 + batch)
     torch.musa.synchronize()
@@ -86,7 +91,7 @@ def test_seeded_candidate_is_repeatable_and_in_support(batch: int) -> None:
     assert first.dtype == torch.int32
     assert first.shape == (batch,)
     assert torch.equal(first, second)
-    assert bool(((first >= 0) & (first < VOCAB)).all().item())
+    assert bool(((first >= 0) & (first < vocab)).all().item())
     _assert_support(probs, first, 0.05)
 
 
@@ -103,9 +108,12 @@ def test_per_row_threshold_and_row_indices_contract() -> None:
     _assert_support(probs, first, min_p, indices)
 
 
+@pytest.mark.parametrize("vocab", SUPPORTED_VOCABS)
 @pytest.mark.parametrize("batch", [1, 4, 16, 64])
-def test_candidate_matches_production_philox_contract(batch: int) -> None:
-    probs = _probs(batch)
+def test_candidate_matches_production_philox_contract(
+    batch: int, vocab: int
+) -> None:
+    probs = _probs(batch, vocab)
     current_output = torch.empty(batch, dtype=torch.int32, device="musa")
     candidate_output = torch.empty(batch, dtype=torch.int32, device="musa")
     current_generator = torch.Generator(device="musa").manual_seed(763100 + batch)
@@ -152,8 +160,9 @@ def test_custom_op_wrapper_falls_back_outside_qwen_shape(monkeypatch) -> None:
     _assert_support(probs, samples, 0.05)
 
 
-def test_candidate_captures_and_replays() -> None:
-    probs = _probs(4)
+@pytest.mark.parametrize("vocab", SUPPORTED_VOCABS)
+def test_candidate_captures_and_replays(vocab: int) -> None:
+    probs = _probs(4, vocab)
     output = torch.empty(4, dtype=torch.int32, device="musa")
     graph = torch.musa.MUSAGraph()
     with torch.musa.graph(graph):
@@ -163,5 +172,5 @@ def test_candidate_captures_and_replays() -> None:
     graph.replay()
     torch.musa.synchronize()
 
-    assert bool(((output >= 0) & (output < VOCAB)).all().item())
+    assert bool(((output >= 0) & (output < probs.shape[1])).all().item())
     _assert_support(probs, output, 0.05)

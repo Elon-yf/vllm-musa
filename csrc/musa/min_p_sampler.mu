@@ -2,7 +2,7 @@
  * Copyright (c) 2020-2026, Moore Threads Technology Co., Ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Shape-specialized min-p sampling for Qwen's 151936-token vocabulary.
+ * Shape-specialized min-p sampling for Qwen's production vocabularies.
  * The chunked reduction and multi-CTA dataflow are adapted from RubyMine
  * problem 900015, submission 20732.  The production wrapper below restores
  * FlashInfer's Philox, per-row threshold, and row-index contracts.
@@ -29,7 +29,8 @@ constexpr int kThreads = 256;
 constexpr int kWarp = 32;
 constexpr int kRowsPerBlock = kThreads / kWarp;
 constexpr int kChunk = 2048;
-constexpr int kQwenVocab = 151936;
+constexpr int kQwen3Vocab = 151936;
+constexpr int kQwen35Vocab = 248320;
 constexpr int kMaxBatch = 64;
 
 struct alignas(16) Float4 {
@@ -318,8 +319,9 @@ void musa_chunked_min_p_sampling_from_probs(
   const int vocab = probs.size(1);
   TORCH_CHECK(batch > 0 && batch <= kMaxBatch,
               "chunked min-p sampler requires 1 <= batch <= ", kMaxBatch);
-  TORCH_CHECK(vocab == kQwenVocab,
-              "chunked min-p sampler requires vocab=", kQwenVocab);
+  TORCH_CHECK(vocab == kQwen3Vocab || vocab == kQwen35Vocab,
+              "chunked min-p sampler requires vocab=", kQwen3Vocab, " or ",
+              kQwen35Vocab);
   TORCH_CHECK(probs.size(0) >= batch,
               "chunked min-p sampler received fewer probability rows than outputs");
 

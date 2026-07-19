@@ -333,7 +333,7 @@ def _min_p_sampling_from_probs_internal(
         and deterministic
         and probs.ndim == 2
         and 0 < probs.shape[0] <= 64
-        and probs.shape[1] == 151936
+        and probs.shape[1] in (151936, 248320)
         and probs.device.type == "musa"
         and probs.is_contiguous()
         and (
