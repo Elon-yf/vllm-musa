@@ -42,6 +42,13 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _musa_ops), musa_ops) {
                 &silu_and_mul_per_token_group_fp8_quant);
 
   musa_ops.def(
+      "fused_add_rms_norm_per_token_group_fp8_quant(Tensor input, "
+      "Tensor residual, Tensor weight, Tensor! residual_out, "
+      "Tensor! output_q, Tensor! output_scale, float epsilon) -> ()");
+  musa_ops.impl("fused_add_rms_norm_per_token_group_fp8_quant", torch::kMUSA,
+                &fused_add_rms_norm_per_token_group_fp8_quant);
+
+  musa_ops.def(
       "per_token_group_quant_8bit_vec(Tensor input, Tensor! output_q, "
       "Tensor! output_s, int group_size, float eps, float min_8bit, "
       "float max_8bit) -> ()");

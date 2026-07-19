@@ -11,6 +11,7 @@ from vllm_musa.model_executor.kernels.linear.scaled_mm.deep_gemm import (
 )
 from vllm_musa.utils.environ import envs
 
+from .rms_deepgemm_fusion import MusaRMSDeepGemmFusionPass
 from .silu_deepgemm_fusion import MusaSiluDeepGemmFusionPass
 
 logger = init_logger(__name__)
@@ -32,6 +33,12 @@ def _silu_deepgemm_fusion_requested(config: VllmConfig) -> bool:
     return _is_validated_qwen3_8b_fp8_single_gpu(config)
 
 
+def _rms_deepgemm_fusion_requested(config: VllmConfig) -> bool:
+    from vllm_musa.platform import _is_validated_qwen3_8b_fp8_single_gpu
+
+    return _is_validated_qwen3_8b_fp8_single_gpu(config)
+
+
 class MusaPostGradPassManager(PostGradPassManager):
     """Add MUSA-only graph fusions to vLLM's standard post-grad pipeline."""
 
@@ -48,3 +55,14 @@ class MusaPostGradPassManager(PostGradPassManager):
             with set_current_vllm_config(config, check_compile=False):
                 self.passes.append(MusaSiluDeepGemmFusionPass(config))
             logger.info("Enabled MUSA dense SwiGLU+DeepGEMM fusion pass")
+        if (
+            _rms_deepgemm_fusion_requested(config)
+            and envs.VLLM_MUSA_CUSTOM_OP_USE_NATIVE.get()
+            and _is_dense_model(config)
+            and current_platform.is_device_capability((3, 1))
+            and _use_row_major_activation_scales(False)
+            and self.pass_config.fuse_act_quant
+        ):
+            with set_current_vllm_config(config, check_compile=False):
+                self.passes.append(MusaRMSDeepGemmFusionPass(config))
+            logger.info("Enabled MUSA dense residual RMSNorm+DeepGEMM fusion pass")
