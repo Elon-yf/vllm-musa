@@ -97,6 +97,10 @@ void top_p_renorm_probs(at::Tensor probs, at::Tensor renorm_probs,
 void top_k_renorm_probs(at::Tensor probs, at::Tensor renorm_probs,
                         std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val);
 
+void musa_rubymine_top_k_renorm_probs(at::Tensor probs,
+                                      at::Tensor renorm_probs,
+                                      int64_t top_k_val);
+
 void deepseek_v4_store_sparse_kv(
     const torch::Tensor& normed,
     torch::Tensor& kv_cache,
