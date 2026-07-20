@@ -235,7 +235,7 @@ _SHADOW_MODULES = [
     (
         "5",
         "vllm_musa/compilation/passes/rms_deepgemm_fusion.py",
-        None,
+        "vllm/compilation/passes/fusion/rms_quant_fusion.py",
         "MUSA residual RMSNorm plus FP8 DeepGEMM fusion pattern",
     ),
     (
