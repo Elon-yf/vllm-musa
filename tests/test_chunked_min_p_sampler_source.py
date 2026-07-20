@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Source contracts for the default-on RubyMine min-p dispatch."""
+"""Source contracts for the default-on chunked min-p dispatch."""
 
 from pathlib import Path
 

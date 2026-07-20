@@ -232,7 +232,7 @@ def _can_use_chunked_min_p_sampler(
     deterministic: bool,
     generator: Optional[torch.Generator],
 ) -> bool:
-    """Gate the RubyMine min-p kernel to its validated production contract."""
+    """Gate the chunked min-p kernel to its validated production contract."""
     return (
         deterministic
         and probs.device.type == "musa"

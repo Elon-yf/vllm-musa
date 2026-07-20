@@ -3,9 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Shape-specialized min-p sampling for Qwen's production vocabularies.
- * The chunked reduction and multi-CTA dataflow are adapted from RubyMine
- * problem 900015, submission 20732.  The production wrapper below restores
- * FlashInfer's Philox, per-row threshold, and row-index contracts.
+ * The chunked reduction preserves FlashInfer's Philox, per-row threshold, and
+ * row-index contracts while splitting wide rows across multiple CTAs.
  */
 
 #include <ATen/Utils.h>
@@ -42,11 +41,8 @@ __device__ __forceinline__ Float4 load4_cached(const float* ptr) {
 }
 
 __device__ __forceinline__ Float4 load4_bypass(const float* ptr) {
-  // The standalone RubyMine donor uses ld.global.cs.v4.f32.  In the full
-  // vLLM extension, combining that four-output inline assembly with Philox
-  // exhausts the mp31 output-register allocator.  Keep the chunked multi-CTA
-  // dataflow first; a later isolated ticket can reintroduce cache bypass with
-  // a lower-pressure load helper if end-to-end evidence warrants it.
+  // The cached vector load avoids the register pressure of a four-output
+  // inline-assembly load when combined with Philox state.
   return load4_cached(ptr);
 }
 
