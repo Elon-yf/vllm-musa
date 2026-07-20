@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Source contracts for default guarded RubyMine top-k dispatch."""
+"""Source contracts for default guarded top-k dispatch."""
 
 from pathlib import Path
 

@@ -81,6 +81,29 @@ def test_tied_and_sparse_rows_native_parity() -> None:
 
 
 @requires_musa
+@pytest.mark.parametrize("vocab", [151936, 248320])
+def test_valid_qwen_vocab_wrapper_uses_default_candidate(vocab: int) -> None:
+    from vllm_musa import _custom_ops
+
+    probs = torch.softmax(
+        torch.randn((1, vocab), device="musa", dtype=torch.float32), dim=-1
+    )
+    actual = _custom_ops.top_k_renorm_probs(probs, 50)
+    expected = _candidate(probs)
+    torch.musa.synchronize()
+
+    torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-7)
+
+    expected_k49 = _native(probs, 49)
+    actual_k49 = _custom_ops.top_k_renorm_probs(probs, 49)
+    per_row_k = torch.tensor([50], device="musa", dtype=torch.int32)
+    expected_per_row = _native(probs, per_row_k)
+    actual_per_row = _custom_ops.top_k_renorm_probs(probs, per_row_k)
+    torch.testing.assert_close(actual_k49, expected_k49, rtol=0, atol=0)
+    torch.testing.assert_close(actual_per_row, expected_per_row, rtol=0, atol=0)
+
+
+@requires_musa
 def test_heterogeneous_and_unsupported_k_keep_native_fallback() -> None:
     from vllm_musa import _custom_ops
 

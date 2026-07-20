@@ -2,8 +2,8 @@
  * Copyright (c) 2020-2026, Moore Threads Technology Co., Ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Stateless top-k=50 probability renormalization. The three-pass radix
- * selection is adapted from RubyMine problem 900014, submission 19805.
+ * Stateless top-k=50 probability renormalization using three-pass radix
+ * selection over non-negative finite probabilities.
  */
 
 #include <cstdint>
@@ -90,9 +90,8 @@ __device__ __forceinline__ void select_radix2(const unsigned int* histogram,
   __syncthreads();
 }
 
-// Two-read radix-select path adapted from RubyMine submission 19805. The
-// kernel is deliberately stateless across launches: unlike the donor's tiny
-// two-row path it has no device-global counters or inter-block rendezvous.
+// Two-read radix-select path. The kernel is stateless across launches and uses
+// no device-global counters or inter-block rendezvous.
 template <int Capacity, int BlockSize>
 __global__ __launch_bounds__(BlockSize, 1) void top_k_renorm_kernel(
     const float4* __restrict__ input, float4* __restrict__ output, int rows,
@@ -269,7 +268,7 @@ void musa_rubymine_top_k_renorm_probs(at::Tensor probs,
   TORCH_CHECK(probs.is_contiguous() && renorm_probs.is_contiguous(),
               "top-k renorm expects contiguous tensors");
   TORCH_CHECK(top_k_val == kTopK,
-              "RubyMine top-k fast path is specialized for k=50");
+              "top-k fast path is specialized for k=50");
 
   const int rows = static_cast<int>(probs.size(0));
   const int vocab = static_cast<int>(probs.size(1));

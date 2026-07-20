@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ruff: noqa: I001
 
-"""Cold-cache A/B/A gate for MUSA-0765 top-k=50 probability renormalization."""
+"""Cold-cache A/B/A gate for top-k=50 probability renormalization."""
 
 import argparse
 import json
@@ -16,7 +16,7 @@ import torch
 
 # Importing the Python custom-op shim loads vllm_musa._C and registers both the
 # pinned native op and the candidate op. The direct calls below intentionally
-# bypass its dispatch wrapper so A/B timing cannot be affected by the env flag.
+# bypass its dispatch wrapper so A/B timing compares the two registered kernels.
 import vllm_musa._custom_ops  # noqa: F401,E402
 
 

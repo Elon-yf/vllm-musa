@@ -26,7 +26,7 @@ def sampler_fast_path_enabled() -> bool:
 
 
 def _is_uniform_top_k_50(top_k: np.ndarray) -> bool:
-    """Whether existing CPU sampling state selects the donor specialization."""
+    """Whether existing CPU sampling state selects the k=50 specialization."""
     return top_k.size > 0 and bool(np.all(top_k == 50))
 
 
@@ -469,9 +469,8 @@ def sample_worker_logits(
     use_top_p = np.any(sampling_states.top_p.np[idx_mapping_np] != 1.0)
     use_min_p = np.any(sampling_states.min_p.np[idx_mapping_np] != 0.0)
 
-    # The RubyMine donor is deliberately limited to the uniform k=50 case.
-    # Select that scalar from the existing CPU sampling state so the decode
-    # path never copies a device tensor to the host merely to choose a kernel.
+    # Select the scalar from existing CPU sampling state so the decode path
+    # never copies a device tensor to the host merely to choose a kernel.
     if use_top_k and _is_uniform_top_k_50(top_k_np):
         top_k = 50
     else:
