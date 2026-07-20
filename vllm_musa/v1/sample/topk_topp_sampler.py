@@ -21,10 +21,6 @@ logger = logging.getLogger(__name__)
 _SAMPLING_EPS = 1e-5
 
 
-def sampler_fast_path_enabled() -> bool:
-    return envs.VLLM_MUSA_SAMPLER_FAST_PATH.get()
-
-
 def musa_seeded_multinomial_enabled() -> bool:
     return envs.VLLM_MUSA_SEEDED_MULTINOMIAL.get()
 
@@ -38,8 +34,6 @@ def can_use_musa_sampler(
     generators: dict[int, torch.Generator],
     logprobs_mode: LogprobsMode,
 ) -> bool:
-    if not sampler_fast_path_enabled():
-        return False
     if not current_platform.is_musa() or not is_musa_tensor(logits):
         return False
     if generators:
@@ -142,9 +136,7 @@ def sample_probs_seeded_multinomial(
     for row_idx in range(probs.shape[0]):
         generator = generators.get(row_idx)
         if generator is None:
-            sample = torch.multinomial(
-                probs[row_idx], num_samples=1, replacement=True
-            )
+            sample = torch.multinomial(probs[row_idx], num_samples=1, replacement=True)
         else:
             sample = torch.multinomial(
                 probs[row_idx],
@@ -199,7 +191,7 @@ def _apply_top_k_top_p(
     if p is None and k is None:
         return logits
 
-    if current_platform.is_musa() and sampler_fast_path_enabled():
+    if current_platform.is_musa():
         if k is not None and logits.shape[0] >= 16:
             if p is None and logits.shape[1] >= 65536:
                 max_top_k = int(k.to(torch.long).max().item())
@@ -264,7 +256,6 @@ def _topk_topp_sampler_init(
     if (
         logprobs_mode not in ("processed_logits", "processed_logprobs")
         and current_platform.is_musa()
-        and sampler_fast_path_enabled()
     ):
         vllm_topk_topp_sampler.logger.info_once(
             "Using MUSA native ops for top-p/top-k/min-p sampling.",
@@ -441,8 +432,6 @@ def can_use_worker_sampler(
     sampling_states: Any,
     idx_mapping_np: np.ndarray,
 ) -> bool:
-    if not sampler_fast_path_enabled():
-        return False
     if not current_platform.is_musa() or not is_musa_tensor(logits):
         return False
     if logprobs_mode == "processed_logprobs":
@@ -557,7 +546,9 @@ def _apply_worker_sampling_filters_for_seeded_multinomial(
     )
     logits = _apply_top_k_top_p(logits, top_k, top_p)
     if use_min_p:
-        sampler.sampling_states.apply_min_p(logits, expanded_idx_mapping, idx_mapping_np)
+        sampler.sampling_states.apply_min_p(
+            logits, expanded_idx_mapping, idx_mapping_np
+        )
     return logits
 
 
@@ -571,11 +562,8 @@ def _worker_sample(
     expanded_local_pos: torch.Tensor,
     return_logprobs: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if (
-        logits.shape[0] == idx_mapping_np.shape[0]
-        and can_use_worker_seeded_multinomial(
-            logits, self.logprobs_mode, self.sampling_states, idx_mapping_np
-        )
+    if logits.shape[0] == idx_mapping_np.shape[0] and can_use_worker_seeded_multinomial(
+        logits, self.logprobs_mode, self.sampling_states, idx_mapping_np
     ):
         vllm_topk_topp_sampler.logger.info_once(
             "Using MUSA seeded multinomial sampling for user-seeded requests.",

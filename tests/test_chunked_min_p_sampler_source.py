@@ -41,10 +41,14 @@ def _load_device_guard(musa):
 
 def test_min_p_dispatch_has_no_environment_gate() -> None:
     source = _read("vllm_musa/_custom_ops.py")
+    sampler = _read("vllm_musa/v1/sample/topk_topp_sampler.py")
     environ = _read("vllm_musa/utils/environ.py")
 
     assert "envs." not in source
     assert "CHUNKED_MIN_P_SAMPLER" not in environ
+    assert "VLLM_MUSA_SAMPLER_FAST_PATH" not in sampler
+    assert "VLLM_MUSA_SAMPLER_FAST_PATH" not in environ
+    assert "sampler_fast_path_enabled" not in sampler
 
 
 def test_min_p_dispatch_keeps_the_validated_contract_guard() -> None:
