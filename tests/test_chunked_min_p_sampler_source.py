@@ -28,6 +28,8 @@ def test_min_p_dispatch_keeps_the_validated_contract_guard() -> None:
     assert "and 0 < probs.shape[0] <= _QWEN_MIN_P_MAX_BATCH" in source
     assert "and probs.is_contiguous()" in source
     assert "and _is_validated_musa_device(probs.device)" in source
+    assert "MtmlMUSAPlatform" in source
+    assert "visible_device_id_to_physical_device_id" in source
     assert "device_id=device_id" in source
     assert "and _is_supported_musa_generator(generator, probs.device)" in source
     assert "musa_chunked_min_p_sampling_from_probs.default" in source
