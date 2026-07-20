@@ -68,4 +68,7 @@ def test_platform_auto_enablement_is_limited_to_the_validated_scope():
     assert "def _silu_deepgemm_fusion_requested(" in pass_manager_source
     assert "VLLM_MUSA_SILU_DEEPGEMM_FUSION" not in pass_manager_source
     assert "_is_validated_qwen3_8b_fp8_single_gpu(config)" in pass_manager_source
-    assert "current_platform.is_device_capability((3, 1))" in pass_manager_source
+    assert "_has_validated_musa_device_capability()" in pass_manager_source
+    assert "torch.musa.current_device()" in pass_manager_source
+    assert "torch.musa.get_device_capability(device_id)" in pass_manager_source
+    assert "current_platform.is_device_capability" not in pass_manager_source
