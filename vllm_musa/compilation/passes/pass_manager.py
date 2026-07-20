@@ -11,7 +11,6 @@ from vllm.logger import init_logger
 from vllm_musa.model_executor.kernels.linear.scaled_mm.deep_gemm import (
     _use_row_major_activation_scales,
 )
-from vllm_musa.utils.environ import envs
 
 from .silu_deepgemm_fusion import MusaSiluDeepGemmFusionPass
 
@@ -51,7 +50,6 @@ class MusaPostGradPassManager(PostGradPassManager):
         super().configure(config)
         if (
             _silu_deepgemm_fusion_requested(config)
-            and envs.VLLM_MUSA_CUSTOM_OP_USE_NATIVE.get()
             and _is_dense_model(config)
             and _has_validated_musa_device_capability()
             and _use_row_major_activation_scales(False)
