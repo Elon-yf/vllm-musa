@@ -1,4 +1,5 @@
 import logging
+from functools import cache
 from typing import Optional, Union
 
 import torch
@@ -186,25 +187,20 @@ def _musa_device_index(device: torch.device) -> Optional[int]:
         return None
 
 
+@cache
+def _get_musa_device_capability(device_id: int) -> tuple[int, int]:
+    """Query one logical MUSA device and cache successful results."""
+    return torch.musa.get_device_capability(device_id)
+
+
 def _is_validated_musa_device(device: torch.device) -> bool:
     """Return whether the tensor's device is the validated S5000 target."""
-    try:
-        from vllm.platforms import current_platform
-
-        from vllm_musa.platform import MtmlMUSAPlatform
-    except Exception:
-        return False
-
     try:
         device_id = _musa_device_index(device)
         if device_id is None:
             return False
-        if isinstance(current_platform, MtmlMUSAPlatform):
-            # MTML queries physical IDs while tensor device indices are visible ordinals.
-            device_id = current_platform.visible_device_id_to_physical_device_id(
-                device_id
-            )
-        return current_platform.is_device_capability((3, 1), device_id=device_id)
+        # torch.musa accepts visible logical IDs, matching torch.device.index.
+        return _get_musa_device_capability(device_id) == (3, 1)
     except Exception:
         # A device query can fail while the platform is still initializing.
         # Falling back is safer than selecting an architecture-specialized op.
