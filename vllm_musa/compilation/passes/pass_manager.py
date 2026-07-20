@@ -71,7 +71,7 @@ class MusaPostGradPassManager(PostGradPassManager):
             _rms_deepgemm_fusion_requested(config)
             and envs.VLLM_MUSA_CUSTOM_OP_USE_NATIVE.get()
             and _is_dense_model(config)
-            and current_platform.is_device_capability((3, 1))
+            and _has_validated_musa_device_capability()
             and _use_row_major_activation_scales(False)
             and self.pass_config.fuse_act_quant
         ):
