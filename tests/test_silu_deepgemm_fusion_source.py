@@ -43,7 +43,7 @@ def test_pass_manager_keeps_the_experimental_scope_narrow():
     ).read_text()
 
     assert "_silu_deepgemm_fusion_requested(config)" in source
-    assert "VLLM_MUSA_CUSTOM_OP_USE_NATIVE.get()" in source
+    assert "VLLM_MUSA_CUSTOM_OP_USE_NATIVE" not in source
     assert "_is_dense_model(config)" in source
     assert "_use_row_major_activation_scales(False)" in source
     assert "self.pass_config.fuse_act_quant" in source
@@ -67,6 +67,7 @@ def test_platform_auto_enablement_is_limited_to_the_validated_scope():
     ).read_text()
     assert "def _silu_deepgemm_fusion_requested(" in pass_manager_source
     assert "VLLM_MUSA_SILU_DEEPGEMM_FUSION" not in pass_manager_source
+    assert "VLLM_MUSA_CUSTOM_OP_USE_NATIVE" not in pass_manager_source
     assert "_is_validated_qwen3_8b_fp8_single_gpu(config)" in pass_manager_source
     assert "_has_validated_musa_device_capability()" in pass_manager_source
     assert "torch.musa.current_device()" in pass_manager_source
