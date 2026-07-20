@@ -24,12 +24,10 @@ def _musa_device() -> Iterator[None]:
         pytest.skip("MUSA device is not available")
     torch.musa.set_device(0)
 
-    from vllm.platforms import current_platform
-
     import vllm_musa
     from vllm_musa.model_executor.kernels.linear.scaled_mm import deep_gemm
 
-    if not current_platform.is_device_capability((3, 1)):
+    if tuple(torch.musa.get_device_capability(0)) != (3, 1):
         pytest.skip("the fused RMSNorm group-quant kernel requires S5000/mp31")
     vllm_musa.register_custom_ops()
     assert deep_gemm is not None
