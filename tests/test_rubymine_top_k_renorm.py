@@ -81,6 +81,26 @@ def test_tied_and_sparse_rows_native_parity() -> None:
 
 
 @requires_musa
+def test_invalid_probabilities_are_sanitized_without_illegal_access() -> None:
+    probs = torch.softmax(torch.randn((1, 1024), device="musa"), dim=-1)
+    probs[0, 0] = torch.nan
+    probs[0, 1] = torch.inf
+    probs[0, 2] = -1.0
+    probs[0, 3] = 2.0
+
+    sanitized = probs.clone()
+    sanitized[~torch.isfinite(sanitized)] = 0.0
+    sanitized[(sanitized < 0.0) | (sanitized > 1.0)] = 0.0
+    expected = _native(sanitized, 50)
+    actual = _candidate(probs)
+    torch.musa.synchronize()
+
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-7)
+    assert torch.equal(actual != 0, expected != 0)
+
+
+@requires_musa
 @pytest.mark.parametrize("vocab", [151936, 248320])
 def test_valid_qwen_vocab_wrapper_uses_default_candidate(vocab: int) -> None:
     from vllm_musa import _custom_ops

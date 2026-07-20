@@ -3,7 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Stateless top-k=50 probability renormalization using three-pass radix
- * selection over non-negative finite probabilities.
+ * selection over probabilities. Values outside [0, 1], including NaN/Inf,
+ * are treated as zero so malformed rows cannot index the radix histogram out
+ * of bounds.
  */
 
 #include <cstdint>
@@ -20,6 +22,14 @@ namespace {
 
 constexpr int kTopK = 50;
 constexpr int kCandidateCapacity = 512;
+constexpr unsigned int kOneBits = 0x3f800000u;
+
+// IEEE-754 bit order is monotonic for finite non-negative values. Therefore a
+// single unsigned comparison accepts exactly +0 through +1 and rejects
+// negative values, NaN, Inf, and values greater than one.
+__device__ __forceinline__ float sanitize_probability(float value) {
+  return __float_as_uint(value) <= kOneBits ? value : 0.0f;
+}
 
 __device__ __forceinline__ float block_sum(float value, float* scratch) {
   const int lane = threadIdx.x & 31;
@@ -108,6 +118,7 @@ __global__ __launch_bounds__(BlockSize, 1) void top_k_renorm_kernel(
   __shared__ unsigned int prefix;
   __shared__ int rank;
   __shared__ int candidate_count;
+  __shared__ int invalid_probability;
   __shared__ float candidates[Capacity];
   __shared__ int candidate_indices[Capacity];
   __shared__ float reduction[BlockSize / 32];
@@ -116,6 +127,7 @@ __global__ __launch_bounds__(BlockSize, 1) void top_k_renorm_kernel(
     prefix = 0;
     rank = kTopK;
     candidate_count = 0;
+    invalid_probability = 0;
   }
   __syncthreads();
 
@@ -128,10 +140,21 @@ __global__ __launch_bounds__(BlockSize, 1) void top_k_renorm_kernel(
   for (int vector = thread; vector < vector_count; vector += BlockSize) {
     const float4 value = input[row_base + vector];
     output[row_base + vector] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    atomicAdd(&histogram[shard][__float_as_uint(value.x) >> 20], 1);
-    atomicAdd(&histogram[shard][__float_as_uint(value.y) >> 20], 1);
-    atomicAdd(&histogram[shard][__float_as_uint(value.z) >> 20], 1);
-    atomicAdd(&histogram[shard][__float_as_uint(value.w) >> 20], 1);
+    unsigned int bits[4] = {
+        __float_as_uint(value.x), __float_as_uint(value.y),
+        __float_as_uint(value.z), __float_as_uint(value.w)};
+    bool invalid = false;
+    #pragma unroll
+    for (int component = 0; component < 4; ++component) {
+      if (bits[component] > kOneBits) {
+        bits[component] = 0;
+        invalid = true;
+      }
+      atomicAdd(&histogram[shard][bits[component] >> 20], 1);
+    }
+    if (invalid) {
+      atomicExch(&invalid_probability, 1);
+    }
   }
   __syncthreads();
   select_radix2(&histogram[0][0], 0, &prefix, &rank);
@@ -145,7 +168,11 @@ __global__ __launch_bounds__(BlockSize, 1) void top_k_renorm_kernel(
 
   for (int vector = thread; vector < vector_count; vector += BlockSize) {
     const float4 value = input[row_base + vector];
-    float values[4] = {value.x, value.y, value.z, value.w};
+    float values[4] = {
+        invalid_probability ? sanitize_probability(value.x) : value.x,
+        invalid_probability ? sanitize_probability(value.y) : value.y,
+        invalid_probability ? sanitize_probability(value.z) : value.z,
+        invalid_probability ? sanitize_probability(value.w) : value.w};
     #pragma unroll
     for (int component = 0; component < 4; ++component) {
       const unsigned int bits = __float_as_uint(values[component]);
@@ -182,13 +209,16 @@ __global__ __launch_bounds__(BlockSize, 1) void top_k_renorm_kernel(
   } else {
     for (int vector = thread; vector < vector_count; vector += BlockSize) {
       const float4 value = input[row_base + vector];
-      const unsigned int bits[4] = {
-          __float_as_uint(value.x), __float_as_uint(value.y),
-          __float_as_uint(value.z), __float_as_uint(value.w)};
+      const float values[4] = {
+          invalid_probability ? sanitize_probability(value.x) : value.x,
+          invalid_probability ? sanitize_probability(value.y) : value.y,
+          invalid_probability ? sanitize_probability(value.z) : value.z,
+          invalid_probability ? sanitize_probability(value.w) : value.w};
       #pragma unroll
       for (int component = 0; component < 4; ++component) {
-        if ((bits[component] >> 10) == mantissa_prefix) {
-          atomicAdd(&histogram[shard][bits[component] & 1023], 1);
+        const unsigned int bits = __float_as_uint(values[component]);
+        if ((bits >> 10) == mantissa_prefix) {
+          atomicAdd(&histogram[shard][bits & 1023], 1);
         }
       }
     }
@@ -209,7 +239,11 @@ __global__ __launch_bounds__(BlockSize, 1) void top_k_renorm_kernel(
   } else {
     for (int vector = thread; vector < vector_count; vector += BlockSize) {
       const float4 value = input[row_base + vector];
-      const float values[4] = {value.x, value.y, value.z, value.w};
+      const float values[4] = {
+          invalid_probability ? sanitize_probability(value.x) : value.x,
+          invalid_probability ? sanitize_probability(value.y) : value.y,
+          invalid_probability ? sanitize_probability(value.z) : value.z,
+          invalid_probability ? sanitize_probability(value.w) : value.w};
       #pragma unroll
       for (int component = 0; component < 4; ++component) {
         const unsigned int bits = __float_as_uint(values[component]);
@@ -220,7 +254,9 @@ __global__ __launch_bounds__(BlockSize, 1) void top_k_renorm_kernel(
     }
   }
 
-  const float inverse = 1.0f / block_sum(greater_sum + selected_sum, reduction);
+  const float selected_total =
+      block_sum(greater_sum + selected_sum, reduction);
+  const float inverse = selected_total > 0.0f ? 1.0f / selected_total : 0.0f;
   if (candidate_count <= Capacity) {
     float* output_row = reinterpret_cast<float*>(output + row_base);
     for (int i = thread; i < candidate_count; i += BlockSize) {
@@ -231,11 +267,24 @@ __global__ __launch_bounds__(BlockSize, 1) void top_k_renorm_kernel(
   } else {
     for (int vector = thread; vector < vector_count; vector += BlockSize) {
       const float4 value = input[row_base + vector];
+      const float values[4] = {
+          invalid_probability ? sanitize_probability(value.x) : value.x,
+          invalid_probability ? sanitize_probability(value.y) : value.y,
+          invalid_probability ? sanitize_probability(value.z) : value.z,
+          invalid_probability ? sanitize_probability(value.w) : value.w};
       float4 normalized;
-      normalized.x = __float_as_uint(value.x) >= threshold ? value.x * inverse : 0.0f;
-      normalized.y = __float_as_uint(value.y) >= threshold ? value.y * inverse : 0.0f;
-      normalized.z = __float_as_uint(value.z) >= threshold ? value.z * inverse : 0.0f;
-      normalized.w = __float_as_uint(value.w) >= threshold ? value.w * inverse : 0.0f;
+      normalized.x = __float_as_uint(values[0]) >= threshold
+                         ? values[0] * inverse
+                         : 0.0f;
+      normalized.y = __float_as_uint(values[1]) >= threshold
+                         ? values[1] * inverse
+                         : 0.0f;
+      normalized.z = __float_as_uint(values[2]) >= threshold
+                         ? values[2] * inverse
+                         : 0.0f;
+      normalized.w = __float_as_uint(values[3]) >= threshold
+                         ? values[3] * inverse
+                         : 0.0f;
       output[row_base + vector] = normalized;
     }
   }
