@@ -80,9 +80,7 @@ def _assert_support(
 
 @pytest.mark.parametrize("vocab", SUPPORTED_VOCABS)
 @pytest.mark.parametrize("batch", [1, 4, 16, 64])
-def test_seeded_candidate_is_repeatable_and_in_support(
-    batch: int, vocab: int
-) -> None:
+def test_seeded_candidate_is_repeatable_and_in_support(batch: int, vocab: int) -> None:
     probs = _probs(batch, vocab)
     first = _candidate(probs, 0.05, seed=1000 + batch)
     second = _candidate(probs, 0.05, seed=1000 + batch)
@@ -110,9 +108,7 @@ def test_per_row_threshold_and_row_indices_contract() -> None:
 
 @pytest.mark.parametrize("vocab", SUPPORTED_VOCABS)
 @pytest.mark.parametrize("batch", [1, 4, 16, 64])
-def test_candidate_matches_production_philox_contract(
-    batch: int, vocab: int
-) -> None:
+def test_candidate_matches_production_philox_contract(batch: int, vocab: int) -> None:
     probs = _probs(batch, vocab)
     current_output = torch.empty(batch, dtype=torch.int32, device="musa")
     candidate_output = torch.empty(batch, dtype=torch.int32, device="musa")
@@ -145,19 +141,87 @@ def test_min_p_edge_values(min_p: float) -> None:
         torch.testing.assert_close(selected, probs.amax(dim=1), rtol=0, atol=0)
 
 
-def test_custom_op_wrapper_falls_back_outside_qwen_shape(monkeypatch) -> None:
+def test_custom_op_wrapper_falls_back_outside_qwen_shape() -> None:
     from vllm_musa import _custom_ops
-    from vllm_musa.utils.environ import envs
 
     probs = torch.softmax(torch.randn((4, 1024), device="musa"), dim=-1)
-    with envs.VLLM_MUSA_CHUNKED_MIN_P_SAMPLER.override(True):
-        samples = _custom_ops.min_p_sampling_from_probs(probs, 0.05)
+    samples = _custom_ops.min_p_sampling_from_probs(probs, 0.05)
     torch.musa.synchronize()
 
     assert samples.dtype == torch.int32
     assert samples.shape == (4,)
-    assert not envs.VLLM_MUSA_CHUNKED_MIN_P_SAMPLER.is_set()
     _assert_support(probs, samples, 0.05)
+
+
+def test_default_dispatch_contract() -> None:
+    from vllm_musa import _custom_ops
+
+    probs = _probs(1)
+    assert _custom_ops._can_use_chunked_min_p_sampler(probs, None, None, True, None)
+
+
+def test_default_wrapper_preserves_philox_contract() -> None:
+    from vllm_musa import _custom_ops
+
+    probs = _probs(1)
+    expected = torch.empty(1, dtype=torch.int32, device="musa")
+    expected_generator = torch.Generator(device="musa").manual_seed(763200)
+    torch.ops._C_musa_ops.min_p_sampling_from_probs(
+        probs, expected, None, None, 0.05, True, expected_generator
+    )
+
+    actual_generator = torch.Generator(device="musa").manual_seed(763200)
+    actual = _custom_ops.min_p_sampling_from_probs(
+        probs, 0.05, generator=actual_generator
+    )
+    torch.musa.synchronize()
+
+    assert torch.equal(actual, expected)
+    assert torch.equal(actual_generator.get_state(), expected_generator.get_state())
+
+
+def test_unsupported_contracts_and_seeded_cpu_fallback() -> None:
+    from vllm_musa import _custom_ops
+
+    probs = _probs(1)
+    musa_generator = torch.Generator(device="musa")
+    cpu_generator = torch.Generator(device="cpu")
+
+    assert _custom_ops._can_use_chunked_min_p_sampler(
+        probs, None, None, True, musa_generator
+    )
+    assert not _custom_ops._can_use_chunked_min_p_sampler(
+        probs, None, None, True, cpu_generator
+    )
+    assert not _custom_ops._can_use_chunked_min_p_sampler(
+        probs, None, None, False, None
+    )
+    assert not _custom_ops._can_use_chunked_min_p_sampler(
+        probs.half(), None, None, True, None
+    )
+    assert not _custom_ops._can_use_chunked_min_p_sampler(
+        _probs(1, 1024), None, None, True, None
+    )
+    assert not _custom_ops._can_use_chunked_min_p_sampler(
+        probs.expand(65, -1), None, None, True, None
+    )
+
+    non_contiguous = torch.empty(
+        (1, 2 * probs.shape[1]), dtype=torch.float32, device="musa"
+    )[:, ::2]
+    assert not non_contiguous.is_contiguous()
+    assert not _custom_ops._can_use_chunked_min_p_sampler(
+        non_contiguous, None, None, True, None
+    )
+
+    bad_indices = torch.arange(1, dtype=torch.int64, device="musa")
+    assert not _custom_ops._can_use_chunked_min_p_sampler(
+        probs, bad_indices, None, True, None
+    )
+    bad_min_p = torch.full((1,), 0.05, dtype=torch.float16, device="musa")
+    assert not _custom_ops._can_use_chunked_min_p_sampler(
+        probs, None, bad_min_p, True, None
+    )
 
 
 @pytest.mark.parametrize("vocab", SUPPORTED_VOCABS)
