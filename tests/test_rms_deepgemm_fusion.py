@@ -168,6 +168,7 @@ def test_rms_fusion_has_no_kernel_environment_control() -> None:
 
     assert "VLLM_MUSA_RMS_DEEPGEMM_FUSION" not in pass_manager
     assert "VLLM_MUSA_RMS_DEEPGEMM_FUSION" not in environ
+    assert "VLLM_MUSA_CUSTOM_OP_USE_NATIVE" not in pass_manager
 
 
 @pytest.mark.parametrize("misaligned_input", [False, True])

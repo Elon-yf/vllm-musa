@@ -67,7 +67,6 @@ class MusaPostGradPassManager(PostGradPassManager):
             logger.info("Enabled MUSA dense SwiGLU+DeepGEMM fusion pass")
         if (
             _rms_deepgemm_fusion_requested(config)
-            and envs.VLLM_MUSA_CUSTOM_OP_USE_NATIVE.get()
             and _is_dense_model(config)
             and _has_validated_musa_device_capability()
             and _use_row_major_activation_scales(False)
