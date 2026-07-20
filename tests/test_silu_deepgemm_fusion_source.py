@@ -57,12 +57,15 @@ def test_platform_auto_enablement_is_limited_to_the_validated_scope():
     assert 'tuple(architectures or ()) == ("Qwen3ForCausalLM",)' in source
     assert 'getattr(hf_text_config, "hidden_size", None) == 4096' in source
     assert 'getattr(hf_text_config, "intermediate_size", None) == 12288' in source
-    assert "VLLM_MUSA_SILU_DEEPGEMM_FUSION.set(True)" not in source
+    assert "VLLM_MUSA_SILU_DEEPGEMM_FUSION" not in source
+
+    environ_source = (ROOT / "vllm_musa" / "utils" / "environ.py").read_text()
+    assert "VLLM_MUSA_SILU_DEEPGEMM_FUSION" not in environ_source
 
     pass_manager_source = (
         ROOT / "vllm_musa" / "compilation" / "passes" / "pass_manager.py"
     ).read_text()
     assert "def _silu_deepgemm_fusion_requested(" in pass_manager_source
-    assert "setting.is_set()" in pass_manager_source
+    assert "VLLM_MUSA_SILU_DEEPGEMM_FUSION" not in pass_manager_source
     assert "_is_validated_qwen3_8b_fp8_single_gpu(config)" in pass_manager_source
     assert "current_platform.is_device_capability((3, 1))" in pass_manager_source

@@ -27,10 +27,6 @@ def _is_dense_model(config: VllmConfig) -> bool:
 
 
 def _silu_deepgemm_fusion_requested(config: VllmConfig) -> bool:
-    setting = envs.VLLM_MUSA_SILU_DEEPGEMM_FUSION
-    if setting.is_set():
-        return setting.get()
-
     from vllm_musa.platform import _is_validated_qwen3_8b_fp8_single_gpu
 
     return _is_validated_qwen3_8b_fp8_single_gpu(config)
