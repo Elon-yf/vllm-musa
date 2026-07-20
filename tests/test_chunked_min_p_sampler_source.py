@@ -110,3 +110,17 @@ def test_min_p_dispatch_preserves_unsupported_input_fallbacks() -> None:
     assert "maybe_min_p_arr.is_contiguous()" in source
     assert "input_probs = probs" in source
     assert "input_min_p_arr = maybe_min_p_arr" in source
+
+
+def test_min_p_kernel_uses_graph_safe_philox_state() -> None:
+    source = _read("csrc/musa/min_p_sampler.mu")
+
+    assert "MUSAGraphsUtils.muh" in source
+    assert "at::PhiloxMusaState philox_state" in source
+    assert "at::musa::philox::unpack(philox_state)" in source
+    assert "philox_state.seed_.val" not in source
+    assert "philox_state.offset_.val" not in source
+    assert source.index("OptionalMUSAGuard device_guard") < source.index(
+        "getDefaultMUSAGenerator"
+    )
+    assert "getDefaultMUSAGenerator(probs.get_device())" in source
