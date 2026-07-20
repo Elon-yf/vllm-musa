@@ -21,10 +21,6 @@ logger = logging.getLogger(__name__)
 _SAMPLING_EPS = 1e-5
 
 
-def sampler_fast_path_enabled() -> bool:
-    return envs.VLLM_MUSA_SAMPLER_FAST_PATH.get()
-
-
 def _is_uniform_top_k_50(top_k: np.ndarray) -> bool:
     """Whether existing CPU sampling state selects the k=50 specialization."""
     return top_k.size > 0 and bool(np.all(top_k == 50))
@@ -43,8 +39,6 @@ def can_use_musa_sampler(
     generators: dict[int, torch.Generator],
     logprobs_mode: LogprobsMode,
 ) -> bool:
-    if not sampler_fast_path_enabled():
-        return False
     if not current_platform.is_musa() or not is_musa_tensor(logits):
         return False
     if generators:
@@ -202,7 +196,7 @@ def _apply_top_k_top_p(
     if p is None and k is None:
         return logits
 
-    if current_platform.is_musa() and sampler_fast_path_enabled():
+    if current_platform.is_musa():
         if k is not None and logits.shape[0] >= 16:
             if p is None and logits.shape[1] >= 65536:
                 max_top_k = int(k.to(torch.long).max().item())
@@ -267,7 +261,6 @@ def _topk_topp_sampler_init(
     if (
         logprobs_mode not in ("processed_logits", "processed_logprobs")
         and current_platform.is_musa()
-        and sampler_fast_path_enabled()
     ):
         vllm_topk_topp_sampler.logger.info_once(
             "Using MUSA native ops for top-p/top-k/min-p sampling.",
@@ -444,8 +437,6 @@ def can_use_worker_sampler(
     sampling_states: Any,
     idx_mapping_np: np.ndarray,
 ) -> bool:
-    if not sampler_fast_path_enabled():
-        return False
     if not current_platform.is_musa() or not is_musa_tensor(logits):
         return False
     if logprobs_mode == "processed_logprobs":
