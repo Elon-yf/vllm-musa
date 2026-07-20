@@ -15,10 +15,11 @@
 #include <cfloat>
 #include <mutex>
 #include <optional>
+#include <tuple>
 
 #include "musa.h"
 #include "pytorch_extension_utils.h"
-#include "torch_musa/csrc/aten/musa/MUSAGeneratorImpl.h"
+#include "torch_musa/csrc/aten/musa/MUSAGraphsUtils.muh"
 #include "torch_musa/csrc/core/MUSAGuard.h"
 #include "torch_musa/csrc/core/MUSAStream.h"
 
@@ -130,7 +131,10 @@ __global__ void threshold_rng_kernel(
     const float* __restrict__ partial, float* __restrict__ threshold,
     float* __restrict__ uniform, const float* __restrict__ min_p_arr,
     float min_p_val, int* __restrict__ output, int batch, int vocab,
-    int chunks, uint64_t philox_seed, uint64_t philox_offset) {
+    int chunks, at::PhiloxMusaState philox_state) {
+  const auto seeds = at::musa::philox::unpack(philox_state);
+  const uint64_t philox_seed = std::get<0>(seeds);
+  const uint64_t philox_offset = std::get<1>(seeds);
   const int warp = threadIdx.x / kWarp;
   const int lane = threadIdx.x & (kWarp - 1);
   const int row = blockIdx.x * kRowsPerBlock + warp;
@@ -343,18 +347,15 @@ void musa_chunked_min_p_sampling_from_probs(
     min_p_arr = min_p_tensor.data_ptr<float>();
   }
 
+  const c10::musa::OptionalMUSAGuard device_guard(probs.device());
   auto gen = at::get_generator_or_default<at::MUSAGeneratorImpl>(
-      gen_, at::musa::detail::getDefaultMUSAGenerator());
-  uint64_t philox_seed;
-  uint64_t philox_offset;
-  {
+      gen_, at::musa::detail::getDefaultMUSAGenerator(probs.get_device()));
+  const at::PhiloxMusaState philox_state = [&] {
     std::lock_guard<std::mutex> lock(gen->mutex_);
     // Match FlashInfer's production min-p contract exactly: one Philox
     // counter reservation per sampled row.
-    at::PhiloxMusaState state = gen->philox_musa_state(batch);
-    philox_seed = state.seed_.val;
-    philox_offset = state.offset_.val;
-  }
+    return gen->philox_musa_state(batch);
+  }();
 
   const int chunks = (vocab + kChunk - 1) / kChunk;
   auto scratch = at::empty({static_cast<int64_t>(batch) * (chunks + 2)},
@@ -363,14 +364,13 @@ void musa_chunked_min_p_sampling_from_probs(
   float* threshold = partial + static_cast<size_t>(batch) * chunks;
   float* uniform = threshold + batch;
 
-  const c10::musa::OptionalMUSAGuard device_guard(probs.device());
   auto stream = at::musa::getCurrentMUSAStream();
   partial_max_kernel<<<batch * chunks, kThreads, 0, stream>>>(
       probs.data_ptr<float>(), indices, partial, vocab, chunks);
   threshold_rng_kernel<<<(batch + kRowsPerBlock - 1) / kRowsPerBlock,
                          kThreads, 0, stream>>>(
       partial, threshold, uniform, min_p_arr, static_cast<float>(min_p_val),
-      output.data_ptr<int>(), batch, vocab, chunks, philox_seed, philox_offset);
+      output.data_ptr<int>(), batch, vocab, chunks, philox_state);
   partial_sum_kernel<<<batch * chunks, kThreads, 0, stream>>>(
       probs.data_ptr<float>(), indices, threshold, partial, vocab, chunks);
   select_kernel<<<(batch + kRowsPerBlock - 1) / kRowsPerBlock, kThreads, 0,

@@ -226,15 +226,23 @@ def test_unsupported_contracts_and_seeded_cpu_fallback() -> None:
 
 @pytest.mark.parametrize("vocab", SUPPORTED_VOCABS)
 def test_candidate_captures_and_replays(vocab: int) -> None:
-    probs = _probs(4, vocab)
-    output = torch.empty(4, dtype=torch.int32, device="musa")
+    batch = 64
+    probs = torch.full((batch, vocab), 1.0 / vocab, dtype=torch.float32, device="musa")
+    output = torch.empty(batch, dtype=torch.int32, device="musa")
+    torch.musa.manual_seed(763300 + vocab)
     graph = torch.musa.MUSAGraph()
     with torch.musa.graph(graph):
         torch.ops._C_musa_ops.musa_chunked_min_p_sampling_from_probs(
             probs, output, None, None, 0.05, True, None
         )
-    graph.replay()
+    replayed = []
+    for _ in range(3):
+        graph.replay()
+        replayed.append(output.clone())
     torch.musa.synchronize()
 
-    assert bool(((output >= 0) & (output < probs.shape[1])).all().item())
-    _assert_support(probs, output, 0.05)
+    for samples in replayed:
+        assert bool(((samples >= 0) & (samples < probs.shape[1])).all().item())
+        _assert_support(probs, samples, 0.05)
+    assert not torch.equal(replayed[0], replayed[1])
+    assert not torch.equal(replayed[1], replayed[2])
