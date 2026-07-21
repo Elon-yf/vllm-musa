@@ -20,6 +20,7 @@ import functools
 import tilelang
 import tilelang.language as T
 import torch
+from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_musa.jit_kernel.tilelang.utils import (
     MUSA_COMMON_PASS_CONFIGS,
@@ -102,7 +103,7 @@ def _block_elems(total_v: int) -> int:
     return max(be, 32)
 
 
-def fused_zba(
+def _fused_zba_impl(
     mixed_qkvz: torch.Tensor,
     mixed_ba: torch.Tensor,
     num_heads_qk: int,
@@ -134,3 +135,56 @@ def fused_zba(
     )
     kernel(z, b, a, mixed_qkvz.contiguous(), mixed_ba.contiguous())
     return z, b, a
+
+
+def _fused_zba_fake(
+    mixed_qkvz: torch.Tensor,
+    mixed_ba: torch.Tensor,
+    num_heads_qk: int,
+    num_heads_v: int,
+    head_qk: int,
+    head_v: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    del num_heads_qk, head_qk
+    m = mixed_qkvz.shape[0]
+    z = torch.empty(
+        (m, num_heads_v, head_v),
+        dtype=mixed_qkvz.dtype,
+        device=mixed_qkvz.device,
+    )
+    b = torch.empty(
+        (m, num_heads_v),
+        dtype=mixed_ba.dtype,
+        device=mixed_ba.device,
+    )
+    return z, b, torch.empty_like(b)
+
+
+# TileLang's lazy JIT factory is intentionally kept behind an opaque custom
+# op.  Inlining the functools.lru_cache wrapper makes Dynamo trace the JIT
+# executable and fails before the upstream qwen_gdn_attention_core op.  The
+# fake implementation preserves symbolic shapes for Inductor and the runtime
+# implementation remains the same fused z/b/a launch.
+direct_register_custom_op(
+    "musa_fused_zba",
+    _fused_zba_impl,
+    fake_impl=_fused_zba_fake,
+)
+
+
+def fused_zba(
+    mixed_qkvz: torch.Tensor,
+    mixed_ba: torch.Tensor,
+    num_heads_qk: int,
+    num_heads_v: int,
+    head_qk: int,
+    head_v: int,
+) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor]":
+    return torch.ops.vllm.musa_fused_zba(
+        mixed_qkvz,
+        mixed_ba,
+        num_heads_qk,
+        num_heads_v,
+        head_qk,
+        head_v,
+    )

@@ -5,20 +5,13 @@ import functools
 import tilelang
 import tilelang.language as T
 import torch
+from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_musa.jit_kernel.tilelang.utils import (
     MUSA_COMMON_PASS_CONFIGS,
     MUSA_COMPILE_FLAGS,
     tilelang_dtype,
 )
-
-
-def register_custom_op(fn=None, **_kw):
-    def _wrap(f):
-        return f
-
-    return _wrap if fn is None else _wrap(fn)
-
 
 __all__ = [
     "RMSNorm",
@@ -219,10 +212,6 @@ def _launch_rms_norm_gated(
     kernel(x, out, weight, z, rstd, float(eps))
 
 
-@register_custom_op(
-    op_name="musa_rms_norm_gated",
-    mutates_args=["out", "rstd"],
-)
 def _rms_norm_gated_custom(
     x: torch.Tensor,
     out: torch.Tensor,
@@ -230,9 +219,9 @@ def _rms_norm_gated_custom(
     z: torch.Tensor,
     rstd: torch.Tensor,
     eps: float,
-    rows_per_block: int = 8,
-    lanes_per_row: int = 16,
-    cta_threads: int | None = None,
+    rows_per_block: int,
+    lanes_per_row: int,
+    cta_threads: int | None,
 ) -> None:
     # Keep the TileLang executable launch opaque to Dynamo.
     _launch_rms_norm_gated(
@@ -246,6 +235,28 @@ def _rms_norm_gated_custom(
         lanes_per_row,
         cta_threads,
     )
+
+
+def _rms_norm_gated_custom_fake(
+    x: torch.Tensor,
+    out: torch.Tensor,
+    weight: torch.Tensor,
+    z: torch.Tensor,
+    rstd: torch.Tensor,
+    eps: float,
+    rows_per_block: int,
+    lanes_per_row: int,
+    cta_threads: int | None,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="musa_rms_norm_gated",
+    op_func=_rms_norm_gated_custom,
+    mutates_args=["out", "rstd"],
+    fake_impl=_rms_norm_gated_custom_fake,
+)
 
 
 def _rms_norm_gated_impl(
@@ -301,7 +312,9 @@ def _rms_norm_gated_impl(
         raise RuntimeError("invalid rows_per_block/lanes_per_row combination.")
 
     rstd = torch.empty((x.shape[0],), dtype=torch.float32, device=x.device)
-    _rms_norm_gated_custom(
+    if x.shape[0] == 0:
+        return out, rstd
+    torch.ops.vllm.musa_rms_norm_gated(
         x,
         out,
         weight,
