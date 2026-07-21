@@ -6,6 +6,7 @@ from __future__ import annotations
 import inspect
 
 import torch
+from mate.gdn_decode import gated_delta_rule_decode
 from mate.gdn_prefill import chunk_gated_delta_rule
 from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
@@ -14,6 +15,9 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
 
 logger = init_logger(__name__)
 
+_MATE_GDN_PREFILL_HAS_OUTPUT = (
+    "output" in inspect.signature(chunk_gated_delta_rule).parameters
+)
 _MATE_GDN_PREFILL_HAS_IS_LOG_SPACE = (
     "is_log_space" in inspect.signature(chunk_gated_delta_rule).parameters
 )
@@ -57,6 +61,63 @@ class MusaQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             core_attn_out,
             attn_metadata,
         )
+
+    def forward_cuda(
+        self,
+        hidden_states: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        # MUSA: Qwen3.5 GDN forward with a single fused z/b/a split kernel
+        # (contiguous z/b/a in one launch) replacing the strided-z output-proj
+        # copy + b/a contiguous copies. mixed_qkv stays a strided view (conv/MATE
+        # accept it) so the large qkv block is never materialized. Qwen3-Next's
+        # interleaved layout and the replicated-ba TP path keep the upstream flow.
+        if self.gqa_interleaved_layout:
+            return super().forward_cuda(hidden_states, output)
+
+        from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+            _encode_layer_name,
+        )
+
+        num_tokens = hidden_states.size(0)
+        mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+        ba, _ = self.in_proj_ba(hidden_states)
+
+        qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
+        mixed_qkv = mixed_qkvz[:, :qkv_size]
+
+        if getattr(self, "disable_tp_for_ba_proj", False) and self.tp_size > 1:
+            z = mixed_qkvz[:, qkv_size:].reshape(num_tokens, -1, self.head_v_dim)
+            b, a = self.split_ba(ba)
+            b = b.contiguous()
+            a = a.contiguous()
+        else:
+            from vllm_musa.jit_kernel.tilelang.gdn_fused_proj import fused_zba
+
+            z, b, a = fused_zba(
+                mixed_qkvz,
+                ba,
+                self.num_k_heads // self.tp_size,
+                self.num_v_heads // self.tp_size,
+                self.head_k_dim,
+                self.head_v_dim,
+            )
+
+        core_attn_out = torch.zeros(
+            (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+
+        torch.ops.vllm.qwen_gdn_attention_core(
+            mixed_qkv,
+            b,
+            a,
+            core_attn_out,
+            layer_name=_encode_layer_name(self.prefix),
+        )
+
+        self._output_projection(core_attn_out, z, output, num_tokens)
 
     def _get_gdn_attention_metadata(self, mixed_qkv: torch.Tensor):
         from vllm.forward_context import get_forward_context
@@ -131,12 +192,78 @@ class MusaQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             validate_data=False,
         )
 
-        query, key, value = self.rearrange_mixed_qkv(mixed_qkv)
+        # MUSA: mate's decode kernel reads q/k/v from strided views; split the
+        # packed qkv without materializing contiguous copies.
+        _qk_dim = self.key_dim // self.tp_size
+        _v_dim = self.value_dim // self.tp_size
+        _q, _k, _v = torch.split(mixed_qkv, [_qk_dim, _qk_dim, _v_dim], dim=-1)
+        query = _q.unflatten(-1, (-1, self.head_k_dim)).unsqueeze(1)
+        key = _k.unflatten(-1, (-1, self.head_k_dim)).unsqueeze(1)
+        value = _v.unflatten(-1, (-1, self.head_v_dim)).unsqueeze(1)
 
-        # MUSA: the mate fp32-VK decode kernel is unavailable in this toolchain,
-        # so pure decode runs the fused recurrent update directly on the paged
-        # state pool (leaner than the upstream general prefill/decode path). Fall
-        # back to the general decode path if this kernel ever fails at runtime.
+        # MUSA: the mamba pool is page-aligned (it must not be laid out contiguously,
+        # or its bytes would alias the attention KV in the shared hybrid tensor), so
+        # ssm_state is not contiguous. Gather the active per-sequence states into a
+        # small contiguous buffer for mate's fp32 VK decode (identity mapping), then
+        # scatter the updated states back. This keeps the fast mate kernel without a
+        # whole-pool contiguity copy.
+        if ssm_state.dtype == torch.float32:
+            try:
+                import os as _os
+
+                _musa_sep = _os.environ.get("VLLM_MUSA_MAMBA_SEPARATE_POOL", "1") == "1"
+                if _musa_sep and ssm_state.is_contiguous():
+                    # MUSA: separate contiguous mamba pool -> mate decodes in
+                    # place (block b at b*state_numel); no gather/scatter copy.
+                    output, _ = gated_delta_rule_decode(
+                        q=query,
+                        k=key,
+                        v=value,
+                        state=ssm_state,
+                        state_layout="VK",
+                        state_indices=state_indices,
+                        scale=self.head_k_dim**-0.5,
+                        A_log=self.A_log.detach().float(),
+                        a=a.view(num_decode_tokens, 1, -1),
+                        dt_bias=self.dt_bias.detach().float(),
+                        b=b.view(num_decode_tokens, 1, -1),
+                        disable_state_update=False,
+                        use_qk_l2norm=True,
+                    )
+                    _log_once(
+                        "info",
+                        "MUSA GDN mate in-place decode active (separate pool)",
+                    )
+                else:
+                    active_state = ssm_state[state_indices]
+                    output, updated_state = gated_delta_rule_decode(
+                        q=query,
+                        k=key,
+                        v=value,
+                        state=active_state,
+                        state_layout="VK",
+                        scale=self.head_k_dim**-0.5,
+                        A_log=self.A_log.detach().float(),
+                        a=a.view(num_decode_tokens, 1, -1),
+                        dt_bias=self.dt_bias.detach().float(),
+                        b=b.view(num_decode_tokens, 1, -1),
+                        disable_state_update=False,
+                        use_qk_l2norm=True,
+                    )
+                    ssm_state[state_indices] = updated_state
+                core_attn_out[:num_decode_tokens] = output.view(
+                    num_decode_tokens,
+                    self.num_v_heads // self.tp_size,
+                    self.head_v_dim,
+                )
+                return True
+            except Exception as e:
+                _log_once(
+                    "warning",
+                    "MATE GDN decode failed; using recurrent fallback: %s",
+                    e,
+                )
+
         try:
             core_attn_out_non_spec, _ = fused_sigmoid_gating_delta_rule_update(
                 A_log=self.A_log,
@@ -172,32 +299,35 @@ class MusaQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         non_spec_state_indices_tensor: torch.Tensor,
         non_spec_query_start_loc: torch.Tensor,
         has_initial_state: torch.Tensor | None,
+        out: torch.Tensor | None = None,
     ):
-        from vllm.model_executor.layers.fla.ops import fused_post_conv_prep
-
         try:
-            q, k, v, g, beta = fused_post_conv_prep(
-                conv_output=mixed_qkv_non_spec,
-                a=a_non_spec,
-                b=b_non_spec,
-                A_log=self.A_log,
-                dt_bias=self.dt_bias,
-                num_k_heads=self.num_k_heads // self.tp_size,
-                head_k_dim=self.head_k_dim,
-                head_v_dim=self.head_v_dim,
-                apply_l2norm=False,
-                output_g_exp=not _MATE_GDN_PREFILL_HAS_IS_LOG_SPACE,
-            )
+            # MUSA: feed mate no-copy strided q/k/v views (skip the qkv
+            # contiguous copy fused_post_conv_prep does) + one fused kernel for
+            # the log-space gating (g, beta). mate l2-norms q/k internally.
+            hk = self.num_k_heads // self.tp_size
+            hv = self.num_v_heads // self.tp_size
+            _kd = hk * self.head_k_dim
+            _vd = hv * self.head_v_dim
+            _qf, _kf, _vf = torch.split(mixed_qkv_non_spec, [_kd, _kd, _vd], dim=-1)
+            q = _qf.view(_qf.shape[0], hk, self.head_k_dim)
+            k = _kf.view(_kf.shape[0], hk, self.head_k_dim)
+            v = _vf.view(_vf.shape[0], hv, self.head_v_dim)
+            from vllm_musa.jit_kernel.fused_gdn_gating import fused_gdn_gating
+
+            g, beta = fused_gdn_gating(self.A_log, a_non_spec, b_non_spec, self.dt_bias)
             if not _MATE_GDN_PREFILL_HAS_IS_LOG_SPACE:
-                # Clamp exp-space g away from exact zero to avoid MATE NaNs on
-                # long real-model prefills with very negative log-space gates.
-                g = g.clamp_min(1e-30)
+                # Exp-space fallback for pre-is_log_space mate; clamp away from
+                # exact zero to avoid MATE NaNs on long prefills.
+                g = torch.exp(g).clamp_min(1e-30)
 
             state_indices = non_spec_state_indices_tensor.to(torch.int64)
             initial_state = ssm_state[state_indices].to(torch.float32)
             if has_initial_state is not None:
                 initial_state[~has_initial_state, ...] = 0
-            cu_seqlens = non_spec_query_start_loc.to(torch.int64)
+            # mate compiles the GDN kernel against this dtype; int32 indexing is
+            # cheaper and the offsets are bounded by the per-forward token cap.
+            cu_seqlens = non_spec_query_start_loc.to(torch.int32)
 
             mate_kwargs = {
                 "q": q,
@@ -213,6 +343,11 @@ class MusaQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             }
             if _MATE_GDN_PREFILL_HAS_IS_LOG_SPACE:
                 mate_kwargs["is_log_space"] = True
+
+            # Let mate write straight into the caller's buffer instead of
+            # producing a temporary that is then copied into it.
+            if out is not None and _MATE_GDN_PREFILL_HAS_OUTPUT:
+                mate_kwargs["output"] = out
 
             output, final_state = chunk_gated_delta_rule(**mate_kwargs)
             ssm_state.index_copy_(0, state_indices, final_state.to(ssm_state.dtype))
@@ -243,6 +378,13 @@ class MusaQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             causal_conv1d_fn,
             causal_conv1d_update,
         )
+
+        try:
+            from vllm_musa.jit_kernel.tilelang.causal_conv1d import (
+                musa_tilelang_causal_conv1d_fn as causal_conv1d_fn,
+            )
+        except Exception:
+            pass  # MUSA: fall back to Triton causal_conv1d_fn on import failure
 
         has_initial_state = attn_metadata.has_initial_state
         spec_query_start_loc = attn_metadata.spec_query_start_loc
@@ -342,6 +484,13 @@ class MusaQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             core_attn_out_spec = None
 
         assert non_spec_state_indices_tensor is not None
+        # With no spec-decode branch the mate output IS the destination, so hand the
+        # buffer down and let the kernel write it.
+        mate_out = (
+            core_attn_out[:num_actual_tokens]
+            if (core_attn_out_spec is None and _MATE_GDN_PREFILL_HAS_OUTPUT)
+            else None
+        )
         core_attn_out_non_spec = self._try_mate_prefill(
             mixed_qkv_non_spec,
             a_non_spec,
@@ -350,7 +499,9 @@ class MusaQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             non_spec_state_indices_tensor,
             non_spec_query_start_loc,
             has_initial_state,
+            out=mate_out,
         )
+        wrote_in_place = mate_out is not None and core_attn_out_non_spec is not None
         if core_attn_out_non_spec is None:
             if has_initial_state is not None:
                 zero_mask = ~has_initial_state
@@ -384,7 +535,7 @@ class MusaQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             merged_out.index_copy_(1, spec_token_indx, core_attn_out_spec)
             merged_out.index_copy_(1, non_spec_token_indx, core_attn_out_non_spec)
             core_attn_out[:num_actual_tokens] = merged_out.squeeze(0)
-        else:
+        elif not wrote_in_place:
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
 
 
