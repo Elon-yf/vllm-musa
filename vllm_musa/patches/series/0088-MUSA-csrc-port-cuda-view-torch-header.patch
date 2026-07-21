@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: musa <musa@local>
+Date: Tue, 21 Jul 2026 18:50:00 +0800
+Subject: [PATCH] MUSA(csrc): port cuda_view torch header
+
+torchada 0.1.75 intentionally narrows generic cuda.h replacement to avoid
+rewriting filenames that merely contain that token.  The CUDA view source is
+the one remaining nested torch/cuda.h include, and torch_musa provides the
+corresponding torch/musa.h header.
+---
+ csrc/cuda_view.cu | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/csrc/cuda_view.cu b/csrc/cuda_view.cu
+--- a/csrc/cuda_view.cu
++++ b/csrc/cuda_view.cu
+@@ -1,6 +1,6 @@
+ // TODO: Remove this once ROCm upgrade to torch 2.11.
+ #include <torch/all.h>
+-#include <torch/cuda.h>
++#include <torch/musa.h>
+ #include <cuda_runtime.h>
+ 
+ // This function assumes that `cpu_tensor` is a CPU tensor,
