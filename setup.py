@@ -221,6 +221,7 @@ VLLM_MUSA_CSRC_SOURCES = [
     "csrc/musa/quantization/fused_add_rms_norm_per_token_group_fp8_quant.cu",
     "csrc/musa/quantization/per_token_group_quant_8bit_vec.cu",
     "csrc/musa/sampler.mu",
+    "csrc/musa/min_p_sampler.mu",
     str(_FLASHINFER_REPO.source_dir / "csrc/norm.cu"),
     str(_FLASHINFER_REPO.source_dir / "csrc/renorm.cu"),
     str(_FLASHINFER_REPO.source_dir / "csrc/sampling.cu"),
