@@ -275,6 +275,21 @@ def _top_k_renorm_probs_internal(
     probs = probs.float()
     maybe_top_k_arr = maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
     renorm_probs = torch.empty_like(probs)
+    use_rubymine = (
+        maybe_top_k_arr is None
+        and top_k_val == 50
+        and probs.device.type == "musa"
+        and _is_validated_musa_device(probs.device)
+        and probs.ndim == 2
+        and probs.is_contiguous()
+        and 0 < probs.shape[0] <= 64
+        and probs.shape[1] in (151936, 248320)
+    )
+    if use_rubymine:
+        torch.ops._C_musa_ops.musa_rubymine_top_k_renorm_probs.default(
+            probs, renorm_probs, top_k_val
+        )
+        return renorm_probs
     torch.ops._C_musa_ops.top_k_renorm_probs.default(
         probs, renorm_probs, maybe_top_k_arr, top_k_val
     )

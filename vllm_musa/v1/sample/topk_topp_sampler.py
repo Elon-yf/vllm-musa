@@ -21,6 +21,11 @@ logger = logging.getLogger(__name__)
 _SAMPLING_EPS = 1e-5
 
 
+def _is_uniform_top_k_50(top_k: np.ndarray) -> bool:
+    """Whether existing CPU sampling state selects the k=50 specialization."""
+    return top_k.size > 0 and bool(np.all(top_k == 50))
+
+
 def musa_seeded_multinomial_enabled() -> bool:
     return envs.VLLM_MUSA_SEEDED_MULTINOMIAL.get()
 
@@ -450,11 +455,17 @@ def sample_worker_logits(
     idx_mapping_np: np.ndarray,
 ) -> torch.Tensor:
     vocab_size = sampling_states.vocab_size
-    use_top_k = np.any(sampling_states.top_k.np[idx_mapping_np] != vocab_size)
+    top_k_np = sampling_states.top_k.np[idx_mapping_np]
+    use_top_k = np.any(top_k_np != vocab_size)
     use_top_p = np.any(sampling_states.top_p.np[idx_mapping_np] != 1.0)
     use_min_p = np.any(sampling_states.min_p.np[idx_mapping_np] != 0.0)
 
-    top_k = sampling_states.top_k.gpu[expanded_idx_mapping] if use_top_k else None
+    # Select the scalar from existing CPU sampling state so the decode path
+    # never copies a device tensor to the host merely to choose a kernel.
+    if use_top_k and _is_uniform_top_k_50(top_k_np):
+        top_k = 50
+    else:
+        top_k = sampling_states.top_k.gpu[expanded_idx_mapping] if use_top_k else None
     top_p = sampling_states.top_p.gpu[expanded_idx_mapping] if use_top_p else None
     min_p = sampling_states.min_p.gpu[expanded_idx_mapping] if use_min_p else None
     return sample_from_logits(logits, top_k, top_p, min_p)
