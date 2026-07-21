@@ -218,6 +218,7 @@ VLLM_MUSA_CSRC_SOURCES = [
     "csrc/musa/mhc/deepseek_v4_mhc_pre.mu",
     "csrc/musa/moe/deepseek_v4_topk_softplus_sqrt.mu",
     "csrc/musa/quantization/silu_and_mul_per_token_group_fp8_quant.cu",
+    "csrc/musa/quantization/fused_add_rms_norm_per_token_group_fp8_quant.cu",
     "csrc/musa/quantization/per_token_group_quant_8bit_vec.cu",
     "csrc/musa/sampler.mu",
     str(_FLASHINFER_REPO.source_dir / "csrc/norm.cu"),

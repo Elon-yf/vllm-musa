@@ -50,6 +50,11 @@ void silu_and_mul_per_token_group_fp8_quant(
     int64_t group_size, double eps, double fp8_min,
     double fp8_max);
 
+void fused_add_rms_norm_per_token_group_fp8_quant(
+    const torch::Tensor& input, const torch::Tensor& residual,
+    const torch::Tensor& weight, torch::Tensor& residual_out,
+    torch::Tensor& output_q, torch::Tensor& output_scale, double epsilon);
+
 void per_token_group_quant_8bit_vec(
     const torch::Tensor& input,
     torch::Tensor& output_q, torch::Tensor& output_s,

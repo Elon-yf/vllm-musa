@@ -233,6 +233,12 @@ _SHADOW_MODULES = [
         "MUSA dense SwiGLU plus FP8 DeepGEMM fusion pattern",
     ),
     (
+        "5",
+        "vllm_musa/compilation/passes/rms_deepgemm_fusion.py",
+        "vllm/compilation/passes/fusion/rms_quant_fusion.py",
+        "MUSA residual RMSNorm plus FP8 DeepGEMM fusion pattern",
+    ),
+    (
         "4a",
         "vllm_musa/v1/attention/backends/flash_attn.py",
         "vllm/v1/attention/backends/flash_attn.py",
