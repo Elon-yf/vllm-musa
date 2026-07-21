@@ -49,6 +49,13 @@ class TestMUSAPlatformBase:
 
         assert MUSAPlatformBase.ray_device_key == "GPU"
 
+    def test_uses_musa_post_grad_pass_manager(self):
+        from vllm_musa.platform import MUSAPlatformBase
+
+        assert MUSAPlatformBase.get_pass_manager_cls() == (
+            "vllm_musa.compilation.passes.MusaPostGradPassManager"
+        )
+
     def test_is_cuda_alike_returns_true(self):
         """Test that is_cuda_alike returns True for MUSA."""
         from vllm_musa.platform import MUSAPlatformBase

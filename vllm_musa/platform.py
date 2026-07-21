@@ -155,6 +155,48 @@ def _has_routed_experts(model_config: Any | None) -> bool:
     )
 
 
+def _is_validated_qwen3_8b_fp8_single_gpu(vllm_config: Any) -> bool:
+    """Return whether the validated Qwen3-8B FP8 single-GPU scope is selected."""
+    model_config = getattr(vllm_config, "model_config", None)
+    if model_config is None or _has_routed_experts(model_config):
+        return False
+
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    if hf_text_config is None:
+        hf_config = getattr(model_config, "hf_config", None)
+        hf_text_config = getattr(hf_config, "text_config", hf_config)
+    architectures = getattr(model_config, "architectures", None)
+    if architectures is None:
+        architectures = getattr(hf_text_config, "architectures", None)
+
+    quantization = getattr(model_config, "quantization", None)
+    if quantization is None:
+        quantization_config = getattr(hf_text_config, "quantization_config", {})
+        if isinstance(quantization_config, dict):
+            quantization = quantization_config.get("quant_method")
+
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    single_gpu = all(
+        getattr(parallel_config, name, 1) == 1
+        for name in (
+            "tensor_parallel_size",
+            "pipeline_parallel_size",
+            "data_parallel_size",
+        )
+    )
+    return (
+        tuple(architectures or ()) == ("Qwen3ForCausalLM",)
+        and getattr(hf_text_config, "model_type", None) == "qwen3"
+        and getattr(hf_text_config, "hidden_size", None) == 4096
+        and getattr(hf_text_config, "intermediate_size", None) == 12288
+        and getattr(hf_text_config, "num_hidden_layers", None) == 36
+        and quantization == "fp8"
+        and getattr(model_config, "dtype", None) == torch.bfloat16
+        and single_gpu
+        and getattr(vllm_config, "speculative_config", None) is None
+    )
+
+
 def _deepseek_v4_flashmla_sparse_block_size(model_config: Any | None) -> int:
     value = os.getenv(_DEEPSEEK_V4_FLASHMLA_SPARSE_BLOCK_ENV)
     if value is None or not _is_deepseek_v4_model(model_config):
@@ -375,6 +417,10 @@ class MUSAPlatformBase(Platform):
     ray_noset_device_env_vars: list[str] = [
         "RAY_EXPERIMENTAL_NOSET_MUSA_VISIBLE_DEVICES",
     ]
+
+    @classmethod
+    def get_pass_manager_cls(cls) -> str:
+        return "vllm_musa.compilation.passes.MusaPostGradPassManager"
 
     @property
     def supported_dtypes(self) -> list[torch.dtype]:
