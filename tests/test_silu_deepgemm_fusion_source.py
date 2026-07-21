@@ -50,6 +50,20 @@ def test_pass_manager_keeps_the_experimental_scope_narrow():
     assert "self.passes.append(MusaSiluDeepGemmFusionPass(config))" in source
 
 
+def test_pass_manager_uses_independent_standard_fusion_flags():
+    source = (
+        ROOT / "vllm_musa" / "compilation" / "passes" / "pass_manager.py"
+    ).read_text()
+
+    silu_block, rms_block = source.split(
+        "        if (\n            _rms_deepgemm_fusion_requested(config)", 1
+    )
+    assert "self.pass_config.fuse_act_quant" in silu_block
+    assert "self.pass_config.fuse_norm_quant" not in silu_block
+    assert "self.pass_config.fuse_norm_quant" in rms_block
+    assert "self.pass_config.fuse_act_quant" not in rms_block
+
+
 def test_platform_auto_enablement_is_limited_to_the_validated_scope():
     source = (ROOT / "vllm_musa" / "platform.py").read_text()
 
