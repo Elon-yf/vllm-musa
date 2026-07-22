@@ -386,8 +386,12 @@ class TestNativeGemvSource:
         source = Path("csrc/musa/gemv.mu").read_text()
 
         assert "ShouldUseQwenFp8Moe32x4(" in source
-        assert "hidden_size == 2048 && nr_n == 768" in source
-        assert "hidden_size == 768 && nr_n == 2048" in source
+        assert "nr_n == 768 || nr_n == 512 || nr_n == 384" in source
+        assert "nr_n == 256 || nr_n == 128" in source
+        assert "use_swigelu && hidden_size == 2048 && qwen_intermediate_size" in source
+        assert "!use_swigelu && nr_n == 2048" in source
+        assert "hidden_size == 512 || hidden_size == 384" in source
+        assert "hidden_size == 256 || hidden_size == 128" in source
         assert "BlockConfig qwen_fp8_moe_config{32, 4" in source
         assert "case 4: GEN_LAUNCH_KERN(32, 4)" in source
 
