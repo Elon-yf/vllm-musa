@@ -719,12 +719,6 @@ class MUSAPlatformBase(Platform):
                 model_config,
                 getattr(parallel_config, "tensor_parallel_size", None),
             )
-            if os.environ.get("VLLM_MUSA_DEEPSEEK_V4_FUSED_MOE_GEMV") is None:
-                os.environ["VLLM_MUSA_DEEPSEEK_V4_FUSED_MOE_GEMV"] = "1"
-                logger.info(
-                    "Enabling DeepSeek-V4 MUSA fused-MoE GEMV dispatcher "
-                    "(set VLLM_MUSA_DEEPSEEK_V4_FUSED_MOE_GEMV=0 to disable)."
-                )
             if _DEEPSEEK_V4_GEMV_MOE_BLOCK_ENV not in os.environ:
                 os.environ[_DEEPSEEK_V4_GEMV_MOE_BLOCK_ENV] = (
                     _DEEPSEEK_V4_DEFAULT_GEMV_MOE_BLOCK

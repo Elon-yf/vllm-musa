@@ -36,6 +36,7 @@ class TestCustomOpsRuntimePatches:
         # the dflash fallback is now the vllm._custom_ops cat-6 object
         # patch; load + apply() it and assert it rebinds to the _shared helpers.
         import vllm
+
         from vllm_musa.patches import _get_patch_files, _load_patch_module, _shared
 
         vllm_ops = ModuleType("vllm._custom_ops")
@@ -163,9 +164,9 @@ class TestMUSAFlashAttentionReshapeCache:
     """
 
     def _load_fa_utils_with_musa_platform(self, monkeypatch, musa_ops_namespace):
+        import vllm
         import vllm.platforms as vllm_platforms
 
-        import vllm
         import vllm_musa
 
         monkeypatch.setenv("VLLM_MUSA_RESHAPE_CACHE_FLASH", "1")
@@ -495,7 +496,7 @@ class TestMUSAPlatformDefaults:
 
             MUSAPlatformBase.check_and_update_config(vllm_config)
 
-            assert os.environ["VLLM_MUSA_DEEPSEEK_V4_FUSED_MOE_GEMV"] == "1"
+            assert "VLLM_MUSA_DEEPSEEK_V4_FUSED_MOE_GEMV" not in os.environ
             assert os.environ["VLLM_MUSA_GEMV_MOE_BLOCK"] == "32x8"
 
     def test_deepseek_v4_preserves_user_moe_gemv_block(self):
@@ -563,8 +564,6 @@ class TestMUSAPlatformDefaults:
             "VLLM_MUSA_DEEPSEEK_V4_INDEXER_TOPK_PREFILL_MATERIALIZED_TOPK_SORTED",
             "VLLM_MUSA_DEEPSEEK_V4_INDEXER_TOPK_PREFILL_MATERIALIZED_DIRECT",
             "VLLM_MUSA_DEEPSEEK_V4_QNORM_ROPE_KV_INSERT_FUSED",
-            "VLLM_MUSA_DEEPSEEK_V4_MOE_DEEPGEMM_PREFILL",
-            "VLLM_MUSA_DEEPSEEK_V4_FUSED_MOE_GEMV",
         ]
 
         with patch.dict(os.environ, {}, clear=False):
@@ -573,7 +572,7 @@ class TestMUSAPlatformDefaults:
 
             MUSAPlatformBase.check_and_update_config(vllm_config)
 
-            assert os.environ["VLLM_MUSA_DEEPSEEK_V4_FUSED_MOE_GEMV"] == "1"
+            assert "VLLM_MUSA_DEEPSEEK_V4_FUSED_MOE_GEMV" not in os.environ
             assert os.environ["VLLM_MUSA_GEMV_MOE_BLOCK"] == "32x8"
             assert "VLLM_MUSA_FUSED_ADD_RMSNORM_BLOCK_X" not in os.environ
             assert "VLLM_MUSA_DEEPSEEK_V4_FLASHMLA_SPARSE_BLOCK_SIZE" not in os.environ
@@ -611,7 +610,6 @@ class TestMUSAPlatformDefaults:
                 not in os.environ
             )
             assert "VLLM_MUSA_DEEPSEEK_V4_QNORM_ROPE_KV_INSERT_FUSED" not in os.environ
-            assert "VLLM_MUSA_DEEPSEEK_V4_MOE_DEEPGEMM_PREFILL" not in os.environ
 
     def test_deepseek_v4_tp8_profile_sets_missing_envs(self):
         from vllm_musa.platform import MUSAPlatformBase
@@ -639,8 +637,6 @@ class TestMUSAPlatformDefaults:
             "VLLM_MUSA_DEEPSEEK_V4_INDEXER_TOPK_PREFILL_MATERIALIZED_TOPK_SORTED",
             "VLLM_MUSA_DEEPSEEK_V4_INDEXER_TOPK_PREFILL_MATERIALIZED_DIRECT",
             "VLLM_MUSA_DEEPSEEK_V4_QNORM_ROPE_KV_INSERT_FUSED",
-            "VLLM_MUSA_DEEPSEEK_V4_MOE_DEEPGEMM_PREFILL",
-            "VLLM_MUSA_DEEPSEEK_V4_FUSED_MOE_GEMV",
         ]
 
         with patch.dict(
@@ -653,7 +649,7 @@ class TestMUSAPlatformDefaults:
 
             MUSAPlatformBase.check_and_update_config(vllm_config)
 
-            assert os.environ["VLLM_MUSA_DEEPSEEK_V4_FUSED_MOE_GEMV"] == "1"
+            assert "VLLM_MUSA_DEEPSEEK_V4_FUSED_MOE_GEMV" not in os.environ
             assert os.environ["VLLM_MUSA_GEMV_MOE_BLOCK"] == "16x8"
             assert os.environ["VLLM_MUSA_FUSED_ADD_RMSNORM_BLOCK_X"] == "256"
             assert (
@@ -699,7 +695,6 @@ class TestMUSAPlatformDefaults:
                 not in os.environ
             )
             assert "VLLM_MUSA_DEEPSEEK_V4_QNORM_ROPE_KV_INSERT_FUSED" not in os.environ
-            assert "VLLM_MUSA_DEEPSEEK_V4_MOE_DEEPGEMM_PREFILL" not in os.environ
             assert vllm_config.cache_config.block_size == 256
 
     def test_deepseek_v4_tp8_aggressive_profile_sets_mhc_deepgemm(self):
@@ -728,8 +723,6 @@ class TestMUSAPlatformDefaults:
             "VLLM_MUSA_DEEPSEEK_V4_INDEXER_TOPK_PREFILL_MATERIALIZED_TOPK_SORTED",
             "VLLM_MUSA_DEEPSEEK_V4_INDEXER_TOPK_PREFILL_MATERIALIZED_DIRECT",
             "VLLM_MUSA_DEEPSEEK_V4_QNORM_ROPE_KV_INSERT_FUSED",
-            "VLLM_MUSA_DEEPSEEK_V4_MOE_DEEPGEMM_PREFILL",
-            "VLLM_MUSA_DEEPSEEK_V4_FUSED_MOE_GEMV",
         ]
 
         with patch.dict(
@@ -742,7 +735,7 @@ class TestMUSAPlatformDefaults:
 
             MUSAPlatformBase.check_and_update_config(vllm_config)
 
-            assert os.environ["VLLM_MUSA_DEEPSEEK_V4_FUSED_MOE_GEMV"] == "1"
+            assert "VLLM_MUSA_DEEPSEEK_V4_FUSED_MOE_GEMV" not in os.environ
             assert os.environ["VLLM_MUSA_GEMV_MOE_BLOCK"] == "16x8"
             assert os.environ["VLLM_MUSA_FUSED_ADD_RMSNORM_BLOCK_X"] == "256"
             assert (
@@ -816,7 +809,6 @@ class TestMUSAPlatformDefaults:
                 == "1"
             )
             assert os.environ["VLLM_MUSA_DEEPSEEK_V4_QNORM_ROPE_KV_INSERT_FUSED"] == "1"
-            assert os.environ["VLLM_MUSA_DEEPSEEK_V4_MOE_DEEPGEMM_PREFILL"] == "1"
             assert vllm_config.cache_config.block_size == 256
 
     def test_deepseek_v4_tp8_profile_preserves_explicit_overrides(self):
@@ -849,7 +841,6 @@ class TestMUSAPlatformDefaults:
             "VLLM_MUSA_DEEPSEEK_V4_INDEXER_TOPK_PREFILL_MATERIALIZED_TOPK_SORTED": "1",
             "VLLM_MUSA_DEEPSEEK_V4_INDEXER_TOPK_PREFILL_MATERIALIZED_DIRECT": "0",
             "VLLM_MUSA_DEEPSEEK_V4_QNORM_ROPE_KV_INSERT_FUSED": "0",
-            "VLLM_MUSA_DEEPSEEK_V4_MOE_DEEPGEMM_PREFILL": "0",
         }
 
         with patch.dict(os.environ, env, clear=False):
@@ -924,7 +915,6 @@ class TestMUSAPlatformDefaults:
                 == "0"
             )
             assert os.environ["VLLM_MUSA_DEEPSEEK_V4_QNORM_ROPE_KV_INSERT_FUSED"] == "0"
-            assert os.environ["VLLM_MUSA_DEEPSEEK_V4_MOE_DEEPGEMM_PREFILL"] == "0"
             assert vllm_config.cache_config.block_size == 64
 
     def test_deepseek_v4_tp8_profile_rejects_unknown_name(self):
@@ -1186,7 +1176,11 @@ class TestMUSAFp8MoEPadding:
         monkeypatch.setattr(
             musa_fp8,
             "_ORIGINAL_FP8_MOE_MAYBE_ROUNDUP_SIZES",
-            lambda self, hidden_size, intermediate_size_per_partition, act_dtype, moe_parallel_config: (
+            lambda self,
+            hidden_size,
+            intermediate_size_per_partition,
+            act_dtype,
+            moe_parallel_config: (
                 hidden_size,
                 intermediate_size_per_partition,
             ),

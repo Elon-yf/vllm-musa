@@ -61,6 +61,7 @@ include = ["vllm_musa*"]
 vllm_musa = [
     "jit_kernel/csrc/*.h",
     "jit_kernel/csrc/*/*.mu",
+    "jit_kernel/include/.gitkeep",
 ]
 
 [tool.ruff]
