@@ -221,6 +221,24 @@ _CAT6: list[DivSpec] = [
 # `musa_sync census` (difflib needs an upstream clone, so this is frozen data).
 _SHADOW_MODULES = [
     (
+        "5",
+        "vllm_musa/compilation/passes/pass_manager.py",
+        "vllm/compilation/passes/pass_manager.py",
+        "OOT post-grad pass manager with MUSA-only fusion registration",
+    ),
+    (
+        "5",
+        "vllm_musa/compilation/passes/silu_deepgemm_fusion.py",
+        "vllm/compilation/passes/fusion/act_quant_fusion.py",
+        "MUSA dense SwiGLU plus FP8 DeepGEMM fusion pattern",
+    ),
+    (
+        "5",
+        "vllm_musa/compilation/passes/rms_deepgemm_fusion.py",
+        "vllm/compilation/passes/fusion/rms_quant_fusion.py",
+        "MUSA residual RMSNorm plus FP8 DeepGEMM fusion pattern",
+    ),
+    (
         "4a",
         "vllm_musa/v1/attention/backends/flash_attn.py",
         "vllm/v1/attention/backends/flash_attn.py",

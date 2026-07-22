@@ -1,5 +1,6 @@
 # Runtime Python dependencies that are portable across MUSA images.
-torchada>=0.1.73
+# 0.1.76 ports nested torch/cuda.h includes to torch/musa.h during builds.
+torchada>=0.1.76
 mthreads-ml-py>=2.2.11
 numpy==1.26
 openai>=2.24.0

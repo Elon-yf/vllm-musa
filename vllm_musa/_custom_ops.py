@@ -1,7 +1,11 @@
 import logging
+from functools import cache
 from typing import Optional, Union
 
 import torch
+
+_QWEN_MIN_P_VOCABS = (151936, 248320)
+_QWEN_MIN_P_MAX_BATCH = 64
 
 try:
     import vllm_musa._C  # noqa: F401
@@ -170,6 +174,99 @@ def _to_tensor_scalar_tuple(x):
         return (None, x)
 
 
+def _musa_device_index(device: torch.device) -> Optional[int]:
+    """Resolve a logical MUSA device index without changing the current device."""
+    try:
+        device_id = device.index
+        if device_id is None:
+            device_id = int(torch.musa.current_device())
+        if device_id < 0 or device_id >= torch.musa.device_count():
+            return None
+        return device_id
+    except Exception:
+        return None
+
+
+@cache
+def _get_musa_device_capability(device_id: int) -> tuple[int, int]:
+    """Query one logical MUSA device and cache successful results."""
+    return torch.musa.get_device_capability(device_id)
+
+
+def _is_validated_musa_device(device: torch.device) -> bool:
+    """Return whether the tensor's device is the validated S5000 target."""
+    try:
+        device_id = _musa_device_index(device)
+        if device_id is None:
+            return False
+        # torch.musa accepts visible logical IDs, matching torch.device.index.
+        return _get_musa_device_capability(device_id) == (3, 1)
+    except Exception:
+        # A device query can fail while the platform is still initializing.
+        # Falling back is safer than selecting an architecture-specialized op.
+        return False
+
+
+def _is_supported_musa_generator(
+    generator: Optional[torch.Generator], device: torch.device
+) -> bool:
+    """Check that a seeded generator belongs to the sampled MUSA device."""
+    if generator is None:
+        return True
+    try:
+        generator_device = generator.device
+        if getattr(generator_device, "type", None) != "musa":
+            return False
+        tensor_device_id = _musa_device_index(device)
+        generator_device_id = _musa_device_index(generator_device)
+        return (
+            tensor_device_id is not None
+            and generator_device_id is not None
+            and tensor_device_id == generator_device_id
+        )
+    except Exception:
+        return False
+
+
+def _can_use_chunked_min_p_sampler(
+    probs: torch.Tensor,
+    indices: Optional[torch.Tensor],
+    maybe_min_p_arr: Optional[torch.Tensor],
+    deterministic: bool,
+    generator: Optional[torch.Generator],
+) -> bool:
+    """Gate the chunked min-p kernel to its validated production contract."""
+    return (
+        deterministic
+        and probs.device.type == "musa"
+        and _is_validated_musa_device(probs.device)
+        and probs.dtype == torch.float32
+        and probs.ndim == 2
+        and 0 < probs.shape[0] <= _QWEN_MIN_P_MAX_BATCH
+        and probs.shape[1] in _QWEN_MIN_P_VOCABS
+        and probs.is_contiguous()
+        and _is_supported_musa_generator(generator, probs.device)
+        and (
+            indices is None
+            or (
+                indices.dtype == torch.int32
+                and indices.device == probs.device
+                and indices.is_contiguous()
+                and indices.numel() >= probs.shape[0]
+            )
+        )
+        and (
+            maybe_min_p_arr is None
+            or (
+                maybe_min_p_arr.device == probs.device
+                and maybe_min_p_arr.dtype == torch.float32
+                and maybe_min_p_arr.is_contiguous()
+                and maybe_min_p_arr.numel() >= probs.shape[0]
+            )
+        )
+    )
+
+
 def _top_k_renorm_probs_internal(
     probs: torch.Tensor,
     maybe_top_k_arr: Optional[torch.Tensor],
@@ -178,6 +275,21 @@ def _top_k_renorm_probs_internal(
     probs = probs.float()
     maybe_top_k_arr = maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
     renorm_probs = torch.empty_like(probs)
+    use_rubymine = (
+        maybe_top_k_arr is None
+        and top_k_val == 50
+        and probs.device.type == "musa"
+        and _is_validated_musa_device(probs.device)
+        and probs.ndim == 2
+        and probs.is_contiguous()
+        and 0 < probs.shape[0] <= 64
+        and probs.shape[1] in (151936, 248320)
+    )
+    if use_rubymine:
+        torch.ops._C_musa_ops.musa_rubymine_top_k_renorm_probs.default(
+            probs, renorm_probs, top_k_val
+        )
+        return renorm_probs
     torch.ops._C_musa_ops.top_k_renorm_probs.default(
         probs, renorm_probs, maybe_top_k_arr, top_k_val
     )
@@ -323,10 +435,24 @@ def _min_p_sampling_from_probs_internal(
     generator: Optional[torch.Generator],
 ) -> torch.Tensor:
     device = probs.device
+    input_probs = probs
+    input_min_p_arr = maybe_min_p_arr
     probs = probs.float()
     maybe_min_p_arr = maybe_min_p_arr.float() if maybe_min_p_arr is not None else None
     samples = torch.empty(probs.size(0), dtype=torch.int32, device=device)
-    torch.ops._C_musa_ops.min_p_sampling_from_probs.default(
+    use_chunked = _can_use_chunked_min_p_sampler(
+        input_probs,
+        indices,
+        input_min_p_arr,
+        deterministic,
+        generator,
+    )
+    op = (
+        torch.ops._C_musa_ops.musa_chunked_min_p_sampling_from_probs.default
+        if use_chunked
+        else torch.ops._C_musa_ops.min_p_sampling_from_probs.default
+    )
+    op(
         probs,
         samples,
         indices,

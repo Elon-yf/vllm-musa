@@ -21,8 +21,9 @@ logger = logging.getLogger(__name__)
 _SAMPLING_EPS = 1e-5
 
 
-def sampler_fast_path_enabled() -> bool:
-    return envs.VLLM_MUSA_SAMPLER_FAST_PATH.get()
+def _is_uniform_top_k_50(top_k: np.ndarray) -> bool:
+    """Whether existing CPU sampling state selects the k=50 specialization."""
+    return top_k.size > 0 and bool(np.all(top_k == 50))
 
 
 def musa_seeded_multinomial_enabled() -> bool:
@@ -38,8 +39,6 @@ def can_use_musa_sampler(
     generators: dict[int, torch.Generator],
     logprobs_mode: LogprobsMode,
 ) -> bool:
-    if not sampler_fast_path_enabled():
-        return False
     if not current_platform.is_musa() or not is_musa_tensor(logits):
         return False
     if generators:
@@ -142,9 +141,7 @@ def sample_probs_seeded_multinomial(
     for row_idx in range(probs.shape[0]):
         generator = generators.get(row_idx)
         if generator is None:
-            sample = torch.multinomial(
-                probs[row_idx], num_samples=1, replacement=True
-            )
+            sample = torch.multinomial(probs[row_idx], num_samples=1, replacement=True)
         else:
             sample = torch.multinomial(
                 probs[row_idx],
@@ -199,7 +196,7 @@ def _apply_top_k_top_p(
     if p is None and k is None:
         return logits
 
-    if current_platform.is_musa() and sampler_fast_path_enabled():
+    if current_platform.is_musa():
         if k is not None and logits.shape[0] >= 16:
             if p is None and logits.shape[1] >= 65536:
                 max_top_k = int(k.to(torch.long).max().item())
@@ -264,7 +261,6 @@ def _topk_topp_sampler_init(
     if (
         logprobs_mode not in ("processed_logits", "processed_logprobs")
         and current_platform.is_musa()
-        and sampler_fast_path_enabled()
     ):
         vllm_topk_topp_sampler.logger.info_once(
             "Using MUSA native ops for top-p/top-k/min-p sampling.",
@@ -441,8 +437,6 @@ def can_use_worker_sampler(
     sampling_states: Any,
     idx_mapping_np: np.ndarray,
 ) -> bool:
-    if not sampler_fast_path_enabled():
-        return False
     if not current_platform.is_musa() or not is_musa_tensor(logits):
         return False
     if logprobs_mode == "processed_logprobs":
@@ -461,11 +455,17 @@ def sample_worker_logits(
     idx_mapping_np: np.ndarray,
 ) -> torch.Tensor:
     vocab_size = sampling_states.vocab_size
-    use_top_k = np.any(sampling_states.top_k.np[idx_mapping_np] != vocab_size)
+    top_k_np = sampling_states.top_k.np[idx_mapping_np]
+    use_top_k = np.any(top_k_np != vocab_size)
     use_top_p = np.any(sampling_states.top_p.np[idx_mapping_np] != 1.0)
     use_min_p = np.any(sampling_states.min_p.np[idx_mapping_np] != 0.0)
 
-    top_k = sampling_states.top_k.gpu[expanded_idx_mapping] if use_top_k else None
+    # Select the scalar from existing CPU sampling state so the decode path
+    # never copies a device tensor to the host merely to choose a kernel.
+    if use_top_k and _is_uniform_top_k_50(top_k_np):
+        top_k = 50
+    else:
+        top_k = sampling_states.top_k.gpu[expanded_idx_mapping] if use_top_k else None
     top_p = sampling_states.top_p.gpu[expanded_idx_mapping] if use_top_p else None
     min_p = sampling_states.min_p.gpu[expanded_idx_mapping] if use_min_p else None
     return sample_from_logits(logits, top_k, top_p, min_p)
@@ -557,7 +557,9 @@ def _apply_worker_sampling_filters_for_seeded_multinomial(
     )
     logits = _apply_top_k_top_p(logits, top_k, top_p)
     if use_min_p:
-        sampler.sampling_states.apply_min_p(logits, expanded_idx_mapping, idx_mapping_np)
+        sampler.sampling_states.apply_min_p(
+            logits, expanded_idx_mapping, idx_mapping_np
+        )
     return logits
 
 
@@ -571,11 +573,8 @@ def _worker_sample(
     expanded_local_pos: torch.Tensor,
     return_logprobs: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if (
-        logits.shape[0] == idx_mapping_np.shape[0]
-        and can_use_worker_seeded_multinomial(
-            logits, self.logprobs_mode, self.sampling_states, idx_mapping_np
-        )
+    if logits.shape[0] == idx_mapping_np.shape[0] and can_use_worker_seeded_multinomial(
+        logits, self.logprobs_mode, self.sampling_states, idx_mapping_np
     ):
         vllm_topk_topp_sampler.logger.info_once(
             "Using MUSA seeded multinomial sampling for user-seeded requests.",

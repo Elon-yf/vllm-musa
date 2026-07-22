@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 def test_torchada_floor_is_consistent():
     assert "dynamic = [\"dependencies\"]" in (ROOT / "pyproject.toml").read_text()
-    assert "torchada>=0.1.73" in (
+    assert "torchada>=0.1.76" in (
         ROOT / "requirements" / "common.txt"
     ).read_text()
 

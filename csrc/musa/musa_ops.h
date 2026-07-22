@@ -50,6 +50,11 @@ void silu_and_mul_per_token_group_fp8_quant(
     int64_t group_size, double eps, double fp8_min,
     double fp8_max);
 
+void fused_add_rms_norm_per_token_group_fp8_quant(
+    const torch::Tensor& input, const torch::Tensor& residual,
+    const torch::Tensor& weight, torch::Tensor& residual_out,
+    torch::Tensor& output_q, torch::Tensor& output_scale, double epsilon);
+
 void per_token_group_quant_8bit_vec(
     const torch::Tensor& input,
     torch::Tensor& output_q, torch::Tensor& output_s,
@@ -66,6 +71,12 @@ void musa_top_k_top_p_sampling_from_probs(
     double top_p_val,
     bool deterministic,
     std::optional<at::Generator> gen_);
+
+void musa_chunked_min_p_sampling_from_probs(
+    at::Tensor probs, at::Tensor output,
+    std::optional<at::Tensor> maybe_indices,
+    std::optional<at::Tensor> maybe_min_p_arr, double min_p_val,
+    bool deterministic, std::optional<at::Generator> gen_);
 
     /*
 * From FlashInfer
@@ -85,6 +96,10 @@ void top_p_renorm_probs(at::Tensor probs, at::Tensor renorm_probs,
 
 void top_k_renorm_probs(at::Tensor probs, at::Tensor renorm_probs,
                         std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val);
+
+void musa_rubymine_top_k_renorm_probs(at::Tensor probs,
+                                      at::Tensor renorm_probs,
+                                      int64_t top_k_val);
 
 void deepseek_v4_store_sparse_kv(
     const torch::Tensor& normed,
