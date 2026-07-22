@@ -50,6 +50,28 @@ Custom `forward_oot` implementations registered for MUSA dispatch:
 | `layers/attention/mla_attention.py` | Multi-head Latent Attention (MLA) |
 | `warmup/deep_gemm_warmup.py` | DeepGEMM JIT warmup |
 
+#### FP8 MoE backend dispatch
+
+On S5000, block-128 E4M3 MoE layers use a shape-keyed `auto` policy. Only
+offline-calibrated per-rank shapes select native GEMV for small token batches.
+For large eligible prefill invocations, `auto` preserves the default-on
+contiguous DeepGEMM path; intermediate and unsupported shapes use
+the established upstream fused-MoE implementation. The experimental grouped
+backend added by this dispatcher remains disabled unless both its operator and
+serving gates produce a validated threshold. The policy is also keyed by graph
+mode and active MP count, so thresholds are not reused across incompatible
+devices.
+
+`VLLM_MUSA_FUSED_MOE_DISPATCH` is a diagnostic force/rollback control with the
+values `auto` (default), `upstream`, `gemv`, or `grouped_gemm`. Forced modes do
+not bypass dtype, layout, expert-parallel, device, or graph-capture safety
+checks. In particular, forced GEMV during graph capture is limited to a
+calibrated capture shape and token range; outside that range it falls back to
+upstream. Production deployments should leave the override unset and use
+`auto`. An explicit `upstream` value bypasses both native GEMV and the
+default-on DeepGEMM prefill path, which makes it suitable as a diagnostic
+rollback rather than a production default.
+
 ### `distributed/` – KV-Transfer Connector
 
 Registers a Mooncake-based KV connector (`mooncake_connector.py`) for disaggregated prefill/decode serving (conditionally loaded when the `mooncake` package is available).
