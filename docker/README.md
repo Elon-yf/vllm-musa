@@ -70,7 +70,7 @@ bash docker/build_image.sh --no-cache --build-arg http_proxy=http://proxy:8118
 | `GET_PIP_URL` | `https://bootstrap.pypa.io/get-pip.py` | PyPA bootstrap script; override this URL when the default host is unavailable from the build network. |
 | `PIP_BOOTSTRAP_INDEX_URL` | `${PYPI_INDEX_URL}` | Simple index used by the pip bootstrap; keep its host in `no_proxy` when the mirror is reached directly. |
 | `RUSTUP_DIST_SERVER` | empty | Optional rustup distribution mirror for the vllm-rs stage (for example `https://rsproxy.cn`). |
-| `RUSTUP_UPDATE_ROOT` | empty | Optional rustup update-root mirror paired with `RUSTUP_DIST_SERVER` (for example `https://rsproxy.cn/rustup/rustup`). |
+| `RUSTUP_UPDATE_ROOT` | empty | Optional rustup update-root mirror paired with `RUSTUP_DIST_SERVER` (for example `https://rsproxy.cn/rustup`). |
 | `MUSA_APT_SOURCE` | `https://dl.mthreads.com/repo/repository/ubuntu2204/` | apt repo for the MUSA runtime SDK. |
 | `INSTALL_MUSA_STACK` | `auto` | `auto`: install the MUSA apt stack unless the base already provides `mcc`; `0`: skip (base image supplies the runtime). |
 | `MUSA_RUNTIME_VERSION` | `5.2` | MUSA runtime line as `major.minor`; derives apt package names (e.g. `musa-toolkit-5-2`). |
