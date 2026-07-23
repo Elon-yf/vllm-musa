@@ -329,6 +329,22 @@ class TestMUSANativeKernelReviewHardening:
         assert "VLLM_MUSA_FUSED_ADD_RMSNORM_BLOCK_X must be one of" in source
         assert "128, 256, 512, or 1024" in source
 
+    def test_fused_rmsnorm_qwen2_small_hidden_uses_256_threads(self):
+        source = (
+            Path(__file__).parents[1] / "csrc/musa/fused_add_rmsnorm.mu"
+        ).read_text()
+
+        gate_start = source.index(
+            "use_qwen2_small_hidden_launch &&\n"
+            "             std::is_same<T, __mt_bfloat16>::value && rows > 0 &&"
+        )
+        gate = source[gate_start : source.index("} else", gate_start)]
+        assert "block_x = 256" in gate
+        assert "std::is_same<T, __mt_bfloat16>::value" in gate
+        assert "rows > 0" in gate
+        assert "rows <= 16 && hidden_size == 896" in gate
+        assert "at::musa::getMUSAArch(input.get_device()) == 310" in source
+
 
 class TestMUSAPlatformDefaults:
     """Tests for MUSA platform-level vLLM config defaults.

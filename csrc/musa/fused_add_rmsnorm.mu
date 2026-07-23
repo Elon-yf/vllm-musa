@@ -7,6 +7,7 @@
 #include "torch_musa/csrc/core/MUSAGuard.h"
 
 #include <cstdlib>
+#include <type_traits>
 
 #include "vec_utils.muh"
 
@@ -125,6 +126,7 @@ __global__ void __launch_bounds__(BLOCK_X, 1) fused_add_rmsnorm_kernel(
 template <typename T>
 void dispatch_fused_add_rmsnorm(T* input, T* residual, const T* weight,
                                 int rows, int hidden_size, float epsilon,
+                                bool use_qwen2_small_hidden_launch,
                                 musaStream_t stream) {
   const int vec_hidden_size = hidden_size / 8;
 
@@ -150,6 +152,11 @@ void dispatch_fused_add_rmsnorm(T* input, T* residual, const T* weight,
     block_x = 256;
   } else if (rows >= 8 && vec_hidden_size >= 1280) {
     block_x = 512;
+  } else if (use_qwen2_small_hidden_launch &&
+             std::is_same<T, __mt_bfloat16>::value && rows > 0 &&
+             rows <= 16 && hidden_size == 896) {
+    // MUSA: reduce idle threads and reduction overhead for small-row H=896.
+    block_x = 256;
   } else {
     block_x = 1024;
   }
@@ -228,13 +235,15 @@ void musa_fused_add_rms_norm(torch::Tensor& input, torch::Tensor& residual,
         static_cast<__half*>(input.data_ptr()),
         static_cast<__half*>(residual.data_ptr()),
         static_cast<const __half*>(weight.data_ptr()), rows, hidden_size,
-        static_cast<float>(epsilon), stream);
+        static_cast<float>(epsilon), false, stream);
   } else if (input.scalar_type() == at::ScalarType::BFloat16) {
+    const bool use_qwen2_small_hidden_launch =
+        at::musa::getMUSAArch(input.get_device()) == 310;
     vllm_musa::dispatch_fused_add_rmsnorm<__mt_bfloat16>(
         static_cast<__mt_bfloat16*>(input.data_ptr()),
         static_cast<__mt_bfloat16*>(residual.data_ptr()),
         static_cast<const __mt_bfloat16*>(weight.data_ptr()), rows, hidden_size,
-        static_cast<float>(epsilon), stream);
+        static_cast<float>(epsilon), use_qwen2_small_hidden_launch, stream);
   } else {
     TORCH_CHECK(false, "only fp16 and bf16 are supported");
   }

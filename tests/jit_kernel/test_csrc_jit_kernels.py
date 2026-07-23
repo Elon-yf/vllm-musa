@@ -405,6 +405,32 @@ def test_ir_fused_add_rmsnorm_preserves_functional_and_inplace_contracts() -> No
     _assert_close(residual_out, expected_residual, atol=0.0, rtol=0.0)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("rows", [1, 16])
+def test_ir_fused_add_rmsnorm_qwen2_small_hidden_contract(
+    dtype: torch.dtype,
+    rows: int,
+) -> None:
+    from vllm_musa.kernels.musa_ops import (
+        fused_add_rms_norm as musa_fused_add_rms_norm,
+    )
+
+    torch.manual_seed(896 + rows)
+    device = torch.device("musa")
+    eps = 1e-6
+    x = torch.randn((rows, 896), device=device, dtype=dtype)
+    residual = torch.randn_like(x)
+    weight = torch.randn((896,), device=device, dtype=dtype)
+    expected, expected_residual = _fused_add_rmsnorm_ref(x, residual, weight, eps)
+
+    output, residual_out = musa_fused_add_rms_norm.impl_fn(x, residual, weight, eps)
+
+    assert output.data_ptr() == x.data_ptr()
+    assert residual_out.data_ptr() == residual.data_ptr()
+    _assert_close(output, expected)
+    _assert_close(residual_out, expected_residual, atol=0.0, rtol=0.0)
+
+
 def _topk_softmax_ref(
     gating: torch.Tensor,
     topk: int,
