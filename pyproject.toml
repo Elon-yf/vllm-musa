@@ -49,6 +49,9 @@ musa = "vllm_musa:musa_platform_plugin"
 [project.entry-points."vllm.general_plugins"]
 musa_custom_ops = "vllm_musa:register_custom_ops"
 
+[project.entry-points."vllm_omni.general_plugins"]
+musa_custom_ops = "vllm_musa.omni:register_omni_optimizations"
+
 [project.urls]
 Homepage = "https://github.com/MooreThreads/vllm-musa"
 Repository = "https://github.com/MooreThreads/vllm-musa"
