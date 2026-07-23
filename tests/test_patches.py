@@ -335,15 +335,15 @@ class TestMUSANativeKernelReviewHardening:
         ).read_text()
 
         gate_start = source.index(
-            "use_qwen2_small_hidden_launch &&\n"
-            "             std::is_same<T, __mt_bfloat16>::value && rows > 0 &&"
+            "std::is_same<T, __mt_bfloat16>::value && rows > 0 &&"
         )
         gate = source[gate_start : source.index("} else", gate_start)]
         assert "block_x = 256" in gate
         assert "std::is_same<T, __mt_bfloat16>::value" in gate
         assert "rows > 0" in gate
         assert "rows <= 16 && hidden_size == 896" in gate
-        assert "at::musa::getMUSAArch(input.get_device()) == 310" in source
+        assert "use_qwen2_small_hidden_launch" not in source
+        assert "getMUSAArch" not in source
 
 
 class TestMUSAPlatformDefaults:
