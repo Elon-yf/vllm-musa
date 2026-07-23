@@ -9,10 +9,6 @@ ARG DEADSNAKES_MIRROR_URL=
 ARG DEADSNAKES_GPGKEY_URL=
 ARG GET_PIP_URL=https://bootstrap.pypa.io/get-pip.py
 ARG PIP_BOOTSTRAP_INDEX_URL=https://pypi.org/simple
-# Optional rustup mirrors for build networks that cannot reach
-# static.rust-lang.org. Empty values preserve rustup's upstream defaults.
-ARG RUSTUP_DIST_SERVER=
-ARG RUSTUP_UPDATE_ROOT=
 
 FROM ${BASE_IMAGE} AS base
 
@@ -23,8 +19,6 @@ ARG DEADSNAKES_MIRROR_URL
 ARG DEADSNAKES_GPGKEY_URL
 ARG GET_PIP_URL
 ARG PIP_BOOTSTRAP_INDEX_URL
-ARG RUSTUP_DIST_SERVER
-ARG RUSTUP_UPDATE_ROOT
 
 FROM base AS apt_base
 
@@ -407,6 +401,8 @@ RUN printf '%s\n' \
 FROM vllm_musa_installed AS vllm_rs_build
 
 ARG BUILD_VLLM_RS=1
+# Optional rustup mirrors for build networks that cannot reach
+# static.rust-lang.org. Empty values preserve rustup's upstream defaults.
 ARG RUSTUP_DIST_SERVER
 ARG RUSTUP_UPDATE_ROOT
 
