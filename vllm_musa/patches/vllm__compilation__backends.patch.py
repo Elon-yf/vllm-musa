@@ -1,15 +1,69 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MUSA cat-6 object patch: accept (and ignore) torch.compile backend keyword
-options on this vLLM snapshot (was inline
-``_patch_vllm_backend_call_options``)."""
+"""MUSA cat-6 object patch for the vLLM compilation backend.
+
+Accept torch.compile backend keyword options on this vLLM snapshot and apply
+the exact Qwen2 RoPE+KV-cache rewrite before vLLM splits the raw FX graph.
+"""
 
 from functools import wraps
+from pathlib import Path
 
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
 PATCHES: list = []
+
+
+def _try_qwen2_rope_kv_presplit(backend, graph) -> int:
+    vllm_config = getattr(backend, "vllm_config", None)
+    compilation_config = getattr(backend, "compilation_config", None)
+    if vllm_config is None or compilation_config is None:
+        return 0
+
+    from vllm_musa.compilation import qwen2_rope_kv_presplit as presplit
+    from vllm_musa.platform import _is_qwen2_rope_kv_fusion_config
+
+    if not _is_qwen2_rope_kv_fusion_config(vllm_config):
+        return 0
+
+    splitting_ops = compilation_config.splitting_ops
+    if (
+        compilation_config.use_inductor_graph_partition
+        or splitting_ops is None
+        or presplit.KV_UPDATE_SPLITTING_OP not in splitting_ops
+    ):
+        logger.warning_once(
+            "MUSA Qwen2 RoPE+KV fusion requires the baseline Dynamo KV-cache "
+            "split; keeping the unfused graph."
+        )
+        return 0
+
+    candidates = presplit.plan_qwen2_rope_kv_presplit(graph)
+    if candidates is None:
+        logger.warning_once(
+            "MUSA Qwen2 RoPE+KV fusion did not find the exact 24-layer raw FX "
+            "graph; keeping the baseline split graph."
+        )
+        return 0
+
+    matched = presplit.apply_qwen2_rope_kv_presplit(graph, candidates)
+    if presplit.FUSED_SPLITTING_OP not in splitting_ops:
+        compilation_config.splitting_ops = [
+            *splitting_ops,
+            presplit.FUSED_SPLITTING_OP,
+        ]
+
+    compilation_config.traced_files.update(
+        {
+            str(Path(__file__).resolve()),
+            str(Path(presplit.__file__).resolve()),
+        }
+    )
+    logger.info_once(
+        "Applied the MUSA Qwen2 RoPE+KV pre-split fusion to %d layers.", matched
+    )
+    return matched
 
 
 def apply() -> None:
@@ -25,6 +79,7 @@ def apply() -> None:
 
     @wraps(original_call)
     def call_with_ignored_options(self, graph, example_inputs, **kwargs):
+        _try_qwen2_rope_kv_presplit(self, graph)
         return original_call(self, graph, example_inputs)
 
     call_with_ignored_options._musa_accepts_backend_options = True

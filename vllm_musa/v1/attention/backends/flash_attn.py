@@ -1382,6 +1382,74 @@ class FlashAttentionImpl(AttentionImpl):
         )
         return output
 
+    def fused_rope_kvcache_supported(self) -> bool:
+        """Whether this layer is inside the exact Qwen2 fusion envelope."""
+        from vllm_musa.utils.environ import envs as musa_envs
+
+        return (
+            musa_envs.VLLM_MUSA_QWEN2_ROPE_KV_FUSION.get()
+            and self.num_heads == 14
+            and self.num_kv_heads == 2
+            and self.head_size == 64
+            and self.attn_type == AttentionType.DECODER
+            and self.kv_cache_dtype in ("auto", "bfloat16")
+            and self.alibi_slopes is None
+            and self.sliding_window == (-1, -1)
+            and not self.logits_soft_cap
+            and self.sinks is None
+            and self.kv_sharing_target_layer_name is None
+        )
+
+    def do_rope_and_kv_cache_update(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        is_neox: bool,
+        kv_cache: torch.Tensor,
+        layer_slot_mapping: torch.Tensor,
+    ) -> None:
+        """Apply Qwen2 RoPE and populate its NHD cache in one MUSA launch."""
+        if query.shape[0] <= 1:
+            key_cache, value_cache = kv_cache.unbind(0)
+            from vllm_musa.kernels.qwen2_rope_kv import try_qwen2_rope_kv_cache
+
+            if try_qwen2_rope_kv_cache(
+                query,
+                key,
+                value,
+                positions,
+                cos_sin_cache,
+                is_neox,
+                key_cache,
+                value_cache,
+                layer_slot_mapping,
+            ):
+                return
+
+        # Keep the fused pass correctness-safe if a runtime tensor property
+        # falls outside the static model/layer gate.
+        from vllm_musa.jit_kernel.csrc.rope import rotary_embedding
+
+        rotary_embedding(
+            positions,
+            query,
+            key,
+            self.head_size,
+            cos_sin_cache,
+            is_neox,
+        )
+        self.do_kv_cache_update(
+            layer,
+            key,
+            value,
+            kv_cache,
+            layer_slot_mapping,
+        )
+
     def do_kv_cache_update(
         self,
         layer: torch.nn.Module,

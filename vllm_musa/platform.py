@@ -197,6 +197,59 @@ def _is_validated_qwen3_8b_fp8_single_gpu(vllm_config: Any) -> bool:
     )
 
 
+def _is_qwen2_rope_kv_fusion_config(vllm_config: Any) -> bool:
+    """Return whether the config is eligible for the exact MP31 Qwen2 fusion."""
+    from vllm_musa.utils.environ import envs as musa_envs
+
+    if not musa_envs.VLLM_MUSA_QWEN2_ROPE_KV_FUSION.get():
+        return False
+    model_config = getattr(vllm_config, "model_config", None)
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    if model_config is None or parallel_config is None:
+        return False
+
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    if hf_text_config is None:
+        hf_config = getattr(model_config, "hf_config", None)
+        hf_text_config = getattr(hf_config, "text_config", hf_config)
+    single_gpu = all(
+        getattr(parallel_config, name, 1) == 1
+        for name in (
+            "tensor_parallel_size",
+            "pipeline_parallel_size",
+            "data_parallel_size",
+            "decode_context_parallel_size",
+        )
+    )
+    model_type = getattr(hf_text_config, "model_type", None)
+    # CosyVoice3 exposes its outer multimodal config here.  The actual talker
+    # attention layers are Qwen2-shaped and are checked again by the backend
+    # gate, so accept that wrapper without broadening the tensor-shape scope.
+    if model_type not in ("qwen2", "cosyvoice3"):
+        return False
+    num_key_value_heads = getattr(hf_text_config, "num_key_value_heads", None)
+    intermediate_size = getattr(hf_text_config, "intermediate_size", None)
+    cache_config = getattr(vllm_config, "cache_config", None)
+    cache_dtype = getattr(cache_config, "cache_dtype", "auto")
+    if model_type == "qwen2":
+        if num_key_value_heads != 2 or intermediate_size != 4864:
+            return False
+    elif num_key_value_heads not in (None, 2) or intermediate_size not in (None, 4864):
+        return False
+    return (
+        getattr(hf_text_config, "hidden_size", None) == 896
+        and getattr(hf_text_config, "num_hidden_layers", None) == 24
+        and getattr(hf_text_config, "num_attention_heads", None) == 14
+        and getattr(model_config, "dtype", None) == torch.bfloat16
+        and getattr(model_config, "quantization", None) in (None, "none")
+        and getattr(vllm_config, "quant_config", None) is None
+        and getattr(vllm_config, "speculative_config", None) is None
+        and cache_dtype in ("auto", torch.bfloat16)
+        and not getattr(model_config, "enforce_eager", False)
+        and single_gpu
+    )
+
+
 def _deepseek_v4_flashmla_sparse_block_size(model_config: Any | None) -> int:
     value = os.getenv(_DEEPSEEK_V4_FLASHMLA_SPARSE_BLOCK_ENV)
     if value is None or not _is_deepseek_v4_model(model_config):
