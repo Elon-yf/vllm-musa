@@ -257,6 +257,63 @@ def _is_qwen2_rope_kv_fusion_config(vllm_config: Any) -> bool:
     )
 
 
+def _is_qwen3_qk_rope_kv_fusion_config(vllm_config: Any) -> bool:
+    """Return whether config is in the validated dense Qwen3 TP1 scope."""
+    from vllm_musa.utils.environ import envs as musa_envs
+
+    if not musa_envs.VLLM_MUSA_QWEN3_QK_ROPE_KV_FUSION.get():
+        return False
+    model_config = getattr(vllm_config, "model_config", None)
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    if model_config is None or parallel_config is None:
+        return False
+
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    if hf_text_config is None:
+        hf_config = getattr(model_config, "hf_config", None)
+        hf_text_config = getattr(hf_config, "text_config", hf_config)
+    architectures = getattr(model_config, "architectures", None)
+    if architectures is None:
+        architectures = getattr(hf_text_config, "architectures", None)
+
+    cache_config = getattr(vllm_config, "cache_config", None)
+    cache_dtype = getattr(cache_config, "cache_dtype", "auto")
+    cache_block_size = getattr(cache_config, "block_size", None)
+    single_gpu = all(
+        getattr(parallel_config, name, 1) == 1
+        for name in (
+            "tensor_parallel_size",
+            "pipeline_parallel_size",
+            "data_parallel_size",
+            "decode_context_parallel_size",
+        )
+    )
+    exact_geometry = (
+        getattr(hf_text_config, "hidden_size", None),
+        getattr(hf_text_config, "intermediate_size", None),
+        getattr(hf_text_config, "num_hidden_layers", None),
+        getattr(hf_text_config, "num_attention_heads", None),
+        getattr(hf_text_config, "num_key_value_heads", None),
+        getattr(hf_text_config, "head_dim", None),
+    ) in (
+        (1024, 3072, 28, 16, 8, 128),
+        (4096, 12288, 36, 32, 8, 128),
+    )
+    return (
+        tuple(architectures or ()) == ("Qwen3ForCausalLM",)
+        and getattr(hf_text_config, "model_type", None) == "qwen3"
+        and exact_geometry
+        and getattr(model_config, "dtype", None) == torch.bfloat16
+        and getattr(model_config, "quantization", None) in (None, "none")
+        and getattr(vllm_config, "quant_config", None) is None
+        and getattr(vllm_config, "speculative_config", None) is None
+        and cache_dtype in ("auto", "bfloat16", torch.bfloat16)
+        and cache_block_size in (None, 64)
+        and not getattr(model_config, "enforce_eager", False)
+        and single_gpu
+    )
+
+
 def _deepseek_v4_flashmla_sparse_block_size(model_config: Any | None) -> int:
     value = os.getenv(_DEEPSEEK_V4_FLASHMLA_SPARSE_BLOCK_ENV)
     if value is None or not _is_deepseek_v4_model(model_config):

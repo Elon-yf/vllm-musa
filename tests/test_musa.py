@@ -291,15 +291,179 @@ class TestMUSAPlatformBase:
             )
             config = make_config("qwen2", 2, 4864)
             assert _is_qwen2_rope_kv_fusion_config(config)
-            config.cache_config = SimpleNamespace(
-                cache_dtype="bfloat16", block_size=64
-            )
+            config.cache_config = SimpleNamespace(cache_dtype="bfloat16", block_size=64)
             assert _is_qwen2_rope_kv_fusion_config(config)
             config.cache_config.block_size = 128
             assert not _is_qwen2_rope_kv_fusion_config(config)
             config.cache_config.block_size = 64
             config.quant_config = object()
             assert not _is_qwen2_rope_kv_fusion_config(config)
+
+    def test_qwen3_qk_rope_kv_fusion_exact_config_gate(self):
+        import torch
+
+        from vllm_musa.platform import _is_qwen3_qk_rope_kv_fusion_config
+        from vllm_musa.utils.environ import envs
+
+        def make_config(
+            *,
+            hidden_size: int,
+            intermediate_size: int,
+            num_hidden_layers: int,
+            num_attention_heads: int,
+            num_key_value_heads: int = 8,
+            head_dim: int = 128,
+            model_type: str = "qwen3",
+            architecture: str = "Qwen3ForCausalLM",
+            tensor_parallel_size: int = 1,
+            quantization=None,
+            quant_config=None,
+            block_size: int = 64,
+        ):
+            return SimpleNamespace(
+                model_config=SimpleNamespace(
+                    hf_text_config=SimpleNamespace(
+                        model_type=model_type,
+                        hidden_size=hidden_size,
+                        intermediate_size=intermediate_size,
+                        num_hidden_layers=num_hidden_layers,
+                        num_attention_heads=num_attention_heads,
+                        num_key_value_heads=num_key_value_heads,
+                        head_dim=head_dim,
+                    ),
+                    architectures=(architecture,),
+                    dtype=torch.bfloat16,
+                    quantization=quantization,
+                    enforce_eager=False,
+                ),
+                parallel_config=SimpleNamespace(
+                    tensor_parallel_size=tensor_parallel_size,
+                    pipeline_parallel_size=1,
+                    data_parallel_size=1,
+                    decode_context_parallel_size=1,
+                ),
+                cache_config=SimpleNamespace(
+                    cache_dtype="bfloat16", block_size=block_size
+                ),
+                quant_config=quant_config,
+                speculative_config=None,
+            )
+
+        qwen3_0_6b = make_config(
+            hidden_size=1024,
+            intermediate_size=3072,
+            num_hidden_layers=28,
+            num_attention_heads=16,
+        )
+        qwen3_8b = make_config(
+            hidden_size=4096,
+            intermediate_size=12288,
+            num_hidden_layers=36,
+            num_attention_heads=32,
+        )
+
+        with envs.VLLM_MUSA_QWEN3_QK_ROPE_KV_FUSION.override(True):
+            assert _is_qwen3_qk_rope_kv_fusion_config(qwen3_0_6b)
+            assert _is_qwen3_qk_rope_kv_fusion_config(qwen3_8b)
+
+            assert not _is_qwen3_qk_rope_kv_fusion_config(
+                make_config(
+                    hidden_size=1024,
+                    intermediate_size=3072,
+                    num_hidden_layers=28,
+                    num_attention_heads=16,
+                    model_type="qwen2",
+                    architecture="Qwen2ForCausalLM",
+                )
+            )
+            assert not _is_qwen3_qk_rope_kv_fusion_config(
+                make_config(
+                    hidden_size=2048,
+                    intermediate_size=6144,
+                    num_hidden_layers=24,
+                    num_attention_heads=8,
+                    num_key_value_heads=2,
+                    head_dim=256,
+                    model_type="qwen3_5",
+                    architecture="Qwen3_5ForCausalLM",
+                )
+            )
+            assert not _is_qwen3_qk_rope_kv_fusion_config(
+                make_config(
+                    hidden_size=4096,
+                    intermediate_size=12288,
+                    num_hidden_layers=36,
+                    num_attention_heads=32,
+                    tensor_parallel_size=2,
+                )
+            )
+            assert not _is_qwen3_qk_rope_kv_fusion_config(
+                make_config(
+                    hidden_size=4096,
+                    intermediate_size=12288,
+                    num_hidden_layers=36,
+                    num_attention_heads=32,
+                    quantization="fp8",
+                )
+            )
+            assert not _is_qwen3_qk_rope_kv_fusion_config(
+                make_config(
+                    hidden_size=4096,
+                    intermediate_size=12288,
+                    num_hidden_layers=36,
+                    num_attention_heads=32,
+                    quant_config=object(),
+                )
+            )
+            assert not _is_qwen3_qk_rope_kv_fusion_config(
+                make_config(
+                    hidden_size=4096,
+                    intermediate_size=12288,
+                    num_hidden_layers=36,
+                    num_attention_heads=32,
+                    block_size=128,
+                )
+            )
+
+        with envs.VLLM_MUSA_QWEN3_QK_ROPE_KV_FUSION.override(False):
+            assert not _is_qwen3_qk_rope_kv_fusion_config(qwen3_0_6b)
+            assert not _is_qwen3_qk_rope_kv_fusion_config(qwen3_8b)
+
+    def test_qwen3_qk_rope_kv_fusion_defaults_on(self, monkeypatch):
+        from vllm_musa.utils.environ import envs
+
+        monkeypatch.delenv("VLLM_MUSA_QWEN3_QK_ROPE_KV_FUSION", raising=False)
+        assert envs.VLLM_MUSA_QWEN3_QK_ROPE_KV_FUSION.get() is True
+
+    @pytest.mark.parametrize(("layout", "expected"), [("NHD", True), ("HND", False)])
+    def test_qwen3_qk_rope_kv_provider_layout_gate(
+        self,
+        monkeypatch,
+        layout: str,
+        expected: bool,
+    ) -> None:
+        from vllm_musa.utils.environ import envs
+        from vllm_musa.v1.attention.backends import flash_attn
+
+        impl = SimpleNamespace(
+            num_heads=16,
+            num_kv_heads=8,
+            head_size=128,
+            attn_type=flash_attn.AttentionType.DECODER,
+            kv_cache_dtype="auto",
+            alibi_slopes=None,
+            sliding_window=(-1, -1),
+            logits_soft_cap=0.0,
+            sinks=None,
+            kv_sharing_target_layer_name=None,
+        )
+        monkeypatch.setattr(flash_attn, "get_flash_attn_version", lambda: 3)
+        monkeypatch.setattr(flash_attn, "get_kv_cache_layout", lambda: layout)
+        with envs.VLLM_MUSA_QWEN3_QK_ROPE_KV_FUSION.override(True):
+            assert (
+                flash_attn.FlashAttentionImpl.qwen3_qk_rope_kvcache_supported(impl)
+                is expected
+            )
 
     def test_supports_fp8_for_musa_3_1(self):
         """Test that FP8 is supported on MUSA capability 3.1."""
