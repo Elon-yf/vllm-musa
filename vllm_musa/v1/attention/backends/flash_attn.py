@@ -1388,11 +1388,12 @@ class FlashAttentionImpl(AttentionImpl):
 
         return (
             musa_envs.VLLM_MUSA_QWEN2_ROPE_KV_FUSION.get()
+            and get_flash_attn_version() == 3
             and self.num_heads == 14
             and self.num_kv_heads == 2
             and self.head_size == 64
             and self.attn_type == AttentionType.DECODER
-            and self.kv_cache_dtype in ("auto", "bfloat16")
+            and self.kv_cache_dtype in ("auto", "bfloat16", torch.bfloat16)
             and self.alibi_slopes is None
             and self.sliding_window == (-1, -1)
             and not self.logits_soft_cap

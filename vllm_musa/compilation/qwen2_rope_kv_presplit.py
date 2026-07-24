@@ -15,6 +15,31 @@ EXPECTED_FUSION_SITES = 24
 _MISSING = object()
 
 
+def qwen2_rope_kv_backend_supported(vllm_config: Any) -> bool:
+    """Return whether every configured attention layer supports the fused op.
+
+    The raw-FX matcher can prove tensor relationships, but it cannot prove
+    which AttentionImpl will execute the upstream fused outer op.  Check the
+    instantiated layers before changing the graph so a future backend/config
+    selection change fails closed instead of reaching a base
+    ``do_rope_and_kv_cache_update`` implementation.
+    """
+    try:
+        from vllm.config import get_layers_from_vllm_config
+        from vllm.model_executor.layers.attention.attention import Attention
+
+        layers = get_layers_from_vllm_config(vllm_config, Attention)
+    except Exception:
+        return False
+
+    if len(layers) != EXPECTED_FUSION_SITES:
+        return False
+    return all(
+        getattr(layer.impl, "fused_rope_kvcache_supported", lambda: False)()
+        for layer in layers.values()
+    )
+
+
 @dataclass(frozen=True)
 class Qwen2RopeKVCandidate:
     rope: fx.Node
@@ -277,4 +302,5 @@ __all__ = [
     "Qwen2RopeKVCandidate",
     "apply_qwen2_rope_kv_presplit",
     "plan_qwen2_rope_kv_presplit",
+    "qwen2_rope_kv_backend_supported",
 ]

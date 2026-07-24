@@ -27,6 +27,14 @@ def _try_qwen2_rope_kv_presplit(backend, graph) -> int:
     if not _is_qwen2_rope_kv_fusion_config(vllm_config):
         return 0
 
+    if not presplit.qwen2_rope_kv_backend_supported(vllm_config):
+        logger.warning_once(
+            "MUSA Qwen2 RoPE+KV fusion requires all 24 attention layers to "
+            "use the MUSA FlashAttention3 fused-cache implementation; "
+            "keeping the baseline split graph."
+        )
+        return 0
+
     splitting_ops = compilation_config.splitting_ops
     if (
         compilation_config.use_inductor_graph_partition

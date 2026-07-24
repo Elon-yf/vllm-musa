@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import operator
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -17,6 +18,7 @@ from vllm_musa.compilation.qwen2_rope_kv_presplit import (
     _is_call,
     apply_qwen2_rope_kv_presplit,
     plan_qwen2_rope_kv_presplit,
+    qwen2_rope_kv_backend_supported,
 )
 
 
@@ -121,3 +123,30 @@ def test_qwen2_rope_kv_presplit_is_atomic_on_mismatch(
     assert _count_calls(graph_module, "vllm::musa_rotary_embedding") == sites
     assert _count_calls(graph_module, KV_UPDATE_SPLITTING_OP) == sites
     assert _count_calls(graph_module, FUSED_SPLITTING_OP) == 0
+
+
+def test_qwen2_rope_kv_backend_gate_requires_all_24_layers(monkeypatch):
+    def set_layers(count: int, unsupported: int | None = None) -> None:
+        layers = {
+            f"model.layers.{index}.self_attn.attn": SimpleNamespace(
+                impl=SimpleNamespace(
+                    fused_rope_kvcache_supported=lambda index=index: (
+                        index != unsupported
+                    )
+                )
+            )
+            for index in range(count)
+        }
+        monkeypatch.setattr(
+            "vllm.config.get_layers_from_vllm_config",
+            lambda _config, _layer_type: layers,
+        )
+
+    set_layers(24)
+    assert qwen2_rope_kv_backend_supported(object())
+
+    set_layers(23)
+    assert not qwen2_rope_kv_backend_supported(object())
+
+    set_layers(24, unsupported=7)
+    assert not qwen2_rope_kv_backend_supported(object())

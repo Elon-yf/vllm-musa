@@ -96,6 +96,9 @@ class TestCompilationBackendPatch:
             platform, "_is_qwen2_rope_kv_fusion_config", lambda _config: True
         )
         monkeypatch.setattr(
+            presplit, "qwen2_rope_kv_backend_supported", lambda _config: True
+        )
+        monkeypatch.setattr(
             presplit,
             "plan_qwen2_rope_kv_presplit",
             lambda _graph: tuple(range(24)),
@@ -138,7 +141,39 @@ class TestCompilationBackendPatch:
             platform, "_is_qwen2_rope_kv_fusion_config", lambda _config: True
         )
         monkeypatch.setattr(
+            presplit, "qwen2_rope_kv_backend_supported", lambda _config: True
+        )
+        monkeypatch.setattr(
             presplit, "plan_qwen2_rope_kv_presplit", lambda _graph: None
+        )
+        splitting_ops = ["vllm::unified_kv_cache_update", "vllm::attention"]
+        compilation_config = SimpleNamespace(
+            use_inductor_graph_partition=False,
+            splitting_ops=splitting_ops,
+            traced_files=set(),
+        )
+        backend = SimpleNamespace(
+            vllm_config=object(), compilation_config=compilation_config
+        )
+
+        assert patch_module._try_qwen2_rope_kv_presplit(backend, object()) == 0
+        assert compilation_config.splitting_ops is splitting_ops
+        assert compilation_config.traced_files == set()
+
+    def test_qwen2_presplit_rejects_unsupported_attention_backend(self, monkeypatch):
+        from vllm_musa import platform
+        from vllm_musa.compilation import qwen2_rope_kv_presplit as presplit
+        from vllm_musa.patches import _get_patch_files, _load_patch_module
+
+        patch_file = next(
+            f for m, f in _get_patch_files() if m == "vllm.compilation.backends"
+        )
+        patch_module = _load_patch_module(patch_file)
+        monkeypatch.setattr(
+            platform, "_is_qwen2_rope_kv_fusion_config", lambda _config: True
+        )
+        monkeypatch.setattr(
+            presplit, "qwen2_rope_kv_backend_supported", lambda _config: False
         )
         splitting_ops = ["vllm::unified_kv_cache_update", "vllm::attention"]
         compilation_config = SimpleNamespace(

@@ -291,6 +291,13 @@ class TestMUSAPlatformBase:
             )
             config = make_config("qwen2", 2, 4864)
             assert _is_qwen2_rope_kv_fusion_config(config)
+            config.cache_config = SimpleNamespace(
+                cache_dtype="bfloat16", block_size=64
+            )
+            assert _is_qwen2_rope_kv_fusion_config(config)
+            config.cache_config.block_size = 128
+            assert not _is_qwen2_rope_kv_fusion_config(config)
+            config.cache_config.block_size = 64
             config.quant_config = object()
             assert not _is_qwen2_rope_kv_fusion_config(config)
 

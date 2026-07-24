@@ -231,6 +231,7 @@ def _is_qwen2_rope_kv_fusion_config(vllm_config: Any) -> bool:
     intermediate_size = getattr(hf_text_config, "intermediate_size", None)
     cache_config = getattr(vllm_config, "cache_config", None)
     cache_dtype = getattr(cache_config, "cache_dtype", "auto")
+    cache_block_size = getattr(cache_config, "block_size", None)
     if model_type == "qwen2":
         if num_key_value_heads != 2 or intermediate_size != 4864:
             return False
@@ -244,7 +245,13 @@ def _is_qwen2_rope_kv_fusion_config(vllm_config: Any) -> bool:
         and getattr(model_config, "quantization", None) in (None, "none")
         and getattr(vllm_config, "quant_config", None) is None
         and getattr(vllm_config, "speculative_config", None) is None
-        and cache_dtype in ("auto", torch.bfloat16)
+        # vLLM uses the string spelling for an explicit BF16 cache, while
+        # lightweight test/config objects may carry torch.bfloat16 directly.
+        and cache_dtype in ("auto", "bfloat16", torch.bfloat16)
+        # MUSA's fused kernel is specialized for the FA3 NHD block-64 cache.
+        # Keep None acceptable before cache initialization, but reject an
+        # explicitly incompatible block size before mutating the FX graph.
+        and cache_block_size in (None, 64)
         and not getattr(model_config, "enforce_eager", False)
         and single_gpu
     )
