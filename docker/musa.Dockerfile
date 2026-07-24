@@ -373,43 +373,24 @@ RUN mkdir -p /tmp/vllm-rs-artifacts && \
         echo "Skipping vllm-rs build because BUILD_VLLM_RS=0"; \
     fi
 
-# Mooncake is built after torch/vllm-musa so future EP components can import and
-# link against the installed torch stack. Device visibility remains unset while
-# its apt dependencies are installed; the final image enables it below.
+# Install the prebuilt MUSA wheel after torch/vllm-musa so Mooncake integrations
+# can import the installed accelerator stack. Device visibility remains unset;
+# the final image enables it below.
 FROM vllm_musa_installed AS mooncake
 
 ARG BUILD_MOONCAKE=1
-ARG MOONCAKE_REPO=https://github.com/kvcache-ai/Mooncake.git
-ARG MOONCAKE_COMMIT=b6a841dc78c707ec655a563453277d969fb8f38d
+ARG MOONCAKE_VERSION=0.3.12
+ARG PYPI_INDEX_URL
 
-ENV PATH=/usr/local/go/bin:${PATH}
-
-# Mooncake is a standalone component; do not route it through the vllm-musa pip
-# index args.
 RUN if [[ "${BUILD_MOONCAKE}" == "1" ]]; then \
-        apt-get update && \
-        apt-get install -y --no-install-recommends \
-            autoconf \
-            ethtool \
-            ibverbs-utils \
-            openssh-server \
-            perftest \
-            rdmacm-utils \
-            wget && \
-        rm -rf /var/lib/apt/lists/* && \
-        git clone "${MOONCAKE_REPO}" /workspace/Mooncake && \
-        cd /workspace/Mooncake && \
-        git checkout "${MOONCAKE_COMMIT}" && \
-        git submodule update --init --recursive && \
-        bash dependencies.sh -y && \
-        mkdir -p build && \
-        cd build && \
-        cmake .. -DUSE_MUSA=ON -DUSE_ETCD=OFF && \
-        make -j "$(nproc)" && \
-        make install && \
-        rm -rf /workspace/Mooncake /root/.cache/pip /tmp/pip-*; \
+        python -m pip install \
+            --no-cache-dir \
+            --only-binary=:all: \
+            --index-url "${PYPI_INDEX_URL}" \
+            "mooncake-transfer-engine-musa==${MOONCAKE_VERSION}" && \
+        MOONCAKE_VERSION="${MOONCAKE_VERSION}" python -c 'import os; from importlib.metadata import version; from mooncake.engine import TransferEngine; actual = version("mooncake-transfer-engine-musa"); expected = os.environ["MOONCAKE_VERSION"]; assert actual == expected, (actual, expected); print(f"PASS mooncake-transfer-engine-musa version={actual}")'; \
     elif [[ "${BUILD_MOONCAKE}" == "0" ]]; then \
-        echo "Skipping Mooncake build because BUILD_MOONCAKE=0"; \
+        echo "Skipping Mooncake install because BUILD_MOONCAKE=0"; \
     else \
         echo "Unsupported BUILD_MOONCAKE=${BUILD_MOONCAKE}" >&2; \
         exit 1; \

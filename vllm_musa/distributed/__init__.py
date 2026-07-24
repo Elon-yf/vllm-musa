@@ -1,6 +1,4 @@
-try:
-    from mooncake.engine import TransferEngine
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-    import vllm_musa.distributed.kv_transfer.kv_connector.v1.mooncake_connector
-except ImportError:
-    pass
+"""MUSA distributed integrations use the pinned upstream Mooncake connector."""
