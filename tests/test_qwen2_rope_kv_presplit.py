@@ -126,7 +126,9 @@ def test_qwen2_rope_kv_presplit_is_atomic_on_mismatch(
 
 
 def test_qwen2_rope_kv_backend_gate_requires_all_24_layers(monkeypatch):
-    def set_layers(count: int, unsupported: int | None = None) -> None:
+    def set_layers(
+        count: int, unsupported: int | None = None
+    ) -> dict[str, SimpleNamespace]:
         layers = {
             f"model.layers.{index}.self_attn.attn": SimpleNamespace(
                 impl=SimpleNamespace(
@@ -141,6 +143,7 @@ def test_qwen2_rope_kv_backend_gate_requires_all_24_layers(monkeypatch):
             "vllm.config.get_layers_from_vllm_config",
             lambda _config, _layer_type: layers,
         )
+        return layers
 
     set_layers(24)
     assert qwen2_rope_kv_backend_supported(object())
@@ -149,4 +152,13 @@ def test_qwen2_rope_kv_backend_gate_requires_all_24_layers(monkeypatch):
     assert not qwen2_rope_kv_backend_supported(object())
 
     set_layers(24, unsupported=7)
+    assert not qwen2_rope_kv_backend_supported(object())
+
+    layers = set_layers(24)
+
+    def raise_backend_error() -> bool:
+        raise RuntimeError("backend capability probe failed")
+
+    failing_impl = layers["model.layers.7.self_attn.attn"].impl
+    failing_impl.fused_rope_kvcache_supported = raise_backend_error
     assert not qwen2_rope_kv_backend_supported(object())

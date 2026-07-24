@@ -34,10 +34,13 @@ def qwen2_rope_kv_backend_supported(vllm_config: Any) -> bool:
 
     if len(layers) != EXPECTED_FUSION_SITES:
         return False
-    return all(
-        getattr(layer.impl, "fused_rope_kvcache_supported", lambda: False)()
-        for layer in layers.values()
-    )
+    try:
+        return all(
+            getattr(layer.impl, "fused_rope_kvcache_supported", lambda: False)()
+            for layer in layers.values()
+        )
+    except Exception:
+        return False
 
 
 @dataclass(frozen=True)
