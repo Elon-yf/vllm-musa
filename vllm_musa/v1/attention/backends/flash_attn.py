@@ -5,6 +5,7 @@
 
 import copy
 from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, version
 from typing import ClassVar
 
 import numpy as np
@@ -65,6 +66,67 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 logger = init_logger(__name__)
 
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
+
+
+def _is_qwen_family_scheduler_lookup_base_config(
+    vllm_config: VllmConfig,
+) -> bool:
+    """Check the Qwen FA3 scheduler configuration envelope."""
+    model_config = getattr(vllm_config, "model_config", None)
+    scheduler_config = getattr(vllm_config, "scheduler_config", None)
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    if model_config is None or scheduler_config is None or parallel_config is None:
+        return False
+
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    if hf_text_config is None:
+        hf_config = getattr(model_config, "hf_config", None)
+        hf_text_config = getattr(hf_config, "text_config", hf_config)
+    model_type = str(getattr(hf_text_config, "model_type", "")).lower()
+    max_num_seqs = getattr(scheduler_config, "max_num_seqs", None)
+    architectures = getattr(model_config, "architectures", None)
+    if architectures is None:
+        architectures = getattr(hf_text_config, "architectures", None)
+    is_qwen_family = model_type.startswith("qwen") or model_type == "cosyvoice3"
+    is_qwen_family = is_qwen_family or any(
+        str(architecture).lower().startswith("qwen")
+        for architecture in architectures or ()
+    )
+
+    return (
+        is_qwen_family
+        and isinstance(max_num_seqs, int)
+        and max_num_seqs >= 1
+        and getattr(vllm_config, "speculative_config", None) is None
+        and all(
+            getattr(parallel_config, name, None) == 1
+            for name in (
+                "tensor_parallel_size",
+                "decode_context_parallel_size",
+                "pipeline_parallel_size",
+            )
+        )
+    )
+
+
+def _is_qwen_family_scheduler_lookup_config(vllm_config: VllmConfig) -> bool:
+    """Gate the direct FA3 scheduler path before runtime shape checks."""
+    from vllm_musa.utils.environ import envs as musa_envs
+
+    return (
+        musa_envs.VLLM_MUSA_QWEN_FA3_SCHEDULER_LOOKUP.get()
+        and _is_qwen_family_scheduler_lookup_base_config(vllm_config)
+    )
+
+
+def _has_supported_fa3_scheduler_layout() -> bool:
+    """The direct builder mirrors the pinned MATE 0.2.4 metadata layout."""
+    try:
+        mate_version = version("mate").split("+", 1)[0]
+        flash_attn_version = version("flash_attn_3").split("+", 1)[0]
+    except PackageNotFoundError:
+        return False
+    return mate_version == "0.2.4" and flash_attn_version == "0.2.4"
 
 
 def _torch_reduce_scatter_dim(
@@ -448,8 +510,13 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         self.max_cudagraph_size = self.compilation_config.max_cudagraph_capture_size
 
         self._sm_count = 60
+        self._sm_count_query_succeeded = False
         # ==================== MUSA ADAPTATION ====================
         self._cu_seqlens_k_buffer: torch.Tensor | None = None
+        self._use_qwen_single_request_scheduler_lookup = (
+            _is_qwen_family_scheduler_lookup_config(vllm_config)
+            and _has_supported_fa3_scheduler_layout()
+        )
         # ========================== END ==========================
 
         if self.use_full_cuda_graph and self.aot_schedule:
@@ -477,6 +544,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                 self._sm_count = torch.musa.get_device_properties(
                     self.device
                 ).multi_processor_count
+                self._sm_count_query_succeeded = True
             except Exception:
                 self._sm_count = 60
 
@@ -643,6 +711,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         prefix_kv_lens = None
         suffix_kv_lens = None
         prefix_scheduler_metadata = None
+        direct_metadata_built = False
 
         if self.dcp_world_size > 1:
             query_kv_lens = query_start_loc[1:] - query_start_loc[:-1]
@@ -697,17 +766,64 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                 causal=True,
             )
         else:
-            scheduler_metadata = schedule(
-                batch_size=num_reqs,
-                cu_query_lens=query_start_loc,
-                max_query_len=max_query_len,
-                seqlens=seq_lens,
-                max_seq_len=max_seq_len,
-                causal=causal,
+            scheduler_metadata = None
+
+            # The direct builder handles only supported Qwen batch-one decode
+            # inputs. All other inputs continue through schedule() below.
+            use_qwen_scheduler_lookup = (
+                self._use_qwen_single_request_scheduler_lookup
+                and self.use_full_cuda_graph
+                and aot_schedule
+                and self._cu_seqlens_k_buffer is not None
+                and num_reqs == 1
+                and num_decodes == 1
+                and num_decode_tokens == 1
+                and num_prefills == 0
+                and max_query_len == 1
+                and 1 <= max_seq_len <= 4096
+                and causal
+                and self.aot_sliding_window == (-1, -1)
+                and self._sm_count_query_succeeded
+                and self._sm_count == 60
+                and 1 <= max_num_splits <= 60
+                and 1 <= self.num_heads_kv <= 32
+                and self.num_heads_q % self.num_heads_kv == 0
+                and 1 <= self.num_heads_q // self.num_heads_kv <= 32
+                and self.headdim in (64, 128)
+                and self.block_size == 64
+                and self.kv_cache_dtype == torch.bfloat16
             )
+            if use_qwen_scheduler_lookup:
+                from vllm_musa.jit_kernel.fa3_metadata import (
+                    try_build_qwen_single_request_fa3_metadata,
+                )
+
+                buf = self._cu_seqlens_k_buffer
+                direct_metadata_built = try_build_qwen_single_request_fa3_metadata(
+                    seq_lens[:1],
+                    buf[:2],
+                    self.scheduler_metadata,
+                    max_seq_len,
+                    self.num_heads_q,
+                    self.num_heads_kv,
+                    self.headdim,
+                    max_num_splits,
+                )
+                if direct_metadata_built:
+                    cu_seqlens_k = buf[:2]
+                    scheduler_metadata = self.scheduler_metadata[:16]
+            if scheduler_metadata is None:
+                scheduler_metadata = schedule(
+                    batch_size=num_reqs,
+                    cu_query_lens=query_start_loc,
+                    max_query_len=max_query_len,
+                    seqlens=seq_lens,
+                    max_seq_len=max_seq_len,
+                    causal=causal,
+                )
 
             # ==================== MUSA ADAPTATION ====================
-            if self.use_full_cuda_graph:
+            if self.use_full_cuda_graph and not direct_metadata_built:
                 if self._cu_seqlens_k_buffer is not None:
                     n = num_reqs + 1
                     buf = self._cu_seqlens_k_buffer
@@ -726,12 +842,13 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         # For FA3 + full cudagraph
         if self.use_full_cuda_graph and scheduler_metadata is not None:
             n = scheduler_metadata.shape[0]
-            self.scheduler_metadata[:n] = scheduler_metadata
-            # NOTE(woosuk): We should zero out the rest of the scheduler
-            # metadata to guarantee the correctness. Otherwise, some thread
-            # blocks may use the invalid scheduler metadata and overwrite the
-            # output buffer.
-            self.scheduler_metadata[n:] = 0
+            if not direct_metadata_built:
+                self.scheduler_metadata[:n] = scheduler_metadata
+                # NOTE(woosuk): We should zero out the rest of the scheduler
+                # metadata to guarantee the correctness. Otherwise, some thread
+                # blocks may use the invalid scheduler metadata and overwrite the
+                # output buffer.
+                self.scheduler_metadata[n:] = 0
             scheduler_metadata = self.scheduler_metadata[:n]
 
         attn_metadata = FlashAttentionMetadata(
