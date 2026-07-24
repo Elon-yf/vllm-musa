@@ -465,6 +465,122 @@ class TestMUSAPlatformBase:
                 is expected
             )
 
+    def test_qwen_fa3_scheduler_lookup_config_gate(self):
+        from vllm_musa.utils.environ import envs
+        from vllm_musa.v1.attention.backends.flash_attn import (
+            _is_qwen_family_scheduler_lookup_config,
+        )
+
+        def make_config(
+            model_type: str,
+            architecture: str,
+            *,
+            max_num_seqs: int = 1,
+            speculative_config=None,
+            pipeline_parallel_size: int = 1,
+            decode_context_parallel_size: int = 1,
+            tensor_parallel_size: int = 1,
+        ):
+            return SimpleNamespace(
+                model_config=SimpleNamespace(
+                    hf_text_config=SimpleNamespace(
+                        model_type=model_type,
+                        architectures=[architecture],
+                    ),
+                    architectures=[architecture],
+                ),
+                scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+                parallel_config=SimpleNamespace(
+                    tensor_parallel_size=tensor_parallel_size,
+                    pipeline_parallel_size=pipeline_parallel_size,
+                    decode_context_parallel_size=decode_context_parallel_size,
+                ),
+                speculative_config=speculative_config,
+            )
+
+        with envs.VLLM_MUSA_QWEN_FA3_SCHEDULER_LOOKUP.override(True):
+            assert _is_qwen_family_scheduler_lookup_config(
+                make_config("qwen3", "Qwen3ForCausalLM")
+            )
+            assert _is_qwen_family_scheduler_lookup_config(
+                make_config("qwen2", "Qwen2ForCausalLM")
+            )
+            assert _is_qwen_family_scheduler_lookup_config(
+                make_config("cosyvoice3", "CosyVoice3ForConditionalGeneration")
+            )
+            assert _is_qwen_family_scheduler_lookup_config(
+                make_config("qwen2", "Qwen2ForCausalLM", max_num_seqs=8)
+            )
+            assert not _is_qwen_family_scheduler_lookup_config(
+                make_config("llama", "LlamaForCausalLM")
+            )
+            assert not _is_qwen_family_scheduler_lookup_config(
+                make_config("deepseek_v3", "DeepseekV3ForCausalLM")
+            )
+            assert not _is_qwen_family_scheduler_lookup_config(
+                make_config("qwen3", "Qwen3ForCausalLM", max_num_seqs=0)
+            )
+            assert not _is_qwen_family_scheduler_lookup_config(
+                make_config(
+                    "qwen3",
+                    "Qwen3ForCausalLM",
+                    speculative_config=object(),
+                )
+            )
+            assert not _is_qwen_family_scheduler_lookup_config(
+                make_config(
+                    "qwen3",
+                    "Qwen3ForCausalLM",
+                    decode_context_parallel_size=2,
+                )
+            )
+            assert not _is_qwen_family_scheduler_lookup_config(
+                make_config(
+                    "qwen3",
+                    "Qwen3ForCausalLM",
+                    tensor_parallel_size=2,
+                )
+            )
+            incomplete_parallel_config = make_config("qwen3", "Qwen3ForCausalLM")
+            del incomplete_parallel_config.parallel_config.pipeline_parallel_size
+            assert not _is_qwen_family_scheduler_lookup_config(
+                incomplete_parallel_config
+            )
+            incomplete_scheduler_config = make_config("qwen3", "Qwen3ForCausalLM")
+            del incomplete_scheduler_config.scheduler_config.max_num_seqs
+            assert not _is_qwen_family_scheduler_lookup_config(
+                incomplete_scheduler_config
+            )
+
+        with envs.VLLM_MUSA_QWEN_FA3_SCHEDULER_LOOKUP.override(False):
+            assert not _is_qwen_family_scheduler_lookup_config(
+                make_config("qwen3", "Qwen3ForCausalLM")
+            )
+
+    def test_qwen_fa3_scheduler_lookup_default_off(self, monkeypatch):
+        from vllm_musa.utils.environ import envs
+
+        monkeypatch.delenv("VLLM_MUSA_QWEN_FA3_SCHEDULER_LOOKUP", raising=False)
+        assert envs.VLLM_MUSA_QWEN_FA3_SCHEDULER_LOOKUP.get() is False
+
+    def test_qwen_fa3_scheduler_lookup_layout_version_gate(self, monkeypatch):
+        from importlib.metadata import PackageNotFoundError
+
+        from vllm_musa.v1.attention.backends import flash_attn
+
+        versions = {"mate": "0.2.4", "flash_attn_3": "0.2.4+musa"}
+        monkeypatch.setattr(flash_attn, "version", versions.__getitem__)
+        assert flash_attn._has_supported_fa3_scheduler_layout()
+
+        versions["mate"] = "0.2.5"
+        assert not flash_attn._has_supported_fa3_scheduler_layout()
+
+        def missing_package(_package):
+            raise PackageNotFoundError
+
+        monkeypatch.setattr(flash_attn, "version", missing_package)
+        assert not flash_attn._has_supported_fa3_scheduler_layout()
+
     def test_supports_fp8_for_musa_3_1(self):
         """Test that FP8 is supported on MUSA capability 3.1."""
         from vllm.platforms.interface import DeviceCapability
