@@ -16,6 +16,8 @@ BOOTSTRAP_PORT="${BOOTSTRAP_PORT:-8998}"
 PROXY_PORT="${PROXY_PORT:-8000}"
 STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-1200}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-512}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
+VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-0}"
 LOG_DIR="${LOG_DIR:-/tmp/vllm-musa-mooncake-example-$$}"
 
 mkdir -p "${LOG_DIR}"
@@ -26,9 +28,19 @@ if [[ ! -f "${PROXY_SCRIPT}" ]]; then
 fi
 
 PIDS=()
+SERVE_ARGS=()
+
+case "${VLLM_ENFORCE_EAGER}" in
+    0) ;;
+    1) SERVE_ARGS+=(--enforce-eager) ;;
+    *)
+        echo "VLLM_ENFORCE_EAGER must be 0 or 1" >&2
+        exit 1
+        ;;
+esac
 
 cleanup() {
-    local status=$?
+    local status=${1:-$?}
     trap - EXIT INT TERM
 
     for pid in "${PIDS[@]}"; do
@@ -42,7 +54,9 @@ cleanup() {
 
     exit "${status}"
 }
-trap cleanup EXIT INT TERM
+trap 'cleanup $?' EXIT
+trap 'cleanup 130' INT
+trap 'cleanup 143' TERM
 
 wait_for_url() {
     local name=$1
@@ -69,8 +83,10 @@ MUSA_VISIBLE_DEVICES="${PREFILL_GPU}" \
 vllm serve "${MODEL_NAME}" \
     --port "${PREFILL_PORT}" \
     --max-model-len "${MAX_MODEL_LEN}" \
+    --max-num-seqs "${MAX_NUM_SEQS}" \
     --gpu-memory-utilization 0.8 \
     --trust-remote-code \
+    "${SERVE_ARGS[@]}" \
     --kv-transfer-config \
     '{"kv_connector":"MooncakeConnector","kv_role":"kv_producer"}' \
     >"${LOG_DIR}/prefill.log" 2>&1 &
@@ -81,8 +97,10 @@ MUSA_VISIBLE_DEVICES="${DECODE_GPU}" \
 vllm serve "${MODEL_NAME}" \
     --port "${DECODE_PORT}" \
     --max-model-len "${MAX_MODEL_LEN}" \
+    --max-num-seqs "${MAX_NUM_SEQS}" \
     --gpu-memory-utilization 0.8 \
     --trust-remote-code \
+    "${SERVE_ARGS[@]}" \
     --kv-transfer-config \
     '{"kv_connector":"MooncakeConnector","kv_role":"kv_consumer"}' \
     >"${LOG_DIR}/decode.log" 2>&1 &

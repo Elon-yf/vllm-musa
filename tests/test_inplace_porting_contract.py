@@ -118,6 +118,9 @@ def test_mooncake_example_uses_current_proxy_and_scoped_cleanup():
     assert "third_party/vllm/examples/disaggregated/mooncake_connector" in script
     assert "mooncake_connector_proxy.py" in script
     assert "VLLM_MOONCAKE_BOOTSTRAP_PORT" in script
+    assert "VLLM_ENFORCE_EAGER" in script
+    assert '--max-num-seqs "${MAX_NUM_SEQS}"' in script
+    assert "trap 'cleanup 143' TERM" in script
     assert '"transfer_id"' not in script  # The maintained proxy owns the protocol.
     assert "toy_proxy_server.py" not in script
     assert "pgrep" not in script

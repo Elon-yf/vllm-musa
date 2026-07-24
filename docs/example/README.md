@@ -23,8 +23,10 @@ bash disaggregated_serving.sh
 bash disaggregated_serving.sh meta-llama/Meta-Llama-3.1-8B-Instruct
 ```
 
-By default, the example leaves the normal compiled serving path enabled. Logs
-are written under `/tmp/vllm-musa-mooncake-example-<pid>`; set `LOG_DIR` to
-retain them elsewhere. `PREFILL_GPU`, `DECODE_GPU`, service ports,
-`MAX_MODEL_LEN`, and `STARTUP_TIMEOUT` can also be overridden through the
+By default, the example leaves the normal compiled serving path enabled and
+limits each server to 16 concurrent sequences. Set `VLLM_ENFORCE_EAGER=1` for a
+functional diagnostic that isolates Mooncake from compilation. Logs are written
+under `/tmp/vllm-musa-mooncake-example-<pid>`; set `LOG_DIR` to retain them
+elsewhere. `PREFILL_GPU`, `DECODE_GPU`, service ports, `MAX_MODEL_LEN`,
+`MAX_NUM_SEQS`, and `STARTUP_TIMEOUT` can also be overridden through the
 environment.
