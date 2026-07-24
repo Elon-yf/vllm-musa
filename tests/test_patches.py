@@ -189,6 +189,192 @@ class TestCompilationBackendPatch:
         assert compilation_config.splitting_ops is splitting_ops
         assert compilation_config.traced_files == set()
 
+    @pytest.mark.parametrize("text_config_source", ["hf_text_config", "hf_config"])
+    def test_qwen3_presplit_fuses_all_sites_and_hashes_helper(
+        self,
+        monkeypatch,
+        text_config_source: str,
+    ):
+        from vllm_musa import platform
+        from vllm_musa.compilation import qwen3_qk_rope_kv_presplit as presplit
+        from vllm_musa.patches import _get_patch_files, _load_patch_module
+
+        patch_file = next(
+            f for m, f in _get_patch_files() if m == "vllm.compilation.backends"
+        )
+        patch_module = _load_patch_module(patch_file)
+        monkeypatch.setattr(
+            platform, "_is_qwen3_qk_rope_kv_fusion_config", lambda _config: True
+        )
+        monkeypatch.setattr(
+            presplit,
+            "qwen3_qk_rope_kv_backend_supported",
+            lambda _config, expected_sites: expected_sites == 28,
+        )
+        monkeypatch.setattr(
+            presplit,
+            "plan_qwen3_qk_rope_kv_presplit",
+            lambda _graph, expected_sites: tuple(range(expected_sites)),
+        )
+        monkeypatch.setattr(
+            presplit,
+            "apply_qwen3_qk_rope_kv_presplit",
+            lambda _graph, candidates: len(candidates),
+        )
+        compilation_config = SimpleNamespace(
+            use_inductor_graph_partition=False,
+            splitting_ops=["vllm::unified_kv_cache_update", "vllm::attention"],
+            traced_files=set(),
+        )
+        text_config = SimpleNamespace(num_hidden_layers=28)
+        model_config = (
+            SimpleNamespace(hf_text_config=text_config)
+            if text_config_source == "hf_text_config"
+            else SimpleNamespace(hf_config=SimpleNamespace(text_config=text_config))
+        )
+        backend = SimpleNamespace(
+            vllm_config=SimpleNamespace(model_config=model_config),
+            compilation_config=compilation_config,
+        )
+
+        assert patch_module._try_qwen3_qk_rope_kv_presplit(backend, object()) == 28
+        assert compilation_config.splitting_ops == [
+            "vllm::unified_kv_cache_update",
+            "vllm::attention",
+            "vllm::musa_qwen3_qk_rope_and_unified_kv_cache_update",
+        ]
+        assert str(Path(presplit.__file__).resolve()) in compilation_config.traced_files
+        assert str(Path(patch_module.__file__).resolve()) in (
+            compilation_config.traced_files
+        )
+
+    def test_qwen3_presplit_missing_layer_count_is_fail_closed(self, monkeypatch):
+        from vllm_musa import platform
+        from vllm_musa.compilation import qwen3_qk_rope_kv_presplit as presplit
+        from vllm_musa.patches import _get_patch_files, _load_patch_module
+
+        patch_file = next(
+            f for m, f in _get_patch_files() if m == "vllm.compilation.backends"
+        )
+        patch_module = _load_patch_module(patch_file)
+        monkeypatch.setattr(
+            platform, "_is_qwen3_qk_rope_kv_fusion_config", lambda _config: True
+        )
+
+        def unexpected_backend_check(*_args, **_kwargs):
+            pytest.fail("backend support must not run without a layer count")
+
+        monkeypatch.setattr(
+            presplit,
+            "qwen3_qk_rope_kv_backend_supported",
+            unexpected_backend_check,
+        )
+        splitting_ops = ["vllm::unified_kv_cache_update", "vllm::attention"]
+        compilation_config = SimpleNamespace(
+            use_inductor_graph_partition=False,
+            splitting_ops=splitting_ops,
+            traced_files=set(),
+        )
+        backend = SimpleNamespace(
+            vllm_config=SimpleNamespace(
+                model_config=SimpleNamespace(hf_config=SimpleNamespace())
+            ),
+            compilation_config=compilation_config,
+        )
+
+        assert patch_module._try_qwen3_qk_rope_kv_presplit(backend, object()) == 0
+        assert compilation_config.splitting_ops is splitting_ops
+        assert compilation_config.traced_files == set()
+
+    def test_qwen3_presplit_site_mismatch_is_atomic(self, monkeypatch):
+        from vllm_musa import platform
+        from vllm_musa.compilation import qwen3_qk_rope_kv_presplit as presplit
+        from vllm_musa.patches import _get_patch_files, _load_patch_module
+
+        patch_file = next(
+            f for m, f in _get_patch_files() if m == "vllm.compilation.backends"
+        )
+        patch_module = _load_patch_module(patch_file)
+        monkeypatch.setattr(
+            platform, "_is_qwen3_qk_rope_kv_fusion_config", lambda _config: True
+        )
+        monkeypatch.setattr(
+            presplit,
+            "qwen3_qk_rope_kv_backend_supported",
+            lambda _config, expected_sites: expected_sites == 36,
+        )
+        monkeypatch.setattr(
+            presplit,
+            "plan_qwen3_qk_rope_kv_presplit",
+            lambda _graph, _expected_sites: None,
+        )
+
+        def fail_if_applied(_graph, _candidates):
+            raise AssertionError("an incomplete Qwen3 plan must not be applied")
+
+        monkeypatch.setattr(
+            presplit, "apply_qwen3_qk_rope_kv_presplit", fail_if_applied
+        )
+        splitting_ops = ["vllm::unified_kv_cache_update", "vllm::attention"]
+        compilation_config = SimpleNamespace(
+            use_inductor_graph_partition=False,
+            splitting_ops=splitting_ops,
+            traced_files=set(),
+        )
+        backend = SimpleNamespace(
+            vllm_config=SimpleNamespace(
+                model_config=SimpleNamespace(
+                    hf_text_config=SimpleNamespace(num_hidden_layers=36)
+                )
+            ),
+            compilation_config=compilation_config,
+        )
+
+        assert patch_module._try_qwen3_qk_rope_kv_presplit(backend, object()) == 0
+        assert compilation_config.splitting_ops is splitting_ops
+        assert compilation_config.traced_files == set()
+
+    def test_qwen3_presplit_rejects_unsupported_attention_backend(self, monkeypatch):
+        from vllm_musa import platform
+        from vllm_musa.compilation import qwen3_qk_rope_kv_presplit as presplit
+        from vllm_musa.patches import _get_patch_files, _load_patch_module
+
+        patch_file = next(
+            f for m, f in _get_patch_files() if m == "vllm.compilation.backends"
+        )
+        patch_module = _load_patch_module(patch_file)
+        monkeypatch.setattr(
+            platform, "_is_qwen3_qk_rope_kv_fusion_config", lambda _config: True
+        )
+        monkeypatch.setattr(
+            presplit,
+            "qwen3_qk_rope_kv_backend_supported",
+            lambda _config, _expected_sites: False,
+        )
+
+        def fail_if_planned(_graph, _expected_sites):
+            raise AssertionError("unsupported backends must not plan a Qwen3 rewrite")
+
+        monkeypatch.setattr(presplit, "plan_qwen3_qk_rope_kv_presplit", fail_if_planned)
+        splitting_ops = ["vllm::unified_kv_cache_update", "vllm::attention"]
+        compilation_config = SimpleNamespace(
+            use_inductor_graph_partition=False,
+            splitting_ops=splitting_ops,
+            traced_files=set(),
+        )
+        backend = SimpleNamespace(
+            vllm_config=SimpleNamespace(
+                model_config=SimpleNamespace(
+                    hf_text_config=SimpleNamespace(num_hidden_layers=28)
+                )
+            ),
+            compilation_config=compilation_config,
+        )
+
+        assert patch_module._try_qwen3_qk_rope_kv_presplit(backend, object()) == 0
+        assert compilation_config.splitting_ops is splitting_ops
+        assert compilation_config.traced_files == set()
+
     def test_live_functorch_config_patch_skips_missing_keys(self):
         from contextlib import nullcontext
 

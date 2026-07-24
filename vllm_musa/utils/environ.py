@@ -98,6 +98,9 @@ class Envs:
     # tensor-layout gates fail closed; the environment switch is an A/B escape
     # hatch rather than a required serving option.
     VLLM_MUSA_QWEN2_ROPE_KV_FUSION = EnvBool(True)
+    # Independent Qwen3 QK-norm + full-RoPE + NHD-cache fusion. Platform and
+    # backend gates restrict it to validated dense Qwen3 configurations.
+    VLLM_MUSA_QWEN3_QK_ROPE_KV_FUSION = EnvBool(True)
 
 
 envs = Envs()

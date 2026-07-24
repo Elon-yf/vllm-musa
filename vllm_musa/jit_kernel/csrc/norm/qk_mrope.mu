@@ -282,8 +282,9 @@ __global__ void fused_qk_rmsnorm_mrope_cache_32q4kv_h128_bf16_kernel(
 
   const int64_t cache_idx =
       static_cast<int64_t>(indices[(int64_t)token * indices_stride]);
+  const bool write_cache = cache_idx >= 0;
 
-  if (group == 0) {
+  if (group == 0 && write_cache) {
     constexpr int kVec = 8;
     constexpr int row_dim = k_heads * hidden;
     constexpr int vec_count = row_dim / kVec;
@@ -315,8 +316,6 @@ __global__ void fused_qk_rmsnorm_mrope_cache_32q4kv_h128_bf16_kernel(
       (int64_t)token * q_out_batch_stride + (int64_t)head * q_out_head_stride;
   const int64_t k_out_base =
       (int64_t)token * k_out_batch_stride + (int64_t)head * k_out_head_stride;
-  const int64_t k_cache_base =
-      cache_idx * k_cache_row_stride + (int64_t)head * hidden;
 
   const float data_0 = __bfloat162float(data[base + lane]);
   const float data_1 = __bfloat162float(data[base + lane + 32]);
@@ -352,8 +351,12 @@ __global__ void fused_qk_rmsnorm_mrope_cache_32q4kv_h128_bf16_kernel(
     q_out[q_out_base + x_index0] = x_rot0;
     q_out[q_out_base + y_index0] = y_rot0;
   } else {
-    k_cache[k_cache_base + x_index0] = x_rot0;
-    k_cache[k_cache_base + y_index0] = y_rot0;
+    if (write_cache) {
+      const int64_t k_cache_base =
+          cache_idx * k_cache_row_stride + (int64_t)head * hidden;
+      k_cache[k_cache_base + x_index0] = x_rot0;
+      k_cache[k_cache_base + y_index0] = y_rot0;
+    }
     if constexpr (STORE_K_OUT) {
       k_out[k_out_base + x_index0] = x_rot0;
       k_out[k_out_base + y_index0] = y_rot0;
@@ -382,8 +385,12 @@ __global__ void fused_qk_rmsnorm_mrope_cache_32q4kv_h128_bf16_kernel(
     q_out[q_out_base + x_index1] = x_rot1;
     q_out[q_out_base + y_index1] = y_rot1;
   } else {
-    k_cache[k_cache_base + x_index1] = x_rot1;
-    k_cache[k_cache_base + y_index1] = y_rot1;
+    if (write_cache) {
+      const int64_t k_cache_base =
+          cache_idx * k_cache_row_stride + (int64_t)head * hidden;
+      k_cache[k_cache_base + x_index1] = x_rot1;
+      k_cache[k_cache_base + y_index1] = y_rot1;
+    }
     if constexpr (STORE_K_OUT) {
       k_out[k_out_base + x_index1] = x_rot1;
       k_out[k_out_base + y_index1] = y_rot1;
@@ -428,8 +435,9 @@ __global__ void fused_qk_rmsnorm_mrope_cache_h128_full_bf16_kernel(
 
   const int64_t cache_idx =
       static_cast<int64_t>(indices[(int64_t)token * indices_stride]);
+  const bool write_cache = cache_idx >= 0;
 
-  if (group == 0) {
+  if (group == 0 && write_cache) {
     constexpr int kVec = 8;
     constexpr int row_dim = K_HEADS * hidden;
     constexpr int vec_count = row_dim / kVec;
@@ -526,12 +534,14 @@ __global__ void fused_qk_rmsnorm_mrope_cache_h128_full_bf16_kernel(
     q_out[q_out_base + rot_offset1] = x_rot1;
     q_out[q_out_base + embed_dim + rot_offset1] = y_rot1;
   } else {
-    const int64_t k_cache_base =
-        cache_idx * k_cache_row_stride + (int64_t)head * hidden;
-    k_cache[k_cache_base + rot_offset0] = x_rot0;
-    k_cache[k_cache_base + embed_dim + rot_offset0] = y_rot0;
-    k_cache[k_cache_base + rot_offset1] = x_rot1;
-    k_cache[k_cache_base + embed_dim + rot_offset1] = y_rot1;
+    if (write_cache) {
+      const int64_t k_cache_base =
+          cache_idx * k_cache_row_stride + (int64_t)head * hidden;
+      k_cache[k_cache_base + rot_offset0] = x_rot0;
+      k_cache[k_cache_base + embed_dim + rot_offset0] = y_rot0;
+      k_cache[k_cache_base + rot_offset1] = x_rot1;
+      k_cache[k_cache_base + embed_dim + rot_offset1] = y_rot1;
+    }
     if constexpr (STORE_K_OUT) {
       const int64_t k_out_base = (int64_t)token * k_out_batch_stride +
                                  (int64_t)head * k_out_head_stride;
@@ -579,8 +589,9 @@ __global__ void fused_qk_rmsnorm_rope_cache_h128_full_bf16_kernel(
 
   const int64_t cache_idx =
       static_cast<int64_t>(indices[(int64_t)token * indices_stride]);
+  const bool write_cache = cache_idx >= 0;
 
-  if (group == 0) {
+  if (group == 0 && write_cache) {
     constexpr int kVec = 8;
     constexpr int row_dim = K_HEADS * hidden;
     constexpr int vec_count = row_dim / kVec;
@@ -656,12 +667,14 @@ __global__ void fused_qk_rmsnorm_rope_cache_h128_full_bf16_kernel(
     q_out[q_out_base + rot_offset1] = x_rot1;
     q_out[q_out_base + embed_dim + rot_offset1] = y_rot1;
   } else {
-    const int64_t k_cache_base =
-        cache_idx * k_cache_row_stride + (int64_t)head * hidden;
-    k_cache[k_cache_base + lane] = x_rot0;
-    k_cache[k_cache_base + embed_dim + lane] = y_rot0;
-    k_cache[k_cache_base + rot_offset1] = x_rot1;
-    k_cache[k_cache_base + embed_dim + rot_offset1] = y_rot1;
+    if (write_cache) {
+      const int64_t k_cache_base =
+          cache_idx * k_cache_row_stride + (int64_t)head * hidden;
+      k_cache[k_cache_base + lane] = x_rot0;
+      k_cache[k_cache_base + embed_dim + lane] = y_rot0;
+      k_cache[k_cache_base + rot_offset1] = x_rot1;
+      k_cache[k_cache_base + embed_dim + rot_offset1] = y_rot1;
+    }
     if constexpr (STORE_K_OUT) {
       const int64_t k_out_base = (int64_t)token * k_out_batch_stride +
                                  (int64_t)head * k_out_head_stride;
@@ -713,8 +726,9 @@ __global__ void fused_qk_rmsnorm_rope_cache_h128r64_bf16_kernel(
 
   const int64_t cache_idx =
       static_cast<int64_t>(indices[(int64_t)token * indices_stride]);
+  const bool write_cache = cache_idx >= 0;
 
-  if (group == 0) {
+  if (group == 0 && write_cache) {
     constexpr int kVec = 8;
     constexpr int row_dim = K_HEADS * hidden;
     constexpr int vec_count = row_dim / kVec;
@@ -814,16 +828,18 @@ __global__ void fused_qk_rmsnorm_rope_cache_h128r64_bf16_kernel(
     *reinterpret_cast<__mt_bfloat162 *>(q_out + q_out_base + 96 + pair_col) =
         pass1;
   } else {
-    const int64_t k_cache_base =
-        cache_idx * k_cache_row_stride + (int64_t)head * hidden;
-    *reinterpret_cast<__mt_bfloat162 *>(k_cache + k_cache_base + pair_col) =
-        x_rot;
-    *reinterpret_cast<__mt_bfloat162 *>(k_cache + k_cache_base + embed_dim +
-                                        pair_col) = y_rot;
-    *reinterpret_cast<__mt_bfloat162 *>(k_cache + k_cache_base + 64 + pair_col) =
-        pass0;
-    *reinterpret_cast<__mt_bfloat162 *>(k_cache + k_cache_base + 96 + pair_col) =
-        pass1;
+    if (write_cache) {
+      const int64_t k_cache_base =
+          cache_idx * k_cache_row_stride + (int64_t)head * hidden;
+      *reinterpret_cast<__mt_bfloat162 *>(k_cache + k_cache_base + pair_col) =
+          x_rot;
+      *reinterpret_cast<__mt_bfloat162 *>(k_cache + k_cache_base + embed_dim +
+                                          pair_col) = y_rot;
+      *reinterpret_cast<__mt_bfloat162 *>(k_cache + k_cache_base + 64 + pair_col) =
+          pass0;
+      *reinterpret_cast<__mt_bfloat162 *>(k_cache + k_cache_base + 96 + pair_col) =
+          pass1;
+    }
     if constexpr (STORE_K_OUT) {
       const int64_t k_out_base = (int64_t)token * k_out_batch_stride +
                                  (int64_t)head * k_out_head_stride;
@@ -875,8 +891,9 @@ __global__ void fused_qk_rmsnorm_mrope_cache_h256r64_bf16_kernel(
 
   const int64_t cache_idx =
       static_cast<int64_t>(indices[(int64_t)token * indices_stride]);
+  const bool write_cache = cache_idx >= 0;
 
-  if (group == 0) {
+  if (group == 0 && write_cache) {
     constexpr int kVec = 8;
     constexpr int row_dim = K_HEADS * hidden;
     constexpr int vec_count = row_dim / kVec;
@@ -960,16 +977,18 @@ __global__ void fused_qk_rmsnorm_mrope_cache_h256r64_bf16_kernel(
     q_out[q_out_base + lane + 192] = out_6;
     q_out[q_out_base + lane + 224] = out_7;
   } else {
-    const int64_t k_cache_base =
-        cache_idx * k_cache_row_stride + (int64_t)head * hidden;
-    k_cache[k_cache_base + lane] = x_rot;
-    k_cache[k_cache_base + lane + 32] = y_rot;
-    k_cache[k_cache_base + lane + 64] = out_2;
-    k_cache[k_cache_base + lane + 96] = out_3;
-    k_cache[k_cache_base + lane + 128] = out_4;
-    k_cache[k_cache_base + lane + 160] = out_5;
-    k_cache[k_cache_base + lane + 192] = out_6;
-    k_cache[k_cache_base + lane + 224] = out_7;
+    if (write_cache) {
+      const int64_t k_cache_base =
+          cache_idx * k_cache_row_stride + (int64_t)head * hidden;
+      k_cache[k_cache_base + lane] = x_rot;
+      k_cache[k_cache_base + lane + 32] = y_rot;
+      k_cache[k_cache_base + lane + 64] = out_2;
+      k_cache[k_cache_base + lane + 96] = out_3;
+      k_cache[k_cache_base + lane + 128] = out_4;
+      k_cache[k_cache_base + lane + 160] = out_5;
+      k_cache[k_cache_base + lane + 192] = out_6;
+      k_cache[k_cache_base + lane + 224] = out_7;
+    }
     if constexpr (STORE_K_OUT) {
       const int64_t k_out_base = (int64_t)token * k_out_batch_stride +
                                  (int64_t)head * k_out_head_stride;
@@ -1293,9 +1312,11 @@ __global__ void fused_qk_rmsnorm_mrope_generic_bf16_kernel(
   }
 
   int64_t cache_idx = 0;
+  bool write_cache = false;
   if constexpr (WITH_CACHE) {
     cache_idx = static_cast<int64_t>(indices[(int64_t)token * indices_stride]);
-    if (group == 0) {
+    write_cache = cache_idx >= 0;
+    if (group == 0 && write_cache) {
       const int row_dim = k_heads * hidden;
       const int64_t v_base = (int64_t)token * v_batch_stride;
       const int64_t v_dst = cache_idx * v_cache_row_stride;
@@ -1366,10 +1387,12 @@ __global__ void fused_qk_rmsnorm_mrope_generic_bf16_kernel(
       q_out[out_base + x_index] = x_rot;
       q_out[out_base + y_index] = y_rot;
     } else if constexpr (WITH_CACHE) {
-      const int64_t cache_base =
-          cache_idx * k_cache_row_stride + (int64_t)head * hidden;
-      k_cache[cache_base + x_index] = x_rot;
-      k_cache[cache_base + y_index] = y_rot;
+      if (write_cache) {
+        const int64_t cache_base =
+            cache_idx * k_cache_row_stride + (int64_t)head * hidden;
+        k_cache[cache_base + x_index] = x_rot;
+        k_cache[cache_base + y_index] = y_rot;
+      }
       if (k_out != nullptr) {
         const int64_t out_base =
             (int64_t)token * k_out_batch_stride +
@@ -1397,9 +1420,11 @@ __global__ void fused_qk_rmsnorm_mrope_generic_bf16_kernel(
           (int64_t)head * q_out_head_stride;
       q_out[out_base + col] = out_value;
     } else if constexpr (WITH_CACHE) {
-      const int64_t cache_base =
-          cache_idx * k_cache_row_stride + (int64_t)head * hidden;
-      k_cache[cache_base + col] = out_value;
+      if (write_cache) {
+        const int64_t cache_base =
+            cache_idx * k_cache_row_stride + (int64_t)head * hidden;
+        k_cache[cache_base + col] = out_value;
+      }
       if (k_out != nullptr) {
         const int64_t out_base =
             (int64_t)token * k_out_batch_stride +

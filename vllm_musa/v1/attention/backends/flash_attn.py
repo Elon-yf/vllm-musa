@@ -1484,6 +1484,114 @@ class FlashAttentionImpl(AttentionImpl):
             and self.kv_sharing_target_layer_name is None
         )
 
+    def qwen3_qk_rope_kvcache_supported(self) -> bool:
+        """Whether this layer is inside the initial dense Qwen3 envelope."""
+        from vllm_musa.utils.environ import envs as musa_envs
+
+        return (
+            musa_envs.VLLM_MUSA_QWEN3_QK_ROPE_KV_FUSION.get()
+            and get_flash_attn_version() == 3
+            and get_kv_cache_layout() == "NHD"
+            and (self.num_heads, self.num_kv_heads) in ((16, 8), (32, 8))
+            and self.head_size == 128
+            and self.attn_type == AttentionType.DECODER
+            and self.kv_cache_dtype in ("auto", "bfloat16", torch.bfloat16)
+            and self.alibi_slopes is None
+            and self.sliding_window == (-1, -1)
+            and not self.logits_soft_cap
+            and self.sinks is None
+            and self.kv_sharing_target_layer_name is None
+        )
+
+    def do_qwen3_qk_rope_and_kv_cache_update(
+        self,
+        layer: torch.nn.Module,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        q_out: torch.Tensor,
+        k_out: torch.Tensor,
+        kv_cache: torch.Tensor,
+        layer_slot_mapping: torch.Tensor | None,
+    ) -> None:
+        """Run the exact Qwen3 provider, falling back before cache fusion."""
+        from vllm_musa.jit_kernel.csrc.norm import (
+            fused_qk_rmsnorm_mrope_cache_out,
+        )
+
+        positions_3d = (
+            positions
+            if positions.dim() == 2
+            else positions.unsqueeze(0).expand(3, -1)
+        )
+        can_fuse_cache = (
+            layer_slot_mapping is not None
+            and layer_slot_mapping.shape[0] == q.shape[0]
+            and get_kv_cache_layout() == "NHD"
+        )
+        if can_fuse_cache:
+            key_cache, value_cache = kv_cache.unbind(0)
+            expected_tail = (self.num_kv_heads, self.head_size)
+            flat_cache_supported = (
+                key_cache.is_contiguous()
+                and value_cache.is_contiguous()
+                and tuple(key_cache.shape[-2:]) == expected_tail
+                and tuple(value_cache.shape[-2:]) == expected_tail
+            )
+            if flat_cache_supported:
+                fused_qk_rmsnorm_mrope_cache_out(
+                    q,
+                    k,
+                    v,
+                    q_weight,
+                    k_weight,
+                    positions_3d,
+                    cos_sin_cache,
+                    q_out,
+                    k_out,
+                    key_cache.view(-1, self.num_kv_heads * self.head_size),
+                    value_cache.view(-1, self.num_kv_heads * self.head_size),
+                    layer_slot_mapping,
+                    True,
+                    64,
+                    0,
+                    0,
+                    False,
+                    1e-6,
+                    False,
+                )
+                return
+
+        torch.ops.vllm.musa_csrc_fused_qk_rmsnorm_mrope(
+            q,
+            k,
+            q_weight,
+            k_weight,
+            positions_3d,
+            cos_sin_cache,
+            q_out,
+            k_out,
+            True,
+            64,
+            0,
+            0,
+            False,
+            1e-6,
+            False,
+        )
+        if layer_slot_mapping is not None:
+            self.do_kv_cache_update(
+                layer,
+                k_out,
+                v,
+                kv_cache,
+                layer_slot_mapping,
+            )
+
     def do_rope_and_kv_cache_update(
         self,
         layer: torch.nn.Module,

@@ -223,6 +223,51 @@ def fused_qk_rmsnorm_mrope(
     return q_out, k_out
 
 
+def fused_qk_rmsnorm_mrope_cache_out(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    q_out: torch.Tensor,
+    k_out: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    is_neox: bool,
+    mrope_section_t: int,
+    mrope_section_h: int,
+    mrope_section_w: int,
+    is_interleaved: bool,
+    eps: float = 1e-6,
+    gemma: bool = False,
+) -> None:
+    """Fuse Q/K RMSNorm, RoPE, and a flat-NHD K/V cache update."""
+    torch.ops.vllm.musa_csrc_fused_qk_rmsnorm_mrope_cache_out(
+        q,
+        k,
+        v,
+        q_weight,
+        k_weight,
+        positions,
+        cos_sin_cache,
+        q_out,
+        k_out,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        bool(is_neox),
+        int(mrope_section_t),
+        int(mrope_section_h),
+        int(mrope_section_w),
+        bool(is_interleaved),
+        float(eps),
+        bool(gemma),
+    )
+
+
 def _fused_qk_rmsnorm_mrope_custom(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -284,4 +329,80 @@ direct_register_custom_op(
     op_func=_fused_qk_rmsnorm_mrope_custom,
     mutates_args=["q_out", "k_out"],
     fake_impl=_fused_qk_rmsnorm_mrope_custom_fake,
+)
+
+
+def _fused_qk_rmsnorm_mrope_cache_out_custom(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    q_out: torch.Tensor,
+    k_out: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    is_neox: bool,
+    mrope_section_t: int,
+    mrope_section_h: int,
+    mrope_section_w: int,
+    is_interleaved: bool,
+    eps: float,
+    gemma: bool,
+) -> None:
+    _qk_mrope_module().sgl_musa_fused_qk_rmsnorm_mrope_cache_out(
+        q,
+        k,
+        v,
+        q_weight,
+        k_weight,
+        positions,
+        cos_sin_cache,
+        q_out,
+        k_out,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        bool(is_neox),
+        int(mrope_section_t),
+        int(mrope_section_h),
+        int(mrope_section_w),
+        bool(is_interleaved),
+        float(eps),
+        bool(gemma),
+    )
+
+
+def _fused_qk_rmsnorm_mrope_cache_out_custom_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    q_out: torch.Tensor,
+    k_out: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    is_neox: bool,
+    mrope_section_t: int,
+    mrope_section_h: int,
+    mrope_section_w: int,
+    is_interleaved: bool,
+    eps: float,
+    gemma: bool,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="musa_csrc_fused_qk_rmsnorm_mrope_cache_out",
+    op_func=_fused_qk_rmsnorm_mrope_cache_out_custom,
+    mutates_args=["q_out", "k_out", "key_cache", "value_cache"],
+    fake_impl=_fused_qk_rmsnorm_mrope_cache_out_custom_fake,
 )
