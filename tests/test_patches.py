@@ -83,6 +83,112 @@ class TestCompilationBackendPatch:
             ["input"],
         )
 
+    def test_qwen2_presplit_keeps_baseline_split_and_hashes_helper(self, monkeypatch):
+        from vllm_musa import platform
+        from vllm_musa.compilation import qwen2_rope_kv_presplit as presplit
+        from vllm_musa.patches import _get_patch_files, _load_patch_module
+
+        patch_file = next(
+            f for m, f in _get_patch_files() if m == "vllm.compilation.backends"
+        )
+        patch_module = _load_patch_module(patch_file)
+        monkeypatch.setattr(
+            platform, "_is_qwen2_rope_kv_fusion_config", lambda _config: True
+        )
+        monkeypatch.setattr(
+            presplit, "qwen2_rope_kv_backend_supported", lambda _config: True
+        )
+        monkeypatch.setattr(
+            presplit,
+            "plan_qwen2_rope_kv_presplit",
+            lambda _graph: tuple(range(24)),
+        )
+        monkeypatch.setattr(
+            presplit,
+            "apply_qwen2_rope_kv_presplit",
+            lambda _graph, candidates: len(candidates),
+        )
+        compilation_config = SimpleNamespace(
+            use_inductor_graph_partition=False,
+            splitting_ops=["vllm::unified_kv_cache_update", "vllm::attention"],
+            traced_files=set(),
+        )
+        backend = SimpleNamespace(
+            vllm_config=object(), compilation_config=compilation_config
+        )
+
+        assert patch_module._try_qwen2_rope_kv_presplit(backend, object()) == 24
+        assert compilation_config.splitting_ops == [
+            "vllm::unified_kv_cache_update",
+            "vllm::attention",
+            "vllm::fused_rope_and_unified_kv_cache_update",
+        ]
+        assert str(Path(presplit.__file__).resolve()) in compilation_config.traced_files
+        assert str(Path(patch_module.__file__).resolve()) in (
+            compilation_config.traced_files
+        )
+
+    def test_qwen2_presplit_mismatch_keeps_baseline_config(self, monkeypatch):
+        from vllm_musa import platform
+        from vllm_musa.compilation import qwen2_rope_kv_presplit as presplit
+        from vllm_musa.patches import _get_patch_files, _load_patch_module
+
+        patch_file = next(
+            f for m, f in _get_patch_files() if m == "vllm.compilation.backends"
+        )
+        patch_module = _load_patch_module(patch_file)
+        monkeypatch.setattr(
+            platform, "_is_qwen2_rope_kv_fusion_config", lambda _config: True
+        )
+        monkeypatch.setattr(
+            presplit, "qwen2_rope_kv_backend_supported", lambda _config: True
+        )
+        monkeypatch.setattr(
+            presplit, "plan_qwen2_rope_kv_presplit", lambda _graph: None
+        )
+        splitting_ops = ["vllm::unified_kv_cache_update", "vllm::attention"]
+        compilation_config = SimpleNamespace(
+            use_inductor_graph_partition=False,
+            splitting_ops=splitting_ops,
+            traced_files=set(),
+        )
+        backend = SimpleNamespace(
+            vllm_config=object(), compilation_config=compilation_config
+        )
+
+        assert patch_module._try_qwen2_rope_kv_presplit(backend, object()) == 0
+        assert compilation_config.splitting_ops is splitting_ops
+        assert compilation_config.traced_files == set()
+
+    def test_qwen2_presplit_rejects_unsupported_attention_backend(self, monkeypatch):
+        from vllm_musa import platform
+        from vllm_musa.compilation import qwen2_rope_kv_presplit as presplit
+        from vllm_musa.patches import _get_patch_files, _load_patch_module
+
+        patch_file = next(
+            f for m, f in _get_patch_files() if m == "vllm.compilation.backends"
+        )
+        patch_module = _load_patch_module(patch_file)
+        monkeypatch.setattr(
+            platform, "_is_qwen2_rope_kv_fusion_config", lambda _config: True
+        )
+        monkeypatch.setattr(
+            presplit, "qwen2_rope_kv_backend_supported", lambda _config: False
+        )
+        splitting_ops = ["vllm::unified_kv_cache_update", "vllm::attention"]
+        compilation_config = SimpleNamespace(
+            use_inductor_graph_partition=False,
+            splitting_ops=splitting_ops,
+            traced_files=set(),
+        )
+        backend = SimpleNamespace(
+            vllm_config=object(), compilation_config=compilation_config
+        )
+
+        assert patch_module._try_qwen2_rope_kv_presplit(backend, object()) == 0
+        assert compilation_config.splitting_ops is splitting_ops
+        assert compilation_config.traced_files == set()
+
     def test_live_functorch_config_patch_skips_missing_keys(self):
         from contextlib import nullcontext
 
@@ -328,6 +434,22 @@ class TestMUSANativeKernelReviewHardening:
         # (avoid brittle cross-literal substring matching).
         assert "VLLM_MUSA_FUSED_ADD_RMSNORM_BLOCK_X must be one of" in source
         assert "128, 256, 512, or 1024" in source
+
+    def test_fused_rmsnorm_qwen2_small_hidden_uses_256_threads(self):
+        source = (
+            Path(__file__).parents[1] / "csrc/musa/fused_add_rmsnorm.mu"
+        ).read_text()
+
+        gate_start = source.index(
+            "std::is_same<T, __mt_bfloat16>::value && rows > 0 &&"
+        )
+        gate = source[gate_start : source.index("} else", gate_start)]
+        assert "block_x = 256" in gate
+        assert "std::is_same<T, __mt_bfloat16>::value" in gate
+        assert "rows > 0" in gate
+        assert "rows <= 16 && hidden_size == 896" in gate
+        assert "use_qwen2_small_hidden_launch" not in source
+        assert "getMUSAArch" not in source
 
 
 class TestMUSAPlatformDefaults:

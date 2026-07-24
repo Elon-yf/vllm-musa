@@ -189,7 +189,10 @@ _CAT6: list[DivSpec] = [
         upstream_path="vllm/compilation/backends.py",
         apply_phase="runtime",
         required=False,
-        intent="VllmBackend.__call__ ignores unsupported torch.compile backend kwargs",
+        intent=(
+            "VllmBackend accepts unsupported torch.compile kwargs and applies the "
+            "exact Qwen2 RoPE+KV raw-FX pre-split rewrite"
+        ),
     ),
     DivSpec(
         id="vllm__compilation__compiler_interface",

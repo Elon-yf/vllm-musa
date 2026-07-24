@@ -92,6 +92,10 @@ class Envs:
     VLLM_MUSA_ENABLE_JIT_TOPK = EnvBool(True)
     VLLM_MUSA_SEEDED_MULTINOMIAL = EnvBool(True)
     VLLM_MUSA_RESHAPE_CACHE_FLASH = EnvBool(True)
+    # Exact-shape Qwen2 RoPE+NHD-cache fusion.  The model, graph, dtype, and
+    # tensor-layout gates fail closed; the environment switch is an A/B escape
+    # hatch rather than a required serving option.
+    VLLM_MUSA_QWEN2_ROPE_KV_FUSION = EnvBool(True)
 
 
 envs = Envs()

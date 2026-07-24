@@ -253,6 +253,54 @@ class TestMUSAPlatformBase:
         )
         assert config.compilation_config.compile_ranges_endpoints == []
 
+    def test_qwen2_rope_kv_fusion_exact_config_gate(self):
+        import torch
+
+        from vllm_musa.platform import _is_qwen2_rope_kv_fusion_config
+        from vllm_musa.utils.environ import envs
+
+        def make_config(model_type: str, kv_heads, intermediate_size):
+            return SimpleNamespace(
+                model_config=SimpleNamespace(
+                    hf_text_config=SimpleNamespace(
+                        model_type=model_type,
+                        hidden_size=896,
+                        intermediate_size=intermediate_size,
+                        num_hidden_layers=24,
+                        num_attention_heads=14,
+                        num_key_value_heads=kv_heads,
+                    ),
+                    dtype=torch.bfloat16,
+                    quantization=None,
+                    enforce_eager=False,
+                ),
+                parallel_config=SimpleNamespace(
+                    tensor_parallel_size=1,
+                    pipeline_parallel_size=1,
+                    data_parallel_size=1,
+                    decode_context_parallel_size=1,
+                ),
+                quant_config=None,
+                speculative_config=None,
+            )
+
+        with envs.VLLM_MUSA_QWEN2_ROPE_KV_FUSION.override(True):
+            assert not _is_qwen2_rope_kv_fusion_config(make_config("qwen2", None, None))
+            assert _is_qwen2_rope_kv_fusion_config(
+                make_config("cosyvoice3", None, None)
+            )
+            config = make_config("qwen2", 2, 4864)
+            assert _is_qwen2_rope_kv_fusion_config(config)
+            config.cache_config = SimpleNamespace(
+                cache_dtype="bfloat16", block_size=64
+            )
+            assert _is_qwen2_rope_kv_fusion_config(config)
+            config.cache_config.block_size = 128
+            assert not _is_qwen2_rope_kv_fusion_config(config)
+            config.cache_config.block_size = 64
+            config.quant_config = object()
+            assert not _is_qwen2_rope_kv_fusion_config(config)
+
     def test_supports_fp8_for_musa_3_1(self):
         """Test that FP8 is supported on MUSA capability 3.1."""
         from vllm.platforms.interface import DeviceCapability

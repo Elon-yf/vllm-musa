@@ -7,6 +7,7 @@
 #include "torch_musa/csrc/core/MUSAGuard.h"
 
 #include <cstdlib>
+#include <type_traits>
 
 #include "vec_utils.muh"
 
@@ -150,6 +151,11 @@ void dispatch_fused_add_rmsnorm(T* input, T* residual, const T* weight,
     block_x = 256;
   } else if (rows >= 8 && vec_hidden_size >= 1280) {
     block_x = 512;
+  } else if (std::is_same<T, __mt_bfloat16>::value && rows > 0 &&
+             rows <= 16 && hidden_size == 896) {
+    // S5000/Qwen2: reduce idle threads and reduction overhead for small-row
+    // H=896.
+    block_x = 256;
   } else {
     block_x = 1024;
   }
