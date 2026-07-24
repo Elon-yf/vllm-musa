@@ -575,6 +575,10 @@ class TestMUSAPlatformBase:
         versions["mate"] = "0.2.5"
         assert not flash_attn._has_supported_fa3_scheduler_layout()
 
+        versions["mate"] = "0.2.4"
+        versions["flash_attn_3"] = "0.2.4+custom"
+        assert not flash_attn._has_supported_fa3_scheduler_layout()
+
         def missing_package(_package):
             raise PackageNotFoundError
 

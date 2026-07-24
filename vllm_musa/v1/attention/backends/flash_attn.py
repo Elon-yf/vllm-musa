@@ -174,11 +174,14 @@ def _is_qwen_family_scheduler_lookup_config(vllm_config: VllmConfig) -> bool:
 def _has_supported_fa3_scheduler_layout() -> bool:
     """The direct builder mirrors the pinned MATE 0.2.4 metadata layout."""
     try:
-        mate_version = version("mate").split("+", 1)[0]
-        flash_attn_version = version("flash_attn_3").split("+", 1)[0]
+        mate_version = version("mate")
+        flash_attn_version = version("flash_attn_3")
     except PackageNotFoundError:
         return False
-    return mate_version == "0.2.4" and flash_attn_version == "0.2.4"
+    return mate_version == "0.2.4" and flash_attn_version in {
+        "0.2.4",
+        "0.2.4+musa",
+    }
 
 
 def _torch_reduce_scatter_dim(
@@ -228,7 +231,6 @@ def _musa_cp_lse_ag_out_rs(
     return_lse: bool = False,
     is_lse_base_on_e=True,
 ):
-
     safe_group = _DCPGroupWithTorchReduceScatter(cp_group)
     return cp_lse_ag_out_rs(
         cp_attn_out,
