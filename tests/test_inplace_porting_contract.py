@@ -94,6 +94,10 @@ def test_musa_image_stage_and_optional_component_contract():
 
 def test_mooncake_uses_the_pinned_upstream_connector():
     distributed_init = (ROOT / "vllm_musa" / "distributed" / "__init__.py").read_text()
+    package_init = (ROOT / "vllm_musa" / "__init__.py").read_text()
+    mooncake_compat = (
+        ROOT / "vllm_musa" / "distributed" / "mooncake_compat.py"
+    ).read_text()
     manifest = (ROOT / "vllm_musa" / "patches" / "manifest.py").read_text()
     legacy_rebind = (
         ROOT
@@ -108,6 +112,14 @@ def test_mooncake_uses_the_pinned_upstream_connector():
     assert not legacy_rebind.exists()
     assert "import vllm_musa.distributed.kv_transfer" not in distributed_init
     assert "kv_connector/v1/mooncake_connector.py" not in manifest
+    configure_index = package_init.index("    configure_legacy_device_filter()")
+    patch_index = package_init.index("    _register_patches()", configure_index)
+    modules_index = package_init.index("    _register_modules()", patch_index)
+    assert configure_index < patch_index < modules_index
+    assert '"MC_TE_FILTERS"' in mooncake_compat
+    assert '"MOONCAKE_RDMA_DEVICES"' in mooncake_compat
+    assert "import mooncake" not in mooncake_compat
+    assert "from vllm" not in mooncake_compat
 
 
 def test_mooncake_example_uses_current_proxy_and_scoped_cleanup():
@@ -126,6 +138,22 @@ def test_mooncake_example_uses_current_proxy_and_scoped_cleanup():
     assert "pgrep" not in script
     assert "pkill" not in script
     assert "kill -- -$$" not in script
+
+
+def test_mooncake_rdma_container_contract_is_explicit():
+    example_readme = (ROOT / "docs" / "example" / "README.md").read_text()
+    for token in (
+        "--network host",
+        "/dev/infiniband:/dev/infiniband",
+        "stat -c '%t %T'",
+        '--device-cgroup-rule="c ${VERBS_MAJOR}:* rmw"',
+        '--device-cgroup-rule="c ${RDMA_CM_MAJOR}:${RDMA_CM_MINOR} rmw"',
+        "--env MC_FORCE_HCA=1",
+        "--cap-add IPC_LOCK",
+        "--ulimit memlock=-1:-1",
+        "MC_TE_FILTERS",
+    ):
+        assert token in example_readme
 
 
 def test_musa_image_provenance_labels_are_derived_from_source():

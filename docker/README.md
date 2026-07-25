@@ -158,6 +158,11 @@ docker run --rm <MUSA GPU flags> \
 
 On a MUSA GPU you should see `musa available: True`.
 
+Mooncake over RoCE also requires host networking and explicit RDMA device
+access. See the
+[container and RDMA prerequisites](../docs/example/README.md#container-and-rdma-prerequisites)
+for the validated runtime flags.
+
 ## How it works (build stages)
 
 `docker/musa.Dockerfile` is multi-stage:

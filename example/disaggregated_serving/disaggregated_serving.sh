@@ -39,6 +39,10 @@ case "${VLLM_ENFORCE_EAGER}" in
         ;;
 esac
 
+# This is a wrapper-only switch; do not make vLLM treat it as an unknown
+# environment variable in each server process.
+unset VLLM_ENFORCE_EAGER
+
 cleanup() {
     local status=${1:-$?}
     trap - EXIT INT TERM

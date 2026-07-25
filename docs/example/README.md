@@ -23,6 +23,65 @@ bash disaggregated_serving.sh
 bash disaggregated_serving.sh meta-llama/Meta-Llama-3.1-8B-Instruct
 ```
 
+### Container and RDMA prerequisites
+
+The single-node example uses P2P handshake endpoints and dynamic Mooncake RPC
+ports. When it runs in a container, use the host network namespace and expose
+the host RoCE devices. `--network host` alone is not sufficient; the container
+also needs the verbs and `rdma_cm` character devices plus locked-memory access.
+
+The following non-privileged runtime shape was validated on S5000 with RoCE:
+
+```bash
+IMAGE=vllm-musa:latest
+# Run this block in bash; the device numbers are hexadecimal in stat output.
+read -r VERBS_MAJOR_HEX _ < \
+  <(stat -c '%t %T' /dev/infiniband/uverbs0)
+read -r RDMA_CM_MAJOR_HEX RDMA_CM_MINOR_HEX < \
+  <(stat -c '%t %T' /dev/infiniband/rdma_cm)
+VERBS_MAJOR=$((16#${VERBS_MAJOR_HEX}))
+RDMA_CM_MAJOR=$((16#${RDMA_CM_MAJOR_HEX}))
+RDMA_CM_MINOR=$((16#${RDMA_CM_MINOR_HEX}))
+# Optional: export MC_TE_FILTERS=mlx5_<n>,mlx5_<m> to restrict HCA selection.
+docker run --rm --name vllm-musa-mooncake \
+  --runtime=mthreads \
+  --network host \
+  --shm-size 256g \
+  --env MTHREADS_VISIBLE_DEVICES=0,1 \
+  --env MC_FORCE_HCA=1 \
+  --env MC_TE_FILTERS \
+  --volume /dev/infiniband:/dev/infiniband \
+  --mount type=bind,src=/sys/class/infiniband,dst=/sys/class/infiniband,readonly \
+  --mount type=bind,src=/sys/class/net,dst=/sys/class/net,readonly \
+  --device-cgroup-rule="c ${VERBS_MAJOR}:* rmw" \
+  --device-cgroup-rule="c ${RDMA_CM_MAJOR}:${RDMA_CM_MINOR} rmw" \
+  --cap-add IPC_LOCK \
+  --ulimit memlock=-1:-1 \
+  "${IMAGE}" bash
+```
+
+Use `ls /sys/class/infiniband` or `ibdev2netdev` on the leased host to obtain
+the real HCA names; do not copy a node-specific list. The `stat` expressions
+derive the verbs and `rdma_cm` device numbers for the current host, so the
+command does not assume the `10:121` minor observed on the validation node.
+Unset `MC_TE_FILTERS` to let Mooncake discover all available HCAs, or export it
+before the command for the official comma-separated HCA allow-list. The
+validation benchmark used `MC_TE_FILTERS=mlx5_2,mlx5_3`; that node-specific
+value is intentionally not embedded in the launch command. `MC_FORCE_HCA=1`
+makes an RDMA validation fail instead of silently falling back to TCP.
+
+Before starting vLLM, verify that the same HCA devices are visible inside the
+container:
+
+```bash
+ls /dev/infiniband /sys/class/infiniband
+python -c 'from mooncake.engine import TransferEngine; print(TransferEngine().get_local_topology(""))'
+```
+
+`MOONCAKE_RDMA_DEVICES` remains a deprecated vLLM-MUSA compatibility alias. It
+is mapped to `MC_TE_FILTERS` before the upstream connector is constructed;
+when both variables are present, the official `MC_TE_FILTERS` value wins.
+
 By default, the example leaves the normal compiled serving path enabled and
 limits each server to 16 concurrent sequences. Set `VLLM_ENFORCE_EAGER=1` for a
 functional diagnostic that isolates Mooncake from compilation. Logs are written

@@ -164,6 +164,12 @@ def register_custom_ops() -> None:
     It applies the runtime object patches and registers all MUSA-specific ops,
     distributed connectors, and attention backends.
     """
+    # Must run before any Mooncake worker is constructed.  Keep this helper
+    # stdlib-only so it does not pull in torch or replace upstream connector
+    # objects during plugin discovery.
+    from .distributed.mooncake_compat import configure_legacy_device_filter
+
+    configure_legacy_device_filter()
     _register_patches()
     _register_ops()
     _register_modules()
