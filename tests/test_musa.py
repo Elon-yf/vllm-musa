@@ -557,11 +557,11 @@ class TestMUSAPlatformBase:
                 make_config("qwen3", "Qwen3ForCausalLM")
             )
 
-    def test_qwen_fa3_scheduler_lookup_default_off(self, monkeypatch):
+    def test_qwen_fa3_scheduler_lookup_default_on(self, monkeypatch):
         from vllm_musa.utils.environ import envs
 
         monkeypatch.delenv("VLLM_MUSA_QWEN_FA3_SCHEDULER_LOOKUP", raising=False)
-        assert envs.VLLM_MUSA_QWEN_FA3_SCHEDULER_LOOKUP.get() is False
+        assert envs.VLLM_MUSA_QWEN_FA3_SCHEDULER_LOOKUP.get() is True
 
     def test_qwen_fa3_scheduler_lookup_layout_version_gate(self, monkeypatch):
         from importlib.metadata import PackageNotFoundError

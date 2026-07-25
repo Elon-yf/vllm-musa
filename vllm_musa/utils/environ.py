@@ -102,8 +102,9 @@ class Envs:
     # backend gates restrict it to validated dense Qwen3 configurations.
     VLLM_MUSA_QWEN3_QK_ROPE_KV_FUSION = EnvBool(True)
     # Direct batch-one Qwen FA3 scheduler metadata, with exact backend gates
-    # for the supported model geometry and decode shape.
-    VLLM_MUSA_QWEN_FA3_SCHEDULER_LOOKUP = EnvBool(False)
+    # for the supported model geometry and decode shape.  Keep the environment
+    # switch as an explicit A/B and emergency-disable escape hatch.
+    VLLM_MUSA_QWEN_FA3_SCHEDULER_LOOKUP = EnvBool(True)
 
 
 envs = Envs()
