@@ -44,6 +44,7 @@ RDMA_CM_MAJOR=$((16#${RDMA_CM_MAJOR_HEX}))
 RDMA_CM_MINOR=$((16#${RDMA_CM_MINOR_HEX}))
 # Optional: export MC_TE_FILTERS=mlx5_<n>,mlx5_<m> to restrict HCA selection.
 docker run --rm --name vllm-musa-mooncake \
+  --detach \
   --runtime=mthreads \
   --network host \
   --shm-size 256g \
@@ -57,7 +58,7 @@ docker run --rm --name vllm-musa-mooncake \
   --device-cgroup-rule="c ${RDMA_CM_MAJOR}:${RDMA_CM_MINOR} rmw" \
   --cap-add IPC_LOCK \
   --ulimit memlock=-1:-1 \
-  "${IMAGE}" bash
+  "${IMAGE}" sleep infinity
 ```
 
 Use `ls /sys/class/infiniband` or `ibdev2netdev` on the leased host to obtain
@@ -71,11 +72,12 @@ value is intentionally not embedded in the launch command. `MC_FORCE_HCA=1`
 makes an RDMA validation fail instead of silently falling back to TCP.
 
 Before starting vLLM, verify that the same HCA devices are visible inside the
-container:
+detached container:
 
 ```bash
-ls /dev/infiniband /sys/class/infiniband
-python -c 'from mooncake.engine import TransferEngine; print(TransferEngine().get_local_topology(""))'
+docker exec vllm-musa-mooncake ls /dev/infiniband /sys/class/infiniband
+docker exec vllm-musa-mooncake python -c \
+  'from mooncake.engine import TransferEngine; print(TransferEngine().get_local_topology(""))'
 ```
 
 `MOONCAKE_RDMA_DEVICES` remains a deprecated vLLM-MUSA compatibility alias. It

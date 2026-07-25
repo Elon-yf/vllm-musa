@@ -143,7 +143,9 @@ def test_mooncake_example_uses_current_proxy_and_scoped_cleanup():
 def test_mooncake_rdma_container_contract_is_explicit():
     example_readme = (ROOT / "docs" / "example" / "README.md").read_text()
     for token in (
+        "--detach",
         "--network host",
+        "sleep infinity",
         "/dev/infiniband:/dev/infiniband",
         "stat -c '%t %T'",
         '--device-cgroup-rule="c ${VERBS_MAJOR}:* rmw"',
