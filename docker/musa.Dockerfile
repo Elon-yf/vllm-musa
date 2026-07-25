@@ -378,23 +378,15 @@ RUN mkdir -p /tmp/vllm-rs-artifacts && \
 # the final image enables it below.
 FROM vllm_musa_installed AS mooncake
 
-ARG BUILD_MOONCAKE=1
 ARG MOONCAKE_VERSION=0.3.12
 ARG PYPI_INDEX_URL
 
-RUN if [[ "${BUILD_MOONCAKE}" == "1" ]]; then \
-        python -m pip install \
-            --no-cache-dir \
-            --only-binary=:all: \
-            --index-url "${PYPI_INDEX_URL}" \
-            "mooncake-transfer-engine-musa==${MOONCAKE_VERSION}" && \
-        MOONCAKE_VERSION="${MOONCAKE_VERSION}" python -c 'import os; from importlib.metadata import version; from mooncake.engine import TransferEngine; actual = version("mooncake-transfer-engine-musa"); expected = os.environ["MOONCAKE_VERSION"]; assert actual == expected, (actual, expected); print(f"PASS mooncake-transfer-engine-musa version={actual}")'; \
-    elif [[ "${BUILD_MOONCAKE}" == "0" ]]; then \
-        echo "Skipping Mooncake install because BUILD_MOONCAKE=0"; \
-    else \
-        echo "Unsupported BUILD_MOONCAKE=${BUILD_MOONCAKE}" >&2; \
-        exit 1; \
-    fi
+RUN python -m pip install \
+        --no-cache-dir \
+        --only-binary=:all: \
+        --index-url "${PYPI_INDEX_URL}" \
+        "mooncake-transfer-engine-musa==${MOONCAKE_VERSION}" && \
+    MOONCAKE_VERSION="${MOONCAKE_VERSION}" python -c 'import os; from importlib.metadata import version; from mooncake.engine import TransferEngine; actual = version("mooncake-transfer-engine-musa"); expected = os.environ["MOONCAKE_VERSION"]; assert actual == expected, (actual, expected); print(f"PASS mooncake-transfer-engine-musa version={actual}")'
 
 FROM mooncake AS final
 

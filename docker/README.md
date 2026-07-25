@@ -13,7 +13,7 @@ The resulting image contains:
   `torch_c_dlpack_ext`),
 - `vllm-musa` and the vendored upstream vLLM, built from source,
 - `vllm-rs` and its Python tool-parser extension when `BUILD_VLLM_RS=1`,
-- `mooncake-transfer-engine-musa` when `BUILD_MOONCAKE=1`.
+- `mooncake-transfer-engine-musa`.
 
 ## Prerequisites
 
@@ -69,7 +69,6 @@ bash docker/build_image.sh --no-cache --build-arg http_proxy=http://proxy:8118
 | `MCCL_VERSION` | `2.4.0` | MCCL (collective communication library) version. |
 | `PYPI_INDEX_URL` | `https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple` | Public index for ordinary third-party wheels **and** the vendored vLLM's dependencies. |
 | `MUSA_PIP_INDEX_URL` | `https://dl.mthreads.com/repo/api/pypi/pypi/simple` | Moore Threads index for the MUSA/MT wheels. |
-| `BUILD_MOONCAKE` | `1` | `1`: install the MUSA Mooncake Transfer Engine wheel; `0`: skip. |
 | `MOONCAKE_VERSION` | `0.3.12` | Exact `mooncake-transfer-engine-musa` version installed from `PYPI_INDEX_URL`. |
 | `BUILD_VLLM_RS` | `1` | `1`: build and install `vllm-rs` plus `_rust_tool_parser`; `0`: omit both and skip Rust/protoc setup. |
 | `IMAGE_REPOSITORY` | `vllm-musa` | Image repository name. |
@@ -109,15 +108,9 @@ BASE_IMAGE=<local-ubuntu-22.04-image> bash docker/build_image.sh
 MUSA_RUNTIME_VERSION=5.2 MUSA_APT_SOURCE=<5.2-apt-repo> bash docker/build_image.sh
 ```
 
-**Skip Mooncake:**
-
-```bash
-BUILD_MOONCAKE=0 bash docker/build_image.sh
-```
-
-The prebuilt MUSA Mooncake wheel is installed by default after the torch and
-vLLM stacks. Pin a different published build with `MOONCAKE_VERSION`; the image
-does not clone or compile Mooncake source.
+The prebuilt MUSA Mooncake wheel is installed after the torch and vLLM stacks.
+Pin a different published build with `MOONCAKE_VERSION`; the image does not
+clone or compile Mooncake source.
 
 **Skip the Rust frontend:**
 
@@ -186,7 +179,7 @@ On a MUSA GPU you should see `musa available: True`.
 6. **vllm_rs_build** — optionally builds Rust artifacts (`BUILD_VLLM_RS`) without
    carrying Rust/protoc into the final image.
 7. **mooncake** — installs the pinned `mooncake-transfer-engine-musa` wheel on
-   top of the torch/vLLM stack unless `BUILD_MOONCAKE=0`.
+   top of the torch/vLLM stack.
 8. **final** — installs optional Rust artifacts, enables MUSA device visibility,
    and removes build caches.
 

@@ -33,7 +33,6 @@ VLLM_MUSA_COMMIT="$(git rev-parse HEAD)"
 VLLM_MUSA_REF="$(git describe --tags --exact-match 2>/dev/null || git branch --show-current)"
 VLLM_TAG="$(awk -F= '$1 == "VLLM_TAG" {print $2; exit}' third_party/PINS)"
 
-BUILD_MOONCAKE="${BUILD_MOONCAKE:-1}"
 MOONCAKE_VERSION="${MOONCAKE_VERSION:-0.3.12}"
 BUILD_VLLM_RS="${BUILD_VLLM_RS:-1}"
 
@@ -53,7 +52,6 @@ docker build \
     --build-arg INSTALL_MUSA_STACK="${INSTALL_MUSA_STACK}" \
     --build-arg MUSA_RUNTIME_VERSION="${MUSA_RUNTIME_VERSION}" \
     --build-arg MCCL_VERSION="${MCCL_VERSION}" \
-    --build-arg BUILD_MOONCAKE="${BUILD_MOONCAKE}" \
     --build-arg MOONCAKE_VERSION="${MOONCAKE_VERSION}" \
     --build-arg BUILD_VLLM_RS="${BUILD_VLLM_RS}" \
     --build-arg VLLM_MUSA_COMMIT="${VLLM_MUSA_COMMIT}" \
