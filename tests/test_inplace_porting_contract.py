@@ -65,7 +65,7 @@ def test_musa_image_stage_and_optional_component_contract():
         1
     ].split("FROM mooncake AS final", 1)[0]
     assert "MTHREADS_VISIBLE_DEVICES" not in mooncake_stage
-    assert "ARG MOONCAKE_VERSION=0.3.12" in mooncake_stage
+    assert "ARG MOONCAKE_VERSION=0.3.12.post1" in mooncake_stage
     assert '"mooncake-transfer-engine-musa==${MOONCAKE_VERSION}"' in mooncake_stage
     assert '--index-url "${PYPI_INDEX_URL}"' in mooncake_stage
     assert "--only-binary=:all:" in mooncake_stage
@@ -81,7 +81,7 @@ def test_musa_image_stage_and_optional_component_contract():
     ):
         assert source_build_token not in mooncake_stage
 
-    assert 'MOONCAKE_VERSION="${MOONCAKE_VERSION:-0.3.12}"' in build_script
+    assert 'MOONCAKE_VERSION="${MOONCAKE_VERSION:-0.3.12.post1}"' in build_script
     assert '--build-arg MOONCAKE_VERSION="${MOONCAKE_VERSION}"' in build_script
     assert "MOONCAKE_REPO" not in build_script
     assert "MOONCAKE_COMMIT" not in build_script
