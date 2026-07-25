@@ -61,6 +61,13 @@ docker run --rm --name vllm-musa-mooncake \
   "${IMAGE}" sleep infinity
 ```
 
+Run the example commands with `docker exec vllm-musa-mooncake ...`, then stop
+the container so it releases the GPUs and `--rm` removes it:
+
+```bash
+docker stop vllm-musa-mooncake
+```
+
 Use `ls /sys/class/infiniband` or `ibdev2netdev` on the leased host to obtain
 the real HCA names; do not copy a node-specific list. The `stat` expressions
 derive the verbs and `rdma_cm` device numbers for the current host, so the
