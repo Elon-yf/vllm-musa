@@ -81,7 +81,9 @@ def test_legacy_sample_skips_only_cpu_proven_qwen_unit_temperature(
     fake_sampler = SimpleNamespace(
         logprobs_mode="raw_logprobs",
         apply_temperature=apply_temperature,
-        topk_topp_sampler=object(),
+        topk_topp_sampler=SimpleNamespace(
+            forward=SimpleNamespace(__name__="forward_native")
+        ),
         use_fp64_gumbel=False,
         _musa_qwen_skip_unit_temperature=True,
     )
