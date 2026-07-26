@@ -121,3 +121,43 @@ def launch_all_gather(
         int(rank),
         int(world_size),
     )
+
+
+def launch_registered(
+    rank_data: torch.Tensor,
+    signal_ptrs_cpu: torch.Tensor,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+    rank: int,
+    world_size: int,
+    shot: int,
+) -> None:
+    _custom_ar_module(int(world_size)).vllm_musa_custom_ar_launch_registered(
+        rank_data,
+        signal_ptrs_cpu,
+        inp,
+        out,
+        int(rank),
+        int(world_size),
+        int(shot),
+    )
+
+
+def launch_graph_registered(
+    rank_data: torch.Tensor,
+    signal_ptrs_cpu: torch.Tensor,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+    rank: int,
+    world_size: int,
+    shot: int,
+) -> None:
+    _custom_ar_module(int(world_size)).vllm_musa_custom_ar_launch_graph_registered(
+        rank_data,
+        signal_ptrs_cpu,
+        inp,
+        out,
+        int(rank),
+        int(world_size),
+        int(shot),
+    )
