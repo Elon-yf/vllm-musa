@@ -66,13 +66,22 @@ logger = init_logger(__name__)
 
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 
-_MUSA_QWEN_ARCH_PREFIXES = ("Qwen2", "Qwen3")
+_MUSA_QWEN_TEXT_GENERATION_ARCHITECTURES = frozenset(
+    {
+        "Qwen2ForCausalLM",
+        "Qwen2MoeForCausalLM",
+        "Qwen3ForCausalLM",
+        "Qwen3MoeForCausalLM",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+    }
+)
 
 
-def _is_musa_qwen_family(model_config: Any) -> bool:
+def _is_musa_qwen_text_generation_architecture(model_config: Any) -> bool:
     architectures = model_config.architectures or ()
     return any(
-        architecture.startswith(_MUSA_QWEN_ARCH_PREFIXES)
+        architecture in _MUSA_QWEN_TEXT_GENERATION_ARCHITECTURES
         for architecture in architectures
     )
 
@@ -80,27 +89,31 @@ def _is_musa_qwen_family(model_config: Any) -> bool:
 def _use_musa_qwen_direct_decode_schedule(
     *,
     aot_schedule: bool,
+    causal: bool,
     is_bfloat16: bool,
     is_qwen_family: bool,
+    use_full_cuda_graph: bool,
     common_prefix_len: int,
     dcp_world_size: int,
-    num_reqs: int,
-    num_decodes: int,
-    num_actual_tokens: int,
-    num_decode_tokens: int,
+    graph_num_reqs: int,
+    graph_num_decodes: int,
+    graph_num_tokens: int,
+    graph_num_decode_tokens: int,
     max_query_len: int,
     max_num_splits: int,
 ) -> bool:
     return (
         aot_schedule
+        and causal
         and is_bfloat16
         and is_qwen_family
+        and use_full_cuda_graph
         and common_prefix_len == 0
         and dcp_world_size == 1
-        and num_reqs == 64
-        and num_decodes == num_reqs
-        and num_actual_tokens == num_reqs
-        and num_decode_tokens == num_actual_tokens
+        and graph_num_reqs == 64
+        and graph_num_decodes == graph_num_reqs
+        and graph_num_tokens == graph_num_reqs
+        and graph_num_decode_tokens == graph_num_tokens
         and max_query_len == 1
         and max_num_splits == 1
     )
@@ -466,7 +479,9 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
 
         self.max_num_splits = 0  # No upper bound on the number of splits.
         self.aot_schedule = get_flash_attn_version() == 3
-        self._musa_qwen_family = _is_musa_qwen_family(self.model_config)
+        self._musa_qwen_family = _is_musa_qwen_text_generation_architecture(
+            self.model_config
+        )
 
         try:
             from vllm.distributed.parallel_state import get_dcp_group
@@ -652,23 +667,27 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         # metadata nor that combine step.
         direct_decode_schedule = _use_musa_qwen_direct_decode_schedule(
             aot_schedule=aot_schedule,
+            causal=common_attn_metadata.causal is True,
             is_bfloat16=(
                 self.model_config.dtype == torch.bfloat16
                 and self.kv_cache_dtype in ("auto", "bfloat16", torch.bfloat16)
             ),
             is_qwen_family=self._musa_qwen_family,
+            use_full_cuda_graph=self.use_full_cuda_graph,
             common_prefix_len=common_prefix_len,
             dcp_world_size=self.dcp_world_size,
-            num_reqs=num_reqs,
-            num_decodes=num_decodes,
-            num_actual_tokens=num_actual_tokens,
-            num_decode_tokens=num_decode_tokens,
+            graph_num_reqs=num_reqs,
+            graph_num_decodes=num_decodes,
+            graph_num_tokens=num_actual_tokens,
+            graph_num_decode_tokens=num_decode_tokens,
             max_query_len=max_query_len,
             max_num_splits=max_num_splits,
         )
         if direct_decode_schedule:
             aot_schedule = False
-            logger.info_once("Using MUSA Qwen direct FA3 decode schedule for BS64.")
+            logger.info_once(
+                "Using MUSA Qwen direct FA3 decode schedule for graph size 64."
+            )
 
         def schedule(
             batch_size, cu_query_lens, max_query_len, seqlens, max_seq_len, causal
