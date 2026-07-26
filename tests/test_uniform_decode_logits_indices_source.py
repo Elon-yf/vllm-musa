@@ -11,6 +11,13 @@ PATCH = (
     / "series"
     / "0090-perf-reuse-uniform-decode-logits-indices.patch"
 )
+HIDDEN_VIEW_PATCH = (
+    ROOT
+    / "vllm_musa"
+    / "patches"
+    / "series"
+    / "0092-perf-reuse-qwen-uniform-decode-hidden-state.patch"
+)
 
 
 def test_uniform_decode_patch_reuses_uploaded_request_indices() -> None:
@@ -70,3 +77,52 @@ def test_uniform_decode_gate_is_exact_for_positive_query_lengths() -> None:
             assert request_indices == baseline
         else:
             assert request_indices != baseline
+
+
+def test_uniform_decode_hidden_view_patch_preserves_fallbacks() -> None:
+    source = HIDDEN_VIEW_PATCH.read_text()
+
+    assert source.count("if use_cached_decode_logits_indices:") == 2
+    assert source.count("sample_hidden_states = hidden_states\n") == 2
+    assert source.count("sample_hidden_states = hidden_states[:num_reqs]") == 2
+    assert (
+        source.count(
+            "+                    sample_hidden_states = hidden_states[logits_indices]"
+        )
+        == 2
+    )
+    assert source.count("hidden_states.shape[0] != num_reqs") == 2
+
+
+def test_identity_hidden_selection_preserves_padding_and_fallback_semantics() -> None:
+    def select_hidden_states(
+        hidden_states: list[str],
+        num_reqs: int,
+        logits_indices: list[int],
+        use_cached_decode_logits_indices: bool,
+    ) -> list[str]:
+        if use_cached_decode_logits_indices:
+            if len(hidden_states) == num_reqs:
+                return hidden_states
+            return hidden_states[:num_reqs]
+        return [hidden_states[index] for index in logits_indices]
+
+    for num_reqs, padded_reqs in ((1, 1), (4, 4), (16, 16), (63, 64), (64, 64)):
+        hidden_states = [f"row-{index}" for index in range(padded_reqs)]
+        selected = select_hidden_states(
+            hidden_states,
+            num_reqs,
+            list(range(num_reqs)),
+            use_cached_decode_logits_indices=True,
+        )
+        assert selected == hidden_states[:num_reqs]
+        if num_reqs == padded_reqs:
+            assert selected is hidden_states
+
+    hidden_states = ["row-0", "row-1", "row-2", "row-3"]
+    assert select_hidden_states(
+        hidden_states,
+        num_reqs=2,
+        logits_indices=[3, 1],
+        use_cached_decode_logits_indices=False,
+    ) == ["row-3", "row-1"]
