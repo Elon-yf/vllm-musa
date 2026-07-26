@@ -8,12 +8,13 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
+from vllm.logger import init_logger
 from vllm.utils.torch_utils import direct_register_custom_op
 
-from vllm.logger import init_logger
 from vllm_musa.jit_kernel.csrc import allreduce as jit_ar
 
 logger = init_logger(__name__)
+_INT32_MAX = (1 << 31) - 1
 
 
 cudaError_t = ctypes.c_int
@@ -127,9 +128,7 @@ def _musa_jit_custom_all_reduce(input: torch.Tensor, comm_id: int) -> torch.Tens
     return comm._custom_all_reduce_impl(input)
 
 
-def _musa_jit_custom_all_reduce_fake(
-    input: torch.Tensor, comm_id: int
-) -> torch.Tensor:
+def _musa_jit_custom_all_reduce_fake(input: torch.Tensor, comm_id: int) -> torch.Tensor:
     return torch.empty_like(input)
 
 
@@ -257,9 +256,7 @@ class _MusaJitCustomAllreduceImpl:
 
         try:
             meta_bytes = jit_ar.meta_size(self.world_size)
-            meta_buffer = _make_shared_buffer(
-                meta_bytes + self.max_size, group=group
-            )
+            meta_buffer = _make_shared_buffer(meta_bytes + self.max_size, group=group)
             self.meta_ptrs = meta_buffer.pointers
             self.meta_opened_ipc_ptrs = meta_buffer.opened_ipc_ptrs
             buffer = _make_shared_buffer(self.max_size, group=group)
@@ -325,6 +322,42 @@ class _MusaJitCustomAllreduceImpl:
             return False
         return inp.is_contiguous()
 
+    def should_custom_all_gather(self, inp: torch.Tensor, dim: int = -1) -> bool:
+        if self.disabled or self.world_size not in (2, 4, 8) or inp.ndim != 2:
+            return False
+        if not self._is_communicator_tensor(inp):
+            return False
+        normalized_dim = dim if dim >= 0 else inp.ndim + dim
+        if normalized_dim != inp.ndim - 1:
+            return False
+        if inp.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            return False
+        if not inp.is_contiguous() or inp.shape[0] <= 0 or inp.shape[1] <= 0:
+            return False
+        pack = 16 // inp.element_size()
+        if inp.shape[1] % pack != 0:
+            return False
+        inp_size = inp.numel() * inp.element_size()
+        output_numel = inp.numel() * self.world_size
+        output_size = output_numel * inp.element_size()
+        return (
+            inp_size <= self.max_size
+            and inp_size % 16 == 0
+            and output_size <= self.max_size
+            and output_numel <= _INT32_MAX
+        )
+
+    def _is_communicator_tensor(self, inp: torch.Tensor) -> bool:
+        return inp.device.type == "musa" and inp.device.index == self.device.index
+
+    def _is_default_stream(self, inp: torch.Tensor) -> bool:
+        try:
+            current = torch.musa.current_stream(device=inp.device)
+            default = torch.musa.default_stream(device=inp.device)
+            return current == default
+        except Exception:
+            return False
+
     @staticmethod
     def _is_current_stream_capturing() -> bool:
         try:
@@ -385,6 +418,40 @@ class _MusaJitCustomAllreduceImpl:
             self.rank,
             self.world_size,
             shot,
+        )
+        return out
+
+    def custom_all_gather(
+        self, input: torch.Tensor, dim: int = -1
+    ) -> torch.Tensor | None:
+        if not self.should_custom_all_gather(input, dim):
+            return None
+        # Logits currently run outside the model graph. Fail closed if a future
+        # runner moves this call under Dynamo or graph capture; that path needs
+        # pointer-registration semantics rather than an eager FFI call.
+        if (
+            self._IS_CAPTURING
+            or self._is_current_stream_capturing()
+            or self._is_torch_compiling()
+            or not self._is_default_stream(input)
+        ):
+            return None
+        return self._custom_all_gather_impl(input)
+
+    def _custom_all_gather_impl(self, input: torch.Tensor) -> torch.Tensor:
+        assert self.buffer_rank_data is not None
+        output_shape = (*input.shape[:-1], input.shape[-1] * self.world_size)
+        out = torch.empty(output_shape, dtype=input.dtype, device=input.device)
+        jit_ar.launch_all_gather(
+            self.buffer_rank_data,
+            self.signal_ptrs_cpu,
+            input,
+            out,
+            self.meta_ptrs[self.rank],
+            self.buffer_ptrs[self.rank],
+            self.max_size,
+            self.rank,
+            self.world_size,
         )
         return out
 
@@ -454,6 +521,16 @@ class MusaJitCustomAllreduce:
         except Exception:
             logger.exception("Failed to initialize MUSA JIT custom all-reduce.")
 
+        availability = torch.tensor([int(self._jit_available)], dtype=torch.int32)
+        dist.all_reduce(availability, op=dist.ReduceOp.MIN, group=group)
+        if not bool(availability.item()) and self._jit_comm is not None:
+            self._jit_comm.close()
+            self._jit_comm = None
+            logger.warning_once(
+                "MUSA JIT custom all-reduce disabled because a peer rank "
+                "failed initialization."
+            )
+
         if self._jit_available:
             logger.info_once(
                 "Using MUSA JIT custom all-reduce for eager and CUDA graph paths."
@@ -483,6 +560,13 @@ class MusaJitCustomAllreduce:
             return self._jit_comm.custom_all_reduce(input)
         return None
 
+    def custom_all_gather(
+        self, input: torch.Tensor, dim: int = -1
+    ) -> torch.Tensor | None:
+        if self._jit_available and self._jit_comm.should_custom_all_gather(input, dim):
+            return self._jit_comm.custom_all_gather(input, dim)
+        return None
+
     def close(self) -> None:
         if self._jit_comm is not None:
             self._jit_comm.close()
@@ -493,3 +577,19 @@ class MusaJitCustomAllreduce:
             self.close()
         except Exception:
             pass
+
+
+def maybe_musa_jit_logits_all_gather(
+    input: torch.Tensor, dim: int = -1
+) -> torch.Tensor | None:
+    """Use the MUSA IPC communicator for a last-dimension logits gather."""
+    from vllm.distributed.parallel_state import get_tp_group
+
+    device_communicator = get_tp_group().device_communicator
+    custom_ar = getattr(device_communicator, "ca_comm", None)
+    if not isinstance(custom_ar, MusaJitCustomAllreduce):
+        return None
+    output = custom_ar.custom_all_gather(input, dim)
+    if output is not None:
+        logger.info_once("Using MUSA JIT IPC all-gather for TP logits.")
+    return output
