@@ -155,8 +155,9 @@ class MusaQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         from vllm.model_executor.layers.mamba.mamba_utils import (
             is_conv_state_dim_first,
         )
-        from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
-            causal_conv1d_update,
+
+        from vllm_musa.jit_kernel.tilelang.causal_conv1d import (
+            musa_tilelang_causal_conv1d_update,
         )
 
         non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
@@ -182,15 +183,33 @@ class MusaQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             self.conv1d.weight.size(0),
             self.conv1d.weight.size(2),
         )
-        mixed_qkv = causal_conv1d_update(
+        # The upstream wrapper casts BF16 activations to the FP32 cache dtype
+        # and casts the result back.  The MUSA kernel accepts those dtypes
+        # directly; keep the upstream path as a structural fallback.
+        mixed_qkv_tilelang = musa_tilelang_causal_conv1d_update(
             mixed_qkv,
             conv_state,
             conv_weights,
             self.conv1d.bias,
             self.activation,
             conv_state_indices=state_indices,
-            validate_data=False,
         )
+        if mixed_qkv_tilelang is None:
+            from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
+                causal_conv1d_update,
+            )
+
+            mixed_qkv = causal_conv1d_update(
+                mixed_qkv,
+                conv_state,
+                conv_weights,
+                self.conv1d.bias,
+                self.activation,
+                conv_state_indices=state_indices,
+                validate_data=False,
+            )
+        else:
+            mixed_qkv = mixed_qkv_tilelang
 
         # MUSA: mate's decode kernel reads q/k/v from strided views; split the
         # packed qkv without materializing contiguous copies.
