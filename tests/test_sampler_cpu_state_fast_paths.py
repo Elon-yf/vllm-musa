@@ -2,12 +2,16 @@
 # ruff: noqa: I001
 """CPU-state contracts for MUSA V2 sampling fast paths."""
 
+import inspect
+from dataclasses import fields
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torchada  # noqa: F401
 import torch
+from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.worker.gpu_input_batch import InputBatch
 
 from vllm_musa.v1.sample import topk_topp_sampler as sampler
 
@@ -16,6 +20,14 @@ requires_musa = pytest.mark.skipif(
     not hasattr(torch, "musa") or not torch.musa.is_available(),
     reason="requires a MUSA device",
 )
+
+
+def test_uniform_top_k_metadata_patch_is_active_and_qwen_gated() -> None:
+    assert "uniform_top_k" in {field.name for field in fields(SamplingMetadata)}
+    source = inspect.getsource(InputBatch._make_sampling_metadata)
+    assert "uniform_top_k" in source
+    assert "self.vocab_size in (151936, 248320)" in source
+    assert "candidate_top_k == 50" in source
 
 
 def _state_array(
@@ -333,6 +345,103 @@ def test_uniform_active_min_p_uses_cpu_state() -> None:
     )
     assert (
         sampler._uniform_active_min_p(np.asarray([0.05, 0.1], dtype=np.float32)) is None
+    )
+
+
+def test_legacy_uniform_min_p_uses_cpu_hint_only_for_qwen_vocab() -> None:
+    min_p = torch.full((4,), 0.05, dtype=torch.float32)
+    processor = SimpleNamespace(
+        min_p=min_p,
+        min_p_cpu=np.full((4,), 0.05, dtype=np.float32),
+    )
+
+    qwen_logits = torch.empty((4, 248320))
+    assert sampler._legacy_min_p_with_cpu_hint(processor, qwen_logits) == pytest.approx(
+        0.05
+    )
+
+    non_qwen_logits = torch.empty((4, 32000))
+    assert sampler._legacy_min_p_with_cpu_hint(processor, non_qwen_logits) is min_p
+
+    processor.min_p_cpu[1] = 0.04
+    assert sampler._legacy_min_p_with_cpu_hint(processor, qwen_logits) is min_p
+
+
+def test_legacy_uniform_top_k_uses_cpu_hint_only_for_musa_native_sampler(
+    monkeypatch,
+) -> None:
+    top_k = torch.full((4,), 50, dtype=torch.int32)
+    metadata = SimpleNamespace(uniform_top_k=50, generators={})
+    musa_sampler = SimpleNamespace(forward=SimpleNamespace(__name__="forward_musa"))
+    logits = torch.empty((4, 248320))
+
+    def can_use_native(_logits, generators, logprobs_mode):
+        return not generators and logprobs_mode == "raw_logprobs"
+
+    monkeypatch.setattr(sampler, "can_use_musa_sampler", can_use_native)
+
+    assert (
+        sampler._legacy_top_k_with_cpu_hint(
+            metadata, top_k, musa_sampler, logits, "raw_logprobs"
+        )
+        == 50
+    )
+
+    metadata.uniform_top_k = 49
+    assert (
+        sampler._legacy_top_k_with_cpu_hint(
+            metadata, top_k, musa_sampler, logits, "raw_logprobs"
+        )
+        is top_k
+    )
+
+    metadata.uniform_top_k = 50
+    fallback_sampler = SimpleNamespace(
+        forward=SimpleNamespace(__name__="forward_native")
+    )
+    assert (
+        sampler._legacy_top_k_with_cpu_hint(
+            metadata, top_k, fallback_sampler, logits, "raw_logprobs"
+        )
+        is top_k
+    )
+
+    metadata.uniform_top_k = None
+    heterogeneous_top_k = torch.tensor([50, 49, 50, 49], dtype=torch.int32)
+    assert (
+        sampler._legacy_top_k_with_cpu_hint(
+            metadata,
+            heterogeneous_top_k,
+            musa_sampler,
+            logits,
+            "raw_logprobs",
+        )
+        is heterogeneous_top_k
+    )
+
+    metadata.uniform_top_k = 50
+    metadata.generators = {0: object()}
+    assert (
+        sampler._legacy_top_k_with_cpu_hint(
+            metadata, top_k, musa_sampler, logits, "raw_logprobs"
+        )
+        is top_k
+    )
+
+    metadata.generators = {}
+    assert (
+        sampler._legacy_top_k_with_cpu_hint(
+            metadata, top_k, musa_sampler, logits, "processed_logprobs"
+        )
+        is top_k
+    )
+
+    non_qwen_logits = torch.empty((4, 32000))
+    assert (
+        sampler._legacy_top_k_with_cpu_hint(
+            metadata, top_k, musa_sampler, non_qwen_logits, "raw_logprobs"
+        )
+        is top_k
     )
 
 

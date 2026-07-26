@@ -285,9 +285,9 @@ def forward_musa(
     self: Any,
     logits: torch.Tensor,
     generators: dict[int, torch.Generator],
-    k: torch.Tensor | None,
-    p: torch.Tensor | None,
-    min_p: torch.Tensor | None = None,
+    k: torch.Tensor | int | None,
+    p: torch.Tensor | float | None,
+    min_p: torch.Tensor | float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     if (
         generators
@@ -357,14 +357,48 @@ def get_processor_min_p(processor: Any) -> torch.Tensor:
     return _squeeze_filter_tensor(min_p)
 
 
+def _legacy_min_p_with_cpu_hint(
+    processor: Any,
+    logits: torch.Tensor,
+) -> torch.Tensor | float:
+    min_p = get_processor_min_p(processor)
+    min_p_cpu = getattr(processor, "min_p_cpu", None)
+    if min_p_cpu is None or not _is_qwen_sampler_vocab(logits):
+        return min_p
+    uniform_min_p = _uniform_active_min_p(min_p_cpu[: logits.shape[0]])
+    return uniform_min_p if uniform_min_p is not None else min_p
+
+
+def _legacy_top_k_with_cpu_hint(
+    sampling_metadata: Any,
+    top_k: torch.Tensor | None,
+    topk_topp_sampler: Any,
+    logits: torch.Tensor,
+    logprobs_mode: LogprobsMode,
+) -> int | torch.Tensor | None:
+    if (
+        top_k is not None
+        and getattr(topk_topp_sampler.forward, "__name__", "") == "forward_musa"
+        and can_use_musa_sampler(
+            logits,
+            sampling_metadata.generators,
+            logprobs_mode,
+        )
+        and _is_qwen_sampler_vocab(logits)
+        and getattr(sampling_metadata, "uniform_top_k", None) == 50
+    ):
+        return 50
+    return top_k
+
+
 def _call_topk_topp_sampler(
     sampler: Any,
     logprobs_mode: LogprobsMode,
     logits: torch.Tensor,
     generators: dict[int, torch.Generator],
-    top_k: torch.Tensor | None,
-    top_p: torch.Tensor | None,
-    min_p: torch.Tensor | None = None,
+    top_k: torch.Tensor | int | None,
+    top_p: torch.Tensor | float | None,
+    min_p: torch.Tensor | float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     original_logprobs_mode = sampler.logprobs_mode
     sampler.logprobs_mode = logprobs_mode
@@ -524,6 +558,14 @@ def _sample(
         logits, sampling_metadata.temperature, sampling_metadata.all_random
     )
 
+    top_k = _legacy_top_k_with_cpu_hint(
+        sampling_metadata,
+        sampling_metadata.top_k,
+        self.topk_topp_sampler,
+        logits,
+        logprobs_mode,
+    )
+
     musa_min_p = None
     defer_min_p = (
         getattr(self.topk_topp_sampler.forward, "__name__", "") == "forward_musa"
@@ -532,7 +574,7 @@ def _sample(
         if defer_min_p and should_defer_min_p_processor(
             logits, sampling_metadata.generators, logprobs_mode, processor
         ):
-            musa_min_p = get_processor_min_p(processor)
+            musa_min_p = _legacy_min_p_with_cpu_hint(processor, logits)
             continue
         logits = processor.apply(logits)
 
@@ -566,7 +608,7 @@ def _sample(
             logprobs_mode,
             logits,
             sampling_metadata.generators,
-            sampling_metadata.top_k,
+            top_k,
             sampling_metadata.top_p,
         )
     else:
@@ -575,7 +617,7 @@ def _sample(
             logprobs_mode,
             logits,
             sampling_metadata.generators,
-            sampling_metadata.top_k,
+            top_k,
             sampling_metadata.top_p,
             min_p=musa_min_p,
         )
