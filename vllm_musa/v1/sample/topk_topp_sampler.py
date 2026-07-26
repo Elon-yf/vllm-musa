@@ -41,11 +41,12 @@ def _uniform_active_min_p(min_p: np.ndarray) -> float | None:
 
 
 def _can_skip_legacy_qwen_unit_temperature(
-    logits: torch.Tensor, sampling_metadata: Any
+    sampler: Any, logits: torch.Tensor, sampling_metadata: Any
 ) -> bool:
     """Use the scheduler's exact CPU hint to avoid a device divide by one."""
     return (
-        getattr(sampling_metadata, "all_random", False)
+        getattr(sampler, "_musa_qwen_skip_unit_temperature", False)
+        and getattr(sampling_metadata, "all_random", False)
         and _is_qwen_sampler_vocab(logits)
         and getattr(sampling_metadata, "uniform_temperature", None) == np.float32(1.0)
     )
@@ -589,7 +590,7 @@ def _sample(
             return greedy_sampled, processed_logprobs
 
     assert sampling_metadata.temperature is not None
-    if not _can_skip_legacy_qwen_unit_temperature(logits, sampling_metadata):
+    if not _can_skip_legacy_qwen_unit_temperature(self, logits, sampling_metadata):
         logits = self.apply_temperature(
             logits, sampling_metadata.temperature, sampling_metadata.all_random
         )

@@ -31,34 +31,41 @@ def test_uniform_sampler_metadata_patch_is_active_and_qwen_gated() -> None:
     assert "uniform_temperature" in source
     assert "self.vocab_size in (151936, 248320)" in source
     assert "candidate_top_k == 50" in source
-    assert "VLLM_MUSA_QWEN_SKIP_UNIT_TEMPERATURE" in source
+    assert "self.all_random" in source
     assert "temperature_cpu == np.float32(1.0)" in source
 
 
 def test_legacy_qwen_unit_temperature_skip_is_exact_and_vocab_gated() -> None:
+    enabled_sampler = SimpleNamespace(_musa_qwen_skip_unit_temperature=True)
     metadata = SimpleNamespace(all_random=True, uniform_temperature=1.0)
     assert sampler._can_skip_legacy_qwen_unit_temperature(
-        torch.empty((4, 248320)), metadata
+        enabled_sampler, torch.empty((4, 248320)), metadata
     )
     assert sampler._can_skip_legacy_qwen_unit_temperature(
-        torch.empty((1, 151936)), metadata
+        enabled_sampler, torch.empty((1, 151936)), metadata
     )
 
     metadata.uniform_temperature = None
     assert not sampler._can_skip_legacy_qwen_unit_temperature(
-        torch.empty((4, 248320)), metadata
+        enabled_sampler, torch.empty((4, 248320)), metadata
     )
     metadata.uniform_temperature = 0.7
     assert not sampler._can_skip_legacy_qwen_unit_temperature(
-        torch.empty((4, 248320)), metadata
+        enabled_sampler, torch.empty((4, 248320)), metadata
     )
     metadata.uniform_temperature = 1.0
     assert not sampler._can_skip_legacy_qwen_unit_temperature(
-        torch.empty((4, 32000)), metadata
+        enabled_sampler, torch.empty((4, 32000)), metadata
     )
     metadata.all_random = False
     assert not sampler._can_skip_legacy_qwen_unit_temperature(
-        torch.empty((4, 248320)), metadata
+        enabled_sampler, torch.empty((4, 248320)), metadata
+    )
+    metadata.all_random = True
+    assert not sampler._can_skip_legacy_qwen_unit_temperature(
+        SimpleNamespace(_musa_qwen_skip_unit_temperature=False),
+        torch.empty((4, 248320)),
+        metadata,
     )
 
 
@@ -76,6 +83,7 @@ def test_legacy_sample_skips_only_cpu_proven_qwen_unit_temperature(
         apply_temperature=apply_temperature,
         topk_topp_sampler=object(),
         use_fp64_gumbel=False,
+        _musa_qwen_skip_unit_temperature=True,
     )
     metadata = SimpleNamespace(
         all_greedy=False,
@@ -104,6 +112,10 @@ def test_legacy_sample_skips_only_cpu_proven_qwen_unit_temperature(
     metadata.uniform_temperature = 1.0
     sampler._sample(fake_sampler, torch.empty((4, 32000)), metadata)
     assert len(temperature_calls) == 2
+
+    fake_sampler._musa_qwen_skip_unit_temperature = False
+    sampler._sample(fake_sampler, torch.empty((4, 248320)), metadata)
+    assert len(temperature_calls) == 3
 
 
 def _state_array(
