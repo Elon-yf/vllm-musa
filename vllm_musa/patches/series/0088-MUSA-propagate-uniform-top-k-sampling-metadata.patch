@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: musa <musa@local>
+Date: Sun, 26 Jul 2026 16:53:48 +0800
+Subject: [PATCH] MUSA: propagate uniform top-k sampling metadata
+
+---
+ vllm/v1/sample/metadata.py        | 2 ++
+ vllm/v1/worker/gpu_input_batch.py | 8 ++++++++
+ 2 files changed, 10 insertions(+)
+
+diff --git a/vllm/v1/sample/metadata.py b/vllm/v1/sample/metadata.py
+index fa4ceac8e7..252cf746a0 100644
+--- a/vllm/v1/sample/metadata.py
++++ b/vllm/v1/sample/metadata.py
+@@ -53,3 +53,5 @@ class SamplingMetadata:
+     # When non-None, use ``holder.has_tracked_requests()`` to see if this batch applies
+     # thinking-token-budget logits (holder may exist with an empty tracking set).
+     thinking_budget_state_holder: ThinkingBudgetStateHolder | None = None
++    # CPU-side hint for exact-gated platform sampler specializations.
++    uniform_top_k: int | None = None
+diff --git a/vllm/v1/worker/gpu_input_batch.py b/vllm/v1/worker/gpu_input_batch.py
+index 589fbd43ef..6c48e7fcb9 100644
+--- a/vllm/v1/worker/gpu_input_batch.py
++++ b/vllm/v1/worker/gpu_input_batch.py
+@@ -917,6 +917,13 @@ class InputBatch:
+                     req_index = self.req_id_to_index[req_id]
+                     logprob_token_ids_by_index[req_index] = token_ids
+ 
++        uniform_top_k = None
++        if self.vocab_size in (151936, 248320) and not self.no_top_k and num_reqs > 0:
++            top_k_cpu = self.top_k_cpu[:num_reqs]
++            candidate_top_k = int(top_k_cpu[0])
++            if candidate_top_k == 50 and np.all(top_k_cpu == candidate_top_k):
++                uniform_top_k = candidate_top_k
++
+         return SamplingMetadata(
+             temperature=temperature,
+             all_greedy=self.all_greedy,
+@@ -937,6 +944,7 @@ class InputBatch:
+             bad_words_token_ids=self.bad_words_token_ids,
+             logitsprocs=self.logitsprocs,
+             thinking_budget_state_holder=self.thinking_budget_state_holder,
++            uniform_top_k=uniform_top_k,
+         )
+ 
+     def get_pooling_params(self) -> list[PoolingParams]:
