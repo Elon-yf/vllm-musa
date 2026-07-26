@@ -19,6 +19,12 @@ from vllm_musa.utils.environ import envs
 logger = logging.getLogger(__name__)
 
 _SAMPLING_EPS = 1e-5
+_MUSA_QWEN_SAMPLER_VOCAB_SIZES = frozenset((151936, 248320))
+
+
+def _is_qwen_sampler_vocab(logits: torch.Tensor) -> bool:
+    """Limit scalar sampler specializations to validated Qwen vocabularies."""
+    return logits.ndim == 2 and logits.shape[1] in _MUSA_QWEN_SAMPLER_VOCAB_SIZES
 
 
 def _is_uniform_top_k_50(top_k: np.ndarray) -> bool:
@@ -26,8 +32,24 @@ def _is_uniform_top_k_50(top_k: np.ndarray) -> bool:
     return top_k.size > 0 and bool(np.all(top_k == 50))
 
 
+def _uniform_active_min_p(min_p: np.ndarray) -> float | None:
+    """Return a uniform active min-p value from the existing CPU state."""
+    if min_p.size == 0 or not bool(np.all(min_p == min_p[0])):
+        return None
+    value = float(min_p[0])
+    return value if value != 0.0 else None
+
+
 def musa_seeded_multinomial_enabled() -> bool:
     return envs.VLLM_MUSA_SEEDED_MULTINOMIAL.get()
+
+
+def musa_qwen_v2_gumbel_enabled() -> bool:
+    return envs.VLLM_MUSA_QWEN_V2_GUMBEL.get()
+
+
+def musa_qwen_legacy_gumbel_enabled() -> bool:
+    return envs.VLLM_MUSA_QWEN_LEGACY_GUMBEL.get()
 
 
 def is_musa_tensor(tensor: torch.Tensor) -> bool:
@@ -184,20 +206,64 @@ def _apply_top_k_top_p_musa_topk_prefilter(
     top_p_mask[:, -1] = False
     logits_sort.masked_fill_(top_p_mask, -float("inf"))
 
-    output = logits.new_full(logits.shape, -float("inf"))
-    output.scatter_(dim=-1, index=logits_idx, src=logits_sort)
-    logits.copy_(output)
-    return logits
+    # ``values`` and ``indices`` do not alias ``logits``. Reuse the input
+    # buffer instead of allocating a full-vocabulary output and copying it
+    # back after the scatter.
+    logits.fill_(-float("inf"))
+    return logits.scatter_(dim=-1, index=logits_idx, src=logits_sort)
+
+
+def _apply_top_k_top_p_musa_uniform_k_prefilter(
+    logits: torch.Tensor, k: int, p: torch.Tensor
+) -> torch.Tensor:
+    """Apply uniform top-k/top-p without reading sampling state from MUSA.
+
+    The CPU sampling state has already proved that every active row uses the
+    same ``k``. The only host read is the post-topk tie check: it preserves the
+    upstream rule that all values tied at the kth boundary remain eligible.
+    """
+    values, indices = logits.topk(k, dim=-1, largest=True, sorted=True)
+    threshold = values[:, -1:]
+    num_ge = (logits >= threshold).sum(dim=-1)
+    if bool((num_ge != k).any().item()):
+        k_tensor = torch.full(
+            (logits.shape[0],), k, dtype=torch.int32, device=logits.device
+        )
+        return vllm_topk_topp_sampler.apply_top_k_top_p_pytorch(logits, k_tensor, p)
+
+    logits_sort = values.flip(dims=(-1,))
+    logits_idx = indices.flip(dims=(-1,))
+    probs_sort = logits_sort.softmax(dim=-1)
+    probs_sum = torch.cumsum(probs_sort, dim=-1, out=probs_sort)
+    top_p_mask = probs_sum <= 1 - p.unsqueeze(dim=1)
+    top_p_mask[:, -1] = False
+    logits_sort.masked_fill_(top_p_mask, -float("inf"))
+
+    logits.fill_(-float("inf"))
+    return logits.scatter_(dim=-1, index=logits_idx, src=logits_sort)
 
 
 def _apply_top_k_top_p(
-    logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
+    logits: torch.Tensor,
+    k: torch.Tensor | int | None,
+    p: torch.Tensor | None,
 ) -> torch.Tensor:
     if p is None and k is None:
         return logits
 
+    # Uniform k=50 is already known from CPU sampling state. Keep the exact
+    # upstream threshold/tie semantics without materializing a device k tensor
+    # or synchronizing it back to the CPU before submitting topk.
+    if isinstance(k, int):
+        if k <= 0 or k >= logits.shape[1]:
+            return logits
+        if p is None:
+            threshold = logits.topk(k, dim=1).values[:, -1:]
+            return logits.masked_fill_(logits < threshold, -float("inf"))
+        return _apply_top_k_top_p_musa_uniform_k_prefilter(logits, k, p)
+
     if current_platform.is_musa():
-        if k is not None and logits.shape[0] >= 16:
+        if isinstance(k, torch.Tensor) and logits.shape[0] >= 16:
             if p is None and logits.shape[1] >= 65536:
                 max_top_k = int(k.to(torch.long).max().item())
                 if 0 < max_top_k <= 1024:
@@ -310,6 +376,128 @@ def _call_topk_topp_sampler(
         sampler.logprobs_mode = original_logprobs_mode
 
 
+def can_use_qwen_legacy_gumbel(
+    logits: torch.Tensor,
+    sampling_metadata: Any,
+    logprobs_mode: LogprobsMode,
+    deferred_min_p: torch.Tensor | None,
+    use_fp64_gumbel: bool,
+) -> bool:
+    """Gate MRV1 Qwen sampling to a batched stateless Gumbel handoff."""
+    if not musa_qwen_legacy_gumbel_enabled():
+        return False
+    if not current_platform.is_musa() or not is_musa_tensor(logits):
+        return False
+    if (
+        logits.ndim != 2
+        or logits.shape[0] == 0
+        or logits.shape[1] != 248320
+        or logits.stride(-1) != 1
+    ):
+        return False
+    if logprobs_mode != "raw_logprobs" or deferred_min_p is not None or use_fp64_gumbel:
+        return False
+    if (
+        sampling_metadata.max_num_logprobs is not None
+        or sampling_metadata.logprob_token_ids
+        or not sampling_metadata.all_random
+    ):
+        return False
+    top_k = sampling_metadata.top_k
+    if (
+        top_k is None
+        or top_k.ndim != 1
+        or top_k.numel() != logits.shape[0]
+        or sampling_metadata.top_p is not None
+    ):
+        return False
+
+    spec_token_ids = getattr(sampling_metadata, "spec_token_ids", None)
+    if spec_token_ids and any(spec_token_ids):
+        return False
+
+    generators = sampling_metadata.generators
+    rows = logits.shape[0]
+    if len(generators) != rows or not all(row in generators for row in range(rows)):
+        return False
+    return all(
+        hasattr(generator, "initial_seed")
+        and hasattr(generator, "get_offset")
+        and hasattr(generator, "set_offset")
+        and getattr(getattr(generator, "device", None), "type", None)
+        == logits.device.type
+        for generator in generators.values()
+    )
+
+
+def get_qwen_legacy_generator_state(
+    generators: dict[int, torch.Generator], rows: int
+) -> tuple[list[int], list[int]] | None:
+    """Read a valid per-row seed/Philox-offset snapshot without mutation."""
+    seeds = []
+    offsets = []
+    int64_max = np.iinfo(np.int64).max
+    try:
+        for row in range(rows):
+            generator = generators[row]
+            seed = int(generator.initial_seed())
+            offset = int(generator.get_offset())
+            if seed < 0 or seed > int64_max or offset < 0 or offset % 4:
+                return None
+            seeds.append(seed)
+            offsets.append(offset)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+    return seeds, offsets
+
+
+def sample_qwen_legacy_gumbel(
+    logits: torch.Tensor,
+    generators: dict[int, torch.Generator],
+    top_k: torch.Tensor,
+    generator_state: tuple[list[int], list[int]],
+) -> torch.Tensor:
+    """Batch MRV1 seeded rows and preserve one-call generator offsets."""
+    logits = _apply_top_k_top_p(logits, top_k, None)
+    seeds_cpu, offsets_cpu = generator_state
+    rows = logits.shape[0]
+    mapping = torch.arange(rows, dtype=torch.int32, device=logits.device)
+    temperature = torch.ones(rows, dtype=torch.float32, device=logits.device)
+    seeds = torch.tensor(seeds_cpu, dtype=torch.int64, device=logits.device)
+    positions = torch.tensor(
+        [offset // 4 for offset in offsets_cpu],
+        dtype=torch.int64,
+        device=logits.device,
+    )
+    sampled = vllm_worker_sampler.gumbel_sample(
+        logits,
+        mapping,
+        temperature,
+        seeds,
+        positions,
+        apply_temperature=False,
+        use_fp64=False,
+    )
+    advanced_rows = []
+    try:
+        for row, offset in enumerate(offsets_cpu):
+            generators[row].set_offset(offset + 4)
+            advanced_rows.append(row)
+    except (RuntimeError, TypeError, ValueError) as error:
+        rollback_errors = []
+        for row in reversed(advanced_rows):
+            try:
+                generators[row].set_offset(offsets_cpu[row])
+            except (RuntimeError, TypeError, ValueError) as rollback_error:
+                rollback_errors.append(rollback_error)
+        if rollback_errors:
+            raise RuntimeError(
+                "Failed to advance and fully roll back legacy MUSA generators"
+            ) from error
+        raise RuntimeError("Failed to advance legacy MUSA generators") from error
+    return sampled
+
+
 def _sample(
     self: Any,
     logits: torch.Tensor,
@@ -348,7 +536,31 @@ def _sample(
             continue
         logits = processor.apply(logits)
 
-    if musa_min_p is None:
+    use_legacy_gumbel = can_use_qwen_legacy_gumbel(
+        logits,
+        sampling_metadata,
+        logprobs_mode,
+        musa_min_p,
+        self.use_fp64_gumbel,
+    )
+    legacy_generator_state = (
+        get_qwen_legacy_generator_state(sampling_metadata.generators, logits.shape[0])
+        if use_legacy_gumbel
+        else None
+    )
+    if legacy_generator_state is not None:
+        vllm_topk_topp_sampler.logger.info_once(
+            "Using the gated MUSA legacy Gumbel sampler for Qwen requests.",
+            scope="global",
+        )
+        random_sampled = sample_qwen_legacy_gumbel(
+            logits,
+            sampling_metadata.generators,
+            sampling_metadata.top_k,
+            legacy_generator_state,
+        )
+        processed_logprobs = None
+    elif musa_min_p is None:
         random_sampled, processed_logprobs = _call_topk_topp_sampler(
             self.topk_topp_sampler,
             logprobs_mode,
@@ -410,6 +622,56 @@ def has_worker_user_seed(sampling_states: Any, idx_mapping_np: np.ndarray) -> bo
     return bool(np.any(has_user_seed[idx_mapping_np]))
 
 
+def has_worker_all_user_seeds(sampling_states: Any, idx_mapping_np: np.ndarray) -> bool:
+    has_user_seed = getattr(sampling_states, "has_user_seed", None)
+    if has_user_seed is None or idx_mapping_np.size == 0:
+        return False
+    return bool(np.all(has_user_seed[idx_mapping_np]))
+
+
+def can_use_qwen_v2_gumbel(
+    sampler: Any,
+    logits: torch.Tensor,
+    expanded_idx_mapping: torch.Tensor,
+    idx_mapping_np: np.ndarray,
+    pos: torch.Tensor,
+    return_logprobs: bool,
+) -> bool:
+    """Gate the pinned V2 Gumbel sampler to one validated Qwen contract."""
+    if not musa_qwen_v2_gumbel_enabled():
+        return False
+    if not current_platform.is_musa() or not is_musa_tensor(logits):
+        return False
+    if not _is_qwen_sampler_vocab(logits) or logits.stride(-1) != 1:
+        return False
+    if idx_mapping_np.ndim != 1 or logits.shape[0] != idx_mapping_np.size:
+        return False
+    if (
+        expanded_idx_mapping.ndim != 1
+        or expanded_idx_mapping.numel() != logits.shape[0]
+    ):
+        return False
+    if pos.ndim != 1 or pos.numel() != logits.shape[0]:
+        return False
+    if getattr(sampler, "num_speculative_tokens", 1) != 1:
+        return False
+    if sampler.use_fp64_gumbel or sampler.logprobs_mode != "raw_logprobs":
+        return False
+    if return_logprobs or not has_worker_all_user_seeds(
+        sampler.sampling_states, idx_mapping_np
+    ):
+        return False
+
+    states = sampler.sampling_states
+    if not np.all(states.temperature.np[idx_mapping_np] == np.float32(1.0)):
+        return False
+    if not np.all(states.top_k.np[idx_mapping_np] == 50):
+        return False
+    if not np.all(states.top_p.np[idx_mapping_np] == np.float32(1.0)):
+        return False
+    return bool(np.all(states.min_p.np[idx_mapping_np] == np.float32(0.05)))
+
+
 def can_use_worker_seeded_multinomial(
     logits: torch.Tensor,
     logprobs_mode: LogprobsMode,
@@ -456,18 +718,28 @@ def sample_worker_logits(
 ) -> torch.Tensor:
     vocab_size = sampling_states.vocab_size
     top_k_np = sampling_states.top_k.np[idx_mapping_np]
+    min_p_np = sampling_states.min_p.np[idx_mapping_np]
     use_top_k = np.any(top_k_np != vocab_size)
     use_top_p = np.any(sampling_states.top_p.np[idx_mapping_np] != 1.0)
-    use_min_p = np.any(sampling_states.min_p.np[idx_mapping_np] != 0.0)
+    use_min_p = np.any(min_p_np != 0.0)
 
     # Select the scalar from existing CPU sampling state so the decode path
     # never copies a device tensor to the host merely to choose a kernel.
-    if use_top_k and _is_uniform_top_k_50(top_k_np):
+    if (
+        use_top_k
+        and _is_uniform_top_k_50(top_k_np)
+        and _is_qwen_sampler_vocab(logits)
+        and (not use_top_p or logits.shape[0] >= 4)
+    ):
         top_k = 50
     else:
         top_k = sampling_states.top_k.gpu[expanded_idx_mapping] if use_top_k else None
     top_p = sampling_states.top_p.gpu[expanded_idx_mapping] if use_top_p else None
-    min_p = sampling_states.min_p.gpu[expanded_idx_mapping] if use_min_p else None
+    uniform_min_p = _uniform_active_min_p(min_p_np)
+    if uniform_min_p is not None:
+        min_p = uniform_min_p
+    else:
+        min_p = sampling_states.min_p.gpu[expanded_idx_mapping] if use_min_p else None
     return sample_from_logits(logits, top_k, top_p, min_p)
 
 
@@ -482,6 +754,38 @@ def sample_worker_logits_seeded_multinomial(
         for row_idx, req_idx in enumerate(idx_mapping_np)
     }
     return sample_probs_seeded_multinomial(probs, generators)
+
+
+def sample_worker_logits_qwen_v2_gumbel(
+    sampler: Any,
+    logits: torch.Tensor,
+    expanded_idx_mapping: torch.Tensor,
+    idx_mapping_np: np.ndarray,
+    pos: torch.Tensor,
+    input_ids: torch.Tensor,
+    expanded_local_pos: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run pinned V2 Gumbel with CPU-proven uniform Qwen top-k state."""
+    processed_logits = sampler.apply_sampling_params(
+        logits,
+        expanded_idx_mapping,
+        idx_mapping_np,
+        pos,
+        input_ids,
+        expanded_local_pos,
+        skip_top_k_top_p=True,
+    )
+    processed_logits = _apply_top_k_top_p(processed_logits, 50, None)
+    sampled = vllm_worker_sampler.gumbel_sample(
+        processed_logits,
+        expanded_idx_mapping,
+        sampler.sampling_states.temperature.gpu,
+        sampler.sampling_states.seeds.gpu,
+        pos,
+        apply_temperature=False,
+        use_fp64=False,
+    )
+    return sampled, processed_logits
 
 
 def _sampling_states_init(self: Any, max_num_reqs: int, vocab_size: int):
@@ -542,16 +846,29 @@ def _apply_worker_sampling_filters_for_seeded_multinomial(
     logits: torch.Tensor,
     expanded_idx_mapping: torch.Tensor,
     idx_mapping_np: np.ndarray,
+    preserve_processed_logits: bool = True,
 ) -> torch.Tensor:
-    logits = torch.empty_like(logits, dtype=torch.float32).copy_(logits)
+    if preserve_processed_logits:
+        logits = torch.empty_like(logits, dtype=torch.float32).copy_(logits)
 
     vocab_size = sampler.sampling_states.vocab_size
-    use_top_k = np.any(sampler.sampling_states.top_k.np[idx_mapping_np] != vocab_size)
+    top_k_np = sampler.sampling_states.top_k.np[idx_mapping_np]
+    use_top_k = np.any(top_k_np != vocab_size)
     use_top_p = np.any(sampler.sampling_states.top_p.np[idx_mapping_np] != 1.0)
     use_min_p = np.any(sampler.sampling_states.min_p.np[idx_mapping_np] != 0.0)
-    top_k = (
-        sampler.sampling_states.top_k.gpu[expanded_idx_mapping] if use_top_k else None
-    )
+    if (
+        use_top_k
+        and _is_uniform_top_k_50(top_k_np)
+        and _is_qwen_sampler_vocab(logits)
+        and (not use_top_p or logits.shape[0] >= 4)
+    ):
+        top_k = 50
+    else:
+        top_k = (
+            sampler.sampling_states.top_k.gpu[expanded_idx_mapping]
+            if use_top_k
+            else None
+        )
     top_p = (
         sampler.sampling_states.top_p.gpu[expanded_idx_mapping] if use_top_p else None
     )
@@ -573,6 +890,28 @@ def _worker_sample(
     expanded_local_pos: torch.Tensor,
     return_logprobs: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if can_use_qwen_v2_gumbel(
+        self,
+        logits,
+        expanded_idx_mapping,
+        idx_mapping_np,
+        pos,
+        return_logprobs,
+    ):
+        vllm_topk_topp_sampler.logger.info_once(
+            "Using the gated MUSA V2 Gumbel sampler for Qwen requests.",
+            scope="global",
+        )
+        return sample_worker_logits_qwen_v2_gumbel(
+            self,
+            logits,
+            expanded_idx_mapping,
+            idx_mapping_np,
+            pos,
+            input_ids,
+            expanded_local_pos,
+        )
+
     if logits.shape[0] == idx_mapping_np.shape[0] and can_use_worker_seeded_multinomial(
         logits, self.logprobs_mode, self.sampling_states, idx_mapping_np
     ):
@@ -594,6 +933,7 @@ def _worker_sample(
             processed_logits,
             expanded_idx_mapping,
             idx_mapping_np,
+            preserve_processed_logits=return_logprobs,
         )
         sampled = sample_worker_logits_seeded_multinomial(
             sampling_logits, self.sampling_states, idx_mapping_np

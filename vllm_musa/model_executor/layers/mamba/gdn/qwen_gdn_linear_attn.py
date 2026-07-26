@@ -21,6 +21,9 @@ _MATE_GDN_PREFILL_HAS_OUTPUT = (
 _MATE_GDN_PREFILL_HAS_IS_LOG_SPACE = (
     "is_log_space" in inspect.signature(chunk_gated_delta_rule).parameters
 )
+_MATE_GDN_DECODE_HAS_OUTPUT = (
+    "output" in inspect.signature(gated_delta_rule_decode).parameters
+)
 
 
 def _log_once(method_name: str, message: str, *args) -> None:
@@ -215,47 +218,64 @@ class MusaQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 if _musa_sep and ssm_state.is_contiguous():
                     # MUSA: separate contiguous mamba pool -> mate decodes in
                     # place (block b at b*state_numel); no gather/scatter copy.
-                    output, _ = gated_delta_rule_decode(
-                        q=query,
-                        k=key,
-                        v=value,
-                        state=ssm_state,
-                        state_layout="VK",
-                        state_indices=state_indices,
-                        scale=self.head_k_dim**-0.5,
-                        A_log=self.A_log.detach().float(),
-                        a=a.view(num_decode_tokens, 1, -1),
-                        dt_bias=self.dt_bias.detach().float(),
-                        b=b.view(num_decode_tokens, 1, -1),
-                        disable_state_update=False,
-                        use_qk_l2norm=True,
-                    )
+                    mate_kwargs = {
+                        "q": query,
+                        "k": key,
+                        "v": value,
+                        "state": ssm_state,
+                        "state_layout": "VK",
+                        "state_indices": state_indices,
+                        "scale": self.head_k_dim**-0.5,
+                        "A_log": self.A_log.detach().float(),
+                        "a": a.view(num_decode_tokens, 1, -1),
+                        "dt_bias": self.dt_bias.detach().float(),
+                        "b": b.view(num_decode_tokens, 1, -1),
+                        "disable_state_update": False,
+                        "use_qk_l2norm": True,
+                    }
+                    if _MATE_GDN_DECODE_HAS_OUTPUT:
+                        mate_kwargs["output"] = core_attn_out[:num_decode_tokens].view(
+                            num_decode_tokens,
+                            1,
+                            self.num_v_heads // self.tp_size,
+                            self.head_v_dim,
+                        )
+                    output, _ = gated_delta_rule_decode(**mate_kwargs)
                     _log_once(
                         "info",
                         "MUSA GDN mate in-place decode active (separate pool)",
                     )
                 else:
                     active_state = ssm_state[state_indices]
-                    output, updated_state = gated_delta_rule_decode(
-                        q=query,
-                        k=key,
-                        v=value,
-                        state=active_state,
-                        state_layout="VK",
-                        scale=self.head_k_dim**-0.5,
-                        A_log=self.A_log.detach().float(),
-                        a=a.view(num_decode_tokens, 1, -1),
-                        dt_bias=self.dt_bias.detach().float(),
-                        b=b.view(num_decode_tokens, 1, -1),
-                        disable_state_update=False,
-                        use_qk_l2norm=True,
-                    )
+                    mate_kwargs = {
+                        "q": query,
+                        "k": key,
+                        "v": value,
+                        "state": active_state,
+                        "state_layout": "VK",
+                        "scale": self.head_k_dim**-0.5,
+                        "A_log": self.A_log.detach().float(),
+                        "a": a.view(num_decode_tokens, 1, -1),
+                        "dt_bias": self.dt_bias.detach().float(),
+                        "b": b.view(num_decode_tokens, 1, -1),
+                        "disable_state_update": False,
+                        "use_qk_l2norm": True,
+                    }
+                    if _MATE_GDN_DECODE_HAS_OUTPUT:
+                        mate_kwargs["output"] = core_attn_out[:num_decode_tokens].view(
+                            num_decode_tokens,
+                            1,
+                            self.num_v_heads // self.tp_size,
+                            self.head_v_dim,
+                        )
+                    output, updated_state = gated_delta_rule_decode(**mate_kwargs)
                     ssm_state[state_indices] = updated_state
-                core_attn_out[:num_decode_tokens] = output.view(
-                    num_decode_tokens,
-                    self.num_v_heads // self.tp_size,
-                    self.head_v_dim,
-                )
+                if not _MATE_GDN_DECODE_HAS_OUTPUT:
+                    core_attn_out[:num_decode_tokens] = output.view(
+                        num_decode_tokens,
+                        self.num_v_heads // self.tp_size,
+                        self.head_v_dim,
+                    )
                 return True
             except Exception as e:
                 _log_once(
