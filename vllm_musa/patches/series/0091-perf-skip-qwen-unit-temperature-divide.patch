@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: musa <musa@local>
+Date: Mon, 27 Jul 2026 03:17:22 +0800
+Subject: [PATCH] perf(musa): propagate Qwen unit temperature metadata
+
+---
+ vllm/v1/sample/metadata.py        |  2 ++
+ vllm/v1/worker/gpu_input_batch.py | 13 +++++++++++++
+ 2 files changed, 15 insertions(+)
+
+diff --git a/vllm/v1/sample/metadata.py b/vllm/v1/sample/metadata.py
+index 252cf746a0..22e9793780 100644
+--- a/vllm/v1/sample/metadata.py
++++ b/vllm/v1/sample/metadata.py
+@@ -55,3 +55,5 @@ class SamplingMetadata:
+     thinking_budget_state_holder: ThinkingBudgetStateHolder | None = None
+     # CPU-side hint for exact-gated platform sampler specializations.
+     uniform_top_k: int | None = None
++    # Exact CPU-side temperature hint for platform sampler specializations.
++    uniform_temperature: float | None = None
+diff --git a/vllm/v1/worker/gpu_input_batch.py b/vllm/v1/worker/gpu_input_batch.py
+index 6c48e7fcb9..5e50933b2d 100644
+--- a/vllm/v1/worker/gpu_input_batch.py
++++ b/vllm/v1/worker/gpu_input_batch.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ # Datastructures defining a GPU input batch
+ 
++import os
+ from dataclasses import dataclass
+ from typing import cast
+ 
+@@ -924,6 +925,17 @@ class InputBatch:
+             if candidate_top_k == 50 and np.all(top_k_cpu == candidate_top_k):
+                 uniform_top_k = candidate_top_k
+ 
++        uniform_temperature = None
++        if self.vocab_size in (151936, 248320) and num_reqs > 0:
++            skip_unit_temperature_enabled = os.environ.get(
++                "VLLM_MUSA_QWEN_SKIP_UNIT_TEMPERATURE", "1"
++            ).lower() not in ("0", "false", "no", "off")
++            temperature_cpu = self.temperature_cpu[:num_reqs]
++            if skip_unit_temperature_enabled and np.all(
++                temperature_cpu == np.float32(1.0)
++            ):
++                uniform_temperature = 1.0
++
+         return SamplingMetadata(
+             temperature=temperature,
+             all_greedy=self.all_greedy,
+@@ -945,6 +957,7 @@ class InputBatch:
+             logitsprocs=self.logitsprocs,
+             thinking_budget_state_holder=self.thinking_budget_state_holder,
+             uniform_top_k=uniform_top_k,
++            uniform_temperature=uniform_temperature,
+         )
+ 
+     def get_pooling_params(self) -> list[PoolingParams]:
