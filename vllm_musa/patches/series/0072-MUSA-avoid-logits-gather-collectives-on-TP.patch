@@ -4,11 +4,11 @@ Date: Mon, 29 Jun 2026 16:55:00 +0800
 Subject: [PATCH] MUSA: avoid logits gather collectives on TP
 
 ---
- .../model_executor/layers/logits_processor.py | 49 +++++++++++++++++--
- 1 file changed, 46 insertions(+), 3 deletions(-)
+ .../model_executor/layers/logits_processor.py | 71 +++++++++++++++++--
+ 1 file changed, 68 insertions(+), 3 deletions(-)
 
 diff --git a/vllm/model_executor/layers/logits_processor.py b/vllm/model_executor/layers/logits_processor.py
-index 3541b9706..651505ab0 100644
+index 3541b9706..9ded650eb 100644
 --- a/vllm/model_executor/layers/logits_processor.py
 +++ b/vllm/model_executor/layers/logits_processor.py
 @@ -5,8 +5,10 @@
@@ -22,7 +22,7 @@ index 3541b9706..651505ab0 100644
      tensor_model_parallel_gather,
  )
  from vllm.model_executor.custom_op import PluggableLayer
-@@ -72,7 +74,35 @@ class LogitsProcessor(PluggableLayer):
+@@ -72,7 +74,57 @@ class LogitsProcessor(PluggableLayer):
                  logits *= self.scale
          return logits
  
@@ -36,10 +36,32 @@ index 3541b9706..651505ab0 100644
 +        logits: torch.Tensor,
 +        lm_head: VocabParallelEmbedding,
 +    ) -> torch.Tensor:
-+        """Rebuild all-gathered logits using the TP all-reduce backend."""
++        """Rebuild all-gathered logits with MUSA IPC or all-reduce fallback."""
 +        tp_size = get_tensor_model_parallel_world_size()
 +        if tp_size == 1:
 +            return logits
++
++        use_ipc_gather = (
++            self.org_vocab_size in (151936, 248320)
++            and tp_size in (2, 4, 8)
++            and logits.dtype == torch.bfloat16
++            and logits.ndim == 2
++            and 0 < logits.shape[0] <= 64
++            and logits.shape[1] > 0
++            and logits.shape[1] % 8 == 0
++            and logits.is_contiguous()
++            and logits.shape[1] * tp_size >= self.org_vocab_size
++        )
++        if use_ipc_gather:
++            from vllm_musa.distributed.device_communicators import (
++                musa_jit_custom_all_reduce as musa_jit_ar,
++            )
++
++            gathered = musa_jit_ar.maybe_musa_jit_logits_all_gather(
++                logits, dim=-1
++            )
++            if gathered is not None:
++                return gathered
 +
 +        tp_rank = get_tensor_model_parallel_rank()
 +        shard_size = logits.shape[-1]
@@ -59,7 +81,7 @@ index 3541b9706..651505ab0 100644
          """gather/all-gather the logits tensor across model parallel group."""
          if self.use_all_gather:
              # Gather is not supported for some devices such as TPUs.
-@@ -80,7 +110,12 @@ class LogitsProcessor(PluggableLayer):
+@@ -80,7 +132,12 @@ class LogitsProcessor(PluggableLayer):
              # NOTE(woosuk): Here, the outputs of every device should not be None
              # because XLA requires strict SPMD among all devices. Every device
              # should execute the same operations after gathering the logits.
@@ -73,7 +95,7 @@ index 3541b9706..651505ab0 100644
          else:
              # None may be returned for rank > 0
              logits = tensor_model_parallel_gather(logits)
-@@ -96,7 +131,7 @@ class LogitsProcessor(PluggableLayer):
+@@ -96,7 +153,7 @@ class LogitsProcessor(PluggableLayer):
          logits = lm_head.quant_method.apply(lm_head, hidden_states, bias=embedding_bias)
  
          # Gather logits for TP
@@ -82,7 +104,7 @@ index 3541b9706..651505ab0 100644
  
          # Remove paddings in vocab (if any).
          if logits is not None:
-@@ -128,6 +163,14 @@ class LogitsProcessor(PluggableLayer):
+@@ -128,6 +185,14 @@ class LogitsProcessor(PluggableLayer):
          if self.scale != 1.0:
              logits = logits * self.scale
  

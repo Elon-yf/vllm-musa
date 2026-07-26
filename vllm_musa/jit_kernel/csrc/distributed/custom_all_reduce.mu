@@ -323,6 +323,101 @@ __global__ void __launch_bounds__(kMaxThreadsPerBlock, 1) custom_all_reduce_2sho
 }
 
 template <typename T, int nranks>
+__global__ void __launch_bounds__(kMaxThreadsPerBlock, 1)
+    cross_device_all_gather_last_dim(RankData data, T* __restrict__ out,
+                                     int rows,
+                                     int shard_packed_size) {
+  using P = typename packed_t<T>::P;
+  const int region_count = rows * nranks;
+  if (gridDim.x >= region_count) {
+    const int region = blockIdx.x % region_count;
+    const int block_in_region = blockIdx.x / region_count;
+    const int blocks_per_region = gridDim.x / region_count;
+    const int row = region / nranks;
+    const int source_rank = region - row * nranks;
+    const P* source = reinterpret_cast<const P*>(data.ptrs[source_rank]) +
+                      row * shard_packed_size;
+    P* destination = reinterpret_cast<P*>(out) + region * shard_packed_size;
+    for (int column = block_in_region * blockDim.x + threadIdx.x;
+         column < shard_packed_size;
+         column += blocks_per_region * blockDim.x) {
+      destination[column] = source[column];
+    }
+  } else {
+    for (int region = blockIdx.x; region < region_count;
+         region += gridDim.x) {
+      const int row = region / nranks;
+      const int source_rank = region - row * nranks;
+      const P* source = reinterpret_cast<const P*>(data.ptrs[source_rank]) +
+                        row * shard_packed_size;
+      P* destination = reinterpret_cast<P*>(out) + region * shard_packed_size;
+      for (int column = threadIdx.x; column < shard_packed_size;
+           column += blockDim.x) {
+        destination[column] = source[column];
+      }
+    }
+  }
+}
+
+template <int nranks>
+__global__ void cross_device_all_gather_start_barrier(RankSignals sg,
+                                                       Signal* self_sg,
+                                                       int rank) {
+  // Each signalling lane owns its system-scope release/acquire pair.
+  if (threadIdx.x < nranks) {
+    __threadfence_system();
+  }
+  __syncthreads_lm();
+  multi_rank_barrier<nranks, true>(sg, self_sg, rank);
+  if (threadIdx.x < nranks) {
+    __threadfence_system();
+  }
+  __syncthreads_lm();
+}
+
+template <int nranks>
+__global__ void cross_device_all_gather_end_barrier(RankSignals sg,
+                                                     Signal* self_sg,
+                                                     int rank) {
+  // The same stream reaches this kernel only after every local copy block has
+  // completed. Wait for peers before allowing the next staging overwrite.
+  if (threadIdx.x < nranks) {
+    __threadfence_system();
+  }
+  __syncthreads_lm();
+  multi_rank_barrier<nranks, false>(sg, self_sg, rank);
+  if (threadIdx.x < nranks) {
+    __threadfence_system();
+  }
+  __syncthreads_lm();
+}
+
+template <typename T, int nranks>
+void launch_all_gather_last_dim(RankData data, RankSignals sg,
+                                Signal* self_sg, T* out, int rank, int rows,
+                                int shard_size, musaStream_t stream) {
+  const int pack = packed_t<T>::P::size;
+  TVM_FFI_ICHECK_EQ(shard_size % pack, 0);
+  const int shard_packed_size = shard_size / pack;
+  const int region_count = rows * nranks;
+  const int block_limit = std::min(kDefaultBlockLimit, kMaxBlocks);
+  int blocks = block_limit;
+  if (blocks >= region_count) {
+    blocks = (blocks / region_count) * region_count;
+  }
+  if (blocks <= 0) {
+    return;
+  }
+  cross_device_all_gather_start_barrier<nranks>
+      <<<1, nranks, 0, stream>>>(sg, self_sg, rank);
+  cross_device_all_gather_last_dim<T, nranks>
+      <<<blocks, kDefaultThreads, 0, stream>>>(data, out, rows,
+                                               shard_packed_size);
+  cross_device_all_gather_end_barrier<nranks>
+      <<<1, nranks, 0, stream>>>(sg, self_sg, rank);
+}
+
+template <typename T, int nranks>
 void launch_ar(RankData data, RankSignals sg, Signal* self_sg, T* out, int rank, int size, int shot, musaStream_t stream) {
   const int pack = packed_t<T>::P::size;
   TVM_FFI_ICHECK_EQ(size % pack, 0);
@@ -361,6 +456,29 @@ void dispatch_world_size(RankData data, RankSignals sg, Signal* self_sg, T* out,
       break;
     default:
       TVM_FFI_THROW(ValueError) << "world_size must be one of 2/4/6/8";
+  }
+}
+
+template <typename T>
+void dispatch_all_gather_world_size(RankData data, RankSignals sg,
+                                    Signal* self_sg, T* out, int rank,
+                                    int world_size, int rows, int shard_size,
+                                    musaStream_t stream) {
+  switch (world_size) {
+    case 2:
+      launch_all_gather_last_dim<T, 2>(data, sg, self_sg, out, rank, rows,
+                                       shard_size, stream);
+      break;
+    case 4:
+      launch_all_gather_last_dim<T, 4>(data, sg, self_sg, out, rank, rows,
+                                       shard_size, stream);
+      break;
+    case 8:
+      launch_all_gather_last_dim<T, 8>(data, sg, self_sg, out, rank, rows,
+                                       shard_size, stream);
+      break;
+    default:
+      TVM_FFI_THROW(ValueError) << "all-gather world_size must be one of 2/4/8";
   }
 }
 
@@ -433,5 +551,96 @@ void vllm_musa_custom_ar_launch_unregistered(
   TVM_FFI_ICHECK_EQ(err, musaSuccess) << "MUSA custom AR kernel failed: " << musaGetErrorString(err);
 }
 
+void vllm_musa_custom_ar_launch_all_gather(
+    ffi::TensorView rank_data,
+    ffi::TensorView signal_ptrs_cpu,
+    ffi::TensorView inp,
+    ffi::TensorView out,
+    int64_t self_signal_ptr,
+    int64_t self_buffer_ptr,
+    int64_t max_size_bytes,
+    int64_t rank,
+    int64_t world_size) {
+  CHECK_MUSA_CONTIGUOUS(inp);
+  CHECK_MUSA_CONTIGUOUS(out);
+  TVM_FFI_ICHECK_EQ(rank_data.device().device_type, kDLCPU);
+  TVM_FFI_ICHECK(rank_data.IsContiguous());
+  TVM_FFI_ICHECK(dtype_equal(rank_data.dtype(), dl_int64));
+  TVM_FFI_ICHECK_GE(rank_data.size(0), kMaxRanks);
+  TVM_FFI_ICHECK_EQ(signal_ptrs_cpu.device().device_type, kDLCPU);
+  TVM_FFI_ICHECK(signal_ptrs_cpu.IsContiguous());
+  TVM_FFI_ICHECK(dtype_equal(signal_ptrs_cpu.dtype(), dl_int64));
+  TVM_FFI_ICHECK_GE(signal_ptrs_cpu.size(0), world_size);
+  TVM_FFI_ICHECK(rank >= 0 && rank < world_size);
+  TVM_FFI_ICHECK_EQ(inp.ndim(), 2);
+  TVM_FFI_ICHECK_EQ(out.ndim(), 2);
+  TVM_FFI_ICHECK_EQ(inp.size(0), out.size(0));
+  TVM_FFI_ICHECK_EQ(inp.size(1) * world_size, out.size(1));
+  TVM_FFI_ICHECK(dtype_equal(inp.dtype(), out.dtype()));
+
+  RankSignals sg{};
+  const auto* ptrs = static_cast<const int64_t*>(signal_ptrs_cpu.data_ptr());
+  for (int i = 0; i < world_size; ++i) {
+    sg.signals[i] = reinterpret_cast<Signal*>(ptrs[i]);
+  }
+  RankData data{};
+  const auto* rank_ptrs = static_cast<const int64_t*>(rank_data.data_ptr());
+  for (int i = 0; i < kMaxRanks; ++i) {
+    data.ptrs[i] = reinterpret_cast<const void*>(rank_ptrs[i]);
+  }
+  // The local input is still live for this eager call and is typically hot
+  // from LM-head GEMM. Peers read the published IPC staging copy, while this
+  // rank can read its original shard directly.
+  data.ptrs[rank] = inp.data_ptr();
+
+  auto* self_sg = reinterpret_cast<Signal*>(self_signal_ptr);
+  auto stream = get_stream(out.device());
+  const int64_t input_numel = tensor_numel(inp);
+  const int64_t output_numel = tensor_numel(out);
+  TVM_FFI_ICHECK_LE(input_numel,
+                    static_cast<int64_t>(std::numeric_limits<int32_t>::max()));
+  TVM_FFI_ICHECK_LE(output_numel,
+                    static_cast<int64_t>(std::numeric_limits<int32_t>::max()));
+  const int64_t element_bytes =
+      (static_cast<int64_t>(inp.dtype().bits) * inp.dtype().lanes + 7) / 8;
+  const int64_t input_nbytes = input_numel * element_bytes;
+  const int64_t output_nbytes = output_numel * element_bytes;
+  TVM_FFI_ICHECK_LE(input_nbytes, max_size_bytes);
+  TVM_FFI_ICHECK_LE(output_nbytes, max_size_bytes);
+  const musaError_t copy_err = musaMemcpyAsync(
+      reinterpret_cast<void*>(self_buffer_ptr), inp.data_ptr(),
+      static_cast<size_t>(input_nbytes), musaMemcpyDeviceToDevice, stream);
+  TVM_FFI_ICHECK_EQ(copy_err, musaSuccess)
+      << "MUSA custom all-gather copy failed: "
+      << musaGetErrorString(copy_err);
+
+  const int rows = static_cast<int>(inp.size(0));
+  const int shard_size = static_cast<int>(inp.size(1));
+  if (dtype_equal(out.dtype(), dl_float16)) {
+    dispatch_all_gather_world_size(
+        data, sg, self_sg, static_cast<half*>(out.data_ptr()),
+        static_cast<int>(rank), static_cast<int>(world_size), rows, shard_size,
+        stream);
+  } else if (dtype_equal(out.dtype(), dl_bfloat16)) {
+    dispatch_all_gather_world_size(
+        data, sg, self_sg, static_cast<__mt_bfloat16*>(out.data_ptr()),
+        static_cast<int>(rank), static_cast<int>(world_size), rows, shard_size,
+        stream);
+  } else if (dtype_equal(out.dtype(), dl_float32)) {
+    dispatch_all_gather_world_size(
+        data, sg, self_sg, static_cast<float*>(out.data_ptr()),
+        static_cast<int>(rank), static_cast<int>(world_size), rows, shard_size,
+        stream);
+  } else {
+    TVM_FFI_THROW(ValueError)
+        << "custom all-gather only supports fp16/bf16/fp32";
+  }
+  const musaError_t err = musaGetLastError();
+  TVM_FFI_ICHECK_EQ(err, musaSuccess)
+      << "MUSA custom all-gather kernel failed: " << musaGetErrorString(err);
+}
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(vllm_musa_custom_ar_meta_size, vllm_musa_custom_ar_meta_size);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(vllm_musa_custom_ar_launch_unregistered, vllm_musa_custom_ar_launch_unregistered);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(vllm_musa_custom_ar_launch_all_gather,
+                              vllm_musa_custom_ar_launch_all_gather);

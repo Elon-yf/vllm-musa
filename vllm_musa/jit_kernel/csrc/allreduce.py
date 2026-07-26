@@ -97,3 +97,27 @@ def launch_unregistered(
         int(world_size),
         int(shot),
     )
+
+
+def launch_all_gather(
+    rank_data: torch.Tensor,
+    signal_ptrs_cpu: torch.Tensor,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+    self_signal_ptr: int,
+    self_buffer_ptr: int,
+    max_size_bytes: int,
+    rank: int,
+    world_size: int,
+) -> None:
+    _custom_ar_module(int(world_size)).vllm_musa_custom_ar_launch_all_gather(
+        rank_data,
+        signal_ptrs_cpu,
+        inp,
+        out,
+        int(self_signal_ptr),
+        int(self_buffer_ptr),
+        int(max_size_bytes),
+        int(rank),
+        int(world_size),
+    )
