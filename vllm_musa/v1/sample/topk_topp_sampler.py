@@ -418,7 +418,7 @@ def can_use_qwen_legacy_gumbel(
 
     generators = sampling_metadata.generators
     rows = logits.shape[0]
-    if len(generators) != rows or not all(row in generators for row in range(rows)):
+    if not generators or any(row < 0 or row >= rows for row in generators):
         return False
     return all(
         hasattr(generator, "initial_seed")
@@ -430,15 +430,15 @@ def can_use_qwen_legacy_gumbel(
     )
 
 
-def get_qwen_legacy_generator_state(
-    generators: dict[int, torch.Generator], rows: int
+def _get_qwen_legacy_generator_state_for_rows(
+    generators: dict[int, torch.Generator], row_indices: list[int]
 ) -> tuple[list[int], list[int]] | None:
-    """Read a valid per-row seed/Philox-offset snapshot without mutation."""
+    """Read a valid sparse per-row seed/offset snapshot without mutation."""
     seeds = []
     offsets = []
     int64_max = np.iinfo(np.int64).max
     try:
-        for row in range(rows):
+        for row in row_indices:
             generator = generators[row]
             seed = int(generator.initial_seed())
             offset = int(generator.get_offset())
@@ -451,6 +451,13 @@ def get_qwen_legacy_generator_state(
     return seeds, offsets
 
 
+def get_qwen_legacy_generator_state(
+    generators: dict[int, torch.Generator], rows: int
+) -> tuple[list[int], list[int]] | None:
+    """Read a valid contiguous per-row seed/offset snapshot without mutation."""
+    return _get_qwen_legacy_generator_state_for_rows(generators, list(range(rows)))
+
+
 def sample_qwen_legacy_gumbel(
     logits: torch.Tensor,
     generators: dict[int, torch.Generator],
@@ -459,6 +466,15 @@ def sample_qwen_legacy_gumbel(
 ) -> torch.Tensor:
     """Batch MRV1 seeded rows and preserve one-call generator offsets."""
     logits = _apply_top_k_top_p(logits, top_k, None)
+    return _sample_qwen_legacy_gumbel_filtered(logits, generators, generator_state)
+
+
+def _sample_qwen_legacy_gumbel_filtered(
+    logits: torch.Tensor,
+    generators: dict[int, torch.Generator],
+    generator_state: tuple[list[int], list[int]],
+) -> torch.Tensor:
+    """Sample already-filtered logits and advance the remapped generators."""
     seeds_cpu, offsets_cpu = generator_state
     rows = logits.shape[0]
     mapping = torch.arange(rows, dtype=torch.int32, device=logits.device)
@@ -495,6 +511,54 @@ def sample_qwen_legacy_gumbel(
                 "Failed to advance and fully roll back legacy MUSA generators"
             ) from error
         raise RuntimeError("Failed to advance legacy MUSA generators") from error
+    return sampled
+
+
+def sample_qwen_legacy_gumbel_partitioned(
+    logits: torch.Tensor,
+    generators: dict[int, torch.Generator],
+    top_k: torch.Tensor,
+) -> torch.Tensor | None:
+    """Use Gumbel for seeded rows and preserve multinomial for unseeded rows."""
+    rows = logits.shape[0]
+    seeded_rows = sorted(generators)
+    if not seeded_rows or any(row < 0 or row >= rows for row in seeded_rows):
+        return None
+    seeded_state = _get_qwen_legacy_generator_state_for_rows(generators, seeded_rows)
+    if seeded_state is None:
+        return None
+    if len(seeded_rows) == rows:
+        return sample_qwen_legacy_gumbel(
+            logits,
+            generators,
+            top_k,
+            seeded_state,
+        )
+
+    filtered_logits = _apply_top_k_top_p(logits, top_k, None)
+    seeded_index = torch.tensor(seeded_rows, dtype=torch.long, device=logits.device)
+    unseeded_rows = [row for row in range(rows) if row not in generators]
+    seeded_logits = filtered_logits.index_select(0, seeded_index)
+    remapped_generators = {
+        new_row: generators[old_row] for new_row, old_row in enumerate(seeded_rows)
+    }
+    seeded_sampled = _sample_qwen_legacy_gumbel_filtered(
+        seeded_logits,
+        remapped_generators,
+        seeded_state,
+    )
+
+    sampled = torch.empty(rows, dtype=torch.long, device=logits.device)
+    sampled.index_copy_(0, seeded_index, seeded_sampled)
+    if unseeded_rows:
+        unseeded_index = torch.tensor(
+            unseeded_rows, dtype=torch.long, device=logits.device
+        )
+        unseeded_probs = filtered_logits.index_select(0, unseeded_index).softmax(
+            dim=-1, dtype=torch.float32
+        )
+        unseeded_sampled = sample_probs_seeded_multinomial(unseeded_probs, {})
+        sampled.index_copy_(0, unseeded_index, unseeded_sampled)
     return sampled
 
 
@@ -543,22 +607,27 @@ def _sample(
         musa_min_p,
         self.use_fp64_gumbel,
     )
-    legacy_generator_state = (
-        get_qwen_legacy_generator_state(sampling_metadata.generators, logits.shape[0])
-        if use_legacy_gumbel
-        else None
-    )
-    if legacy_generator_state is not None:
-        vllm_topk_topp_sampler.logger.info_once(
-            "Using the gated MUSA legacy Gumbel sampler for Qwen requests.",
-            scope="global",
-        )
-        random_sampled = sample_qwen_legacy_gumbel(
+    legacy_sampled = (
+        sample_qwen_legacy_gumbel_partitioned(
             logits,
             sampling_metadata.generators,
             sampling_metadata.top_k,
-            legacy_generator_state,
         )
+        if use_legacy_gumbel
+        else None
+    )
+    if legacy_sampled is not None:
+        if len(sampling_metadata.generators) < logits.shape[0]:
+            vllm_topk_topp_sampler.logger.info_once(
+                "Using mixed seeded/unseeded MUSA legacy Gumbel partition.",
+                scope="global",
+            )
+        else:
+            vllm_topk_topp_sampler.logger.info_once(
+                "Using the gated MUSA legacy Gumbel sampler for Qwen requests.",
+                scope="global",
+            )
+        random_sampled = legacy_sampled
         processed_logprobs = None
     elif musa_min_p is None:
         random_sampled, processed_logprobs = _call_topk_topp_sampler(
