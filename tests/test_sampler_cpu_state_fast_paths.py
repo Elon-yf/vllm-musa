@@ -22,12 +22,88 @@ requires_musa = pytest.mark.skipif(
 )
 
 
-def test_uniform_top_k_metadata_patch_is_active_and_qwen_gated() -> None:
-    assert "uniform_top_k" in {field.name for field in fields(SamplingMetadata)}
+def test_uniform_sampler_metadata_patch_is_active_and_qwen_gated() -> None:
+    metadata_fields = {field.name for field in fields(SamplingMetadata)}
+    assert "uniform_top_k" in metadata_fields
+    assert "uniform_temperature" in metadata_fields
     source = inspect.getsource(InputBatch._make_sampling_metadata)
     assert "uniform_top_k" in source
+    assert "uniform_temperature" in source
     assert "self.vocab_size in (151936, 248320)" in source
     assert "candidate_top_k == 50" in source
+    assert "VLLM_MUSA_QWEN_SKIP_UNIT_TEMPERATURE" in source
+    assert "temperature_cpu == np.float32(1.0)" in source
+
+
+def test_legacy_qwen_unit_temperature_skip_is_exact_and_vocab_gated() -> None:
+    metadata = SimpleNamespace(all_random=True, uniform_temperature=1.0)
+    assert sampler._can_skip_legacy_qwen_unit_temperature(
+        torch.empty((4, 248320)), metadata
+    )
+    assert sampler._can_skip_legacy_qwen_unit_temperature(
+        torch.empty((1, 151936)), metadata
+    )
+
+    metadata.uniform_temperature = None
+    assert not sampler._can_skip_legacy_qwen_unit_temperature(
+        torch.empty((4, 248320)), metadata
+    )
+    metadata.uniform_temperature = 0.7
+    assert not sampler._can_skip_legacy_qwen_unit_temperature(
+        torch.empty((4, 248320)), metadata
+    )
+    metadata.uniform_temperature = 1.0
+    assert not sampler._can_skip_legacy_qwen_unit_temperature(
+        torch.empty((4, 32000)), metadata
+    )
+    metadata.all_random = False
+    assert not sampler._can_skip_legacy_qwen_unit_temperature(
+        torch.empty((4, 248320)), metadata
+    )
+
+
+def test_legacy_sample_skips_only_cpu_proven_qwen_unit_temperature(
+    monkeypatch,
+) -> None:
+    temperature_calls = []
+
+    def apply_temperature(logits, temperature, all_random):
+        temperature_calls.append((temperature, all_random))
+        return logits
+
+    fake_sampler = SimpleNamespace(
+        logprobs_mode="raw_logprobs",
+        apply_temperature=apply_temperature,
+        topk_topp_sampler=object(),
+        use_fp64_gumbel=False,
+    )
+    metadata = SimpleNamespace(
+        all_greedy=False,
+        all_random=True,
+        temperature=torch.ones(4),
+        top_k=None,
+        top_p=None,
+        generators={},
+        logitsprocs=SimpleNamespace(argmax_invariant=[]),
+        uniform_temperature=1.0,
+    )
+    monkeypatch.setattr(sampler, "can_use_qwen_legacy_gumbel", lambda *_args: False)
+    monkeypatch.setattr(
+        sampler,
+        "_call_topk_topp_sampler",
+        lambda *_args, **_kwargs: (torch.zeros(4, dtype=torch.int64), None),
+    )
+
+    sampler._sample(fake_sampler, torch.empty((4, 248320)), metadata)
+    assert temperature_calls == []
+
+    metadata.uniform_temperature = None
+    sampler._sample(fake_sampler, torch.empty((4, 248320)), metadata)
+    assert len(temperature_calls) == 1
+
+    metadata.uniform_temperature = 1.0
+    sampler._sample(fake_sampler, torch.empty((4, 32000)), metadata)
+    assert len(temperature_calls) == 2
 
 
 def _state_array(
