@@ -280,9 +280,23 @@ def test_qwen_legacy_gumbel_gate_fails_closed(monkeypatch) -> None:
         None,
         False,
     )
-    assert not sampler.can_use_qwen_legacy_gumbel(
+    assert sampler.can_use_qwen_legacy_gumbel(
         logits,
         _legacy_gumbel_metadata(4, generators={0: _FakeGenerator(1)}),
+        "raw_logprobs",
+        None,
+        False,
+    )
+    assert not sampler.can_use_qwen_legacy_gumbel(
+        logits,
+        _legacy_gumbel_metadata(4, generators={}),
+        "raw_logprobs",
+        None,
+        False,
+    )
+    assert not sampler.can_use_qwen_legacy_gumbel(
+        logits,
+        _legacy_gumbel_metadata(4, generators={4: _FakeGenerator(1)}),
         "raw_logprobs",
         None,
         False,
@@ -332,6 +346,65 @@ def test_qwen_legacy_gumbel_rolls_back_partial_generator_advance(
         )
 
     assert [generator.get_offset() for generator in generators.values()] == [0] * rows
+
+
+def test_qwen_legacy_gumbel_partitions_seeded_and_unseeded_rows(
+    monkeypatch,
+) -> None:
+    rows = 4
+    logits = torch.randn((rows, 248320))
+    generators = {0: _FakeGenerator(60043), 2: _FakeGenerator(60045)}
+    captured = {}
+
+    def fake_gumbel_sample(
+        processed_logits,
+        mapping,
+        temperature,
+        seeds,
+        positions,
+        **kwargs,
+    ):
+        captured.update(
+            processed_logits=processed_logits.clone(),
+            mapping=mapping.clone(),
+            temperature=temperature.clone(),
+            seeds=seeds.clone(),
+            positions=positions.clone(),
+            kwargs=kwargs,
+        )
+        return torch.tensor([10, 20], dtype=torch.int64)
+
+    def fake_multinomial(probs, subset_generators):
+        captured.update(
+            unseeded_probs=probs.clone(),
+            unseeded_generators=subset_generators,
+        )
+        return torch.tensor([11, 13], dtype=torch.int64)
+
+    monkeypatch.setattr(sampler, "_apply_top_k_top_p", lambda tensor, *_args: tensor)
+    monkeypatch.setattr(
+        sampler.vllm_worker_sampler, "gumbel_sample", fake_gumbel_sample
+    )
+    monkeypatch.setattr(sampler, "sample_probs_seeded_multinomial", fake_multinomial)
+
+    sampled = sampler.sample_qwen_legacy_gumbel_partitioned(
+        logits,
+        generators,
+        torch.full((rows,), 50, dtype=torch.int32),
+    )
+
+    assert sampled.tolist() == [10, 11, 20, 13]
+    assert torch.equal(captured["processed_logits"], logits[[0, 2]])
+    assert captured["mapping"].tolist() == [0, 1]
+    assert captured["seeds"].tolist() == [60043, 60045]
+    assert captured["positions"].tolist() == [0, 0]
+    assert captured["kwargs"] == {"apply_temperature": False, "use_fp64": False}
+    assert torch.allclose(
+        captured["unseeded_probs"],
+        logits[[1, 3]].softmax(dim=-1, dtype=torch.float32),
+    )
+    assert captured["unseeded_generators"] == {}
+    assert [generator.get_offset() for generator in generators.values()] == [4, 4]
 
 
 def test_qwen_legacy_gumbel_gate_is_disabled_by_default(monkeypatch) -> None:
