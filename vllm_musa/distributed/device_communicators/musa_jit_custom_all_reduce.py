@@ -465,7 +465,12 @@ class _MusaJitCustomAllreduceImpl:
             return False
         return inp.is_contiguous()
 
-    def should_custom_all_gather(self, inp: torch.Tensor, dim: int = -1) -> bool:
+    def should_custom_all_gather(
+        self,
+        inp: torch.Tensor,
+        dim: int = -1,
+        output_dtype: torch.dtype | None = None,
+    ) -> bool:
         if self.disabled or self.world_size not in (2, 4, 8) or inp.ndim != 2:
             return False
         if not self._is_communicator_tensor(inp):
@@ -475,6 +480,12 @@ class _MusaJitCustomAllreduceImpl:
             return False
         if inp.dtype not in (torch.float16, torch.bfloat16, torch.float32):
             return False
+        if output_dtype is None:
+            output_dtype = inp.dtype
+        if output_dtype != inp.dtype and not (
+            inp.dtype == torch.bfloat16 and output_dtype == torch.float32
+        ):
+            return False
         if not inp.is_contiguous() or inp.shape[0] <= 0 or inp.shape[1] <= 0:
             return False
         pack = 16 // inp.element_size()
@@ -482,7 +493,8 @@ class _MusaJitCustomAllreduceImpl:
             return False
         inp_size = inp.numel() * inp.element_size()
         output_numel = inp.numel() * self.world_size
-        output_size = output_numel * inp.element_size()
+        output_element_size = 4 if output_dtype == torch.float32 else inp.element_size()
+        output_size = output_numel * output_element_size
         return (
             inp_size <= self.max_size
             and inp_size % 16 == 0
@@ -586,9 +598,12 @@ class _MusaJitCustomAllreduceImpl:
         return out
 
     def custom_all_gather(
-        self, input: torch.Tensor, dim: int = -1
+        self,
+        input: torch.Tensor,
+        dim: int = -1,
+        output_dtype: torch.dtype | None = None,
     ) -> torch.Tensor | None:
-        if not self.should_custom_all_gather(input, dim):
+        if not self.should_custom_all_gather(input, dim, output_dtype):
             return None
         # Logits currently run outside the model graph. Fail closed if a future
         # runner moves this call under Dynamo or graph capture; that path needs
@@ -600,12 +615,20 @@ class _MusaJitCustomAllreduceImpl:
             or not self._is_default_stream(input)
         ):
             return None
-        return self._custom_all_gather_impl(input)
+        return self._custom_all_gather_impl(input, output_dtype)
 
-    def _custom_all_gather_impl(self, input: torch.Tensor) -> torch.Tensor:
+    def _custom_all_gather_impl(
+        self,
+        input: torch.Tensor,
+        output_dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
         assert self.buffer_rank_data is not None
         output_shape = (*input.shape[:-1], input.shape[-1] * self.world_size)
-        out = torch.empty(output_shape, dtype=input.dtype, device=input.device)
+        out = torch.empty(
+            output_shape,
+            dtype=output_dtype if output_dtype is not None else input.dtype,
+            device=input.device,
+        )
         jit_ar.launch_all_gather(
             self.buffer_rank_data,
             self.signal_ptrs_cpu,
@@ -734,10 +757,15 @@ class MusaJitCustomAllreduce:
         return None
 
     def custom_all_gather(
-        self, input: torch.Tensor, dim: int = -1
+        self,
+        input: torch.Tensor,
+        dim: int = -1,
+        output_dtype: torch.dtype | None = None,
     ) -> torch.Tensor | None:
-        if self._jit_available and self._jit_comm.should_custom_all_gather(input, dim):
-            return self._jit_comm.custom_all_gather(input, dim)
+        if self._jit_available and self._jit_comm.should_custom_all_gather(
+            input, dim, output_dtype
+        ):
+            return self._jit_comm.custom_all_gather(input, dim, output_dtype)
         return None
 
     def close(self) -> None:
@@ -753,7 +781,9 @@ class MusaJitCustomAllreduce:
 
 
 def maybe_musa_jit_logits_all_gather(
-    input: torch.Tensor, dim: int = -1
+    input: torch.Tensor,
+    dim: int = -1,
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor | None:
     """Use the MUSA IPC communicator for a last-dimension logits gather."""
     from vllm.distributed.parallel_state import get_tp_group
@@ -762,7 +792,7 @@ def maybe_musa_jit_logits_all_gather(
     custom_ar = getattr(device_communicator, "ca_comm", None)
     if not isinstance(custom_ar, MusaJitCustomAllreduce):
         return None
-    output = custom_ar.custom_all_gather(input, dim)
+    output = custom_ar.custom_all_gather(input, dim, output_dtype)
     if output is not None:
         logger.info_once("Using MUSA JIT IPC all-gather for TP logits.")
     return output

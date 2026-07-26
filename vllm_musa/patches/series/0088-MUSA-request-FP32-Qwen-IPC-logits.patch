@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: musa <musa@local>
+Date: Mon, 27 Jul 2026 07:01:37 +0800
+Subject: [PATCH] MUSA: request FP32 Qwen IPC logits
+
+---
+ .../model_executor/layers/logits_processor.py | 21 +++++++++++++++++--
+ 1 file changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/vllm/model_executor/layers/logits_processor.py b/vllm/model_executor/layers/logits_processor.py
+index 9ded650ebf..4654e32866 100644
+--- a/vllm/model_executor/layers/logits_processor.py
++++ b/vllm/model_executor/layers/logits_processor.py
+@@ -2,6 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """A layer that compute logits from hidden_stats."""
+ 
++import os
++
+ import torch
+ 
+ from vllm.distributed import (
+@@ -50,6 +52,9 @@ class LogitsProcessor(PluggableLayer):
+         self.org_vocab_size = org_vocab_size or vocab_size
+         # Soft cap the logits. Used in Gemma 2.
+         self.soft_cap = soft_cap
++        self._musa_fp32_logits_gather = os.environ.get(
++            "VLLM_MUSA_QWEN_FP32_LOGITS_GATHER", "1"
++        ).lower() not in {"0", "false", "no", "off"}
+         # Whether to use gather or all-gather to gather the logits.
+         self.use_all_gather = current_platform.use_all_gather()
+ 
+@@ -82,11 +87,14 @@ class LogitsProcessor(PluggableLayer):
+         self,
+         logits: torch.Tensor,
+         lm_head: VocabParallelEmbedding,
++        output_dtype: torch.dtype | None = None,
+     ) -> torch.Tensor:
+         """Rebuild all-gathered logits with MUSA IPC or all-reduce fallback."""
+         tp_size = get_tensor_model_parallel_world_size()
+         if tp_size == 1:
+             return logits
++        if tp_size not in (4, 8):
++            output_dtype = None
+ 
+         use_ipc_gather = (
+             self.org_vocab_size in (151936, 248320)
+@@ -105,7 +113,7 @@ class LogitsProcessor(PluggableLayer):
+             )
+ 
+             gathered = musa_jit_ar.maybe_musa_jit_logits_all_gather(
+-                logits, dim=-1
++                logits, dim=-1, output_dtype=output_dtype
+             )
+             if gathered is not None:
+                 return gathered
+@@ -135,7 +143,16 @@ class LogitsProcessor(PluggableLayer):
+             if self._use_musa_logits_all_reduce():
+                 # Preserve the all-gather layout while avoiding MCCL
+                 # gather/all_gather paths that are not reliable on MUSA.
+-                logits = self._musa_all_reduce_logits(logits, lm_head)
++                output_dtype = (
++                    torch.float32
++                    if self._musa_fp32_logits_gather
++                    and self.scale == 1.0
++                    and self.soft_cap is None
++                    else None
++                )
++                logits = self._musa_all_reduce_logits(
++                    logits, lm_head, output_dtype=output_dtype
++                )
+             else:
+                 logits = tensor_model_parallel_all_gather(logits)
+         else:

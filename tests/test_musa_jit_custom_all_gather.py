@@ -32,6 +32,8 @@ def test_custom_all_gather_gate_accepts_only_last_dim_packed_2d():
     accepted = torch.empty((4, 32), dtype=torch.bfloat16)
 
     assert impl.should_custom_all_gather(accepted, -1)
+    assert impl.should_custom_all_gather(accepted, -1, output_dtype=torch.float32)
+    assert not impl.should_custom_all_gather(accepted, -1, output_dtype=torch.float16)
     assert impl.should_custom_all_gather(accepted, 1)
     assert not impl.should_custom_all_gather(accepted, 0)
     assert not impl.should_custom_all_gather(accepted[:, ::2], -1)
@@ -46,6 +48,9 @@ def test_custom_all_gather_gate_accepts_only_last_dim_packed_2d():
     )
     impl.max_size = accepted.numel() * accepted.element_size()
     assert not impl.should_custom_all_gather(accepted, -1)
+    impl.max_size = accepted.numel() * accepted.element_size() * impl.world_size
+    assert impl.should_custom_all_gather(accepted, -1)
+    assert not impl.should_custom_all_gather(accepted, -1, output_dtype=torch.float32)
     impl.max_size = 1024 * 1024
     impl.world_size = 6
     assert not impl.should_custom_all_gather(accepted, -1)
@@ -104,6 +109,33 @@ def test_custom_all_gather_launches_with_last_dim_concatenated(monkeypatch):
     assert captured["world_size"] == 2
 
 
+def test_custom_all_gather_launches_bfloat16_to_float32(monkeypatch):
+    impl = _impl()
+    input_tensor = torch.arange(128, dtype=torch.bfloat16).view(4, 32)
+    captured = {}
+
+    def launch_all_gather(
+        rank_data,
+        signals,
+        inp,
+        out,
+        self_signal_ptr,
+        self_buffer_ptr,
+        max_size_bytes,
+        rank,
+        world_size,
+    ):
+        captured.update(inp=inp, out=out)
+
+    monkeypatch.setattr(custom_ar.jit_ar, "launch_all_gather", launch_all_gather)
+    output = impl._custom_all_gather_impl(input_tensor, output_dtype=torch.float32)
+
+    assert output.shape == (4, 64)
+    assert output.dtype == torch.float32
+    assert captured["inp"] is input_tensor
+    assert captured["out"] is output
+
+
 @pytest.mark.parametrize(
     "capturing,stream_capturing,compiling",
     [
@@ -141,11 +173,15 @@ def test_custom_all_gather_fails_closed_on_non_default_stream(monkeypatch):
 
 
 def test_logits_helper_uses_only_musa_jit_communicator(monkeypatch):
-    expected = torch.empty((4, 64), dtype=torch.bfloat16)
+    expected = torch.empty((4, 64), dtype=torch.float32)
     communicator = object.__new__(custom_ar.MusaJitCustomAllreduce)
     communicator._jit_comm = SimpleNamespace(disabled=False)
     monkeypatch.setattr(
-        communicator, "custom_all_gather", lambda input_tensor, dim: expected
+        communicator,
+        "custom_all_gather",
+        lambda input_tensor, dim, output_dtype=None: (
+            expected if output_dtype == torch.float32 else None
+        ),
     )
 
     import vllm.distributed.parallel_state as parallel_state
@@ -158,7 +194,8 @@ def test_logits_helper_uses_only_musa_jit_communicator(monkeypatch):
         ),
     )
     output = custom_ar.maybe_musa_jit_logits_all_gather(
-        torch.empty((4, 32), dtype=torch.bfloat16)
+        torch.empty((4, 32), dtype=torch.bfloat16),
+        output_dtype=torch.float32,
     )
     assert output is expected
 
