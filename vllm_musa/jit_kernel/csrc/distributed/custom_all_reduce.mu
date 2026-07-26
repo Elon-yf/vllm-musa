@@ -322,12 +322,13 @@ __global__ void __launch_bounds__(kMaxThreadsPerBlock, 1) custom_all_reduce_2sho
   } while (idx_base < size);
 }
 
-template <typename T, int nranks>
+template <typename InputT, typename OutputT, int nranks>
 __global__ void __launch_bounds__(kMaxThreadsPerBlock, 1)
-    cross_device_all_gather_last_dim(RankData data, T* __restrict__ out,
+    cross_device_all_gather_last_dim(RankData data, OutputT* __restrict__ out,
                                      int rows,
                                      int shard_packed_size) {
-  using P = typename packed_t<T>::P;
+  using InputP = typename packed_t<InputT>::P;
+  using OutputP = array_t<OutputT, InputP::size>;
   const int region_count = rows * nranks;
   if (gridDim.x >= region_count) {
     const int region = blockIdx.x % region_count;
@@ -335,25 +336,35 @@ __global__ void __launch_bounds__(kMaxThreadsPerBlock, 1)
     const int blocks_per_region = gridDim.x / region_count;
     const int row = region / nranks;
     const int source_rank = region - row * nranks;
-    const P* source = reinterpret_cast<const P*>(data.ptrs[source_rank]) +
-                      row * shard_packed_size;
-    P* destination = reinterpret_cast<P*>(out) + region * shard_packed_size;
+    const InputP* source = reinterpret_cast<const InputP*>(data.ptrs[source_rank]) +
+                           row * shard_packed_size;
+    OutputP* destination = reinterpret_cast<OutputP*>(out) +
+                           region * shard_packed_size;
     for (int column = block_in_region * blockDim.x + threadIdx.x;
          column < shard_packed_size;
          column += blocks_per_region * blockDim.x) {
-      destination[column] = source[column];
+      if constexpr (std::is_same<InputT, OutputT>::value) {
+        destination[column] = source[column];
+      } else {
+        destination[column] = upcast(source[column]);
+      }
     }
   } else {
     for (int region = blockIdx.x; region < region_count;
          region += gridDim.x) {
       const int row = region / nranks;
       const int source_rank = region - row * nranks;
-      const P* source = reinterpret_cast<const P*>(data.ptrs[source_rank]) +
-                        row * shard_packed_size;
-      P* destination = reinterpret_cast<P*>(out) + region * shard_packed_size;
+      const InputP* source = reinterpret_cast<const InputP*>(data.ptrs[source_rank]) +
+                             row * shard_packed_size;
+      OutputP* destination = reinterpret_cast<OutputP*>(out) +
+                             region * shard_packed_size;
       for (int column = threadIdx.x; column < shard_packed_size;
            column += blockDim.x) {
-        destination[column] = source[column];
+        if constexpr (std::is_same<InputT, OutputT>::value) {
+          destination[column] = source[column];
+        } else {
+          destination[column] = upcast(source[column]);
+        }
       }
     }
   }
@@ -392,11 +403,11 @@ __global__ void cross_device_all_gather_end_barrier(RankSignals sg,
   __syncthreads_lm();
 }
 
-template <typename T, int nranks>
+template <typename InputT, typename OutputT, int nranks>
 void launch_all_gather_last_dim(RankData data, RankSignals sg,
-                                Signal* self_sg, T* out, int rank, int rows,
+                                Signal* self_sg, OutputT* out, int rank, int rows,
                                 int shard_size, musaStream_t stream) {
-  const int pack = packed_t<T>::P::size;
+  const int pack = packed_t<InputT>::P::size;
   TVM_FFI_ICHECK_EQ(shard_size % pack, 0);
   const int shard_packed_size = shard_size / pack;
   const int region_count = rows * nranks;
@@ -410,7 +421,7 @@ void launch_all_gather_last_dim(RankData data, RankSignals sg,
   }
   cross_device_all_gather_start_barrier<nranks>
       <<<1, nranks, 0, stream>>>(sg, self_sg, rank);
-  cross_device_all_gather_last_dim<T, nranks>
+  cross_device_all_gather_last_dim<InputT, OutputT, nranks>
       <<<blocks, kDefaultThreads, 0, stream>>>(data, out, rows,
                                                shard_packed_size);
   cross_device_all_gather_end_barrier<nranks>
@@ -459,23 +470,23 @@ void dispatch_world_size(RankData data, RankSignals sg, Signal* self_sg, T* out,
   }
 }
 
-template <typename T>
+template <typename InputT, typename OutputT>
 void dispatch_all_gather_world_size(RankData data, RankSignals sg,
-                                    Signal* self_sg, T* out, int rank,
+                                    Signal* self_sg, OutputT* out, int rank,
                                     int world_size, int rows, int shard_size,
                                     musaStream_t stream) {
   switch (world_size) {
     case 2:
-      launch_all_gather_last_dim<T, 2>(data, sg, self_sg, out, rank, rows,
-                                       shard_size, stream);
+      launch_all_gather_last_dim<InputT, OutputT, 2>(
+          data, sg, self_sg, out, rank, rows, shard_size, stream);
       break;
     case 4:
-      launch_all_gather_last_dim<T, 4>(data, sg, self_sg, out, rank, rows,
-                                       shard_size, stream);
+      launch_all_gather_last_dim<InputT, OutputT, 4>(
+          data, sg, self_sg, out, rank, rows, shard_size, stream);
       break;
     case 8:
-      launch_all_gather_last_dim<T, 8>(data, sg, self_sg, out, rank, rows,
-                                       shard_size, stream);
+      launch_all_gather_last_dim<InputT, OutputT, 8>(
+          data, sg, self_sg, out, rank, rows, shard_size, stream);
       break;
     default:
       TVM_FFI_THROW(ValueError) << "all-gather world_size must be one of 2/4/8";
@@ -576,7 +587,11 @@ void vllm_musa_custom_ar_launch_all_gather(
   TVM_FFI_ICHECK_EQ(out.ndim(), 2);
   TVM_FFI_ICHECK_EQ(inp.size(0), out.size(0));
   TVM_FFI_ICHECK_EQ(inp.size(1) * world_size, out.size(1));
-  TVM_FFI_ICHECK(dtype_equal(inp.dtype(), out.dtype()));
+  const bool same_dtype = dtype_equal(inp.dtype(), out.dtype());
+  const bool bfloat16_to_float32 =
+      dtype_equal(inp.dtype(), dl_bfloat16) &&
+      dtype_equal(out.dtype(), dl_float32);
+  TVM_FFI_ICHECK(same_dtype || bfloat16_to_float32);
 
   RankSignals sg{};
   const auto* ptrs = static_cast<const int64_t*>(signal_ptrs_cpu.data_ptr());
@@ -601,10 +616,12 @@ void vllm_musa_custom_ar_launch_all_gather(
                     static_cast<int64_t>(std::numeric_limits<int32_t>::max()));
   TVM_FFI_ICHECK_LE(output_numel,
                     static_cast<int64_t>(std::numeric_limits<int32_t>::max()));
-  const int64_t element_bytes =
+  const int64_t input_element_bytes =
       (static_cast<int64_t>(inp.dtype().bits) * inp.dtype().lanes + 7) / 8;
-  const int64_t input_nbytes = input_numel * element_bytes;
-  const int64_t output_nbytes = output_numel * element_bytes;
+  const int64_t output_element_bytes =
+      (static_cast<int64_t>(out.dtype().bits) * out.dtype().lanes + 7) / 8;
+  const int64_t input_nbytes = input_numel * input_element_bytes;
+  const int64_t output_nbytes = output_numel * output_element_bytes;
   TVM_FFI_ICHECK_LE(input_nbytes, max_size_bytes);
   TVM_FFI_ICHECK_LE(output_nbytes, max_size_bytes);
   const musaError_t copy_err = musaMemcpyAsync(
@@ -616,24 +633,30 @@ void vllm_musa_custom_ar_launch_all_gather(
 
   const int rows = static_cast<int>(inp.size(0));
   const int shard_size = static_cast<int>(inp.size(1));
-  if (dtype_equal(out.dtype(), dl_float16)) {
-    dispatch_all_gather_world_size(
+  if (bfloat16_to_float32) {
+    dispatch_all_gather_world_size<__mt_bfloat16, float>(
+        data, sg, self_sg, static_cast<float*>(out.data_ptr()),
+        static_cast<int>(rank), static_cast<int>(world_size), rows, shard_size,
+        stream);
+  } else if (dtype_equal(out.dtype(), dl_float16)) {
+    dispatch_all_gather_world_size<half, half>(
         data, sg, self_sg, static_cast<half*>(out.data_ptr()),
         static_cast<int>(rank), static_cast<int>(world_size), rows, shard_size,
         stream);
   } else if (dtype_equal(out.dtype(), dl_bfloat16)) {
-    dispatch_all_gather_world_size(
+    dispatch_all_gather_world_size<__mt_bfloat16, __mt_bfloat16>(
         data, sg, self_sg, static_cast<__mt_bfloat16*>(out.data_ptr()),
         static_cast<int>(rank), static_cast<int>(world_size), rows, shard_size,
         stream);
   } else if (dtype_equal(out.dtype(), dl_float32)) {
-    dispatch_all_gather_world_size(
+    dispatch_all_gather_world_size<float, float>(
         data, sg, self_sg, static_cast<float*>(out.data_ptr()),
         static_cast<int>(rank), static_cast<int>(world_size), rows, shard_size,
         stream);
   } else {
     TVM_FFI_THROW(ValueError)
-        << "custom all-gather only supports fp16/bf16/fp32";
+        << "custom all-gather only supports same-dtype fp16/bf16/fp32 or "
+           "bf16-to-fp32";
   }
   const musaError_t err = musaGetLastError();
   TVM_FFI_ICHECK_EQ(err, musaSuccess)
