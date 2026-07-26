@@ -391,6 +391,30 @@ def _legacy_top_k_with_cpu_hint(
     return top_k
 
 
+def _legacy_gumbel_top_k_with_cpu_hint(
+    sampling_metadata: Any,
+    logits: torch.Tensor,
+    top_k: torch.Tensor | None,
+) -> int | torch.Tensor | None:
+    """Use the CPU-proven uniform k in the legacy seeded path.
+
+    Legacy Gumbel still needs the top-k support mask, but it does not need the
+    per-row device tensor when the scheduler already proved that every Qwen
+    row uses k=50.  Passing the scalar keeps the fixed-k path from reading a
+    device tensor back to the host for dispatch checks.  Heterogeneous and
+    non-Qwen requests retain the original tensor path.
+    """
+    if getattr(
+        sampling_metadata, "uniform_top_k", None
+    ) == 50 and _is_qwen_sampler_vocab(logits):
+        vllm_topk_topp_sampler.logger.info_once(
+            "Using the CPU uniform top-k hint for gated MUSA legacy Gumbel.",
+            scope="global",
+        )
+        return 50
+    return top_k
+
+
 def _call_topk_topp_sampler(
     sampler: Any,
     logprobs_mode: LogprobsMode,
@@ -488,7 +512,7 @@ def get_qwen_legacy_generator_state(
 def sample_qwen_legacy_gumbel(
     logits: torch.Tensor,
     generators: dict[int, torch.Generator],
-    top_k: torch.Tensor,
+    top_k: int | torch.Tensor | None,
     generator_state: tuple[list[int], list[int]],
 ) -> torch.Tensor:
     """Batch MRV1 seeded rows and preserve one-call generator offsets."""
@@ -595,10 +619,13 @@ def _sample(
             "Using the gated MUSA legacy Gumbel sampler for Qwen requests.",
             scope="global",
         )
+        legacy_top_k = _legacy_gumbel_top_k_with_cpu_hint(
+            sampling_metadata, logits, sampling_metadata.top_k
+        )
         random_sampled = sample_qwen_legacy_gumbel(
             logits,
             sampling_metadata.generators,
-            sampling_metadata.top_k,
+            legacy_top_k,
             legacy_generator_state,
         )
         processed_logprobs = None

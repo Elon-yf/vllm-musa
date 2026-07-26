@@ -445,6 +445,42 @@ def test_legacy_uniform_top_k_uses_cpu_hint_only_for_musa_native_sampler(
     )
 
 
+def test_legacy_gumbel_uniform_top_k_uses_cpu_hint_with_generators() -> None:
+    top_k = torch.full((4,), 50, dtype=torch.int32)
+    metadata = SimpleNamespace(uniform_top_k=50)
+
+    assert (
+        sampler._legacy_gumbel_top_k_with_cpu_hint(
+            metadata, torch.empty((4, 248320)), top_k
+        )
+        == 50
+    )
+
+    metadata.uniform_top_k = None
+    assert (
+        sampler._legacy_gumbel_top_k_with_cpu_hint(
+            metadata, torch.empty((4, 248320)), top_k
+        )
+        is top_k
+    )
+
+    metadata.uniform_top_k = None
+    heterogeneous_top_k = torch.tensor([50, 49, 50, 49], dtype=torch.int32)
+    assert (
+        sampler._legacy_gumbel_top_k_with_cpu_hint(
+            metadata, torch.empty((4, 248320)), heterogeneous_top_k
+        )
+        is heterogeneous_top_k
+    )
+    metadata.uniform_top_k = 50
+    assert (
+        sampler._legacy_gumbel_top_k_with_cpu_hint(
+            metadata, torch.empty((4, 131072)), top_k
+        )
+        is top_k
+    )
+
+
 def test_uniform_top_k_threshold_preserves_ties() -> None:
     logits = torch.arange(64, dtype=torch.float32).repeat(2, 1)
     logits[:, 12:17] = 14.0
