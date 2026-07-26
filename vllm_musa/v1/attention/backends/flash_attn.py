@@ -5,7 +5,7 @@
 
 import copy
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
@@ -65,6 +65,45 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 logger = init_logger(__name__)
 
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
+
+_MUSA_QWEN_ARCH_PREFIXES = ("Qwen2", "Qwen3")
+
+
+def _is_musa_qwen_family(model_config: Any) -> bool:
+    architectures = model_config.architectures or ()
+    return any(
+        architecture.startswith(_MUSA_QWEN_ARCH_PREFIXES)
+        for architecture in architectures
+    )
+
+
+def _use_musa_qwen_direct_decode_schedule(
+    *,
+    aot_schedule: bool,
+    is_bfloat16: bool,
+    is_qwen_family: bool,
+    common_prefix_len: int,
+    dcp_world_size: int,
+    num_reqs: int,
+    num_decodes: int,
+    num_actual_tokens: int,
+    num_decode_tokens: int,
+    max_query_len: int,
+    max_num_splits: int,
+) -> bool:
+    return (
+        aot_schedule
+        and is_bfloat16
+        and is_qwen_family
+        and common_prefix_len == 0
+        and dcp_world_size == 1
+        and num_reqs == 64
+        and num_decodes == num_reqs
+        and num_actual_tokens == num_reqs
+        and num_decode_tokens == num_actual_tokens
+        and max_query_len == 1
+        and max_num_splits == 1
+    )
 
 
 def _torch_reduce_scatter_dim(
@@ -427,6 +466,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
 
         self.max_num_splits = 0  # No upper bound on the number of splits.
         self.aot_schedule = get_flash_attn_version() == 3
+        self._musa_qwen_family = _is_musa_qwen_family(self.model_config)
 
         try:
             from vllm.distributed.parallel_state import get_dcp_group
@@ -605,6 +645,30 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
 
         if envs.VLLM_BATCH_INVARIANT:
             max_num_splits = 1
+
+        # With one KV split, the FA3 AOT path still selects the persistent
+        # scheduler and launches a combine kernel per attention layer.  The
+        # direct path selects the single-tile scheduler and needs neither AOT
+        # metadata nor that combine step.
+        direct_decode_schedule = _use_musa_qwen_direct_decode_schedule(
+            aot_schedule=aot_schedule,
+            is_bfloat16=(
+                self.model_config.dtype == torch.bfloat16
+                and self.kv_cache_dtype in ("auto", "bfloat16", torch.bfloat16)
+            ),
+            is_qwen_family=self._musa_qwen_family,
+            common_prefix_len=common_prefix_len,
+            dcp_world_size=self.dcp_world_size,
+            num_reqs=num_reqs,
+            num_decodes=num_decodes,
+            num_actual_tokens=num_actual_tokens,
+            num_decode_tokens=num_decode_tokens,
+            max_query_len=max_query_len,
+            max_num_splits=max_num_splits,
+        )
+        if direct_decode_schedule:
+            aot_schedule = False
+            logger.info_once("Using MUSA Qwen direct FA3 decode schedule for BS64.")
 
         def schedule(
             batch_size, cu_query_lens, max_query_len, seqlens, max_seq_len, causal
