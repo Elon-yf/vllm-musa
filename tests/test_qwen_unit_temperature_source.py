@@ -9,7 +9,7 @@ PATCH = (
     / "vllm_musa"
     / "patches"
     / "series"
-    / "0088-perf-musa-unify-Qwen-runtime-fast-paths.patch"
+    / "0090-perf-musa-unify-Qwen-runtime-fast-paths.patch"
 )
 SAMPLER = ROOT / "vllm_musa" / "v1" / "sample" / "topk_topp_sampler.py"
 
