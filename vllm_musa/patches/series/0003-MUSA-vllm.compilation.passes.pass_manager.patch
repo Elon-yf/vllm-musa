@@ -4,14 +4,14 @@ Date: Wed, 3 Jun 2026 11:47:35 +0000
 Subject: [PATCH] MUSA: vllm.compilation.passes.pass_manager
 
 ---
- vllm/compilation/passes/pass_manager.py | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
+ vllm/compilation/passes/pass_manager.py | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
 
 diff --git a/vllm/compilation/passes/pass_manager.py b/vllm/compilation/passes/pass_manager.py
-index 4b98ac577..5a4bbcb26 100644
+index 4b98ac577..3033e46f4 100644
 --- a/vllm/compilation/passes/pass_manager.py
 +++ b/vllm/compilation/passes/pass_manager.py
-@@ -43,7 +43,7 @@ if current_platform.is_cuda_alike():
+@@ -43,10 +43,15 @@ if current_platform.is_cuda_alike():
      from .utility.scatter_split_replace import ScatterSplitReplacementPass
      from .utility.split_coalescing import SplitCoalescingPass
  
@@ -20,3 +20,24 @@ index 4b98ac577..5a4bbcb26 100644
      from .fusion.allreduce_rms_fusion import AllReduceFusionPass
      from .fusion.collective_fusion import AsyncTPPass
  
++if current_platform.is_musa():
++    from vllm_musa._inductor.musa_allreduce_rms_fusion import (
++        MusaAllReduceRMSNormFusionPass,
++    )
++
+ if current_platform.is_xpu():
+     from .fusion.act_quant_fusion import ActivationQuantFusionPass
+     from .fusion.rms_quant_fusion import RMSNormQuantFusionPass
+@@ -151,8 +156,11 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
+             if self.pass_config.fuse_act_padding and rocm_aiter_ops.is_enabled():
+                 # Run the more specific RMSNorm+router-pad fusion before
+                 # AR+RMS, since both consume fused_add_rms_norm.
+                 self.passes += [RocmAiterTritonAddRMSNormPadFusionPass(config)]
+-
++
++            if current_platform.is_musa():
++                self.passes += [MusaAllReduceRMSNormFusionPass(config)]
++
+             if self.pass_config.fuse_allreduce_rms:
+                 if rocm_aiter_ops.is_enabled():
+                     self.passes += [RocmAiterAllReduceFusionPass(config)]
