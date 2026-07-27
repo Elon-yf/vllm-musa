@@ -257,7 +257,6 @@ class TestMUSAPlatformBase:
         import torch
 
         from vllm_musa.platform import _is_qwen2_rope_kv_fusion_config
-        from vllm_musa.utils.environ import envs
 
         def make_config(model_type: str, kv_heads, intermediate_size):
             return SimpleNamespace(
@@ -284,26 +283,22 @@ class TestMUSAPlatformBase:
                 speculative_config=None,
             )
 
-        with envs.VLLM_MUSA_QWEN2_ROPE_KV_FUSION.override(True):
-            assert not _is_qwen2_rope_kv_fusion_config(make_config("qwen2", None, None))
-            assert _is_qwen2_rope_kv_fusion_config(
-                make_config("cosyvoice3", None, None)
-            )
-            config = make_config("qwen2", 2, 4864)
-            assert _is_qwen2_rope_kv_fusion_config(config)
-            config.cache_config = SimpleNamespace(cache_dtype="bfloat16", block_size=64)
-            assert _is_qwen2_rope_kv_fusion_config(config)
-            config.cache_config.block_size = 128
-            assert not _is_qwen2_rope_kv_fusion_config(config)
-            config.cache_config.block_size = 64
-            config.quant_config = object()
-            assert not _is_qwen2_rope_kv_fusion_config(config)
+        assert not _is_qwen2_rope_kv_fusion_config(make_config("qwen2", None, None))
+        assert _is_qwen2_rope_kv_fusion_config(make_config("cosyvoice3", None, None))
+        config = make_config("qwen2", 2, 4864)
+        assert _is_qwen2_rope_kv_fusion_config(config)
+        config.cache_config = SimpleNamespace(cache_dtype="bfloat16", block_size=64)
+        assert _is_qwen2_rope_kv_fusion_config(config)
+        config.cache_config.block_size = 128
+        assert not _is_qwen2_rope_kv_fusion_config(config)
+        config.cache_config.block_size = 64
+        config.quant_config = object()
+        assert not _is_qwen2_rope_kv_fusion_config(config)
 
     def test_qwen3_qk_rope_kv_fusion_exact_config_gate(self):
         import torch
 
         from vllm_musa.platform import _is_qwen3_qk_rope_kv_fusion_config
-        from vllm_musa.utils.environ import envs
 
         def make_config(
             *,
@@ -362,78 +357,67 @@ class TestMUSAPlatformBase:
             num_attention_heads=32,
         )
 
-        with envs.VLLM_MUSA_QWEN3_QK_ROPE_KV_FUSION.override(True):
-            assert _is_qwen3_qk_rope_kv_fusion_config(qwen3_0_6b)
-            assert _is_qwen3_qk_rope_kv_fusion_config(qwen3_8b)
+        assert _is_qwen3_qk_rope_kv_fusion_config(qwen3_0_6b)
+        assert _is_qwen3_qk_rope_kv_fusion_config(qwen3_8b)
 
-            assert not _is_qwen3_qk_rope_kv_fusion_config(
-                make_config(
-                    hidden_size=1024,
-                    intermediate_size=3072,
-                    num_hidden_layers=28,
-                    num_attention_heads=16,
-                    model_type="qwen2",
-                    architecture="Qwen2ForCausalLM",
-                )
+        assert not _is_qwen3_qk_rope_kv_fusion_config(
+            make_config(
+                hidden_size=1024,
+                intermediate_size=3072,
+                num_hidden_layers=28,
+                num_attention_heads=16,
+                model_type="qwen2",
+                architecture="Qwen2ForCausalLM",
             )
-            assert not _is_qwen3_qk_rope_kv_fusion_config(
-                make_config(
-                    hidden_size=2048,
-                    intermediate_size=6144,
-                    num_hidden_layers=24,
-                    num_attention_heads=8,
-                    num_key_value_heads=2,
-                    head_dim=256,
-                    model_type="qwen3_5",
-                    architecture="Qwen3_5ForCausalLM",
-                )
+        )
+        assert not _is_qwen3_qk_rope_kv_fusion_config(
+            make_config(
+                hidden_size=2048,
+                intermediate_size=6144,
+                num_hidden_layers=24,
+                num_attention_heads=8,
+                num_key_value_heads=2,
+                head_dim=256,
+                model_type="qwen3_5",
+                architecture="Qwen3_5ForCausalLM",
             )
-            assert not _is_qwen3_qk_rope_kv_fusion_config(
-                make_config(
-                    hidden_size=4096,
-                    intermediate_size=12288,
-                    num_hidden_layers=36,
-                    num_attention_heads=32,
-                    tensor_parallel_size=2,
-                )
+        )
+        assert not _is_qwen3_qk_rope_kv_fusion_config(
+            make_config(
+                hidden_size=4096,
+                intermediate_size=12288,
+                num_hidden_layers=36,
+                num_attention_heads=32,
+                tensor_parallel_size=2,
             )
-            assert not _is_qwen3_qk_rope_kv_fusion_config(
-                make_config(
-                    hidden_size=4096,
-                    intermediate_size=12288,
-                    num_hidden_layers=36,
-                    num_attention_heads=32,
-                    quantization="fp8",
-                )
+        )
+        assert not _is_qwen3_qk_rope_kv_fusion_config(
+            make_config(
+                hidden_size=4096,
+                intermediate_size=12288,
+                num_hidden_layers=36,
+                num_attention_heads=32,
+                quantization="fp8",
             )
-            assert not _is_qwen3_qk_rope_kv_fusion_config(
-                make_config(
-                    hidden_size=4096,
-                    intermediate_size=12288,
-                    num_hidden_layers=36,
-                    num_attention_heads=32,
-                    quant_config=object(),
-                )
+        )
+        assert not _is_qwen3_qk_rope_kv_fusion_config(
+            make_config(
+                hidden_size=4096,
+                intermediate_size=12288,
+                num_hidden_layers=36,
+                num_attention_heads=32,
+                quant_config=object(),
             )
-            assert not _is_qwen3_qk_rope_kv_fusion_config(
-                make_config(
-                    hidden_size=4096,
-                    intermediate_size=12288,
-                    num_hidden_layers=36,
-                    num_attention_heads=32,
-                    block_size=128,
-                )
+        )
+        assert not _is_qwen3_qk_rope_kv_fusion_config(
+            make_config(
+                hidden_size=4096,
+                intermediate_size=12288,
+                num_hidden_layers=36,
+                num_attention_heads=32,
+                block_size=128,
             )
-
-        with envs.VLLM_MUSA_QWEN3_QK_ROPE_KV_FUSION.override(False):
-            assert not _is_qwen3_qk_rope_kv_fusion_config(qwen3_0_6b)
-            assert not _is_qwen3_qk_rope_kv_fusion_config(qwen3_8b)
-
-    def test_qwen3_qk_rope_kv_fusion_defaults_on(self, monkeypatch):
-        from vllm_musa.utils.environ import envs
-
-        monkeypatch.delenv("VLLM_MUSA_QWEN3_QK_ROPE_KV_FUSION", raising=False)
-        assert envs.VLLM_MUSA_QWEN3_QK_ROPE_KV_FUSION.get() is True
+        )
 
     @pytest.mark.parametrize(("layout", "expected"), [("NHD", True), ("HND", False)])
     def test_qwen3_qk_rope_kv_provider_layout_gate(
@@ -442,7 +426,6 @@ class TestMUSAPlatformBase:
         layout: str,
         expected: bool,
     ) -> None:
-        from vllm_musa.utils.environ import envs
         from vllm_musa.v1.attention.backends import flash_attn
 
         impl = SimpleNamespace(
@@ -459,14 +442,12 @@ class TestMUSAPlatformBase:
         )
         monkeypatch.setattr(flash_attn, "get_flash_attn_version", lambda: 3)
         monkeypatch.setattr(flash_attn, "get_kv_cache_layout", lambda: layout)
-        with envs.VLLM_MUSA_QWEN3_QK_ROPE_KV_FUSION.override(True):
-            assert (
-                flash_attn.FlashAttentionImpl.qwen3_qk_rope_kvcache_supported(impl)
-                is expected
-            )
+        assert (
+            flash_attn.FlashAttentionImpl.qwen3_qk_rope_kvcache_supported(impl)
+            is expected
+        )
 
     def test_qwen_fa3_scheduler_lookup_config_gate(self):
-        from vllm_musa.utils.environ import envs
         from vllm_musa.v1.attention.backends.flash_attn import (
             _is_qwen_family_scheduler_lookup_config,
         )
@@ -498,70 +479,54 @@ class TestMUSAPlatformBase:
                 speculative_config=speculative_config,
             )
 
-        with envs.VLLM_MUSA_QWEN_FA3_SCHEDULER_LOOKUP.override(True):
-            assert _is_qwen_family_scheduler_lookup_config(
-                make_config("qwen3", "Qwen3ForCausalLM")
+        assert _is_qwen_family_scheduler_lookup_config(
+            make_config("qwen3", "Qwen3ForCausalLM")
+        )
+        assert _is_qwen_family_scheduler_lookup_config(
+            make_config("qwen2", "Qwen2ForCausalLM")
+        )
+        assert _is_qwen_family_scheduler_lookup_config(
+            make_config("cosyvoice3", "CosyVoice3ForConditionalGeneration")
+        )
+        assert _is_qwen_family_scheduler_lookup_config(
+            make_config("qwen2", "Qwen2ForCausalLM", max_num_seqs=8)
+        )
+        assert not _is_qwen_family_scheduler_lookup_config(
+            make_config("llama", "LlamaForCausalLM")
+        )
+        assert not _is_qwen_family_scheduler_lookup_config(
+            make_config("deepseek_v3", "DeepseekV3ForCausalLM")
+        )
+        assert not _is_qwen_family_scheduler_lookup_config(
+            make_config("qwen3", "Qwen3ForCausalLM", max_num_seqs=0)
+        )
+        assert not _is_qwen_family_scheduler_lookup_config(
+            make_config(
+                "qwen3",
+                "Qwen3ForCausalLM",
+                speculative_config=object(),
             )
-            assert _is_qwen_family_scheduler_lookup_config(
-                make_config("qwen2", "Qwen2ForCausalLM")
+        )
+        assert not _is_qwen_family_scheduler_lookup_config(
+            make_config(
+                "qwen3",
+                "Qwen3ForCausalLM",
+                decode_context_parallel_size=2,
             )
-            assert _is_qwen_family_scheduler_lookup_config(
-                make_config("cosyvoice3", "CosyVoice3ForConditionalGeneration")
+        )
+        assert not _is_qwen_family_scheduler_lookup_config(
+            make_config(
+                "qwen3",
+                "Qwen3ForCausalLM",
+                tensor_parallel_size=2,
             )
-            assert _is_qwen_family_scheduler_lookup_config(
-                make_config("qwen2", "Qwen2ForCausalLM", max_num_seqs=8)
-            )
-            assert not _is_qwen_family_scheduler_lookup_config(
-                make_config("llama", "LlamaForCausalLM")
-            )
-            assert not _is_qwen_family_scheduler_lookup_config(
-                make_config("deepseek_v3", "DeepseekV3ForCausalLM")
-            )
-            assert not _is_qwen_family_scheduler_lookup_config(
-                make_config("qwen3", "Qwen3ForCausalLM", max_num_seqs=0)
-            )
-            assert not _is_qwen_family_scheduler_lookup_config(
-                make_config(
-                    "qwen3",
-                    "Qwen3ForCausalLM",
-                    speculative_config=object(),
-                )
-            )
-            assert not _is_qwen_family_scheduler_lookup_config(
-                make_config(
-                    "qwen3",
-                    "Qwen3ForCausalLM",
-                    decode_context_parallel_size=2,
-                )
-            )
-            assert not _is_qwen_family_scheduler_lookup_config(
-                make_config(
-                    "qwen3",
-                    "Qwen3ForCausalLM",
-                    tensor_parallel_size=2,
-                )
-            )
-            incomplete_parallel_config = make_config("qwen3", "Qwen3ForCausalLM")
-            del incomplete_parallel_config.parallel_config.pipeline_parallel_size
-            assert not _is_qwen_family_scheduler_lookup_config(
-                incomplete_parallel_config
-            )
-            incomplete_scheduler_config = make_config("qwen3", "Qwen3ForCausalLM")
-            del incomplete_scheduler_config.scheduler_config.max_num_seqs
-            assert not _is_qwen_family_scheduler_lookup_config(
-                incomplete_scheduler_config
-            )
-
-        with envs.VLLM_MUSA_QWEN_FA3_SCHEDULER_LOOKUP.override(False):
-            assert not _is_qwen_family_scheduler_lookup_config(
-                make_config("qwen3", "Qwen3ForCausalLM")
-            )
-
-    def test_qwen_fa3_scheduler_lookup_default_on(self, monkeypatch):
-        from vllm_musa.utils.environ import envs
-
-        monkeypatch.delenv("VLLM_MUSA_QWEN_FA3_SCHEDULER_LOOKUP", raising=False)
-        assert envs.VLLM_MUSA_QWEN_FA3_SCHEDULER_LOOKUP.get() is True
+        )
+        incomplete_parallel_config = make_config("qwen3", "Qwen3ForCausalLM")
+        del incomplete_parallel_config.parallel_config.pipeline_parallel_size
+        assert not _is_qwen_family_scheduler_lookup_config(incomplete_parallel_config)
+        incomplete_scheduler_config = make_config("qwen3", "Qwen3ForCausalLM")
+        del incomplete_scheduler_config.scheduler_config.max_num_seqs
+        assert not _is_qwen_family_scheduler_lookup_config(incomplete_scheduler_config)
 
     def test_qwen_fa3_scheduler_lookup_layout_version_gate(self, monkeypatch):
         from importlib.metadata import PackageNotFoundError

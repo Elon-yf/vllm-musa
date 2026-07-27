@@ -56,14 +56,6 @@ def musa_seeded_multinomial_enabled() -> bool:
     return envs.VLLM_MUSA_SEEDED_MULTINOMIAL.get()
 
 
-def musa_qwen_v2_gumbel_enabled() -> bool:
-    return envs.VLLM_MUSA_QWEN_V2_GUMBEL.get()
-
-
-def musa_qwen_legacy_gumbel_enabled() -> bool:
-    return envs.VLLM_MUSA_QWEN_LEGACY_GUMBEL.get()
-
-
 def is_musa_tensor(tensor: torch.Tensor) -> bool:
     return tensor.device.type == "musa"
 
@@ -454,8 +446,6 @@ def can_use_qwen_legacy_gumbel(
     use_fp64_gumbel: bool,
 ) -> bool:
     """Gate MRV1 Qwen sampling to a batched stateless Gumbel handoff."""
-    if not musa_qwen_legacy_gumbel_enabled():
-        return False
     if not current_platform.is_musa() or not is_musa_tensor(logits):
         return False
     if (
@@ -793,8 +783,6 @@ def can_use_qwen_v2_gumbel(
     return_logprobs: bool,
 ) -> bool:
     """Gate the pinned V2 Gumbel sampler to one validated Qwen contract."""
-    if not musa_qwen_v2_gumbel_enabled():
-        return False
     if not current_platform.is_musa() or not is_musa_tensor(logits):
         return False
     if not _is_qwen_sampler_vocab(logits) or logits.stride(-1) != 1:

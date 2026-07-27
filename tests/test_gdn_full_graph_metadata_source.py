@@ -9,14 +9,13 @@ PATCH = (
     / "vllm_musa"
     / "patches"
     / "series"
-    / "0089-perf-skip-empty-full-graph-GDN-metadata-fill.patch"
+    / "0088-perf-musa-unify-Qwen-runtime-fast-paths.patch"
 )
 
 
 def test_full_occupancy_skips_empty_gdn_query_padding_fill():
     source = PATCH.read_text()
 
-    assert source.count("diff --git") == 1
     assert (
         "diff --git a/vllm/v1/attention/backends/gdn_attn.py "
         "b/vllm/v1/attention/backends/gdn_attn.py"

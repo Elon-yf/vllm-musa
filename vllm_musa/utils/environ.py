@@ -91,20 +91,7 @@ class Envs:
     VLLM_MUSA_FUSED_ADD_RMSNORM = EnvBool(True)
     VLLM_MUSA_ENABLE_JIT_TOPK = EnvBool(True)
     VLLM_MUSA_SEEDED_MULTINOMIAL = EnvBool(True)
-    VLLM_MUSA_QWEN_V2_GUMBEL = EnvBool(False)
-    VLLM_MUSA_QWEN_LEGACY_GUMBEL = EnvBool(False)
     VLLM_MUSA_RESHAPE_CACHE_FLASH = EnvBool(True)
-    # Exact-shape Qwen2 RoPE+NHD-cache fusion.  The model, graph, dtype, and
-    # tensor-layout gates fail closed; the environment switch is an A/B escape
-    # hatch rather than a required serving option.
-    VLLM_MUSA_QWEN2_ROPE_KV_FUSION = EnvBool(True)
-    # Independent Qwen3 QK-norm + full-RoPE + NHD-cache fusion. Platform and
-    # backend gates restrict it to validated dense Qwen3 configurations.
-    VLLM_MUSA_QWEN3_QK_ROPE_KV_FUSION = EnvBool(True)
-    # Direct batch-one Qwen FA3 scheduler metadata, with exact backend gates
-    # for the supported model geometry and decode shape.  Keep the environment
-    # switch as an explicit A/B and emergency-disable escape hatch.
-    VLLM_MUSA_QWEN_FA3_SCHEDULER_LOOKUP = EnvBool(True)
 
 
 envs = Envs()

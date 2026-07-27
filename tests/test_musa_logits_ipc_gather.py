@@ -17,7 +17,6 @@ def _processor(org_vocab_size: int):
     processor.scale = 1.0
     processor.soft_cap = None
     processor.use_all_gather = True
-    processor._musa_fp32_logits_gather = True
     return processor
 
 
@@ -126,12 +125,9 @@ def test_tp2_standard_qwen_logits_keep_same_dtype_ipc_output(monkeypatch):
     assert output_dtypes == [None]
 
 
-@pytest.mark.parametrize(
-    "scale,soft_cap,enabled",
-    [(2.0, None, True), (1.0, 30.0, True), (1.0, None, False)],
-)
+@pytest.mark.parametrize("scale,soft_cap", [(2.0, None), (1.0, 30.0)])
 def test_transformed_qwen_logits_keep_same_dtype_ipc_output(
-    monkeypatch, scale, soft_cap, enabled
+    monkeypatch, scale, soft_cap
 ):
     _patch_tp(monkeypatch, world_size=4)
     local_logits = torch.empty((1, 37984), dtype=torch.bfloat16)
@@ -146,7 +142,6 @@ def test_transformed_qwen_logits_keep_same_dtype_ipc_output(
     processor = _processor(151936)
     processor.scale = scale
     processor.soft_cap = soft_cap
-    processor._musa_fp32_logits_gather = enabled
     monkeypatch.setattr(processor, "_use_musa_logits_all_reduce", lambda: True)
 
     output = processor._gather_logits(local_logits, SimpleNamespace())

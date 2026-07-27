@@ -199,10 +199,6 @@ def _is_validated_qwen3_8b_fp8_single_gpu(vllm_config: Any) -> bool:
 
 def _is_qwen2_rope_kv_fusion_config(vllm_config: Any) -> bool:
     """Return whether the config is eligible for the exact MP31 Qwen2 fusion."""
-    from vllm_musa.utils.environ import envs as musa_envs
-
-    if not musa_envs.VLLM_MUSA_QWEN2_ROPE_KV_FUSION.get():
-        return False
     model_config = getattr(vllm_config, "model_config", None)
     parallel_config = getattr(vllm_config, "parallel_config", None)
     if model_config is None or parallel_config is None:
@@ -259,10 +255,6 @@ def _is_qwen2_rope_kv_fusion_config(vllm_config: Any) -> bool:
 
 def _is_qwen3_qk_rope_kv_fusion_config(vllm_config: Any) -> bool:
     """Return whether config is in the validated dense Qwen3 TP1 scope."""
-    from vllm_musa.utils.environ import envs as musa_envs
-
-    if not musa_envs.VLLM_MUSA_QWEN3_QK_ROPE_KV_FUSION.get():
-        return False
     model_config = getattr(vllm_config, "model_config", None)
     parallel_config = getattr(vllm_config, "parallel_config", None)
     if model_config is None or parallel_config is None:

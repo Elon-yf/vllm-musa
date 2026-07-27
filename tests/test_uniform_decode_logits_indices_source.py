@@ -9,14 +9,7 @@ PATCH = (
     / "vllm_musa"
     / "patches"
     / "series"
-    / "0090-perf-reuse-uniform-decode-logits-indices.patch"
-)
-HIDDEN_VIEW_PATCH = (
-    ROOT
-    / "vllm_musa"
-    / "patches"
-    / "series"
-    / "0092-perf-reuse-qwen-uniform-decode-hidden-state.patch"
+    / "0088-perf-musa-unify-Qwen-runtime-fast-paths.patch"
 )
 
 
@@ -35,7 +28,7 @@ def test_uniform_decode_patch_reuses_uploaded_request_indices() -> None:
         "Qwen3_5MoeForConditionalGeneration",
     ):
         assert architecture in source
-    assert "VLLM_MUSA_QWEN_UNIFORM_DECODE_LOGITS_INDICES" in source
+    assert "VLLM_MUSA_QWEN_UNIFORM_DECODE_LOGITS_INDICES" not in source
     assert "max_num_scheduled_tokens == 1" in source
     assert "num_tokens_unpadded == num_reqs" in source
     assert "torch.arange(self.max_num_reqs, dtype=torch.int32" in source
@@ -80,9 +73,9 @@ def test_uniform_decode_gate_is_exact_for_positive_query_lengths() -> None:
 
 
 def test_uniform_decode_hidden_view_patch_preserves_fallbacks() -> None:
-    source = HIDDEN_VIEW_PATCH.read_text()
+    source = PATCH.read_text()
 
-    assert source.count("if use_cached_decode_logits_indices:") == 2
+    assert source.count("+                if use_cached_decode_logits_indices:") == 2
     assert source.count("sample_hidden_states = hidden_states\n") == 2
     assert source.count("sample_hidden_states = hidden_states[:num_reqs]") == 2
     assert (

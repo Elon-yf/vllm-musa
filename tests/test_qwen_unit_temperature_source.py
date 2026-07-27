@@ -9,29 +9,20 @@ PATCH = (
     / "vllm_musa"
     / "patches"
     / "series"
-    / "0091-perf-skip-qwen-unit-temperature-divide.patch"
-)
-DECODE_PATCH = (
-    ROOT
-    / "vllm_musa"
-    / "patches"
-    / "series"
-    / "0090-perf-reuse-uniform-decode-logits-indices.patch"
+    / "0088-perf-musa-unify-Qwen-runtime-fast-paths.patch"
 )
 SAMPLER = ROOT / "vllm_musa" / "v1" / "sample" / "topk_topp_sampler.py"
 
 
 def test_qwen_unit_temperature_metadata_gate_is_fail_closed() -> None:
     source = PATCH.read_text()
-    cumulative_source = DECODE_PATCH.read_text() + source
 
     assert "uniform_temperature: float | None = None" in source
     assert "self.vocab_size in (151936, 248320)" in source
     assert "self.all_random" in source
     assert "num_reqs > 0" in source
     assert "temperature_cpu == np.float32(1.0)" in source
-    assert "VLLM_MUSA_QWEN_SKIP_UNIT_TEMPERATURE" in source
-    assert '("0", "false", "no", "off")' in source
+    assert "VLLM_MUSA_QWEN_SKIP_UNIT_TEMPERATURE" not in source
     assert "uniform_temperature=uniform_temperature" in source
     assert "current_platform.is_musa()" in source
     assert "not self.is_pooling_model" in source
@@ -44,7 +35,7 @@ def test_qwen_unit_temperature_metadata_gate_is_fail_closed() -> None:
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
     ):
-        assert architecture in cumulative_source
+        assert architecture in source
 
 
 def test_qwen_unit_temperature_sampler_keeps_original_fallback() -> None:

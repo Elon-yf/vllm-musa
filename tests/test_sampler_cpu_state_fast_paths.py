@@ -197,7 +197,6 @@ def _legacy_gumbel_metadata(rows: int, **kwargs) -> SimpleNamespace:
 
 
 def test_qwen_legacy_gumbel_gate_and_generator_handoff(monkeypatch) -> None:
-    monkeypatch.setenv("VLLM_MUSA_QWEN_LEGACY_GUMBEL", "1")
     monkeypatch.setattr(sampler.current_platform, "is_musa", lambda: True)
     monkeypatch.setattr(sampler, "is_musa_tensor", lambda _tensor: True)
     rows = 4
@@ -254,7 +253,6 @@ def test_qwen_legacy_gumbel_gate_and_generator_handoff(monkeypatch) -> None:
 
 
 def test_qwen_legacy_gumbel_gate_fails_closed(monkeypatch) -> None:
-    monkeypatch.setenv("VLLM_MUSA_QWEN_LEGACY_GUMBEL", "1")
     monkeypatch.setattr(sampler.current_platform, "is_musa", lambda: True)
     monkeypatch.setattr(sampler, "is_musa_tensor", lambda _tensor: True)
     logits = torch.randn((4, 248320))
@@ -407,22 +405,7 @@ def test_qwen_legacy_gumbel_partitions_seeded_and_unseeded_rows(
     assert [generator.get_offset() for generator in generators.values()] == [4, 4]
 
 
-def test_qwen_legacy_gumbel_gate_is_disabled_by_default(monkeypatch) -> None:
-    monkeypatch.delenv("VLLM_MUSA_QWEN_LEGACY_GUMBEL", raising=False)
-    monkeypatch.setattr(sampler.current_platform, "is_musa", lambda: True)
-    monkeypatch.setattr(sampler, "is_musa_tensor", lambda _tensor: True)
-
-    assert not sampler.can_use_qwen_legacy_gumbel(
-        torch.randn((4, 248320)),
-        _legacy_gumbel_metadata(4),
-        "raw_logprobs",
-        None,
-        False,
-    )
-
-
 def test_qwen_v2_gumbel_gate_accepts_only_exact_contract(monkeypatch) -> None:
-    monkeypatch.setenv("VLLM_MUSA_QWEN_V2_GUMBEL", "1")
     monkeypatch.setattr(sampler.current_platform, "is_musa", lambda: True)
     monkeypatch.setattr(sampler, "is_musa_tensor", lambda _tensor: True)
     rows = 4
@@ -464,7 +447,6 @@ def test_qwen_v2_gumbel_gate_accepts_only_exact_contract(monkeypatch) -> None:
 
 
 def test_qwen_v2_gumbel_gate_rejects_non_qwen_vocab(monkeypatch) -> None:
-    monkeypatch.setenv("VLLM_MUSA_QWEN_V2_GUMBEL", "1")
     monkeypatch.setattr(sampler.current_platform, "is_musa", lambda: True)
     monkeypatch.setattr(sampler, "is_musa_tensor", lambda _tensor: True)
     rows = 4
@@ -475,21 +457,6 @@ def test_qwen_v2_gumbel_gate_rejects_non_qwen_vocab(monkeypatch) -> None:
         torch.randn((rows, 131072)),
         mapping,
         np.arange(rows, dtype=np.int64),
-        mapping,
-        False,
-    )
-
-
-def test_qwen_v2_gumbel_gate_is_disabled_by_default(monkeypatch) -> None:
-    monkeypatch.delenv("VLLM_MUSA_QWEN_V2_GUMBEL", raising=False)
-    rows = 1
-    mapping = torch.zeros(rows, dtype=torch.int64)
-
-    assert not sampler.can_use_qwen_v2_gumbel(
-        _gumbel_gate_sampler(rows),
-        torch.randn((rows, 151936)),
-        mapping,
-        np.zeros(rows, dtype=np.int64),
         mapping,
         False,
     )

@@ -12,16 +12,39 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import vllm.envs as envs
+from vllm.config import (
+    VllmConfig,
+    get_current_vllm_config,
+    get_current_vllm_config_or_none,
+    get_layers_from_vllm_config,
+)
+from vllm.config.cache import CacheDType
+from vllm.distributed.parallel_state import get_dcp_group
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.platforms import current_platform
+from vllm.platforms.interface import DeviceCapability
+from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.backend import (
     AttentionBackend,
+    AttentionCGSupport,
     AttentionImpl,
+    AttentionMetadataBuilder,
     AttentionType,
+    CommonAttentionMetadata,
     MultipleOf,
 )
+from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
+from vllm.v1.attention.backends.utils import (
+    get_dcp_local_seq_lens,
+    get_kv_cache_layout,
+    split_decodes_and_prefills,
+)
+from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
+from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
+from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_musa.v1.attention.backends.fa_utils import (
     flash_attn_supports_fp8,
@@ -33,39 +56,12 @@ if is_flash_attn_varlen_func_available():
     from vllm_musa.v1.attention.backends.fa_utils import (
         flash_attn_supports_sinks,
         flash_attn_varlen_func,
+        flash_attn_with_kvcache,
         get_scheduler_metadata,
         reshape_and_cache_flash,
-        flash_attn_with_kvcache,
     )
 
-from vllm.config import (
-    VllmConfig,
-    get_current_vllm_config,
-    get_current_vllm_config_or_none,
-    get_layers_from_vllm_config,
-)
-from vllm.config.cache import CacheDType
-from vllm.distributed.parallel_state import get_dcp_group
-from vllm.logger import init_logger
-from vllm.platforms.interface import DeviceCapability
-from vllm.utils.math_utils import cdiv, round_up
-from vllm.v1.attention.backend import (
-    AttentionCGSupport,
-    AttentionMetadataBuilder,
-    CommonAttentionMetadata,
-)
-from vllm.v1.attention.backends.utils import (
-    get_dcp_local_seq_lens,
-    get_kv_cache_layout,
-    split_decodes_and_prefills,
-)
-from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
-from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
-from vllm.v1.kv_cache_interface import AttentionSpec
-
 logger = init_logger(__name__)
-
-from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 
 _MUSA_QWEN_TEXT_GENERATION_ARCHITECTURES = frozenset(
     {
@@ -163,12 +159,7 @@ def _is_qwen_family_scheduler_lookup_base_config(
 
 def _is_qwen_family_scheduler_lookup_config(vllm_config: VllmConfig) -> bool:
     """Gate the direct FA3 scheduler path before runtime shape checks."""
-    from vllm_musa.utils.environ import envs as musa_envs
-
-    return (
-        musa_envs.VLLM_MUSA_QWEN_FA3_SCHEDULER_LOOKUP.get()
-        and _is_qwen_family_scheduler_lookup_base_config(vllm_config)
-    )
+    return _is_qwen_family_scheduler_lookup_base_config(vllm_config)
 
 
 def _has_supported_fa3_scheduler_layout() -> bool:
@@ -1586,11 +1577,8 @@ class FlashAttentionImpl(AttentionImpl):
 
     def fused_rope_kvcache_supported(self) -> bool:
         """Whether this layer is inside the exact Qwen2 fusion envelope."""
-        from vllm_musa.utils.environ import envs as musa_envs
-
         return (
-            musa_envs.VLLM_MUSA_QWEN2_ROPE_KV_FUSION.get()
-            and get_flash_attn_version() == 3
+            get_flash_attn_version() == 3
             and self.num_heads == 14
             and self.num_kv_heads == 2
             and self.head_size == 64
@@ -1605,11 +1593,8 @@ class FlashAttentionImpl(AttentionImpl):
 
     def qwen3_qk_rope_kvcache_supported(self) -> bool:
         """Whether this layer is inside the initial dense Qwen3 envelope."""
-        from vllm_musa.utils.environ import envs as musa_envs
-
         return (
-            musa_envs.VLLM_MUSA_QWEN3_QK_ROPE_KV_FUSION.get()
-            and get_flash_attn_version() == 3
+            get_flash_attn_version() == 3
             and get_kv_cache_layout() == "NHD"
             and (self.num_heads, self.num_kv_heads) in ((16, 8), (32, 8))
             and self.head_size == 128
@@ -1643,9 +1628,7 @@ class FlashAttentionImpl(AttentionImpl):
         )
 
         positions_3d = (
-            positions
-            if positions.dim() == 2
-            else positions.unsqueeze(0).expand(3, -1)
+            positions if positions.dim() == 2 else positions.unsqueeze(0).expand(3, -1)
         )
         can_fuse_cache = (
             layer_slot_mapping is not None
@@ -1828,11 +1811,6 @@ class FlashAttentionImpl(AttentionImpl):
         cu_seqlens_k = attn_metadata.query_start_loc
         max_seqlen_q = attn_metadata.max_query_len
         max_seqlen_k = attn_metadata.max_query_len
-
-        descale_shape = (
-            cu_seqlens_q.shape[0] - 1,  # type: ignore[union-attr]
-            self.num_kv_heads,
-        )
 
         # Call flash attention directly on Q, K, V tensors
         sliding_window_size = (
