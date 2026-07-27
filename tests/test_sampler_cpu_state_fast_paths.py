@@ -157,13 +157,16 @@ def _gumbel_gate_sampler(
     )
 
 
-def _unfiltered_gumbel_gate_sampler(rows: int, vocab_size: int = 151936):
+def _unfiltered_gumbel_gate_sampler(
+    rows: int, vocab_size: int = 151936
+) -> SimpleNamespace:
     states = SimpleNamespace(
         temperature=_state_array([1.0] * rows, torch.float32),
         top_k=_state_array([vocab_size] * rows, torch.int32),
         top_p=_state_array([1.0] * rows, torch.float32),
         min_p=_state_array([0.0] * rows, torch.float32),
         seeds=SimpleNamespace(gpu=object()),
+        has_user_seed=np.zeros(rows, dtype=np.bool_),
     )
     return SimpleNamespace(
         sampling_states=states,
@@ -447,7 +450,7 @@ def test_qwen_v2_gumbel_gate_is_disabled_by_default(monkeypatch) -> None:
 def test_qwen_v2_unfiltered_gumbel_gate_accepts_exact_contract(
     monkeypatch, vocab_size: int
 ) -> None:
-    monkeypatch.setenv("VLLM_MUSA_QWEN_UNFILTERED_GUMBEL", "1")
+    monkeypatch.setattr(sampler, "_MUSA_QWEN_UNFILTERED_GUMBEL_ENABLED", True)
     monkeypatch.setattr(sampler.current_platform, "is_musa", lambda: True)
     monkeypatch.setattr(sampler, "is_musa_tensor", lambda _tensor: True)
     rows = 2
@@ -464,7 +467,7 @@ def test_qwen_v2_unfiltered_gumbel_gate_accepts_exact_contract(
 
 
 def test_qwen_v2_unfiltered_gumbel_gate_rejects_noncontract(monkeypatch) -> None:
-    monkeypatch.setenv("VLLM_MUSA_QWEN_UNFILTERED_GUMBEL", "1")
+    monkeypatch.setattr(sampler, "_MUSA_QWEN_UNFILTERED_GUMBEL_ENABLED", True)
     monkeypatch.setattr(sampler.current_platform, "is_musa", lambda: True)
     monkeypatch.setattr(sampler, "is_musa_tensor", lambda _tensor: True)
     rows = 2
@@ -507,6 +510,14 @@ def test_qwen_v2_unfiltered_gumbel_gate_rejects_noncontract(monkeypatch) -> None
     rejected.append((value, False))
 
     value = _unfiltered_gumbel_gate_sampler(rows)
+    value.sampling_states.has_user_seed[0] = True
+    rejected.append((value, False))
+
+    value = _unfiltered_gumbel_gate_sampler(rows)
+    del value.sampling_states.has_user_seed
+    rejected.append((value, False))
+
+    value = _unfiltered_gumbel_gate_sampler(rows)
     rejected.append((value, True))
 
     for candidate, return_logprobs in rejected:
@@ -520,8 +531,10 @@ def test_qwen_v2_unfiltered_gumbel_gate_rejects_noncontract(monkeypatch) -> None
         )
 
 
-def test_qwen_v2_unfiltered_gumbel_gate_is_disabled_by_default(monkeypatch) -> None:
-    monkeypatch.delenv("VLLM_MUSA_QWEN_UNFILTERED_GUMBEL", raising=False)
+def test_qwen_v2_unfiltered_gumbel_gate_rejects_cached_disabled_flag(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(sampler, "_MUSA_QWEN_UNFILTERED_GUMBEL_ENABLED", False)
     rows = 1
     mapping = torch.zeros(rows, dtype=torch.int64)
 

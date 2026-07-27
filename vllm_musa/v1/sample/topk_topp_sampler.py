@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 _SAMPLING_EPS = 1e-5
 _MUSA_QWEN_SAMPLER_VOCAB_SIZES = frozenset((151936, 248320))
+_MUSA_QWEN_UNFILTERED_GUMBEL_ENABLED = envs.VLLM_MUSA_QWEN_UNFILTERED_GUMBEL.get()
 
 
 def _is_qwen_sampler_vocab(logits: torch.Tensor) -> bool:
@@ -61,7 +62,7 @@ def musa_qwen_v2_gumbel_enabled() -> bool:
 
 
 def musa_qwen_unfiltered_gumbel_enabled() -> bool:
-    return envs.VLLM_MUSA_QWEN_UNFILTERED_GUMBEL.get()
+    return _MUSA_QWEN_UNFILTERED_GUMBEL_ENABLED
 
 
 def musa_qwen_legacy_gumbel_enabled() -> bool:
@@ -794,6 +795,8 @@ def can_use_qwen_v2_unfiltered_gumbel(
         return False
 
     states = sampler.sampling_states
+    if has_worker_user_seed(states, idx_mapping_np):
+        return False
     if not (
         np.all(states.temperature.np[idx_mapping_np] == np.float32(1.0))
         and np.all(states.top_k.np[idx_mapping_np] == logits.shape[1])
@@ -1041,7 +1044,7 @@ def _apply_worker_sampling_filters_for_seeded_multinomial(
     return logits
 
 
-def _worker_sample(
+def _worker_sample_unfiltered_gumbel(
     self: Any,
     logits: torch.Tensor,
     expanded_idx_mapping: torch.Tensor,
@@ -1070,6 +1073,28 @@ def _worker_sample(
             pos,
         )
 
+    return _worker_sample(
+        self,
+        logits,
+        expanded_idx_mapping,
+        idx_mapping_np,
+        pos,
+        input_ids,
+        expanded_local_pos,
+        return_logprobs=return_logprobs,
+    )
+
+
+def _worker_sample(
+    self: Any,
+    logits: torch.Tensor,
+    expanded_idx_mapping: torch.Tensor,
+    idx_mapping_np: np.ndarray,
+    pos: torch.Tensor,
+    input_ids: torch.Tensor,
+    expanded_local_pos: torch.Tensor,
+    return_logprobs: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
     if can_use_qwen_v2_gumbel(
         self,
         logits,
@@ -1182,7 +1207,11 @@ def install_hooks() -> None:
     worker_cls = vllm_worker_sampler.Sampler
     if not getattr(worker_cls, "_musa_sampling_hooks_installed", False):
         worker_cls._musa_original_sample = worker_cls.sample
-        worker_cls.sample = _worker_sample
+        worker_cls.sample = (
+            _worker_sample_unfiltered_gumbel
+            if _MUSA_QWEN_UNFILTERED_GUMBEL_ENABLED
+            else _worker_sample
+        )
         worker_cls._musa_sampling_hooks_installed = True
 
 
