@@ -104,9 +104,7 @@ def test_decode_kernel_rejects_unverified_mixed_dtype_tuple():
     state = torch.randn(2, 8, 3, dtype=torch.bfloat16)
     weight = torch.randn(8, 4, dtype=torch.bfloat16)
 
-    assert (
-        causal_conv1d.musa_tilelang_causal_conv1d_update(x, state, weight) is None
-    )
+    assert causal_conv1d.musa_tilelang_causal_conv1d_update(x, state, weight) is None
 
 
 def test_decode_kernel_rejects_noncontiguous_indices():

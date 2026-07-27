@@ -26,7 +26,9 @@ def test_register_graph_buffers_populates_persistent_rank_data(monkeypatch):
 
     local_handles = [(b"a" * 64, 8), (b"b" * 64, 16)]
     peer_handles = [(b"c" * 64, 24), (b"d" * 64, 32)]
-    monkeypatch.setattr(impl, "_graph_pointer_meta", lambda tensor: local_handles.pop(0))
+    monkeypatch.setattr(
+        impl, "_graph_pointer_meta", lambda tensor: local_handles.pop(0)
+    )
 
     def all_gather_object(output, local_meta, group):
         assert group is impl.group

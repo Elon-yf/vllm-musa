@@ -411,8 +411,7 @@ class _MusaJitCustomAllreduceImpl:
             )
 
         local_meta = [
-            self._graph_pointer_meta(tensor)
-            for tensor in self._pending_graph_inputs
+            self._graph_pointer_meta(tensor) for tensor in self._pending_graph_inputs
         ]
         gathered: list[list[tuple[bytes, int]] | None] = [None] * self.world_size
         dist.all_gather_object(gathered, local_meta, group=self.group)

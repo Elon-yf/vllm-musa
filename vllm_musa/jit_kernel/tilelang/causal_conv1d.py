@@ -1,7 +1,6 @@
 """MUSA TileLang causal conv1d forward kernel."""
 
 import functools
-from typing import List, Optional, Union
 
 import tilelang
 import tilelang.language as T
@@ -642,7 +641,6 @@ def _causal_conv1d_prefill_width4_kernel(
             w_base = T.alloc_var("int32")
             state_base = T.alloc_var("int32")
             out_base = T.alloc_var("int32")
-            state_cut = T.alloc_var("int32")
             col0 = T.alloc_var("float32")
             col1 = T.alloc_var("float32")
             col2 = T.alloc_var("float32")
@@ -708,7 +706,6 @@ def _causal_conv1d_prefill_width4_kernel(
                             x_base + (seq_len - 1) * x_stride_token
                         ]
                     else:
-                        state_cut = 3 - seq_len
                         if seq_len == 1:
                             if load_init:
                                 conv_states[state_base] = conv_states[
@@ -1026,9 +1023,7 @@ def _causal_conv1d_decode_width4_batched_kernel(
             # while leaving the null block unchanged.
             if seq_idx < batch and feat < dim and not valid:
                 x_base = seq_idx * x_stride_token + feat
-                out[seq_idx * o_stride_token + feat] = T.Cast(
-                    out_dtype, x[x_base]
-                )
+                out[seq_idx * o_stride_token + feat] = T.Cast(out_dtype, x[x_base])
 
             if valid:
                 load_init = False
@@ -1088,14 +1083,14 @@ _causal_conv1d_decode_width4_batched_kernel.mode = "lazy"
 def _check_inputs(
     x: torch.Tensor,
     weight: torch.Tensor,
-    bias: Optional[torch.Tensor],
-    conv_states: Optional[torch.Tensor],
+    bias: torch.Tensor | None,
+    conv_states: torch.Tensor | None,
     query_start_loc: torch.Tensor,
-    cache_indices: Optional[torch.Tensor],
-    has_initial_state: Optional[torch.Tensor],
-    cache_index_mapping: Optional[torch.Tensor],
-    activation: Optional[Union[str, bool]],
-    seq_lens_cpu: List[int],
+    cache_indices: torch.Tensor | None,
+    has_initial_state: torch.Tensor | None,
+    cache_index_mapping: torch.Tensor | None,
+    activation: str | bool | None,
+    seq_lens_cpu: list[int],
 ) -> tuple[int, int, int, int, str]:
     if isinstance(activation, bool) and activation:
         activation = "silu"
@@ -1169,14 +1164,14 @@ def _check_inputs(
 def _causal_conv1d_fwd_impl(
     x: torch.Tensor,
     weight: torch.Tensor,
-    bias: Optional[torch.Tensor],
-    conv_states: Optional[torch.Tensor],
+    bias: torch.Tensor | None,
+    conv_states: torch.Tensor | None,
     query_start_loc: torch.Tensor,
-    seq_lens_cpu: List[int],
-    cache_indices: Optional[torch.Tensor] = None,
-    has_initial_state: Optional[torch.Tensor] = None,
-    cache_index_mapping: Optional[torch.Tensor] = None,
-    activation: Optional[Union[str, bool]] = "silu",
+    seq_lens_cpu: list[int],
+    cache_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
+    cache_index_mapping: torch.Tensor | None = None,
+    activation: str | bool | None = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
 ) -> torch.Tensor:
     if isinstance(activation, bool) and activation:
@@ -1451,15 +1446,15 @@ def _causal_conv1d_fwd_impl(
 def _causal_conv1d_fwd_custom(
     x: torch.Tensor,
     weight: torch.Tensor,
-    bias: Optional[torch.Tensor],
-    conv_states: Optional[torch.Tensor],
+    bias: torch.Tensor | None,
+    conv_states: torch.Tensor | None,
     query_start_loc: torch.Tensor,
-    seq_lens_cpu: List[int],
-    cache_indices: Optional[torch.Tensor] = None,
-    has_initial_state: Optional[torch.Tensor] = None,
-    activation: Optional[str] = "silu",
+    seq_lens_cpu: list[int],
+    cache_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
+    activation: str | None = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
-    cache_index_mapping: Optional[torch.Tensor] = None,
+    cache_index_mapping: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return _causal_conv1d_fwd_impl(
         x,
@@ -1479,15 +1474,15 @@ def _causal_conv1d_fwd_custom(
 def causal_conv1d_fwd(
     x: torch.Tensor,
     weight: torch.Tensor,
-    bias: Optional[torch.Tensor],
-    conv_states: Optional[torch.Tensor],
+    bias: torch.Tensor | None,
+    conv_states: torch.Tensor | None,
     query_start_loc: torch.Tensor,
-    seq_lens_cpu: List[int],
-    cache_indices: Optional[torch.Tensor] = None,
-    has_initial_state: Optional[torch.Tensor] = None,
-    activation: Optional[Union[str, bool]] = "silu",
+    seq_lens_cpu: list[int],
+    cache_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
+    activation: str | bool | None = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
-    cache_index_mapping: Optional[torch.Tensor] = None,
+    cache_index_mapping: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if isinstance(seq_lens_cpu, torch.Tensor) and seq_lens_cpu.device.type != "cpu":
         # Backward-compatible positional form used by the generic mamba wrapper:
@@ -1524,15 +1519,15 @@ def causal_conv1d_fwd(
 def causal_conv1d_fn(
     x: torch.Tensor,
     weight: torch.Tensor,
-    bias: Optional[torch.Tensor],
-    conv_states: Optional[torch.Tensor],
+    bias: torch.Tensor | None,
+    conv_states: torch.Tensor | None,
     query_start_loc: torch.Tensor,
-    seq_lens_cpu: List[int],
-    cache_indices: Optional[torch.Tensor] = None,
-    has_initial_state: Optional[torch.Tensor] = None,
-    activation: Optional[Union[str, bool]] = "silu",
+    seq_lens_cpu: list[int],
+    cache_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
+    activation: str | bool | None = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
-    cache_index_mapping: Optional[torch.Tensor] = None,
+    cache_index_mapping: torch.Tensor | None = None,
     **_: object,
 ) -> torch.Tensor:
     return causal_conv1d_fwd(
