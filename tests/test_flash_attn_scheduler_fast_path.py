@@ -23,6 +23,7 @@ from vllm_musa.v1.attention.backends.flash_attn import (
         (["Qwen3MoeForCausalLM"], True),
         (["Qwen3_5ForConditionalGeneration"], True),
         (["Qwen3_5MoeForConditionalGeneration"], True),
+        (["CosyVoice3Model"], True),
         (["Qwen2AudioForConditionalGeneration"], False),
         (["Qwen2VLForConditionalGeneration"], False),
         (["Qwen2_5OmniForConditionalGeneration"], False),
@@ -98,6 +99,8 @@ def _make_graph_size_64_builder(*, is_qwen_family: bool):
     builder.model_config = SimpleNamespace(dtype=torch.bfloat16)
     builder.cache_config = SimpleNamespace(cache_dtype="auto")
     builder._musa_qwen_family = is_qwen_family
+    builder._use_qwen_single_request_scheduler_lookup = True
+    builder._sm_count_query_succeeded = True
     builder._cu_seqlens_k_buffer = torch.empty(65, dtype=torch.int32)
     builder.scheduler_metadata = torch.zeros(257, dtype=torch.int32)
     return builder
@@ -118,6 +121,8 @@ def _make_graph_size_64_metadata():
 
 
 def test_builder_skips_aot_metadata_for_qwen_graph_size_64(monkeypatch) -> None:
+    from vllm_musa.jit_kernel import fa3_metadata
+
     monkeypatch.setattr(
         flash_attn,
         "split_decodes_and_prefills",
@@ -128,6 +133,13 @@ def test_builder_skips_aot_metadata_for_qwen_graph_size_64(monkeypatch) -> None:
         pytest.fail("direct graph-size-64 path called the AOT scheduler")
 
     monkeypatch.setattr(flash_attn, "get_scheduler_metadata", unexpected_scheduler_call)
+    monkeypatch.setattr(
+        fa3_metadata,
+        "try_build_qwen_single_request_fa3_metadata",
+        lambda *_args, **_kwargs: pytest.fail(
+            "graph-size-64 path called the batch-one metadata lookup"
+        ),
+    )
     metadata = _make_graph_size_64_builder(is_qwen_family=True).build(
         common_prefix_len=0,
         common_attn_metadata=_make_graph_size_64_metadata(),

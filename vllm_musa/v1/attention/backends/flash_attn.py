@@ -71,12 +71,13 @@ _MUSA_QWEN_TEXT_GENERATION_ARCHITECTURES = frozenset(
         "Qwen3MoeForCausalLM",
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
+        "CosyVoice3Model",
     }
 )
 
 
 def _is_musa_qwen_text_generation_architecture(model_config: Any) -> bool:
-    architectures = model_config.architectures or ()
+    architectures = getattr(model_config, "architectures", None) or ()
     return any(
         architecture in _MUSA_QWEN_TEXT_GENERATION_ARCHITECTURES
         for architecture in architectures
@@ -126,20 +127,8 @@ def _is_qwen_family_scheduler_lookup_base_config(
     if model_config is None or scheduler_config is None or parallel_config is None:
         return False
 
-    hf_text_config = getattr(model_config, "hf_text_config", None)
-    if hf_text_config is None:
-        hf_config = getattr(model_config, "hf_config", None)
-        hf_text_config = getattr(hf_config, "text_config", hf_config)
-    model_type = str(getattr(hf_text_config, "model_type", "")).lower()
     max_num_seqs = getattr(scheduler_config, "max_num_seqs", None)
-    architectures = getattr(model_config, "architectures", None)
-    if architectures is None:
-        architectures = getattr(hf_text_config, "architectures", None)
-    is_qwen_family = model_type.startswith("qwen") or model_type == "cosyvoice3"
-    is_qwen_family = is_qwen_family or any(
-        str(architecture).lower().startswith("qwen")
-        for architecture in architectures or ()
-    )
+    is_qwen_family = _is_musa_qwen_text_generation_architecture(model_config)
 
     return (
         is_qwen_family

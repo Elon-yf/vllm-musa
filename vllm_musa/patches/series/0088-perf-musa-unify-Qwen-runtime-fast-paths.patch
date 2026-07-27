@@ -5,12 +5,12 @@ Subject: [PATCH] perf(musa): unify Qwen runtime fast paths
 
 ---
  .../model_executor/layers/logits_processor.py | 14 ++++-
- vllm/v1/attention/backends/gdn_attn.py        |  6 +-
+ vllm/v1/attention/backends/gdn_attn.py        |  7 ++-
  vllm/v1/sample/metadata.py                    |  4 ++
  vllm/v1/worker/gpu/model_runner.py            | 14 +++++
  vllm/v1/worker/gpu_input_batch.py             | 15 +++++
  vllm/v1/worker/gpu_model_runner.py            | 63 ++++++++++++++++++-
- 6 files changed, 110 insertions(+), 6 deletions(-)
+ 6 files changed, 110 insertions(+), 7 deletions(-)
 
 diff --git a/vllm/model_executor/layers/logits_processor.py b/vllm/model_executor/layers/logits_processor.py
 index 9ded650ebf..f2efaaa989 100644
@@ -57,12 +57,14 @@ index 9ded650ebf..f2efaaa989 100644
                  logits = tensor_model_parallel_all_gather(logits)
          else:
 diff --git a/vllm/v1/attention/backends/gdn_attn.py b/vllm/v1/attention/backends/gdn_attn.py
-index 09f296bda7..a8cede7414 100644
+index 09f296bda7..0a034c131c 100644
 --- a/vllm/v1/attention/backends/gdn_attn.py
 +++ b/vllm/v1/attention/backends/gdn_attn.py
-@@ -488,7 +488,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+@@ -486,9 +486,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+             self.non_spec_query_start_loc[: num_decodes + 1].copy_(
+                 non_spec_query_start_loc, non_blocking=True
              )
-             non_spec_num_query_tokens = non_spec_query_start_loc[-1]  # type: ignore[index]
+-            non_spec_num_query_tokens = non_spec_query_start_loc[-1]  # type: ignore[index]
              non_spec_query_start_loc = self.non_spec_query_start_loc[: batch_size + 1]
 -            non_spec_query_start_loc[num_decodes + 1 :].fill_(non_spec_num_query_tokens)
 +            if num_decodes < batch_size:

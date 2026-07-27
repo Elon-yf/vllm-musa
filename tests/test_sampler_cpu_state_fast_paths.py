@@ -745,7 +745,9 @@ def test_seeded_large_uniform_top_k_top_p_uses_cpu_scalar(monkeypatch) -> None:
         min_p=_state_array([0.0] * rows, torch.float32),
         apply_min_p=lambda *_args: None,
     )
-    fake_sampler = SimpleNamespace(sampling_states=sampling_states)
+    fake_sampler = SimpleNamespace(
+        sampling_states=sampling_states, _musa_qwen_family=True
+    )
     mapping = torch.arange(rows, dtype=torch.int64)
     mapping_np = np.arange(rows, dtype=np.int64)
 
@@ -778,7 +780,9 @@ def test_seeded_small_batch_qwen_vocab_uses_cpu_scalar(monkeypatch) -> None:
         min_p=_state_array([0.0] * rows, torch.float32),
         apply_min_p=lambda *_args: None,
     )
-    fake_sampler = SimpleNamespace(sampling_states=sampling_states)
+    fake_sampler = SimpleNamespace(
+        sampling_states=sampling_states, _musa_qwen_family=True
+    )
     mapping = torch.arange(rows, dtype=torch.int64)
     mapping_np = np.arange(rows, dtype=np.int64)
 
@@ -791,6 +795,39 @@ def test_seeded_small_batch_qwen_vocab_uses_cpu_scalar(monkeypatch) -> None:
     )
 
     assert captured == {"top_k": 50, "top_p": None}
+
+
+def test_qwen_vocab_without_model_trait_keeps_tensor_top_k(monkeypatch) -> None:
+    captured = {}
+
+    def fake_apply_top_k_top_p(logits, top_k, top_p):
+        captured.update(top_k=top_k, top_p=top_p)
+        return logits
+
+    monkeypatch.setattr(sampler, "_apply_top_k_top_p", fake_apply_top_k_top_p)
+    rows = 4
+    vocab_size = 151936
+    sampling_states = SimpleNamespace(
+        vocab_size=vocab_size,
+        top_k=_state_array([50] * rows, torch.int32),
+        top_p=_state_array([1.0] * rows, torch.float32),
+        min_p=_state_array([0.0] * rows, torch.float32),
+        apply_min_p=lambda *_args: None,
+    )
+    fake_sampler = SimpleNamespace(sampling_states=sampling_states)
+    mapping = torch.arange(rows, dtype=torch.int64)
+    mapping_np = np.arange(rows, dtype=np.int64)
+
+    sampler._apply_worker_sampling_filters_for_seeded_multinomial(
+        fake_sampler,
+        torch.randn((rows, vocab_size)),
+        mapping,
+        mapping_np,
+        preserve_processed_logits=False,
+    )
+
+    assert isinstance(captured["top_k"], torch.Tensor)
+    assert captured["top_p"] is None
 
 
 def test_non_qwen_vocab_keeps_tensor_top_k_path(monkeypatch) -> None:
@@ -810,7 +847,9 @@ def test_non_qwen_vocab_keeps_tensor_top_k_path(monkeypatch) -> None:
         min_p=_state_array([0.0] * rows, torch.float32),
         apply_min_p=lambda *_args: None,
     )
-    fake_sampler = SimpleNamespace(sampling_states=sampling_states)
+    fake_sampler = SimpleNamespace(
+        sampling_states=sampling_states, _musa_qwen_family=True
+    )
     mapping = torch.arange(rows, dtype=torch.int64)
     mapping_np = np.arange(rows, dtype=np.int64)
 

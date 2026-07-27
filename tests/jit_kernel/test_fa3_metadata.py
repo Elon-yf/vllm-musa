@@ -32,6 +32,8 @@ def _make_builder(flash_attn):
     builder.headdim = 128
     builder.block_size = 64
     builder.kv_cache_dtype = torch.bfloat16
+    builder.model_config = SimpleNamespace(dtype=torch.bfloat16)
+    builder._musa_qwen_family = True
     builder.cache_config = SimpleNamespace(cache_dtype="auto")
     return builder
 

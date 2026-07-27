@@ -485,8 +485,17 @@ class TestMUSAPlatformBase:
         assert _is_qwen_family_scheduler_lookup_config(
             make_config("qwen2", "Qwen2ForCausalLM")
         )
-        assert _is_qwen_family_scheduler_lookup_config(
+        assert not _is_qwen_family_scheduler_lookup_config(
             make_config("cosyvoice3", "CosyVoice3ForConditionalGeneration")
+        )
+        assert _is_qwen_family_scheduler_lookup_config(
+            make_config("cosyvoice3", "CosyVoice3Model")
+        )
+        assert not _is_qwen_family_scheduler_lookup_config(
+            make_config("qwen2_vl", "Qwen2VLForConditionalGeneration")
+        )
+        assert not _is_qwen_family_scheduler_lookup_config(
+            make_config("qwen3_omni_moe", "Qwen3OmniMoeForConditionalGeneration")
         )
         assert _is_qwen_family_scheduler_lookup_config(
             make_config("qwen2", "Qwen2ForCausalLM", max_num_seqs=8)
