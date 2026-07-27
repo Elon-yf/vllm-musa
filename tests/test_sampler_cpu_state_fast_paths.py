@@ -8,13 +8,17 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+
+# isort: off
 import torchada  # noqa: F401
 import torch
+
+# isort: on
+
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.worker.gpu_input_batch import InputBatch
 
 from vllm_musa.v1.sample import topk_topp_sampler as sampler
-
 
 requires_musa = pytest.mark.skipif(
     not hasattr(torch, "musa") or not torch.musa.is_available(),

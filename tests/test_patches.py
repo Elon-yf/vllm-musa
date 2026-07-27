@@ -1484,11 +1484,7 @@ class TestMUSAFp8MoEPadding:
         monkeypatch.setattr(
             musa_fp8,
             "_ORIGINAL_FP8_MOE_MAYBE_ROUNDUP_SIZES",
-            lambda self,
-            hidden_size,
-            intermediate_size_per_partition,
-            act_dtype,
-            moe_parallel_config: (
+            lambda self, hidden_size, intermediate_size_per_partition, act_dtype, moe_parallel_config: (
                 hidden_size,
                 intermediate_size_per_partition,
             ),

@@ -4,8 +4,11 @@
 
 from types import SimpleNamespace
 
+# isort: off
 import torchada  # noqa: F401
 import torch
+
+# isort: on
 
 from vllm_musa.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as gdn
 
