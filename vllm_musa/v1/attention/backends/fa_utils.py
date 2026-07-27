@@ -12,8 +12,8 @@ if current_platform.is_musa():
         flash_attn_with_kvcache as _mate_flash_attn_with_kvcache,
     )
     from flash_attn_interface import get_scheduler_metadata as get_scheduler_metadata
-
     from vllm import _custom_ops as ops
+
     from vllm_musa import _custom_ops as musa_ops
     from vllm_musa.utils.environ import envs
 
