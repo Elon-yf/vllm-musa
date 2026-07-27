@@ -261,12 +261,6 @@ _SHADOW_MODULES = [
     ),
     (
         "5",
-        "vllm_musa/distributed/kv_transfer/kv_connector/v1/mooncake_connector.py",
-        "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py",
-        "rebinds upstream (sim 0.12) — 4b-conversion candidate",
-    ),
-    (
-        "5",
         "vllm_musa/model_executor/kernels/linear/scaled_mm/deep_gemm.py",
         "vllm/model_executor/kernels/linear/scaled_mm/deep_gemm.py",
         "OOT subclass/register seam",

@@ -8,19 +8,17 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def test_torchada_floor_is_consistent():
-    assert "dynamic = [\"dependencies\"]" in (ROOT / "pyproject.toml").read_text()
-    assert "torchada>=0.1.76" in (
-        ROOT / "requirements" / "common.txt"
-    ).read_text()
+    assert 'dynamic = ["dependencies"]' in (ROOT / "pyproject.toml").read_text()
+    assert "torchada>=0.1.76" in (ROOT / "requirements" / "common.txt").read_text()
 
 
 def test_musa_image_runtime_dependency_contract():
     private_requirements = (
-        ROOT / "requirements" / "musa_private.txt"
-    ).read_text().splitlines()
+        (ROOT / "requirements" / "musa_private.txt").read_text().splitlines()
+    )
     runtime_requirements = (
-        ROOT / "requirements" / "vllm_runtime_transitive.txt"
-    ).read_text().splitlines()
+        (ROOT / "requirements" / "vllm_runtime_transitive.txt").read_text().splitlines()
+    )
     dockerfile = (ROOT / "docker" / "musa.Dockerfile").read_text()
 
     assert "triton==3.2.0" in private_requirements
@@ -63,19 +61,101 @@ def test_musa_image_stage_and_optional_component_contract():
     assert "TORCH_MUSA_ARCH_LIST=31" in deps_stage
     assert "MATE_MUSA_ARCH_LIST=3.1" in deps_stage
 
-    mooncake_stage = dockerfile.split(
-        "FROM vllm_musa_installed AS mooncake", 1
-    )[1].split("FROM mooncake AS final", 1)[0]
+    mooncake_stage = dockerfile.split("FROM vllm_musa_installed AS mooncake", 1)[
+        1
+    ].split("FROM mooncake AS final", 1)[0]
     assert "MTHREADS_VISIBLE_DEVICES" not in mooncake_stage
-    assert "build.sh --use-mcc" not in mooncake_stage
-    assert "cmake .. -DUSE_MUSA=ON -DUSE_ETCD=OFF" in mooncake_stage
-    assert "OUTPUT_DIR=dist ./scripts/build_wheel.sh" not in mooncake_stage
-    assert "-DSTORE_USE_ETCD=ON" not in mooncake_stage
+    assert "ARG MOONCAKE_VERSION=0.3.12.post1" in mooncake_stage
+    assert '"mooncake-transfer-engine-musa==${MOONCAKE_VERSION}"' in mooncake_stage
+    assert '--index-url "${PYPI_INDEX_URL}"' in mooncake_stage
+    assert "--only-binary=:all:" in mooncake_stage
+    assert 'version("mooncake-transfer-engine-musa")' in mooncake_stage
+    for source_build_token in (
+        "MOONCAKE_REPO",
+        "MOONCAKE_COMMIT",
+        "git clone",
+        "git submodule",
+        "dependencies.sh",
+        "cmake ..",
+        "make install",
+    ):
+        assert source_build_token not in mooncake_stage
+
+    assert 'MOONCAKE_VERSION="${MOONCAKE_VERSION:-0.3.12.post1}"' in build_script
+    assert '--build-arg MOONCAKE_VERSION="${MOONCAKE_VERSION}"' in build_script
+    assert "MOONCAKE_REPO" not in build_script
+    assert "MOONCAKE_COMMIT" not in build_script
 
     assert "ARG BUILD_VLLM_RS=1" in dockerfile
     assert "/tmp/vllm-rs-artifacts/build-mode" in dockerfile
     assert 'BUILD_VLLM_RS="${BUILD_VLLM_RS:-1}"' in build_script
     assert '--build-arg BUILD_VLLM_RS="${BUILD_VLLM_RS}"' in build_script
+
+
+def test_mooncake_uses_the_pinned_upstream_connector():
+    distributed_init = (ROOT / "vllm_musa" / "distributed" / "__init__.py").read_text()
+    package_init = (ROOT / "vllm_musa" / "__init__.py").read_text()
+    mooncake_compat = (
+        ROOT / "vllm_musa" / "distributed" / "mooncake_compat.py"
+    ).read_text()
+    manifest = (ROOT / "vllm_musa" / "patches" / "manifest.py").read_text()
+    legacy_rebind = (
+        ROOT
+        / "vllm_musa"
+        / "distributed"
+        / "kv_transfer"
+        / "kv_connector"
+        / "v1"
+        / "mooncake_connector.py"
+    )
+
+    assert not legacy_rebind.exists()
+    assert "import vllm_musa.distributed.kv_transfer" not in distributed_init
+    assert "kv_connector/v1/mooncake_connector.py" not in manifest
+    configure_index = package_init.index("    configure_legacy_device_filter()")
+    patch_index = package_init.index("    _register_patches()", configure_index)
+    modules_index = package_init.index("    _register_modules()", patch_index)
+    assert configure_index < patch_index < modules_index
+    assert '"MC_TE_FILTERS"' in mooncake_compat
+    assert '"MOONCAKE_RDMA_DEVICES"' in mooncake_compat
+    assert "import mooncake" not in mooncake_compat
+    assert "from vllm" not in mooncake_compat
+
+
+def test_mooncake_example_uses_current_proxy_and_scoped_cleanup():
+    script = (
+        ROOT / "example" / "disaggregated_serving" / "disaggregated_serving.sh"
+    ).read_text()
+
+    assert "third_party/vllm/examples/disaggregated/mooncake_connector" in script
+    assert "mooncake_connector_proxy.py" in script
+    assert "VLLM_MOONCAKE_BOOTSTRAP_PORT" in script
+    assert "VLLM_ENFORCE_EAGER" in script
+    assert '--max-num-seqs "${MAX_NUM_SEQS}"' in script
+    assert "trap 'cleanup 143' TERM" in script
+    assert '"transfer_id"' not in script  # The maintained proxy owns the protocol.
+    assert "toy_proxy_server.py" not in script
+    assert "pgrep" not in script
+    assert "pkill" not in script
+    assert "kill -- -$$" not in script
+
+
+def test_mooncake_rdma_container_contract_is_explicit():
+    example_readme = (ROOT / "docs" / "example" / "README.md").read_text()
+    for token in (
+        "--detach",
+        "--network host",
+        "sleep infinity",
+        "/dev/infiniband:/dev/infiniband",
+        "stat -c '%t %T'",
+        '--device-cgroup-rule="c ${VERBS_MAJOR}:* rmw"',
+        '--device-cgroup-rule="c ${RDMA_CM_MAJOR}:${RDMA_CM_MINOR} rmw"',
+        "--env MC_FORCE_HCA=1",
+        "--cap-add IPC_LOCK",
+        "--ulimit memlock=-1:-1",
+        "MC_TE_FILTERS",
+    ):
+        assert token in example_readme
 
 
 def test_musa_image_provenance_labels_are_derived_from_source():
@@ -94,8 +174,7 @@ def test_musa_image_provenance_labels_are_derived_from_source():
 
     assert "git rev-parse HEAD" in build_script
     assert (
-        "git describe --tags --exact-match 2>/dev/null || "
-        "git branch --show-current"
+        "git describe --tags --exact-match 2>/dev/null || " "git branch --show-current"
     ) in build_script
     assert 'awk -F= \'$1 == "VLLM_TAG"' in build_script
     for name in ("VLLM_MUSA_COMMIT", "VLLM_MUSA_REF", "VLLM_TAG"):

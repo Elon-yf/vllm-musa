@@ -74,7 +74,12 @@ rollback rather than a production default.
 
 ### `distributed/` – KV-Transfer Connector
 
-Registers a Mooncake-based KV connector (`mooncake_connector.py`) for disaggregated prefill/decode serving (conditionally loaded when the `mooncake` package is available).
+Uses the Mooncake connector from the pinned upstream vLLM checkout for
+disaggregated prefill/decode serving. The MUSA image installs the compatible
+`mooncake-transfer-engine-musa` package; no MUSA-specific constructor rebind is
+required. Use Mooncake's official `MC_TE_FILTERS` HCA allow-list for RDMA
+selection. The old `MOONCAKE_RDMA_DEVICES` variable is only a deprecated
+compatibility alias, and never overrides an explicitly set `MC_TE_FILTERS`.
 
 ### `utils/` – Utilities
 

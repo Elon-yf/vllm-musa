@@ -13,7 +13,7 @@ The resulting image contains:
   `torch_c_dlpack_ext`),
 - `vllm-musa` and the vendored upstream vLLM, built from source,
 - `vllm-rs` and its Python tool-parser extension when `BUILD_VLLM_RS=1`,
-- Mooncake (KV transfer engine) when `BUILD_MOONCAKE=1`.
+- `mooncake-transfer-engine-musa`.
 
 ## Prerequisites
 
@@ -25,7 +25,7 @@ The resulting image contains:
     and the vendored vLLM's dependencies,
   - the MUSA apt source (`MUSA_APT_SOURCE`) — the runtime SDK,
   - GitHub — the vendored vLLM/flashinfer clones, the Rust frontend's
-    `llm-multimodal` dependency, and Mooncake when those components are enabled.
+    `llm-multimodal` dependency when the Rust frontend is enabled.
 - **A MUSA GPU visible to the build** if you want the final-stage import verify to
   pass — see [Building on a MUSA host](#building-on-a-musa-host).
 
@@ -69,8 +69,7 @@ bash docker/build_image.sh --no-cache --build-arg http_proxy=http://proxy:8118
 | `MCCL_VERSION` | `2.4.0` | MCCL (collective communication library) version. |
 | `PYPI_INDEX_URL` | `https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple` | Public index for ordinary third-party wheels **and** the vendored vLLM's dependencies. |
 | `MUSA_PIP_INDEX_URL` | `https://dl.mthreads.com/repo/api/pypi/pypi/simple` | Moore Threads index for the MUSA/MT wheels. |
-| `BUILD_MOONCAKE` | `1` | `1`: build Mooncake (KV transfer engine) from source; `0`: skip. |
-| `MOONCAKE_REPO` / `MOONCAKE_COMMIT` | GitHub / pinned SHA | Mooncake source (only used when `BUILD_MOONCAKE=1`). |
+| `MOONCAKE_VERSION` | `0.3.12.post1` | Exact `mooncake-transfer-engine-musa` version installed from `PYPI_INDEX_URL`. |
 | `BUILD_VLLM_RS` | `1` | `1`: build and install `vllm-rs` plus `_rust_tool_parser`; `0`: omit both and skip Rust/protoc setup. |
 | `IMAGE_REPOSITORY` | `vllm-musa` | Image repository name. |
 | `IMAGE_FLAVOR` | `ubuntu22.04_py<py>_musa_runtime_<ver>_pytorch_release_<torch>` | Tag flavor; `<torch>` is derived from `requirements/musa_private.txt` and sanitized for Docker tags. |
@@ -109,15 +108,9 @@ BASE_IMAGE=<local-ubuntu-22.04-image> bash docker/build_image.sh
 MUSA_RUNTIME_VERSION=5.2 MUSA_APT_SOURCE=<5.2-apt-repo> bash docker/build_image.sh
 ```
 
-**Skip Mooncake:**
-
-```bash
-BUILD_MOONCAKE=0 bash docker/build_image.sh
-```
-
-Mooncake is built by default, after the torch and vLLM stacks are installed so
-EP-related components can import or link against them. The image builds Mooncake
-with `USE_MUSA=ON` and `USE_ETCD=OFF`, then installs the CMake targets directly.
+The prebuilt MUSA Mooncake wheel is installed after the torch and vLLM stacks.
+Pin a different published build with `MOONCAKE_VERSION`; the image does not
+clone or compile Mooncake source.
 
 **Skip the Rust frontend:**
 
@@ -165,6 +158,11 @@ docker run --rm <MUSA GPU flags> \
 
 On a MUSA GPU you should see `musa available: True`.
 
+Mooncake over RoCE also requires host networking and explicit RDMA device
+access. See the
+[container and RDMA prerequisites](../docs/example/README.md#container-and-rdma-prerequisites)
+for the validated runtime flags.
+
 ## How it works (build stages)
 
 `docker/musa.Dockerfile` is multi-stage:
@@ -185,8 +183,8 @@ On a MUSA GPU you should see `musa available: True`.
    vLLM, re-pins numpy, installs runtime dependencies, and runs import checks.
 6. **vllm_rs_build** — optionally builds Rust artifacts (`BUILD_VLLM_RS`) without
    carrying Rust/protoc into the final image.
-7. **mooncake** — builds Mooncake on top of the installed torch/vLLM stack
-   unless `BUILD_MOONCAKE=0`.
+7. **mooncake** — installs the pinned `mooncake-transfer-engine-musa` wheel on
+   top of the torch/vLLM stack.
 8. **final** — installs optional Rust artifacts, enables MUSA device visibility,
    and removes build caches.
 
