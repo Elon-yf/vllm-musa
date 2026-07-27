@@ -414,7 +414,20 @@ class _MusaJitCustomAllreduceImpl:
             self._graph_pointer_meta(tensor) for tensor in self._pending_graph_inputs
         ]
         gathered: list[list[tuple[bytes, int]] | None] = [None] * self.world_size
-        dist.all_gather_object(gathered, local_meta, group=self.group)
+        gathered[self.rank] = local_meta
+        # ``all_gather_object`` is incompatible with a Gloo process group
+        # under inference mode (PyTorch #126032). Match vLLM's native custom
+        # AR registration and broadcast each rank's metadata on the CPU group.
+        ranks = sorted(dist.get_process_group_ranks(group=self.group))
+        for group_rank, global_rank in enumerate(ranks):
+            payload = [gathered[group_rank]]
+            dist.broadcast_object_list(
+                payload,
+                src=global_rank,
+                group=self.group,
+                device="cpu",
+            )
+            gathered[group_rank] = payload[0]
         if any(peer_meta is None for peer_meta in gathered):
             raise RuntimeError("MUSA custom AR graph metadata gather was incomplete")
         gathered_meta = [peer_meta for peer_meta in gathered if peer_meta is not None]

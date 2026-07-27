@@ -30,10 +30,18 @@ def test_register_graph_buffers_populates_persistent_rank_data(monkeypatch):
         impl, "_graph_pointer_meta", lambda tensor: local_handles.pop(0)
     )
 
-    def all_gather_object(output, local_meta, group):
+    ranks = [4, 9]
+    broadcast_sources = []
+
+    def broadcast_object_list(payload, src, group, device):
         assert group is impl.group
-        output[0] = list(local_meta)
-        output[1] = peer_handles
+        assert device == "cpu"
+        broadcast_sources.append(src)
+        if src == ranks[0]:
+            assert payload[0] == [(b"a" * 64, 8), (b"b" * 64, 16)]
+        else:
+            assert payload[0] is None
+            payload[0] = peer_handles
 
     peer_bases = {ord("c"): 10_000, ord("d"): 20_000}
 
@@ -42,7 +50,13 @@ def test_register_graph_buffers_populates_persistent_rank_data(monkeypatch):
             first_byte = ctypes.string_at(ctypes.byref(handle), 1)[0]
             return ctypes.c_void_p(peer_bases[first_byte])
 
-    monkeypatch.setattr(custom_ar.dist, "all_gather_object", all_gather_object)
+    monkeypatch.setattr(custom_ar.dist, "get_process_group_ranks", lambda group: ranks)
+    monkeypatch.setattr(custom_ar.dist, "broadcast_object_list", broadcast_object_list)
+    monkeypatch.setattr(
+        custom_ar.dist,
+        "all_gather_object",
+        lambda *_args, **_kwargs: pytest.fail("Gloo object gather must not be used"),
+    )
     monkeypatch.setattr(custom_ar, "_MusaRTLibrary", FakeRuntime)
     monkeypatch.setattr(
         custom_ar.torch,
@@ -61,6 +75,7 @@ def test_register_graph_buffers_populates_persistent_rank_data(monkeypatch):
     assert impl._pending_graph_inputs == []
     assert impl._graph_input_refs == inputs
     assert sorted(impl._graph_opened_ptrs) == [10_000, 20_000]
+    assert broadcast_sources == ranks
 
 
 def test_capture_resets_state_when_registration_fails(monkeypatch):
