@@ -28,12 +28,12 @@ index 9ded650ebf..f2efaaa989 100644
              return logits
 +        if tp_size not in (4, 8):
 +            output_dtype = None
- 
+
          use_ipc_gather = (
              self.org_vocab_size in (151936, 248320)
 @@ -105,7 +108,7 @@ class LogitsProcessor(PluggableLayer):
              )
- 
+
              gathered = musa_jit_ar.maybe_musa_jit_logits_all_gather(
 -                logits, dim=-1
 +                logits, dim=-1, output_dtype=output_dtype
@@ -72,7 +72,7 @@ index 09f296bda7..0a034c131c 100644
 +                non_spec_query_start_loc[num_decodes + 1 :].fill_(
 +                    non_spec_query_start_loc_cpu[-1].item()
 +                )
- 
+
          attn_metadata = GDNAttentionMetadata(
              num_prefills=num_prefills,
 diff --git a/vllm/v1/sample/metadata.py b/vllm/v1/sample/metadata.py
@@ -119,7 +119,7 @@ index 589fbd43ef..c0e3fb61d6 100644
 @@ -917,6 +917,19 @@ class InputBatch:
                      req_index = self.req_id_to_index[req_id]
                      logprob_token_ids_by_index[req_index] = token_ids
- 
+
 +        uniform_top_k = None
 +        if self.vocab_size in (151936, 248320) and not self.no_top_k and num_reqs > 0:
 +            top_k_cpu = self.top_k_cpu[:num_reqs]
@@ -143,7 +143,7 @@ index 589fbd43ef..c0e3fb61d6 100644
 +            uniform_top_k=uniform_top_k,
 +            uniform_temperature=uniform_temperature,
          )
- 
+
      def get_pooling_params(self) -> list[PoolingParams]:
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
 index c1f1b43606..487ceda13c 100644
@@ -152,7 +152,7 @@ index c1f1b43606..487ceda13c 100644
 @@ -812,6 +812,36 @@ class GPUModelRunner(
          self.query_pos = self._make_buffer(arange_size, dtype=torch.int64)
          self._arange_scratch = np.empty(arange_size, dtype=np.int64)
- 
+
 +        qwen_text_generation_architectures = {
 +            "Qwen2ForCausalLM",
 +            "Qwen2MoeForCausalLM",
@@ -213,7 +213,7 @@ index c1f1b43606..487ceda13c 100644
 @@ -4198,9 +4236,18 @@ class GPUModelRunner(
              max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
              num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
- 
+
 +            # Keep graph padding and mixed/chunked prefills on the existing
 +            # query_start_loc path. This gate uses only actual requests/tokens.
 +            use_cached_decode_logits_indices = (
@@ -227,12 +227,12 @@ index c1f1b43606..487ceda13c 100644
                  num_scheduled_tokens_np,
 +                use_cached_decode_logits_indices=use_cached_decode_logits_indices,
              )
- 
+
              cascade_attn_prefix_lens = None
 @@ -4424,13 +4471,23 @@ class GPUModelRunner(
                          kv_connector_output,
                      )
- 
+
 -                sample_hidden_states = hidden_states[logits_indices]
 +                if use_cached_decode_logits_indices:
 +                    sample_hidden_states = hidden_states
@@ -244,7 +244,7 @@ index c1f1b43606..487ceda13c 100644
              else:
                  # Rare case.
                  assert not self.is_pooling_model
- 
+
 -                sample_hidden_states = hidden_states[logits_indices]
 +                if use_cached_decode_logits_indices:
 +                    sample_hidden_states = hidden_states
