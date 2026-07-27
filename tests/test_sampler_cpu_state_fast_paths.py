@@ -271,13 +271,14 @@ def test_qwen_legacy_gumbel_gate_fails_closed(monkeypatch) -> None:
     monkeypatch.setattr(sampler, "is_musa_tensor", lambda _tensor: True)
     logits = torch.randn((4, 248320))
 
-    assert _can_use_qwen_legacy_gumbel(
-        torch.randn((1, 248320)),
-        _legacy_gumbel_metadata(1),
-        "raw_logprobs",
-        None,
-        False,
-    )
+    for rows in (1, 2, 3):
+        assert not _can_use_qwen_legacy_gumbel(
+            torch.randn((rows, 248320)),
+            _legacy_gumbel_metadata(rows),
+            "raw_logprobs",
+            None,
+            False,
+        )
     assert not _can_use_qwen_legacy_gumbel(
         torch.randn((4, 151936)),
         _legacy_gumbel_metadata(4),

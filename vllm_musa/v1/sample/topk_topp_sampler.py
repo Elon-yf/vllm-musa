@@ -456,7 +456,10 @@ def can_use_qwen_legacy_gumbel(
         return False
     if (
         logits.ndim != 2
-        or logits.shape[0] == 0
+        # The legacy Gumbel seed/mapping setup is not amortized below four
+        # rows on S5000. Preserve the seeded-multinomial fallback for those
+        # shapes; the first measured positive serving cell starts at four.
+        or logits.shape[0] < 4
         or logits.shape[1] != 248320
         or logits.stride(-1) != 1
     ):
