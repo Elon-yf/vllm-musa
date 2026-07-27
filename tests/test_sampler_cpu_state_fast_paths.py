@@ -141,6 +141,7 @@ def _gumbel_gate_sampler(
     num_speculative_tokens: int = 1,
     use_fp64_gumbel: bool = False,
     logprobs_mode: str = "raw_logprobs",
+    is_qwen_family: bool = True,
 ) -> SimpleNamespace:
     states = SimpleNamespace(
         temperature=_state_array([temperature] * rows, torch.float32),
@@ -154,6 +155,7 @@ def _gumbel_gate_sampler(
         num_speculative_tokens=num_speculative_tokens,
         use_fp64_gumbel=use_fp64_gumbel,
         logprobs_mode=logprobs_mode,
+        _musa_qwen_family=is_qwen_family,
     )
 
 
@@ -196,6 +198,10 @@ def _legacy_gumbel_metadata(rows: int, **kwargs) -> SimpleNamespace:
     )
 
 
+def _can_use_qwen_legacy_gumbel(*args, **kwargs) -> bool:
+    return sampler.can_use_qwen_legacy_gumbel(*args, **kwargs, is_qwen_family=True)
+
+
 def test_qwen_legacy_gumbel_gate_and_generator_handoff(monkeypatch) -> None:
     monkeypatch.setattr(sampler.current_platform, "is_musa", lambda: True)
     monkeypatch.setattr(sampler, "is_musa_tensor", lambda _tensor: True)
@@ -203,13 +209,17 @@ def test_qwen_legacy_gumbel_gate_and_generator_handoff(monkeypatch) -> None:
     logits = torch.randn((rows, 248320))
     metadata = _legacy_gumbel_metadata(rows)
 
-    assert sampler.can_use_qwen_legacy_gumbel(
-        logits, metadata, "raw_logprobs", None, False
+    assert not sampler.can_use_qwen_legacy_gumbel(
+        logits,
+        metadata,
+        "raw_logprobs",
+        None,
+        False,
+        is_qwen_family=False,
     )
+    assert _can_use_qwen_legacy_gumbel(logits, metadata, "raw_logprobs", None, False)
     metadata.generators = dict(reversed(tuple(metadata.generators.items())))
-    assert sampler.can_use_qwen_legacy_gumbel(
-        logits, metadata, "raw_logprobs", None, False
-    )
+    assert _can_use_qwen_legacy_gumbel(logits, metadata, "raw_logprobs", None, False)
     state = sampler.get_qwen_legacy_generator_state(metadata.generators, rows)
     assert state == ([60043, 60044, 60045, 60046], [0, 0, 0, 0])
 
@@ -257,56 +267,56 @@ def test_qwen_legacy_gumbel_gate_fails_closed(monkeypatch) -> None:
     monkeypatch.setattr(sampler, "is_musa_tensor", lambda _tensor: True)
     logits = torch.randn((4, 248320))
 
-    assert sampler.can_use_qwen_legacy_gumbel(
+    assert _can_use_qwen_legacy_gumbel(
         torch.randn((1, 248320)),
         _legacy_gumbel_metadata(1),
         "raw_logprobs",
         None,
         False,
     )
-    assert not sampler.can_use_qwen_legacy_gumbel(
+    assert not _can_use_qwen_legacy_gumbel(
         torch.randn((4, 151936)),
         _legacy_gumbel_metadata(4),
         "raw_logprobs",
         None,
         False,
     )
-    assert not sampler.can_use_qwen_legacy_gumbel(
+    assert not _can_use_qwen_legacy_gumbel(
         logits,
         _legacy_gumbel_metadata(4, max_num_logprobs=0),
         "raw_logprobs",
         None,
         False,
     )
-    assert sampler.can_use_qwen_legacy_gumbel(
+    assert _can_use_qwen_legacy_gumbel(
         logits,
         _legacy_gumbel_metadata(4, generators={0: _FakeGenerator(1)}),
         "raw_logprobs",
         None,
         False,
     )
-    assert not sampler.can_use_qwen_legacy_gumbel(
+    assert not _can_use_qwen_legacy_gumbel(
         logits,
         _legacy_gumbel_metadata(4, generators={}),
         "raw_logprobs",
         None,
         False,
     )
-    assert not sampler.can_use_qwen_legacy_gumbel(
+    assert not _can_use_qwen_legacy_gumbel(
         logits,
         _legacy_gumbel_metadata(4, generators={4: _FakeGenerator(1)}),
         "raw_logprobs",
         None,
         False,
     )
-    assert not sampler.can_use_qwen_legacy_gumbel(
+    assert not _can_use_qwen_legacy_gumbel(
         logits,
         _legacy_gumbel_metadata(4, spec_token_ids=[[1], [], [], []]),
         "raw_logprobs",
         None,
         False,
     )
-    assert not sampler.can_use_qwen_legacy_gumbel(
+    assert not _can_use_qwen_legacy_gumbel(
         logits, _legacy_gumbel_metadata(4), "raw_logprobs", None, True
     )
     invalid = _legacy_gumbel_metadata(4)
@@ -414,6 +424,14 @@ def test_qwen_v2_gumbel_gate_accepts_only_exact_contract(monkeypatch) -> None:
     mapping_np = np.arange(rows, dtype=np.int64)
     pos = mapping.clone()
 
+    assert not sampler.can_use_qwen_v2_gumbel(
+        _gumbel_gate_sampler(rows, is_qwen_family=False),
+        logits,
+        mapping,
+        mapping_np,
+        pos,
+        False,
+    )
     assert sampler.can_use_qwen_v2_gumbel(
         _gumbel_gate_sampler(rows), logits, mapping, mapping_np, pos, False
     )
@@ -891,7 +909,7 @@ def test_unseeded_uniform_min_p_reaches_sampler_as_scalar(monkeypatch) -> None:
     mapping_np = np.asarray([0, 1], dtype=np.int64)
 
     sampler.sample_worker_logits(
-        torch.randn((2, 128)), sampling_states, mapping, mapping_np
+        torch.randn((2, 128)), sampling_states, mapping, mapping_np, False
     )
 
     assert captured == {"top_k": None, "top_p": None, "min_p": pytest.approx(0.05)}
@@ -915,7 +933,7 @@ def test_unseeded_mixed_min_p_keeps_tensor_fallback(monkeypatch) -> None:
     mapping_np = np.asarray([0, 1], dtype=np.int64)
 
     sampler.sample_worker_logits(
-        torch.randn((2, 128)), sampling_states, mapping, mapping_np
+        torch.randn((2, 128)), sampling_states, mapping, mapping_np, False
     )
 
     assert isinstance(captured["min_p"], torch.Tensor)

@@ -328,6 +328,7 @@ def _topk_topp_sampler_init(
 ):
     original_init = vllm_topk_topp_sampler.TopKTopPSampler._musa_original_init
     original_init(self, logprobs_mode, use_fp64_gumbel)
+    self._musa_qwen_family = False
     if (
         logprobs_mode not in ("processed_logits", "processed_logprobs")
         and current_platform.is_musa()
@@ -444,9 +445,14 @@ def can_use_qwen_legacy_gumbel(
     logprobs_mode: LogprobsMode,
     deferred_min_p: torch.Tensor | None,
     use_fp64_gumbel: bool,
+    is_qwen_family: bool = False,
 ) -> bool:
     """Gate MRV1 Qwen sampling to a batched stateless Gumbel handoff."""
-    if not current_platform.is_musa() or not is_musa_tensor(logits):
+    if (
+        not is_qwen_family
+        or not current_platform.is_musa()
+        or not is_musa_tensor(logits)
+    ):
         return False
     if (
         logits.ndim != 2
@@ -628,6 +634,7 @@ def _sample(
     sampling_metadata: Any,
     logprobs_mode_override: LogprobsMode | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    is_qwen_family = bool(getattr(self, "_musa_qwen_family", False))
     logprobs_mode = logprobs_mode_override or self.logprobs_mode
     assert not (sampling_metadata.all_greedy and sampling_metadata.all_random)
     if sampling_metadata.all_random:
@@ -649,12 +656,16 @@ def _sample(
             logits, sampling_metadata.temperature, sampling_metadata.all_random
         )
 
-    top_k = _legacy_top_k_with_cpu_hint(
-        sampling_metadata,
-        sampling_metadata.top_k,
-        self.topk_topp_sampler,
-        logits,
-        logprobs_mode,
+    top_k = (
+        _legacy_top_k_with_cpu_hint(
+            sampling_metadata,
+            sampling_metadata.top_k,
+            self.topk_topp_sampler,
+            logits,
+            logprobs_mode,
+        )
+        if is_qwen_family
+        else sampling_metadata.top_k
     )
 
     musa_min_p = None
@@ -675,6 +686,7 @@ def _sample(
         logprobs_mode,
         musa_min_p,
         self.use_fp64_gumbel,
+        is_qwen_family,
     )
     legacy_top_k = (
         _legacy_gumbel_top_k_with_cpu_hint(
@@ -783,7 +795,11 @@ def can_use_qwen_v2_gumbel(
     return_logprobs: bool,
 ) -> bool:
     """Gate the pinned V2 Gumbel sampler to one validated Qwen contract."""
-    if not current_platform.is_musa() or not is_musa_tensor(logits):
+    if (
+        not getattr(sampler, "_musa_qwen_family", False)
+        or not current_platform.is_musa()
+        or not is_musa_tensor(logits)
+    ):
         return False
     if not _is_qwen_sampler_vocab(logits) or logits.stride(-1) != 1:
         return False
@@ -858,6 +874,7 @@ def sample_worker_logits(
     sampling_states: Any,
     expanded_idx_mapping: torch.Tensor,
     idx_mapping_np: np.ndarray,
+    is_qwen_family: bool,
 ) -> torch.Tensor:
     vocab_size = sampling_states.vocab_size
     top_k_np = sampling_states.top_k.np[idx_mapping_np]
@@ -870,6 +887,7 @@ def sample_worker_logits(
     # never copies a device tensor to the host merely to choose a kernel.
     if (
         use_top_k
+        and is_qwen_family
         and _is_uniform_top_k_50(top_k_np)
         and _is_qwen_sampler_vocab(logits)
         and (not use_top_p or logits.shape[0] >= 4)
@@ -1001,6 +1019,7 @@ def _apply_worker_sampling_filters_for_seeded_multinomial(
     use_min_p = np.any(sampler.sampling_states.min_p.np[idx_mapping_np] != 0.0)
     if (
         use_top_k
+        and getattr(sampler, "_musa_qwen_family", False)
         and _is_uniform_top_k_50(top_k_np)
         and _is_qwen_sampler_vocab(logits)
         and (not use_top_p or logits.shape[0] >= 4)
@@ -1100,6 +1119,7 @@ def _worker_sample(
             self.sampling_states,
             expanded_idx_mapping,
             idx_mapping_np,
+            bool(getattr(self, "_musa_qwen_family", False)),
         )
         return sampled, processed_logits
 
