@@ -673,10 +673,7 @@ void vllm_musa_custom_ar_launch_all_gather_registered(
   TVM_FFI_ICHECK_EQ(inp.size(0), out.size(0));
   TVM_FFI_ICHECK_EQ(inp.size(1) * world_size, out.size(1));
   const bool same_dtype = dtype_equal(inp.dtype(), out.dtype());
-  const bool bfloat16_to_float32 =
-      dtype_equal(inp.dtype(), dl_bfloat16) &&
-      dtype_equal(out.dtype(), dl_float32);
-  TVM_FFI_ICHECK(same_dtype || bfloat16_to_float32);
+  TVM_FFI_ICHECK(same_dtype);
 
   RankSignals sg{};
   const auto* signal_ptrs =
@@ -706,30 +703,25 @@ void vllm_musa_custom_ar_launch_all_gather_registered(
 
   const int rows = static_cast<int>(inp.size(0));
   const int shard_size = static_cast<int>(inp.size(1));
-  if (bfloat16_to_float32) {
-    dispatch_all_gather_world_size<__mt_bfloat16, float>(
-        data, sg, self_sg, static_cast<float*>(out.data_ptr()),
-        static_cast<int>(rank), static_cast<int>(world_size), rows, shard_size,
-        stream);
-  } else if (dtype_equal(out.dtype(), dl_float16)) {
-    dispatch_all_gather_world_size<half, half>(
+  if (dtype_equal(out.dtype(), dl_float16)) {
+    dispatch_all_gather_world_size<half>(
         data, sg, self_sg, static_cast<half*>(out.data_ptr()),
         static_cast<int>(rank), static_cast<int>(world_size), rows, shard_size,
         stream);
   } else if (dtype_equal(out.dtype(), dl_bfloat16)) {
-    dispatch_all_gather_world_size<__mt_bfloat16, __mt_bfloat16>(
+    dispatch_all_gather_world_size<__mt_bfloat16>(
         data, sg, self_sg, static_cast<__mt_bfloat16*>(out.data_ptr()),
         static_cast<int>(rank), static_cast<int>(world_size), rows, shard_size,
         stream);
   } else if (dtype_equal(out.dtype(), dl_float32)) {
-    dispatch_all_gather_world_size<float, float>(
+    dispatch_all_gather_world_size<float>(
         data, sg, self_sg, static_cast<float*>(out.data_ptr()),
         static_cast<int>(rank), static_cast<int>(world_size), rows, shard_size,
         stream);
   } else {
     TVM_FFI_THROW(ValueError)
         << "registered custom all-gather only supports same-dtype "
-           "fp16/bf16/fp32 or bf16-to-fp32";
+           "fp16/bf16/fp32";
   }
   const musaError_t err = musaGetLastError();
   TVM_FFI_ICHECK_EQ(err, musaSuccess)
