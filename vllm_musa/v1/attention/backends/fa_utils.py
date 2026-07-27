@@ -7,13 +7,13 @@ from vllm.platforms import current_platform
 from vllm.v1.attention.backends.fa_utils import logger
 
 if current_platform.is_musa():
-    from flash_attn_interface import (  # noqa: F401
-        flash_attn_varlen_func,
-        flash_attn_with_kvcache,
-        get_scheduler_metadata,
+    from flash_attn_interface import flash_attn_varlen_func as flash_attn_varlen_func
+    from flash_attn_interface import (
+        flash_attn_with_kvcache as _mate_flash_attn_with_kvcache,
     )
-    from vllm import _custom_ops as ops
+    from flash_attn_interface import get_scheduler_metadata as get_scheduler_metadata
 
+    from vllm import _custom_ops as ops
     from vllm_musa import _custom_ops as musa_ops
     from vllm_musa.utils.environ import envs
 
@@ -128,3 +128,30 @@ def flash_attn_supports_mla():
 
 def is_flash_attn_varlen_func_available() -> bool:
     return "flash_attn_varlen_func" in globals()
+
+
+# MUSA: present the paged KV to mate's FMHA decode as page_size=64 (TME fast
+# path) without changing the unified KV block. When the attention block is a
+# multiple of 64 (>64), reshape the k/v cache
+# [n_blk, blk, H, D] -> [n_blk*r, 64, H, D] (a view) and expand the page table;
+# mate then reads page_size == 64 and avoids the slow LSU KV load.
+_MUSA_B64_ARANGE: dict = {}
+
+
+def flash_attn_with_kvcache(*args, **kwargs):
+    pt = kwargs.get("page_table")
+    kc = kwargs.get("k_cache")
+    vc = kwargs.get("v_cache")
+    if pt is not None and kc is not None and vc is not None and kc.dim() >= 2:
+        blk = kc.shape[1]
+        if blk != 64 and blk % 64 == 0:
+            r = blk // 64
+            kwargs["k_cache"] = kc.reshape(kc.shape[0] * r, 64, *kc.shape[2:])
+            kwargs["v_cache"] = vc.reshape(vc.shape[0] * r, 64, *vc.shape[2:])
+            key = (r, pt.device, pt.dtype)
+            ar = _MUSA_B64_ARANGE.get(key)
+            if ar is None:
+                ar = torch.arange(r, device=pt.device, dtype=pt.dtype)
+                _MUSA_B64_ARANGE[key] = ar
+            kwargs["page_table"] = (pt.unsqueeze(-1) * r + ar).reshape(pt.shape[0], -1)
+    return _mate_flash_attn_with_kvcache(*args, **kwargs)
