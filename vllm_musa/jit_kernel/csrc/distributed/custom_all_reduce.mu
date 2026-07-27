@@ -653,10 +653,14 @@ void vllm_musa_custom_ar_launch_all_gather_registered(
   // by the alternating replay/rank-skew stress harness.
   CHECK_MUSA_CONTIGUOUS(inp);
   CHECK_MUSA_CONTIGUOUS(out);
+  TVM_FFI_ICHECK(world_size == 2 || world_size == 4 || world_size == 8);
+  TVM_FFI_ICHECK_EQ(inp.device().device_id, out.device().device_id);
+  TVM_FFI_ICHECK_EQ(rank_data.ndim(), 1);
   TVM_FFI_ICHECK_EQ(rank_data.device().device_type, kDLCPU);
   TVM_FFI_ICHECK(rank_data.IsContiguous());
   TVM_FFI_ICHECK(dtype_equal(rank_data.dtype(), dl_int64));
   TVM_FFI_ICHECK_GE(rank_data.size(0), kMaxRanks);
+  TVM_FFI_ICHECK_EQ(signal_ptrs_cpu.ndim(), 1);
   TVM_FFI_ICHECK_EQ(signal_ptrs_cpu.device().device_type, kDLCPU);
   TVM_FFI_ICHECK(signal_ptrs_cpu.IsContiguous());
   TVM_FFI_ICHECK(dtype_equal(signal_ptrs_cpu.dtype(), dl_int64));
@@ -664,6 +668,8 @@ void vllm_musa_custom_ar_launch_all_gather_registered(
   TVM_FFI_ICHECK(rank >= 0 && rank < world_size);
   TVM_FFI_ICHECK_EQ(inp.ndim(), 2);
   TVM_FFI_ICHECK_EQ(out.ndim(), 2);
+  TVM_FFI_ICHECK_GT(inp.size(0), 0);
+  TVM_FFI_ICHECK_GT(inp.size(1), 0);
   TVM_FFI_ICHECK_EQ(inp.size(0), out.size(0));
   TVM_FFI_ICHECK_EQ(inp.size(1) * world_size, out.size(1));
   const bool same_dtype = dtype_equal(inp.dtype(), out.dtype());
