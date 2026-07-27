@@ -24,8 +24,9 @@ def test_register_graph_buffers_populates_persistent_rank_data(monkeypatch):
     impl._graph_opened_ptrs = []
     impl._next_graph_slot = 0
 
-    local_handles = [(b"a" * 64, 8), (b"b" * 64, 16)]
-    peer_handles = [(b"c" * 64, 24), (b"d" * 64, 32)]
+    handle_size = ctypes.sizeof(custom_ar.cudaIpcMemHandle_t)
+    local_handles = [(b"a" * handle_size, 8), (b"b" * handle_size, 16)]
+    peer_handles = [(b"c" * handle_size, 24), (b"d" * handle_size, 32)]
     monkeypatch.setattr(
         impl, "_graph_pointer_meta", lambda tensor: local_handles.pop(0)
     )
@@ -38,7 +39,10 @@ def test_register_graph_buffers_populates_persistent_rank_data(monkeypatch):
         assert device == "cpu"
         broadcast_sources.append(src)
         if src == ranks[0]:
-            assert payload[0] == [(b"a" * 64, 8), (b"b" * 64, 16)]
+            assert payload[0] == [
+                (b"a" * handle_size, 8),
+                (b"b" * handle_size, 16),
+            ]
         else:
             assert payload[0] is None
             payload[0] = peer_handles
