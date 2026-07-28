@@ -14,8 +14,6 @@ _MHC_PRE_BIG_FUSE_HIDDEN_BLOCK_ENV = (
     "VLLM_MUSA_DEEPSEEK_V4_MHC_PRE_BIG_FUSE_HIDDEN_BLOCK"
 )
 _MHC_PRE_BIG_FUSE_PASS_CONFIG_ENV = "VLLM_MUSA_DEEPSEEK_V4_MHC_PRE_BIG_FUSE_PASS_CONFIG"
-_MHC_PRE_DECODE_PRENORM_IMPL_ENV = "VLLM_MUSA_DEEPSEEK_V4_MHC_PRE_DECODE_PRENORM_IMPL"
-_MHC_WEIGHTED_RMSNORM_IMPL_ENV = "VLLM_MUSA_DEEPSEEK_V4_MHC_WEIGHTED_RMSNORM_IMPL"
 
 
 def mhc_pre_musa(
@@ -29,10 +27,10 @@ def mhc_pre_musa(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    impl = os.getenv("VLLM_MUSA_DEEPSEEK_V4_MHC_PRE_IMPL", "auto").lower()
-    auto_impl = impl == "auto"
-    if impl == "auto":
-        impl = _select_mhc_pre_auto_impl(residual)
+    # The shape-dispatched optimized provider is the production default.  The
+    # old implementation selector was only useful for A/B experiments and made
+    # the selected path depend on process-global environment state.
+    impl = _select_mhc_pre_auto_impl(residual)
     if impl in {"native", "musa", "mu"}:
         return _mhc_pre_native_provider(
             residual,
@@ -70,9 +68,7 @@ def mhc_pre_musa(
                 hc_post_mult_value,
                 sinkhorn_repeat,
             )
-        except (ImportError, OSError, NotImplementedError):
-            if not auto_impl:
-                raise
+        except (ImportError, OSError, NotImplementedError, RuntimeError):
             return _mhc_pre_native_provider(
                 residual,
                 fn,
@@ -85,17 +81,30 @@ def mhc_pre_musa(
                 sinkhorn_repeat,
             )
     if impl in {"deepgemm_big_fuse", "deepgemm-big-fuse"}:
-        return _mhc_pre_deepgemm_big_fuse_provider(
-            residual,
-            fn,
-            hc_scale,
-            hc_base,
-            rms_eps,
-            hc_pre_eps,
-            hc_sinkhorn_eps,
-            hc_post_mult_value,
-            sinkhorn_repeat,
-        )
+        try:
+            return _mhc_pre_deepgemm_big_fuse_provider(
+                residual,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+            )
+        except (ImportError, OSError, NotImplementedError, RuntimeError):
+            return _mhc_pre_native_provider(
+                residual,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+            )
     raise ValueError(f"unsupported DeepSeek-V4 MHC pre impl: {impl!r}")
 
 
@@ -129,21 +138,6 @@ def _try_mhc_weighted_rms_norm_musa(
     norm_weight: torch.Tensor,
     norm_eps: float,
 ) -> torch.Tensor | None:
-    impl = os.getenv(_MHC_WEIGHTED_RMSNORM_IMPL_ENV, "auto").strip().lower()
-    disabled_impls = {"", "0", "false", "off", "torch", "fallback"}
-    tilelang_impls = {"1", "true", "on", "tilelang", "jit", "musa"}
-    if impl in disabled_impls:
-        return None
-    if impl not in {"auto"} | tilelang_impls:
-        raise ValueError(
-            f"{_MHC_WEIGHTED_RMSNORM_IMPL_ENV} must be 'auto', one of "
-            "TileLang aliases ('tilelang', 'jit', 'musa', '1', 'true', "
-            "'on'), or one of torch/off aliases ('torch', 'fallback', "
-            "'off', '0', 'false', ''), "
-            f"got {impl!r}"
-        )
-
-    explicit_tilelang = impl in tilelang_impls
     hidden_size = x.shape[-1]
     threads = _mhc_weighted_rms_norm_threads(hidden_size)
     supported = (
@@ -158,29 +152,22 @@ def _try_mhc_weighted_rms_norm_musa(
         and threads is not None
     )
     if not supported:
-        if explicit_tilelang:
-            raise NotImplementedError(
-                "DeepSeek-V4 MHC TileLang weighted RMSNorm requires contiguous "
-                "MUSA bf16 x, contiguous bf16 norm_weight on the same device, "
-                "and hidden_size divisible by 64; got "
-                f"x_shape={tuple(x.shape)}, "
-                f"x_dtype={x.dtype}, x_device={x.device}, "
-                f"x_contiguous={x.is_contiguous()}, "
-                f"weight_shape={tuple(norm_weight.shape)}, "
-                f"weight_dtype={norm_weight.dtype}, "
-                f"weight_device={norm_weight.device}, "
-                f"weight_contiguous={norm_weight.is_contiguous()}"
-            )
         return None
 
     try:
         from vllm_musa.deepseek_v4_jit.tilelang_kernels import (
             mhc_weighted_rmsnorm_kernel,
+            mhc_weighted_rmsnorm_mudnn_like_kernel,
         )
 
         x_2d = x.view(-1, hidden_size)
         out_2d = torch.empty_like(x_2d)
-        mhc_weighted_rmsnorm_kernel(hidden_size, threads=threads)(
+        kernel_factory = (
+            mhc_weighted_rmsnorm_mudnn_like_kernel
+            if hidden_size == 4096
+            else mhc_weighted_rmsnorm_kernel
+        )
+        kernel_factory(hidden_size, threads=threads)(
             x_2d,
             norm_weight,
             out_2d,
@@ -188,8 +175,6 @@ def _try_mhc_weighted_rms_norm_musa(
         )
         return out_2d.view_as(x)
     except (ImportError, OSError, NotImplementedError, RuntimeError):
-        if explicit_tilelang:
-            raise
         return None
 
 
@@ -247,6 +232,29 @@ def mhc_fused_post_pre_musa(
     norm_eps: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     del n_splits, tile_n
+    fused_result = _try_mhc_fused_post_prenorm_musa(
+        x,
+        residual,
+        post_layer_mix,
+        comb_res_mix,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+    )
+    if fused_result is not None:
+        residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur = fused_result
+        layer_input_cur = _apply_optional_rms_norm(
+            layer_input_cur,
+            norm_weight,
+            norm_eps,
+        )
+        return residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur
+
     residual_cur = mhc_post_musa(x, residual, post_layer_mix, comb_res_mix)
     post_mix_cur, comb_mix_cur, layer_input_cur = mhc_pre_musa(
         residual_cur,
@@ -265,6 +273,162 @@ def mhc_fused_post_pre_musa(
         norm_eps,
     )
     return residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur
+
+
+def _try_mhc_fused_post_prenorm_musa(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    hc_mult = residual.shape[-2]
+    hidden_size = residual.shape[-1]
+    num_tokens = residual.numel() // (hc_mult * hidden_size)
+    hc_mult3 = hc_mult * (2 + hc_mult)
+    outer_shape = residual.shape[:-2]
+
+    supported = (
+        residual.device.type == "musa"
+        and 0 < num_tokens <= 16
+        and hc_mult == 4
+        and hidden_size == 4096
+        and x.device == residual.device
+        and post_layer_mix.device == residual.device
+        and comb_res_mix.device == residual.device
+        and fn.device == residual.device
+        and hc_scale.device == residual.device
+        and hc_base.device == residual.device
+        and x.dtype == torch.bfloat16
+        and residual.dtype == torch.bfloat16
+        and post_layer_mix.dtype == torch.float32
+        and comb_res_mix.dtype == torch.float32
+        and fn.dtype == torch.float32
+        and hc_scale.dtype == torch.float32
+        and hc_base.dtype == torch.float32
+        and x.is_contiguous()
+        and residual.is_contiguous()
+        and post_layer_mix.is_contiguous()
+        and comb_res_mix.is_contiguous()
+        and fn.is_contiguous()
+        and hc_scale.is_contiguous()
+        and hc_base.is_contiguous()
+        and x.shape == (*outer_shape, hidden_size)
+        and post_layer_mix.shape
+        in (
+            (*outer_shape, hc_mult, 1),
+            (*outer_shape, hc_mult),
+        )
+        and comb_res_mix.shape == (*outer_shape, hc_mult, hc_mult)
+        and fn.shape == (hc_mult3, hc_mult * hidden_size)
+        and hc_scale.shape == (3,)
+        and hc_base.shape == (hc_mult3,)
+    )
+    if not supported:
+        return None
+
+    residual_flat = residual.view(num_tokens, hc_mult, hidden_size)
+    x_flat = x.view(num_tokens, hidden_size)
+    post_flat = post_layer_mix.view(num_tokens, hc_mult)
+    comb_flat = comb_res_mix.view(num_tokens, hc_mult, hc_mult)
+    tile_n = 2 if num_tokens < 8 else 3
+    split_k = 8 if num_tokens < 8 else 4
+
+    residual_cur = torch.empty_like(residual_flat)
+    gemm_out_mul = torch.empty(
+        split_k,
+        num_tokens,
+        hc_mult3,
+        dtype=torch.float32,
+        device=residual.device,
+    )
+    gemm_out_sqrsum = torch.empty(
+        split_k,
+        num_tokens,
+        dtype=torch.float32,
+        device=residual.device,
+    )
+
+    from vllm_musa.deepseek_v4_jit.tilelang_kernels import (
+        mhc_fused_post_prenorm_kernel,
+        mhc_pre_big_fuse_decode_split_kernel,
+    )
+
+    mhc_fused_post_prenorm_kernel(
+        hidden_size,
+        n_out=hc_mult3,
+        threads=256,
+        tile_n=tile_n,
+        split_k=split_k,
+    )(
+        comb_flat,
+        residual_flat,
+        post_flat,
+        x_flat,
+        fn.view(hc_mult3, hc_mult, hidden_size),
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        residual_cur,
+    )
+
+    post_mix_cur = torch.empty(
+        num_tokens,
+        hc_mult,
+        dtype=torch.float32,
+        device=residual.device,
+    )
+    comb_mix_cur = torch.empty(
+        num_tokens,
+        hc_mult * hc_mult,
+        dtype=torch.float32,
+        device=residual.device,
+    )
+    layer_input_cur = torch.empty(
+        num_tokens,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device=residual.device,
+    )
+    threads, hidden_block, pass_config = _resolve_mhc_pre_big_fuse_config(
+        num_tokens,
+        split_k,
+    )
+    mhc_pre_big_fuse_decode_split_kernel(
+        hidden_size,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        n_splits=split_k,
+        hc_mult=hc_mult,
+        threads=threads,
+        hidden_block=hidden_block,
+        pass_config=pass_config,
+    )(
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        hc_scale,
+        hc_base,
+        residual_cur,
+        post_mix_cur,
+        comb_mix_cur,
+        layer_input_cur,
+    )
+
+    return (
+        residual_cur.view(*outer_shape, hc_mult, hidden_size),
+        post_mix_cur.view(*outer_shape, hc_mult, 1),
+        comb_mix_cur.view(*outer_shape, hc_mult, hc_mult),
+        layer_input_cur.view(*outer_shape, hidden_size),
+    )
 
 
 def _reshape_hc_head_input(
@@ -326,20 +490,10 @@ def hc_head_musa(
 
 
 def _select_mhc_pre_auto_impl(residual: torch.Tensor) -> str:
-    max_tilelang_tokens = int(
-        os.getenv("VLLM_MUSA_DEEPSEEK_V4_MHC_PRE_TILELANG_MAX_TOKENS", "16")
-    )
-    if max_tilelang_tokens <= 0:
-        return "native"
     hc_mult = residual.shape[-2]
     hidden_size = residual.shape[-1]
-    num_tokens = residual.numel() // (hc_mult * hidden_size)
-    if (
-        hc_mult == 4
-        and hidden_size in {4096, 7168}
-        and num_tokens <= max_tilelang_tokens
-    ):
-        return "tilelang"
+    if hc_mult == 4 and hidden_size in {4096, 7168}:
+        return "deepgemm_big_fuse"
     return "native"
 
 
@@ -483,17 +637,7 @@ def _select_mhc_pre_big_fuse_prenorm_impl(
     num_tokens: int,
     hc_hidden_size: int,
 ) -> str:
-    impl = os.getenv(_MHC_PRE_DECODE_PRENORM_IMPL_ENV, "deepgemm").strip().lower()
-    if impl in {"", "0", "false", "off", "deepgemm"}:
-        return "deepgemm"
-    if impl in {"1", "true", "on", "auto", "tilelang"}:
-        if hc_hidden_size == 16384 and num_tokens <= 64:
-            return "tilelang"
-        return "deepgemm"
-    raise ValueError(
-        f"{_MHC_PRE_DECODE_PRENORM_IMPL_ENV} must be one of "
-        "'deepgemm', 'tilelang', 'auto', '0', or '1', got {impl!r}"
-    )
+    return "deepgemm"
 
 
 def _mhc_prenorm_gemm_sqrsum_tilelang_decode_partials(
@@ -968,19 +1112,10 @@ def mhc_post_musa(
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
-    impl = os.getenv("VLLM_MUSA_DEEPSEEK_V4_MHC_POST_IMPL", "auto").lower()
-    if impl in {"auto", ""}:
-        try:
-            return _mhc_post_tilelang_provider(
-                x, residual, post_layer_mix, comb_res_mix
-            )
-        except (ImportError, OSError, NotImplementedError):
-            return mhc_post_torch_fallback(x, residual, post_layer_mix, comb_res_mix)
-    if impl in {"tilelang", "jit", "native", "musa", "mu"}:
+    try:
         return _mhc_post_tilelang_provider(x, residual, post_layer_mix, comb_res_mix)
-    if impl in {"torch", "fallback"}:
+    except (ImportError, OSError, NotImplementedError, RuntimeError):
         return mhc_post_torch_fallback(x, residual, post_layer_mix, comb_res_mix)
-    raise ValueError(f"unsupported DeepSeek-V4 MHC post impl: {impl!r}")
 
 
 def mhc_post_musa_fallback(

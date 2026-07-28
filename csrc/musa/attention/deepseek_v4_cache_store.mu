@@ -1,7 +1,5 @@
 #include <cmath>
 #include <cstdint>
-#include <cstdlib>
-#include <cstring>
 
 #include <musa_bf16.h>
 #include <musa_fp8.h>
@@ -24,8 +22,6 @@ constexpr int kQNormThreads = 256;
 
 constexpr int kIndexInt32 = 1;
 constexpr int kIndexInt64 = 2;
-constexpr const char* kFusedQKVInsertEnv =
-    "VLLM_MUSA_DEEPSEEK_V4_QNORM_ROPE_KV_INSERT_FUSED";
 
 __device__ __forceinline__ int64_t load_index(const void* ptr, int kind,
                                               int64_t idx) {
@@ -34,6 +30,16 @@ __device__ __forceinline__ int64_t load_index(const void* ptr, int kind,
   }
   return static_cast<int64_t>(static_cast<const int64_t*>(ptr)[idx]);
 }
+
+__device__ __forceinline__ float warp_reduce_max(float value) {
+  value = fmaxf(value, __shfl_xor_sync(0xffffffffu, value, 16));
+  value = fmaxf(value, __shfl_xor_sync(0xffffffffu, value, 8));
+  value = fmaxf(value, __shfl_xor_sync(0xffffffffu, value, 4));
+  value = fmaxf(value, __shfl_xor_sync(0xffffffffu, value, 2));
+  value = fmaxf(value, __shfl_xor_sync(0xffffffffu, value, 1));
+  return value;
+}
+
 
 __global__ void deepseek_v4_qnorm_rope_kernel(
     __mt_bfloat16* __restrict__ q, const void* __restrict__ positions,
@@ -252,11 +258,6 @@ int index_kind(const torch::Tensor& tensor) {
   TORCH_CHECK(false, "slot_mapping must be int32 or int64");
 }
 
-bool env_flag_enabled(const char* name) {
-  const char* value = std::getenv(name);
-  return value != nullptr && std::strcmp(value, "1") == 0;
-}
-
 __global__ void deepseek_v4_qnorm_rope_kv_pack_fused_kernel(
     __mt_bfloat16* __restrict__ q, const __mt_bfloat16* __restrict__ kv,
     uint8_t* __restrict__ cache, const void* __restrict__ slots,
@@ -271,8 +272,6 @@ __global__ void deepseek_v4_qnorm_rope_kv_pack_fused_kernel(
   }
 
   __shared__ float reduce[kQNormThreads];
-  __shared__ int scale_exponents[kTokenScaleBytes];
-
   const int tid = threadIdx.x;
   __mt_bfloat16* row = q + (token * num_heads + head) * kHeadDim;
 
@@ -328,57 +327,47 @@ __global__ void deepseek_v4_qnorm_rope_kv_pack_fused_kernel(
                        pos_in_block * kTokenScaleBytes;
   const __mt_bfloat16* input = kv + token * kHeadDim;
 
-  for (int qblock = 0; qblock < kNopeDim / kQuantBlockSize; ++qblock) {
-    const int64_t start = qblock * kQuantBlockSize;
-    if (tid < kQuantBlockSize) {
-      const float value = __bfloat162float(input[start + tid]);
-      reduce[tid] = fabsf(value);
-    }
-    __syncthreads();
-
-    for (int stride = kQuantBlockSize / 2; stride > 0; stride >>= 1) {
-      if (tid < stride) {
-        reduce[tid] = fmaxf(reduce[tid], reduce[tid + stride]);
-      }
-      __syncthreads();
-    }
-
-    if (tid == 0) {
-      const float amax = fmaxf(reduce[0], 1.0e-4f);
-      const int exponent =
-          static_cast<int>(ceilf(log2f(amax / 448.0f)));
-      scale_exponents[qblock] = exponent;
+  // One warp owns each 64-element FP8 group. The previous implementation
+  // processed the seven groups serially with a block-wide reduction and
+  // barriers for every group. Keep the same scale rule and cache layout while
+  // running all seven groups in parallel and using warp shuffles.
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  if (warp < kNopeDim / kQuantBlockSize) {
+    const int64_t start = static_cast<int64_t>(warp) * kQuantBlockSize;
+    const float x0 = __bfloat162float(input[start + lane * 2]);
+    const float x1 = __bfloat162float(input[start + lane * 2 + 1]);
+    const float amax =
+        fmaxf(warp_reduce_max(fmaxf(fabsf(x0), fabsf(x1))), 1.0e-4f);
+    const int exponent = static_cast<int>(ceilf(log2f(amax / 448.0f)));
+    const float inv_scale = exp2f(-exponent);
+    const float scaled0 = fminf(fmaxf(x0 * inv_scale, -448.0f), 448.0f);
+    const float scaled1 = fminf(fmaxf(x1 * inv_scale, -448.0f), 448.0f);
+    const __mt_fp8_e4m3 packed0(scaled0);
+    const __mt_fp8_e4m3 packed1(scaled1);
+    reinterpret_cast<uint16_t*>(token_ptr + start)[lane] =
+        static_cast<uint16_t>(packed0.__x) |
+        (static_cast<uint16_t>(packed1.__x) << 8);
+    if (lane == 0) {
       const int scale_byte = max(0, min(255, exponent + 127));
-      scale_ptr[qblock] = static_cast<uint8_t>(scale_byte);
+      scale_ptr[warp] = static_cast<uint8_t>(scale_byte);
     }
-    __syncthreads();
-
-    if (tid < kQuantBlockSize) {
-      const float value = __bfloat162float(input[start + tid]);
-      const float scaled = fminf(fmaxf(value * exp2f(-scale_exponents[qblock]),
-                                      -448.0f),
-                                448.0f);
-      const __mt_fp8_e4m3 packed(scaled);
-      token_ptr[start + tid] = packed.__x;
-    }
-    __syncthreads();
-  }
-
-  if (tid == 0) {
-    scale_ptr[kTokenScaleBytes - 1] = 0;
   }
 
   __mt_bfloat16* rope_ptr =
       reinterpret_cast<__mt_bfloat16*>(token_ptr + kNopeDim);
-  for (int64_t pair = tid; pair < kRopeDim / 2; pair += blockDim.x) {
-    const int64_t even_dim = kNopeDim + pair * 2;
+  if (warp == 7) {
+    if (lane == 0) {
+      scale_ptr[kTokenScaleBytes - 1] = 0;
+    }
+    const int64_t even_dim = kNopeDim + lane * 2;
     const int64_t odd_dim = even_dim + 1;
     const float even = __bfloat162float(input[even_dim]);
     const float odd = __bfloat162float(input[odd_dim]);
-    const float c = cos_ptr[pair];
-    const float s = sin_ptr[pair];
-    rope_ptr[pair * 2] = __float2bfloat16(even * c - odd * s);
-    rope_ptr[pair * 2 + 1] = __float2bfloat16(even * s + odd * c);
+    const float c = cos_ptr[lane];
+    const float s = sin_ptr[lane];
+    rope_ptr[lane * 2] = __float2bfloat16(even * c - odd * s);
+    rope_ptr[lane * 2 + 1] = __float2bfloat16(even * s + odd * c);
   }
 }
 
@@ -438,42 +427,20 @@ void deepseek_v4_qnorm_rope_kv_insert(
   const dim3 q_grid(static_cast<unsigned int>(q.size(0)),
                     static_cast<unsigned int>(q.size(1)));
   const dim3 q_block(kQNormThreads);
-  if (env_flag_enabled(kFusedQKVInsertEnv)) {
-    deepseek_v4_qnorm_rope_kv_pack_fused_kernel<<<q_grid, q_block, 0, stream>>>(
-        static_cast<__mt_bfloat16*>(q.data_ptr()),
-        static_cast<const __mt_bfloat16*>(kv.data_ptr()),
-        static_cast<uint8_t*>(kv_cache.data_ptr()), slot_mapping.data_ptr(),
-        index_kind(slot_mapping), positions.data_ptr(), index_kind(positions),
-        static_cast<const float*>(cos_sin_cache.data_ptr()),
-        static_cast<float>(eps), q.size(0), q.size(1), slot_mapping.numel(),
-        kv_cache.size(0), cache_block_size, kv_cache.stride(0));
-    const auto err = musaGetLastError();
-    TORCH_CHECK(err == musaSuccess,
-                "deepseek_v4_qnorm_rope_kv_pack_fused launch failed: ",
-                musaGetErrorString(err));
-    return;
-  }
-  deepseek_v4_qnorm_rope_kernel<<<q_grid, q_block, 0, stream>>>(
-      static_cast<__mt_bfloat16*>(q.data_ptr()), positions.data_ptr(),
-      index_kind(positions), static_cast<const float*>(cos_sin_cache.data_ptr()),
-      static_cast<float>(eps), q.size(0), q.size(1));
-  auto err = musaGetLastError();
-  TORCH_CHECK(err == musaSuccess, "deepseek_v4_qnorm_rope launch failed: ",
-              musaGetErrorString(err));
-
-  if (slot_mapping.numel() == 0) {
-    return;
-  }
-  const dim3 kv_grid(static_cast<unsigned int>(slot_mapping.numel()));
-  const dim3 kv_block(128);
-  deepseek_v4_kv_rope_pack_kernel<<<kv_grid, kv_block, 0, stream>>>(
+  // The fused q-norm/RoPE/KV-pack kernel is the validated DeepSeek-V4 path.
+  // Keep the fallback kernels available for source-level reuse, but do not
+  // make production behavior depend on an A/B-only process environment flag.
+  deepseek_v4_qnorm_rope_kv_pack_fused_kernel<<<q_grid, q_block, 0, stream>>>(
+      static_cast<__mt_bfloat16*>(q.data_ptr()),
       static_cast<const __mt_bfloat16*>(kv.data_ptr()),
       static_cast<uint8_t*>(kv_cache.data_ptr()), slot_mapping.data_ptr(),
       index_kind(slot_mapping), positions.data_ptr(), index_kind(positions),
-      static_cast<const float*>(cos_sin_cache.data_ptr()), slot_mapping.numel(),
+      static_cast<const float*>(cos_sin_cache.data_ptr()),
+      static_cast<float>(eps), q.size(0), q.size(1), slot_mapping.numel(),
       kv_cache.size(0), cache_block_size, kv_cache.stride(0));
-  err = musaGetLastError();
-  TORCH_CHECK(err == musaSuccess, "deepseek_v4_kv_rope_pack launch failed: ",
+  auto err = musaGetLastError();
+  TORCH_CHECK(err == musaSuccess,
+              "deepseek_v4_qnorm_rope_kv_pack_fused launch failed: ",
               musaGetErrorString(err));
 }
 

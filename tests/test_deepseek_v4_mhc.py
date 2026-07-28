@@ -60,9 +60,7 @@ def _stores_subscript(node: ast.AST, name: str) -> bool:
 def test_mhc_pre_defaults_to_auto_provider():
     source = _read("vllm_musa/deepseek_v4_mhc.py")
 
-    assert 'VLLM_MUSA_DEEPSEEK_V4_MHC_PRE_IMPL", "auto"' in source
     assert "def _select_mhc_pre_auto_impl(" in source
-    assert "VLLM_MUSA_DEEPSEEK_V4_MHC_PRE_TILELANG_MAX_TOKENS" in source
     assert "hidden_size in {4096, 7168}" in source
     assert "def _mhc_pre_native_provider(" in source
     assert "deepseek_v4_mhc_pre(" in source
@@ -71,8 +69,8 @@ def test_mhc_pre_defaults_to_auto_provider():
         "def _mhc_pre_tilelang_provider("
     )
     assert '"deepgemm_big_fuse"' in source
-    assert 'if impl == "auto":' in source
     assert "impl = _select_mhc_pre_auto_impl(residual)" in source
+    assert "VLLM_MUSA_DEEPSEEK_V4_MHC_PRE_IMPL" not in source
 
 
 def test_mhc_pre_custom_op_is_registered():
@@ -99,18 +97,15 @@ def test_fp8_einsum_fallback_validates_group_size_divisibility():
     assert '_validate_group_size_divisible("weight input", in_dim)' in source
 
 
-def test_mhc_pre_deepgemm_big_fuse_is_default_off():
+def test_mhc_pre_deepgemm_big_fuse_is_shape_selected_by_default():
     source = _read("vllm_musa/deepseek_v4_mhc.py")
 
     assert "def _mhc_pre_deepgemm_big_fuse_provider(" in source
-    assert "VLLM_MUSA_DEEPSEEK_V4_MHC_PRE_DECODE_PRENORM_IMPL" in source
     assert "VLLM_MUSA_DEEPSEEK_V4_MHC_PRE_DEEPGEMM_SPLIT_K" in source
     assert "VLLM_MUSA_DEEPSEEK_V4_MHC_PRE_BIG_FUSE_HIDDEN_BLOCK" in source
     assert "VLLM_MUSA_DEEPSEEK_V4_MHC_PRE_BIG_FUSE_PASS_CONFIG" in source
-    assert 'impl in {"deepgemm_big_fuse", "deepgemm-big-fuse"}' in source
     assert "return _mhc_pre_deepgemm_big_fuse_provider(" in source
-    assert 'return "native"' in source
-    assert 'return "deepgemm_big_fuse"' not in source
+    assert 'return "deepgemm_big_fuse"' in source
 
 
 def test_mhc_fused_post_pre_composes_musa_post_pre_and_norm():
@@ -121,34 +116,61 @@ def test_mhc_fused_post_pre_composes_musa_post_pre_and_norm():
     apply_norm = _function_node(source_tree, "_apply_optional_rms_norm")
     weighted_norm = _function_node(source_tree, "_try_mhc_weighted_rms_norm_musa")
     kernel_factory = _function_node(kernels_tree, "mhc_weighted_rmsnorm_kernel")
+    mudnn_like_factory = _function_node(
+        kernels_tree, "mhc_weighted_rmsnorm_mudnn_like_kernel"
+    )
     inner_kernel = _function_node(kernel_factory, "_kernel")
+    mudnn_like_inner = _function_node(mudnn_like_factory, "_kernel")
 
     assert "def mhc_fused_post_pre_musa(" in source
     assert "residual_cur = mhc_post_musa(" in source
     assert "post_mix_cur, comb_mix_cur, layer_input_cur = mhc_pre_musa(" in source
     assert "def _apply_optional_rms_norm(" in source
     assert "def _try_mhc_weighted_rms_norm_musa(" in source
-    assert "VLLM_MUSA_DEEPSEEK_V4_MHC_WEIGHTED_RMSNORM_IMPL" in source
+    assert "VLLM_MUSA_DEEPSEEK_V4_MHC_WEIGHTED_RMSNORM_IMPL" not in source
     assert "def mhc_weighted_rmsnorm_kernel(" in kernels
+    assert "def mhc_weighted_rmsnorm_mudnn_like_kernel(" in kernels
     assert _calls(apply_norm, "_try_mhc_weighted_rms_norm_musa")
     assert _loads_name(apply_norm, "norm_weight")
-    assert _calls(weighted_norm, "mhc_weighted_rmsnorm_kernel")
+    assert _loads_name(weighted_norm, "kernel_factory")
+    assert "mhc_weighted_rmsnorm_kernel" in source
+    assert "mhc_weighted_rmsnorm_mudnn_like_kernel" in source
     assert _calls(kernel_factory, "T.rsqrt")
     kernel_args = [arg.arg for arg in inner_kernel.args.args]
     assert len(kernel_args) == 4
     _, weight_arg, out_arg, _ = kernel_args
     assert _loads_name(inner_kernel, weight_arg)
     assert _stores_subscript(inner_kernel, out_arg)
+    assert _calls(mudnn_like_factory, "T.ieee_frsqrt")
+    mudnn_like_args = [arg.arg for arg in mudnn_like_inner.args.args]
+    assert len(mudnn_like_args) == 4
+    _, mudnn_weight_arg, mudnn_out_arg, _ = mudnn_like_args
+    assert _loads_name(mudnn_like_inner, mudnn_weight_arg)
+    assert _stores_subscript(mudnn_like_inner, mudnn_out_arg)
+
+
+def test_mhc_fused_post_prenorm_small_m_path_is_shape_bounded():
+    source = _read("vllm_musa/deepseek_v4_mhc.py")
+    kernels = _read("vllm_musa/deepseek_v4_jit/tilelang_kernels.py")
+
+    assert "def _try_mhc_fused_post_prenorm_musa(" in source
+    assert "num_tokens <= 16" in source
+    assert "hidden_size == 4096" in source
+    assert "tile_n = 2 if num_tokens < 8 else 3" in source
+    assert "split_k = 8 if num_tokens < 8 else 4" in source
+    assert "def mhc_fused_post_prenorm_kernel(" in kernels
+    assert "new_residual[row] = T.cast(" in kernels
+    assert "residual_out[token_id, row, hidden_idx]" in kernels
+    assert "out_partial[" in kernels
+    assert "sqrsum_partial[split_id, token_id]" in kernels
 
 
 def test_mhc_auto_paths_fall_back_when_tilelang_is_unavailable():
     source = _read("vllm_musa/deepseek_v4_mhc.py")
 
-    assert 'VLLM_MUSA_DEEPSEEK_V4_MHC_POST_IMPL", "auto"' in source
-    assert "except (ImportError, OSError, NotImplementedError):" in source
+    assert "except (ImportError, OSError, NotImplementedError, RuntimeError):" in source
     assert "return mhc_post_torch_fallback(" in source
     assert "return _mhc_pre_native_provider(" in source
-    assert "if not auto_impl:" in source
 
 
 def test_hc_head_musa_eager_path_preserves_token_dimensions():
@@ -166,16 +188,17 @@ def test_hc_head_musa_eager_path_preserves_token_dimensions():
     assert "return y.reshape(*token_shape, hidden_size).to(dtype)" in source
 
 
-def test_mhc_pre_decode_prenorm_tilelang_selector_is_default_off():
+def test_mhc_pre_decode_prenorm_uses_deepgemm_by_default():
     source = _read("vllm_musa/deepseek_v4_mhc.py")
 
-    assert "def _select_mhc_pre_big_fuse_prenorm_impl(" in source
-    assert 'os.getenv(_MHC_PRE_DECODE_PRENORM_IMPL_ENV, "deepgemm")' in source
-    assert 'impl in {"", "0", "false", "off", "deepgemm"}' in source
-    assert 'impl in {"1", "true", "on", "auto", "tilelang"}' in source
-    assert "hc_hidden_size == 16384 and num_tokens <= 64" in source
-    assert 'return "tilelang"' in source
-    assert 'return "deepgemm"' in source
+    selector = source[
+        source.index("def _select_mhc_pre_big_fuse_prenorm_impl(") : source.index(
+            "def _mhc_prenorm_gemm_sqrsum_tilelang_decode_partials("
+        )
+    ]
+    assert 'return "deepgemm"' in selector
+    assert 'return "tilelang"' not in selector
+    assert "VLLM_MUSA_DEEPSEEK_V4_MHC_PRE_DECODE_PRENORM_IMPL" not in source
 
 
 def test_mhc_pre_deepgemm_big_fuse_shape_guards_and_splitk():
