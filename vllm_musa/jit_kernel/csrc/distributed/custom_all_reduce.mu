@@ -32,31 +32,15 @@ namespace {
 #define SGL_CUSTOM_AR_MAX_BLOCKS 120
 #endif
 
-// SGLang MR413 TP2 fast paths, adapted to the vLLM raw/no-raw ABI.
-#ifndef VLLM_MUSA_FUSED_AR_TP2_REGCACHE
-#define VLLM_MUSA_FUSED_AR_TP2_REGCACHE 1
-#endif
-
-#ifndef VLLM_MUSA_FUSED_AR_TP2_VEC2RANK
-#define VLLM_MUSA_FUSED_AR_TP2_VEC2RANK 1
-#endif
-
 // Limit the TP4 rows=64, hidden=2048 fused two-shot grid to 32 blocks. The
 // grid-stride loops still cover all rows while halving block-indexed cross-rank
 // synchronization groups relative to the generic 64-block launch.
-#ifndef VLLM_MUSA_FUSED_AR_TP4_BS64_2SHOT_BLOCK_CAP
-#define VLLM_MUSA_FUSED_AR_TP4_BS64_2SHOT_BLOCK_CAP 32
-#endif
-
 constexpr int kMaxBlocks = SGL_CUSTOM_AR_MAX_BLOCKS;
 constexpr int kMaxThreadsPerBlock = 1024;
 constexpr int kDefaultThreads = SGL_CUSTOM_AR_THREADS;
 constexpr int kDefaultBlockLimit = SGL_CUSTOM_AR_BLOCKS;
+constexpr int kTp4Rows64TwoShotBlockLimit = 32;
 constexpr int kMaxRanks = 8;
-static_assert(
-    VLLM_MUSA_FUSED_AR_TP4_BS64_2SHOT_BLOCK_CAP == 32 ||
-        VLLM_MUSA_FUSED_AR_TP4_BS64_2SHOT_BLOCK_CAP == 64,
-    "TP4 BS64 fused two-shot block cap must be 32 or 64");
 using FlagType = uint32_t;
 
 template <int nranks>
@@ -64,10 +48,7 @@ inline int fused_ar_rmsnorm_2shot_blocks(int rows, int hidden) {
   int blocks = std::min(rows, kMaxBlocks);
   if constexpr (nranks == 4) {
     if (rows == 64 && hidden == 2048) {
-      blocks = std::min(
-          blocks,
-          static_cast<int>(
-              VLLM_MUSA_FUSED_AR_TP4_BS64_2SHOT_BLOCK_CAP));
+      blocks = std::min(blocks, kTp4Rows64TwoShotBlockLimit);
     }
   }
   return blocks;
@@ -546,17 +527,17 @@ __device__ __forceinline__ float load_weight_scalar<float>(const float* weight, 
   return weight[idx];
 }
 
-// Direct TP2 one-stage kernel adapted from SGLang MR413.  It keeps the reduced
-// or residual value in registers across the RMS reduction, avoiding the
-// second global read in the generic vLLM kernel.  MR413 compiles one vec8 lane
-// per thread for both TP2 h2048 vec2rank and non-power-of-two h5120 regcache.
+// Direct TP2 one-stage kernel. It keeps the reduced or residual value in
+// registers across the RMS reduction, avoiding the second global read in the
+// generic vLLM kernel. The specialized path uses one vec8 lane per thread for
+// both TP2 h2048 vector-rank and non-power-of-two h5120 register-cache cases.
 template <
     typename T,
     typename WT,
     bool HasResidual,
     bool WriteReduced>
 __global__ void __launch_bounds__(kMaxThreadsPerBlock, 1)
-fused_ar_rmsnorm_tp2_mr413_kernel(
+fused_ar_rmsnorm_tp2_specialized_kernel(
     RankData data,
     const RankData* device_data,
     RankSignals sg,
@@ -574,7 +555,7 @@ fused_ar_rmsnorm_tp2_mr413_kernel(
     data = *device_data;
   }
   using P = typename packed_t<T>::P;
-  static_assert(P::size == 8, "MR413 TP2 fused path expects 8 values per pack");
+  static_assert(P::size == 8, "specialized TP2 fused path expects 8 values per pack");
   extern __shared__ float warp_sums[];
   const int tid = static_cast<int>(threadIdx.x);
   const int packed_hidden = hidden / P::size;
@@ -645,7 +626,7 @@ fused_ar_rmsnorm_tp2_mr413_kernel(
 }
 
 template <typename T, typename WT, bool HasResidual, bool WriteReduced>
-bool launch_fused_ar_rmsnorm_tp2_mr413(
+bool launch_fused_ar_rmsnorm_tp2_specialized(
     RankData data,
     const RankData* device_data,
     RankSignals sg,
@@ -664,37 +645,33 @@ bool launch_fused_ar_rmsnorm_tp2_mr413(
     return false;
   }
 
-#if VLLM_MUSA_FUSED_AR_TP2_VEC2RANK
   if (hidden == 2048 && rows <= 128) {
-    // Match MR413's TP2 h2048 compile config: one vec8 lane per thread
-    // (2048 / 8 == 256 threads), not the generic 512-thread module.
+    // Use one vec8 lane per thread (2048 / 8 == 256 threads), rather than the
+    // generic 512-thread module.
     constexpr int threads = 2048 / 8;
     const int blocks = std::min(kMaxBlocks, rows);
     const size_t smem_bytes =
         static_cast<size_t>((threads + 31) / 32) * sizeof(float);
-    fused_ar_rmsnorm_tp2_mr413_kernel<
+    fused_ar_rmsnorm_tp2_specialized_kernel<
         T, WT, HasResidual, WriteReduced>
         <<<blocks, threads, smem_bytes, stream>>>(
             data, device_data, sg, self_sg, residual, weight, norm_out,
             residual_out, reduced, rank, rows, hidden, eps);
     return true;
   }
-#endif
 
-#if VLLM_MUSA_FUSED_AR_TP2_REGCACHE
   if (hidden == 5120 && rows <= 128) {
     constexpr int threads = 5120 / 8;
     const int blocks = std::min(kMaxBlocks, rows);
     const size_t smem_bytes =
         static_cast<size_t>((threads + 31) / 32) * sizeof(float);
-    fused_ar_rmsnorm_tp2_mr413_kernel<
+    fused_ar_rmsnorm_tp2_specialized_kernel<
         T, WT, HasResidual, WriteReduced>
         <<<blocks, threads, smem_bytes, stream>>>(
             data, device_data, sg, self_sg, residual, weight, norm_out,
             residual_out, reduced, rank, rows, hidden, eps);
     return true;
   }
-#endif
 
   return false;
 }
@@ -1356,7 +1333,7 @@ void launch_fused_ar_rmsnorm(
   TVM_FFI_ICHECK_LE(packed_size64, static_cast<int64_t>(std::numeric_limits<int32_t>::max()));
   if (shot == 1) {
     if constexpr (nranks == 2) {
-      if (launch_fused_ar_rmsnorm_tp2_mr413<T, WT, false, true>(
+      if (launch_fused_ar_rmsnorm_tp2_specialized<T, WT, false, true>(
               data,
               device_data,
               sg,
@@ -1467,7 +1444,7 @@ void launch_fused_ar_residual_rmsnorm(
   TVM_FFI_ICHECK_LE(packed_size64, static_cast<int64_t>(std::numeric_limits<int32_t>::max()));
   if (shot == 1) {
     if constexpr (nranks == 2) {
-      if (launch_fused_ar_rmsnorm_tp2_mr413<T, WT, true, true>(
+      if (launch_fused_ar_rmsnorm_tp2_specialized<T, WT, true, true>(
               data,
               device_data,
               sg,
@@ -1579,7 +1556,7 @@ void launch_fused_ar_residual_rmsnorm_no_raw(
   TVM_FFI_ICHECK_LE(packed_size64, static_cast<int64_t>(std::numeric_limits<int32_t>::max()));
   if (shot == 1) {
     if constexpr (nranks == 2) {
-      if (launch_fused_ar_rmsnorm_tp2_mr413<T, WT, true, false>(
+      if (launch_fused_ar_rmsnorm_tp2_specialized<T, WT, true, false>(
               data,
               device_data,
               sg,

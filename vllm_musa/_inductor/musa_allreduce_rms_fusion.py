@@ -20,6 +20,7 @@ graphs and residual output for residual graphs.
 
 from __future__ import annotations
 
+import logging
 import operator
 from typing import Any
 
@@ -51,14 +52,13 @@ logger = init_logger(__name__)
 
 
 def _rms_input_weight_supported_dtype(match: pm.Match) -> bool:
-    """Allow RMSNorm weights supported by unfused Qwen3.5/Gemma semantics.
+    """Allow RMSNorm weight dtypes supported by the unfused semantics.
 
     vllm.ir.ops.rms_norm upcasts activations to fp32 and multiplies in the
-    weight dtype before casting the output back to the activation dtype. Qwen3.5
-    uses GemmaRMSNorm, whose native path intentionally passes fp32 weights, so
+    weight dtype before casting the output back to the activation dtype, so
     input/weight dtype equality is not a semantic requirement. Keep this check
-    limited to fused-kernel capability: fp16/bf16 activations with either same
-    dtype or fp32 weights.
+    limited to fused-kernel capability: fp16/bf16 activations with either the
+    same dtype or fp32 weights.
     """
     for node in match.nodes:
         if node.op != "call_function":
@@ -265,10 +265,6 @@ class MusaAllReduceRMSNormFusionPass(VllmPatternMatcherPass):
         super().__init__(config)
         self.disabled = True
         self.max_token_num: int | None = None
-        self.debug_enabled = (
-            musa_envs.VLLM_MUSA_FUSED_AR_RMSNORM_DEBUG.get()
-        )
-
         if not current_platform.is_musa():
             return
 
@@ -492,7 +488,7 @@ class MusaAllReduceRMSNormFusionPass(VllmPatternMatcherPass):
     def _log_candidate_pattern_counts(
         self, graph: fx.Graph, *, stage: str, record_totals: bool
     ) -> None:
-        if not self.debug_enabled:
+        if not logger.isEnabledFor(logging.DEBUG):
             return
         car_nodes, fused_nodes, direct, add, fused_add = self._collect_candidates(
             graph
@@ -516,7 +512,7 @@ class MusaAllReduceRMSNormFusionPass(VllmPatternMatcherPass):
             f'{car.name}->{fused_node.name}'
             for car, fused_node in fused_add[:4]
         ]
-        logger.warning(
+        logger.debug(
             'MUSA CAR-RMSNorm candidates %s fusion pass #%d: '
             'car=%d fused_ar_rms=%d direct_car_rmsnorm=%d '
             'add_car_rmsnorm=%d fused_add_car_rmsnorm=%d other_car=%d; '
@@ -538,10 +534,8 @@ class MusaAllReduceRMSNormFusionPass(VllmPatternMatcherPass):
             cls._candidate_total_fused_add,
             examples,
         )
-        if not self.debug_enabled:
-            return
         for idx, fused in enumerate(fused_nodes):
-            logger.warning(
+            logger.debug(
                 'MUSA CAR-RMSNorm fused node %s pass #%d idx=%d fused={%s}',
                 stage,
                 pass_id,
@@ -549,7 +543,7 @@ class MusaAllReduceRMSNormFusionPass(VllmPatternMatcherPass):
                 self._node_debug(fused),
             )
         for idx, (car, rms) in enumerate(direct):
-            logger.warning(
+            logger.debug(
                 'MUSA CAR-RMSNorm direct candidate %s pass #%d idx=%d car={%s} rms={%s}',
                 stage,
                 pass_id,
@@ -558,7 +552,7 @@ class MusaAllReduceRMSNormFusionPass(VllmPatternMatcherPass):
                 self._node_debug(rms),
             )
         for idx, (car, add_node, rms) in enumerate(add):
-            logger.warning(
+            logger.debug(
                 'MUSA CAR-RMSNorm add candidate %s pass #%d idx=%d car={%s} add={%s} rms={%s}',
                 stage,
                 pass_id,
@@ -568,7 +562,7 @@ class MusaAllReduceRMSNormFusionPass(VllmPatternMatcherPass):
                 self._node_debug(rms),
             )
         for idx, (car, fused_add_node) in enumerate(fused_add):
-            logger.warning(
+            logger.debug(
                 'MUSA CAR-RMSNorm fused-add candidate %s pass #%d idx=%d '
                 'car={%s} fused_add={%s}',
                 stage,
@@ -656,8 +650,8 @@ class MusaAllReduceRMSNormFusionPass(VllmPatternMatcherPass):
 
             # vLLM 0.24 lowers add + RMSNorm to a two-output IR node:
             # fused_add_rms_norm(CAR, residual, weight, eps) -> (rms, residual).
-            # Keep the proven 0.22 SGLang-port raw/no-raw user routing and only
-            # adapt how this combined node's inputs and outputs are accessed.
+            # Keep the raw/no-raw user routing and adapt only how this combined
+            # node's inputs and outputs are accessed.
             rewrote_fused_add = False
             fused_add_users = [
                 user

@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import ast
+import os
+import runpy
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).parents[1]
@@ -20,17 +23,35 @@ FUSED_OPS = ROOT / "vllm_musa/fused_allreduce_rmsnorm_ops.py"
 FUSION_PASS = ROOT / "vllm_musa/_inductor/musa_allreduce_rms_fusion.py"
 
 
-def test_registered_graph_flag_is_opt_in() -> None:
+def test_fused_path_defaults_on_with_independent_fallback_gates() -> None:
     source = ENVIRON.read_text()
     assert (
-        "VLLM_MUSA_FUSED_AR_RMSNORM_GRAPH_REGISTERED_INPUT = "
-        "EnvBool(False)"
-    ) in source
+        "VLLM_MUSA_FUSED_AR_RMSNORM = EnvBool(True)"
+        in source
+    )
     assert (
-        "VLLM_MUSA_FUSED_AR_RMSNORM_GRAPH_REGISTERED_INPUT_MAX_BYTES "
-        "= EnvInt("
+        "VLLM_MUSA_FUSED_AR_RMSNORM_GRAPH_REGISTERED_INPUT = "
+        "EnvBool(True)"
     ) in source
-    assert "512 * 1024" in source
+    assert "VLLM_MUSA_FUSED_AR_RMSNORM_DEBUG" not in source
+    assert "GRAPH_REGISTERED_INPUT_MAX_BYTES = EnvInt" not in source
+
+
+def test_fused_path_gates_can_be_disabled_independently() -> None:
+    namespace = runpy.run_path(str(ENVIRON))
+    envs = namespace["envs"]
+    fused = envs.VLLM_MUSA_FUSED_AR_RMSNORM
+    registered = envs.VLLM_MUSA_FUSED_AR_RMSNORM_GRAPH_REGISTERED_INPUT
+
+    with patch.dict(os.environ, {}, clear=True):
+        assert fused.get() is True
+        assert registered.get() is True
+        with fused.override(False):
+            assert fused.get() is False
+            assert registered.get() is True
+        with registered.override(False):
+            assert fused.get() is True
+            assert registered.get() is False
 
 
 def test_fusion_uses_one_canonical_feature_gate() -> None:
@@ -45,12 +66,11 @@ def test_fusion_uses_one_canonical_feature_gate() -> None:
     assert "VLLM_MUSA_FUSED_ALLREDUCE_RMSNORM" not in fusion_source
 
 
-def test_python_registered_path_is_syntax_valid_and_sglang_independent() -> None:
+def test_python_registered_path_is_syntax_valid_and_dependency_free() -> None:
     comm_source = COMM.read_text()
     launcher_source = LAUNCHER.read_text()
     ast.parse(comm_source)
     ast.parse(launcher_source)
-    assert "sglang" not in comm_source.lower()
     assert "_register_graph_inputs()" in comm_source
     assert "capture_succeeded" in comm_source
     assert "torch.get_device_module().is_current_stream_capturing()" in comm_source
@@ -76,12 +96,10 @@ def test_fused_kernel_copy_is_cpu_rank_data_only() -> None:
     ) == 3
 
 
-def test_sglang_mr413_tp2_fast_paths_preserve_vllm_abis() -> None:
+def test_tp2_specialized_fast_paths_preserve_vllm_abis() -> None:
     source = KERNEL.read_text()
-    assert "fused_ar_rmsnorm_tp2_mr413_kernel" in source
-    assert source.count("launch_fused_ar_rmsnorm_tp2_mr413<T, WT,") == 3
-    assert "VLLM_MUSA_FUSED_AR_TP2_REGCACHE" in source
-    assert "VLLM_MUSA_FUSED_AR_TP2_VEC2RANK" in source
+    assert "fused_ar_rmsnorm_tp2_specialized_kernel" in source
+    assert source.count("launch_fused_ar_rmsnorm_tp2_specialized<T, WT,") == 3
     assert "hidden == 5120 && rows <= 128" in source
     assert "hidden == 2048 && rows <= 128" in source
     assert "load_weight_scalar<WT>" in source
@@ -149,21 +167,11 @@ def test_no_raw_one_shot_matches_raw_dtype_rounding_order() -> None:
     )
 
 
-def test_tp4_rows64_two_shot_defaults_to_cap32() -> None:
+def test_tp4_rows64_two_shot_uses_bounded_block_count() -> None:
     launcher_source = LAUNCHER.read_text()
     kernel_source = KERNEL.read_text()
-    assert (
-        '"VLLM_MUSA_FUSED_AR_TP4_BS64_2SHOT_BLOCK_CAP",\n'
-        '            "32",'
-    ) in launcher_source
-    assert "f\"_tp4bs64bc{tp4_bs64_2shot_block_cap}\"" in launcher_source
-    assert (
-        "-DVLLM_MUSA_FUSED_AR_TP4_BS64_2SHOT_BLOCK_CAP="
-    ) in launcher_source
-    assert (
-        "#define VLLM_MUSA_FUSED_AR_TP4_BS64_2SHOT_BLOCK_CAP 32"
-        in kernel_source
-    )
+    assert "kTp4Rows64TwoShotBlockLimit = 32" in kernel_source
+    assert "tp4bs64bc" not in launcher_source
     assert "if constexpr (nranks == 4)" in kernel_source
     assert "if (rows == 64 && hidden == 2048)" in kernel_source
     assert (
@@ -172,3 +180,20 @@ def test_tp4_rows64_two_shot_defaults_to_cap32() -> None:
         )
         == 3
     )
+
+
+def test_registered_graph_input_has_a_fixed_staging_boundary() -> None:
+    comm_source = COMM.read_text()
+    assert "_GRAPH_REGISTERED_INPUT_MAX_BYTES = 512 * 1024" in comm_source
+    assert (
+        "tensor.numel() * tensor.element_size()\n"
+        "            <= self._GRAPH_REGISTERED_INPUT_MAX_BYTES"
+    ) in comm_source
+    assert "_graph_registered_input_enabled" in comm_source
+
+
+def test_launcher_has_no_external_kernel_tuning_controls() -> None:
+    source = LAUNCHER.read_text()
+    assert "import os" not in source
+    assert "os.environ" not in source
+    assert "return threads, blocks, 0, 1, max(120, blocks)" in source

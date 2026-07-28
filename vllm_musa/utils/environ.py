@@ -86,27 +86,14 @@ class EnvBool(EnvField):
         raise ValueError(f'"{value}" is not a valid boolean value')
 
 
-class EnvInt(EnvField):
-    def parse(self, value: str) -> int:
-        return int(value)
-
-
 class Envs:
     VLLM_MUSA_CUSTOM_OP_USE_NATIVE = EnvBool(False)
     VLLM_MUSA_FUSED_ADD_RMSNORM = EnvBool(True)
-    # Enable the MUSA CAR-RMSNorm graph rewrite and fused runtime path.
-    VLLM_MUSA_FUSED_AR_RMSNORM = EnvBool(False)
-    # Opt in to exchanging Graph-input IPC handles. Eager execution and the
-    # default Graph path keep using the fixed staging buffer.
-    VLLM_MUSA_FUSED_AR_RMSNORM_GRAPH_REGISTERED_INPUT = EnvBool(False)
-    # Direct graph-input IPC was faster through 512 KiB and regressed at
-    # 640/960 KiB in paired TP2 tests; larger inputs keep the staging path.
-    VLLM_MUSA_FUSED_AR_RMSNORM_GRAPH_REGISTERED_INPUT_MAX_BYTES = EnvInt(
-        512 * 1024
-    )
-    # Opt-in detailed graph-candidate diagnostics for CAR-RMSNorm fusion.
-    # Keep disabled by default so normal inference has no per-node log volume.
-    VLLM_MUSA_FUSED_AR_RMSNORM_DEBUG = EnvBool(False)
+    # Enable the MUSA custom all-reduce and RMSNorm fused path.
+    VLLM_MUSA_FUSED_AR_RMSNORM = EnvBool(True)
+    # Use registered graph inputs when eligible. Explicitly disabling this
+    # option keeps the fused path and uses the staging-buffer fallback.
+    VLLM_MUSA_FUSED_AR_RMSNORM_GRAPH_REGISTERED_INPUT = EnvBool(True)
     VLLM_MUSA_ENABLE_JIT_TOPK = EnvBool(True)
     VLLM_MUSA_SEEDED_MULTINOMIAL = EnvBool(True)
     VLLM_MUSA_RESHAPE_CACHE_FLASH = EnvBool(True)
