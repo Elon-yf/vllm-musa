@@ -21,6 +21,9 @@ _MATE_GDN_PREFILL_HAS_OUTPUT = (
 _MATE_GDN_PREFILL_HAS_IS_LOG_SPACE = (
     "is_log_space" in inspect.signature(chunk_gated_delta_rule).parameters
 )
+_MATE_GDN_DECODE_HAS_OUTPUT = (
+    "output" in inspect.signature(gated_delta_rule_decode).parameters
+)
 
 
 def _log_once(method_name: str, message: str, *args) -> None:
@@ -172,8 +175,9 @@ class MusaQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         from vllm.model_executor.layers.mamba.mamba_utils import (
             is_conv_state_dim_first,
         )
-        from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
-            causal_conv1d_update,
+
+        from vllm_musa.jit_kernel.tilelang.causal_conv1d import (
+            musa_tilelang_causal_conv1d_update,
         )
 
         non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
@@ -199,15 +203,33 @@ class MusaQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             self.conv1d.weight.size(0),
             self.conv1d.weight.size(2),
         )
-        mixed_qkv = causal_conv1d_update(
+        # The upstream wrapper casts BF16 activations to the FP32 cache dtype
+        # and casts the result back.  The MUSA kernel accepts those dtypes
+        # directly; keep the upstream path as a structural fallback.
+        mixed_qkv_tilelang = musa_tilelang_causal_conv1d_update(
             mixed_qkv,
             conv_state,
             conv_weights,
             self.conv1d.bias,
             self.activation,
             conv_state_indices=state_indices,
-            validate_data=False,
         )
+        if mixed_qkv_tilelang is None:
+            from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
+                causal_conv1d_update,
+            )
+
+            mixed_qkv = causal_conv1d_update(
+                mixed_qkv,
+                conv_state,
+                conv_weights,
+                self.conv1d.bias,
+                self.activation,
+                conv_state_indices=state_indices,
+                validate_data=False,
+            )
+        else:
+            mixed_qkv = mixed_qkv_tilelang
 
         # MUSA: mate's decode kernel reads q/k/v from strided views; split the
         # packed qkv without materializing contiguous copies.
@@ -240,44 +262,54 @@ class MusaQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 if _musa_sep and ssm_state.is_contiguous():
                     # MUSA: separate contiguous mamba pool -> mate decodes in
                     # place (block b at b*state_numel); no gather/scatter copy.
-                    output, _ = gated_delta_rule_decode(
-                        q=query,
-                        k=key,
-                        v=value,
-                        state=ssm_state,
-                        state_layout="VK",
-                        state_indices=state_indices,
-                        scale=self.head_k_dim**-0.5,
-                        A_log=self._gdn_A_log_f32(),
-                        a=a.view(num_decode_tokens, 1, -1),
-                        dt_bias=self._gdn_dt_bias_f32(),
-                        b=b.view(num_decode_tokens, 1, -1),
-                        output=_out_view,
-                        disable_state_update=False,
-                        use_qk_l2norm=True,
-                    )
+                    mate_kwargs = {
+                        "q": query,
+                        "k": key,
+                        "v": value,
+                        "state": ssm_state,
+                        "state_layout": "VK",
+                        "state_indices": state_indices,
+                        "scale": self.head_k_dim**-0.5,
+                        "A_log": self._gdn_A_log_f32(),
+                        "a": a.view(num_decode_tokens, 1, -1),
+                        "dt_bias": self._gdn_dt_bias_f32(),
+                        "b": b.view(num_decode_tokens, 1, -1),
+                        "disable_state_update": False,
+                        "use_qk_l2norm": True,
+                    }
+                    if _MATE_GDN_DECODE_HAS_OUTPUT:
+                        mate_kwargs["output"] = _out_view
+                    output, _ = gated_delta_rule_decode(**mate_kwargs)
                     _log_once(
                         "info",
                         "MUSA GDN mate in-place decode active (separate pool)",
                     )
                 else:
                     active_state = ssm_state[state_indices]
-                    output, updated_state = gated_delta_rule_decode(
-                        q=query,
-                        k=key,
-                        v=value,
-                        state=active_state,
-                        state_layout="VK",
-                        scale=self.head_k_dim**-0.5,
-                        A_log=self._gdn_A_log_f32(),
-                        a=a.view(num_decode_tokens, 1, -1),
-                        dt_bias=self._gdn_dt_bias_f32(),
-                        b=b.view(num_decode_tokens, 1, -1),
-                        output=_out_view,
-                        disable_state_update=False,
-                        use_qk_l2norm=True,
-                    )
+                    mate_kwargs = {
+                        "q": query,
+                        "k": key,
+                        "v": value,
+                        "state": active_state,
+                        "state_layout": "VK",
+                        "scale": self.head_k_dim**-0.5,
+                        "A_log": self._gdn_A_log_f32(),
+                        "a": a.view(num_decode_tokens, 1, -1),
+                        "dt_bias": self._gdn_dt_bias_f32(),
+                        "b": b.view(num_decode_tokens, 1, -1),
+                        "disable_state_update": False,
+                        "use_qk_l2norm": True,
+                    }
+                    if _MATE_GDN_DECODE_HAS_OUTPUT:
+                        mate_kwargs["output"] = _out_view
+                    output, updated_state = gated_delta_rule_decode(**mate_kwargs)
                     ssm_state[state_indices] = updated_state
+                if not _MATE_GDN_DECODE_HAS_OUTPUT:
+                    core_attn_out[:num_decode_tokens] = output.view(
+                        num_decode_tokens,
+                        self.num_v_heads // self.tp_size,
+                        self.head_v_dim,
+                    )
                 return True
             except Exception as e:
                 _log_once(

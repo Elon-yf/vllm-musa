@@ -8,12 +8,18 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
+from vllm.logger import init_logger
 from vllm.utils.torch_utils import direct_register_custom_op
 
-from vllm.logger import init_logger
 from vllm_musa.jit_kernel.csrc import allreduce as jit_ar
 
 logger = init_logger(__name__)
+_INT32_MAX = (1 << 31) - 1
+
+
+_MAX_GRAPH_RANK_DATA_BYTES = 8 * 1024 * 1024
+_MAX_RANKS = 8
+_MU_POINTER_ATTRIBUTE_RANGE_START_ADDR = 11
 
 
 cudaError_t = ctypes.c_int
@@ -108,6 +114,57 @@ class _MusaRTLibrary:
         self.check(self.funcs["cudaIpcCloseMemHandle"](ptr))
 
 
+class _MusaDriverLibrary:
+    _exported_functions = (
+        _Function(
+            "muPointerGetAttribute",
+            ctypes.c_int,
+            [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint64],
+        ),
+        _Function(
+            "muGetErrorString",
+            ctypes.c_int,
+            [ctypes.c_int, ctypes.POINTER(ctypes.c_char_p)],
+        ),
+    )
+    _library_cache: dict[str, Any] = {}
+    _func_cache: dict[str, dict[str, Any]] = {}
+
+    def __init__(self, so_file: str = "libmusa.so") -> None:
+        if so_file not in self._library_cache:
+            self._library_cache[so_file] = ctypes.CDLL(so_file)
+        self.lib = self._library_cache[so_file]
+
+        if so_file not in self._func_cache:
+            funcs: dict[str, Any] = {}
+            for func in self._exported_functions:
+                f = getattr(self.lib, func.name)
+                f.restype = func.restype
+                f.argtypes = func.argtypes
+                funcs[func.name] = f
+            self._func_cache[so_file] = funcs
+        self.funcs = self._func_cache[so_file]
+
+    def check(self, result: int) -> None:
+        if result == 0:
+            return
+        error = ctypes.c_char_p()
+        self.funcs["muGetErrorString"](result, ctypes.byref(error))
+        message = error.value.decode() if error.value is not None else "unknown"
+        raise RuntimeError(f"MUSA driver error {result}: {message}")
+
+    def allocation_base(self, pointer: int) -> int:
+        base = ctypes.c_uint64()
+        self.check(
+            self.funcs["muPointerGetAttribute"](
+                ctypes.byref(base),
+                _MU_POINTER_ATTRIBUTE_RANGE_START_ADDR,
+                ctypes.c_uint64(pointer),
+            )
+        )
+        return int(base.value)
+
+
 _COMM_REGISTRY: dict[int, Any] = {}
 _NEXT_COMM_ID = 0
 
@@ -127,9 +184,7 @@ def _musa_jit_custom_all_reduce(input: torch.Tensor, comm_id: int) -> torch.Tens
     return comm._custom_all_reduce_impl(input)
 
 
-def _musa_jit_custom_all_reduce_fake(
-    input: torch.Tensor, comm_id: int
-) -> torch.Tensor:
+def _musa_jit_custom_all_reduce_fake(input: torch.Tensor, comm_id: int) -> torch.Tensor:
     return torch.empty_like(input)
 
 
@@ -236,6 +291,13 @@ class _MusaJitCustomAllreduceImpl:
         self.buffer_ptrs: list[int] = []
         self.buffer_opened_ipc_ptrs: list[int] = []
         self.buffer_rank_data: torch.Tensor | None = None
+        self.graph_rank_data: torch.Tensor | None = None
+        self._pending_graph_inputs: list[torch.Tensor] = []
+        self._graph_input_refs: list[torch.Tensor] = []
+        self._graph_local_handles: dict[int, bytes] = {}
+        self._graph_peer_bases: dict[tuple[int, bytes], int] = {}
+        self._graph_opened_ptrs: list[int] = []
+        self._next_graph_slot = 0
 
         if isinstance(device, int):
             device = torch.device(f"musa:{device}")
@@ -257,9 +319,7 @@ class _MusaJitCustomAllreduceImpl:
 
         try:
             meta_bytes = jit_ar.meta_size(self.world_size)
-            meta_buffer = _make_shared_buffer(
-                meta_bytes + self.max_size, group=group
-            )
+            meta_buffer = _make_shared_buffer(meta_bytes + self.max_size, group=group)
             self.meta_ptrs = meta_buffer.pointers
             self.meta_opened_ipc_ptrs = meta_buffer.opened_ipc_ptrs
             buffer = _make_shared_buffer(self.max_size, group=group)
@@ -299,6 +359,14 @@ class _MusaJitCustomAllreduceImpl:
         self.signal_ptrs_cpu = torch.tensor(self.meta_ptrs, dtype=torch.int64)
         buffer_ptrs = self.buffer_ptrs + [0] * (8 - self.world_size)
         self.buffer_rank_data = torch.tensor(buffer_ptrs, dtype=torch.int64)
+        graph_slots = _MAX_GRAPH_RANK_DATA_BYTES // (
+            _MAX_RANKS * torch.tensor([], dtype=torch.int64).element_size()
+        )
+        self.graph_rank_data = torch.zeros(
+            (graph_slots, _MAX_RANKS),
+            dtype=torch.int64,
+            device=self.device,
+        )
         self._comm_id = _register_comm(self)
         self.disabled = False
         logger.info_once(
@@ -309,11 +377,95 @@ class _MusaJitCustomAllreduceImpl:
 
     @contextmanager
     def capture(self):
+        self._pending_graph_inputs = []
         try:
             self._IS_CAPTURING = True
             yield
         finally:
-            self._IS_CAPTURING = False
+            try:
+                if self._pending_graph_inputs:
+                    self._register_graph_buffers()
+            finally:
+                self._IS_CAPTURING = False
+
+    def _graph_pointer_meta(self, tensor: torch.Tensor) -> tuple[bytes, int]:
+        pointer = tensor.data_ptr()
+        base = _MusaDriverLibrary().allocation_base(pointer)
+        handle = self._graph_local_handles.get(base)
+        if handle is None:
+            handle = _ipc_handle_to_bytes(
+                _MusaRTLibrary().ipc_get_mem_handle(ctypes.c_void_p(base))
+            )
+            self._graph_local_handles[base] = handle
+        return handle, pointer - base
+
+    def _register_graph_buffers(self) -> None:
+        assert self.graph_rank_data is not None
+        count = len(self._pending_graph_inputs)
+        start = self._next_graph_slot
+        end = start + count
+        if end > self.graph_rank_data.shape[0]:
+            raise RuntimeError(
+                "MUSA custom AR exhausted graph rank-data slots: "
+                f"need={end}, capacity={self.graph_rank_data.shape[0]}"
+            )
+
+        local_meta = [
+            self._graph_pointer_meta(tensor) for tensor in self._pending_graph_inputs
+        ]
+        gathered: list[list[tuple[bytes, int]] | None] = [None] * self.world_size
+        gathered[self.rank] = local_meta
+        # ``all_gather_object`` is incompatible with a Gloo process group
+        # under inference mode (PyTorch #126032). Match vLLM's native custom
+        # AR registration and broadcast each rank's metadata on the CPU group.
+        ranks = sorted(dist.get_process_group_ranks(group=self.group))
+        for group_rank, global_rank in enumerate(ranks):
+            payload = [gathered[group_rank]]
+            dist.broadcast_object_list(
+                payload,
+                src=global_rank,
+                group=self.group,
+                device="cpu",
+            )
+            gathered[group_rank] = payload[0]
+        if any(peer_meta is None for peer_meta in gathered):
+            raise RuntimeError("MUSA custom AR graph metadata gather was incomplete")
+        gathered_meta = [peer_meta for peer_meta in gathered if peer_meta is not None]
+        if any(len(peer_meta) != count for peer_meta in gathered_meta):
+            raise RuntimeError(
+                "MUSA custom AR graph buffer count differs across ranks: "
+                f"local={count}, gathered={[len(meta) for meta in gathered_meta]}"
+            )
+
+        runtime = _MusaRTLibrary()
+        rows: list[list[int]] = []
+        for buffer_index, local_tensor in enumerate(self._pending_graph_inputs):
+            row = [0] * _MAX_RANKS
+            for peer_rank, peer_meta in enumerate(gathered_meta):
+                handle, offset = peer_meta[buffer_index]
+                if peer_rank == self.rank:
+                    pointer = local_tensor.data_ptr()
+                else:
+                    peer_key = (peer_rank, handle)
+                    peer_base = self._graph_peer_bases.get(peer_key)
+                    if peer_base is None:
+                        peer_base = int(
+                            runtime.ipc_open_mem_handle(
+                                _ipc_handle_from_bytes(handle)
+                            ).value
+                        )
+                        self._graph_peer_bases[peer_key] = peer_base
+                        self._graph_opened_ptrs.append(peer_base)
+                    pointer = peer_base + int(offset)
+                row[peer_rank] = pointer
+            rows.append(row)
+
+        rank_data_cpu = torch.tensor(rows, dtype=torch.int64)
+        self.graph_rank_data[start:end].copy_(rank_data_cpu.to(self.device))
+        torch.musa.synchronize(self.device)
+        self._graph_input_refs.extend(self._pending_graph_inputs)
+        self._pending_graph_inputs = []
+        self._next_graph_slot = end
 
     def should_custom_ar(self, inp: torch.Tensor) -> bool:
         if self.disabled:
@@ -324,6 +476,54 @@ class _MusaJitCustomAllreduceImpl:
         if inp_size % 16 != 0 or inp_size > self.max_size:
             return False
         return inp.is_contiguous()
+
+    def should_custom_all_gather(
+        self,
+        inp: torch.Tensor,
+        dim: int = -1,
+        output_dtype: torch.dtype | None = None,
+    ) -> bool:
+        if self.disabled or self.world_size not in (2, 4, 8) or inp.ndim != 2:
+            return False
+        if not self._is_communicator_tensor(inp):
+            return False
+        normalized_dim = dim if dim >= 0 else inp.ndim + dim
+        if normalized_dim != inp.ndim - 1:
+            return False
+        if inp.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            return False
+        if output_dtype is None:
+            output_dtype = inp.dtype
+        if output_dtype != inp.dtype and not (
+            inp.dtype == torch.bfloat16 and output_dtype == torch.float32
+        ):
+            return False
+        if not inp.is_contiguous() or inp.shape[0] <= 0 or inp.shape[1] <= 0:
+            return False
+        pack = 16 // inp.element_size()
+        if inp.shape[1] % pack != 0:
+            return False
+        inp_size = inp.numel() * inp.element_size()
+        output_numel = inp.numel() * self.world_size
+        output_element_size = 4 if output_dtype == torch.float32 else inp.element_size()
+        output_size = output_numel * output_element_size
+        return (
+            inp_size <= self.max_size
+            and inp_size % 16 == 0
+            and output_size <= self.max_size
+            and output_numel <= _INT32_MAX
+        )
+
+    def _is_communicator_tensor(self, inp: torch.Tensor) -> bool:
+        return inp.device.type == "musa" and inp.device.index == self.device.index
+
+    def _is_default_stream(self, inp: torch.Tensor) -> bool:
+        try:
+            current = torch.musa.current_stream(device=inp.device)
+            default = torch.musa.default_stream(device=inp.device)
+            return current == default
+        except Exception:
+            return False
 
     @staticmethod
     def _is_current_stream_capturing() -> bool:
@@ -355,7 +555,7 @@ class _MusaJitCustomAllreduceImpl:
             if not self._is_current_stream_capturing():
                 # Match vLLM's CustomAllreduce warmup semantics. During graph
                 # warmup no communication should run; the real graph capture
-                # below records the scratch-buffer copy plus JIT AR kernel.
+                # below records the registered-input JIT AR kernel.
                 return torch.empty_like(input)
             return self._custom_all_reduce_custom_op(input)
         if self._is_torch_compiling():
@@ -363,13 +563,15 @@ class _MusaJitCustomAllreduceImpl:
             # loader. The registered op provides the compile-time fake impl and
             # launches the same fixed-staging kernel at runtime.
             return self._custom_all_reduce_custom_op(input)
-        # Use fixed staging buffers instead of caching peer IPC pointers for
-        # each input. This keeps eager and graph replay on the same
-        # pointer-stable kernel.
+        # Eager tensors are not pointer-stable, so retain the fixed staging
+        # path outside graph capture.
         return self._custom_all_reduce_impl(input)
 
     def _custom_all_reduce_impl(self, input: torch.Tensor) -> torch.Tensor:
         assert self.buffer_rank_data is not None
+        assert self.signal_ptrs_cpu is not None
+        if self._IS_CAPTURING and self._is_current_stream_capturing():
+            return self._graph_custom_all_reduce_impl(input)
         out = torch.empty_like(input)
         shot = jit_ar.preferred_shot(
             self.world_size, input.numel() * input.element_size()
@@ -388,11 +590,77 @@ class _MusaJitCustomAllreduceImpl:
         )
         return out
 
+    def _graph_custom_all_reduce_impl(self, input: torch.Tensor) -> torch.Tensor:
+        assert self.graph_rank_data is not None
+        assert self.signal_ptrs_cpu is not None
+        slot = self._next_graph_slot + len(self._pending_graph_inputs)
+        if slot >= self.graph_rank_data.shape[0]:
+            raise RuntimeError("MUSA custom AR graph rank-data buffer is full")
+        out = torch.empty_like(input)
+        self._pending_graph_inputs.append(input)
+        jit_ar.launch_graph_registered(
+            self.graph_rank_data[slot],
+            self.signal_ptrs_cpu,
+            input,
+            out,
+            self.rank,
+            self.world_size,
+            jit_ar.preferred_shot(self.world_size, input.nbytes),
+        )
+        return out
+
+    def custom_all_gather(
+        self,
+        input: torch.Tensor,
+        dim: int = -1,
+        output_dtype: torch.dtype | None = None,
+    ) -> torch.Tensor | None:
+        if not self.should_custom_all_gather(input, dim, output_dtype):
+            return None
+        # Logits currently run outside the model graph. Fail closed if a future
+        # runner moves this call under Dynamo or graph capture; that path needs
+        # pointer-registration semantics rather than an eager FFI call.
+        if (
+            self._IS_CAPTURING
+            or self._is_current_stream_capturing()
+            or self._is_torch_compiling()
+            or not self._is_default_stream(input)
+        ):
+            return None
+        return self._custom_all_gather_impl(input, output_dtype)
+
+    def _custom_all_gather_impl(
+        self,
+        input: torch.Tensor,
+        output_dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        assert self.buffer_rank_data is not None
+        output_shape = (*input.shape[:-1], input.shape[-1] * self.world_size)
+        out = torch.empty(
+            output_shape,
+            dtype=output_dtype if output_dtype is not None else input.dtype,
+            device=input.device,
+        )
+        jit_ar.launch_all_gather(
+            self.buffer_rank_data,
+            self.signal_ptrs_cpu,
+            input,
+            out,
+            self.meta_ptrs[self.rank],
+            self.buffer_ptrs[self.rank],
+            self.max_size,
+            self.rank,
+            self.world_size,
+        )
+        return out
+
     def close(self) -> None:
         if self.meta_opened_ipc_ptrs:
             _close_ipc_handles(self.meta_opened_ipc_ptrs)
         if self.buffer_opened_ipc_ptrs:
             _close_ipc_handles(self.buffer_opened_ipc_ptrs)
+        if self._graph_opened_ptrs:
+            _close_ipc_handles(self._graph_opened_ptrs)
         if self.meta_ptrs:
             try:
                 _free_own_shared_buffer(self.meta_ptrs, rank=self.rank)
@@ -415,6 +683,13 @@ class _MusaJitCustomAllreduceImpl:
         self.buffer_ptrs = []
         self.buffer_opened_ipc_ptrs = []
         self.buffer_rank_data = None
+        self.graph_rank_data = None
+        self._graph_opened_ptrs = []
+        self._graph_peer_bases = {}
+        self._graph_local_handles = {}
+        self._graph_input_refs = []
+        self._pending_graph_inputs = []
+        self._next_graph_slot = 0
         self.disabled = True
 
     def __del__(self) -> None:
@@ -454,6 +729,16 @@ class MusaJitCustomAllreduce:
         except Exception:
             logger.exception("Failed to initialize MUSA JIT custom all-reduce.")
 
+        availability = torch.tensor([int(self._jit_available)], dtype=torch.int32)
+        dist.all_reduce(availability, op=dist.ReduceOp.MIN, group=group)
+        if not bool(availability.item()) and self._jit_comm is not None:
+            self._jit_comm.close()
+            self._jit_comm = None
+            logger.warning_once(
+                "MUSA JIT custom all-reduce disabled because a peer rank "
+                "failed initialization."
+            )
+
         if self._jit_available:
             logger.info_once(
                 "Using MUSA JIT custom all-reduce for eager and CUDA graph paths."
@@ -483,6 +768,18 @@ class MusaJitCustomAllreduce:
             return self._jit_comm.custom_all_reduce(input)
         return None
 
+    def custom_all_gather(
+        self,
+        input: torch.Tensor,
+        dim: int = -1,
+        output_dtype: torch.dtype | None = None,
+    ) -> torch.Tensor | None:
+        if self._jit_available and self._jit_comm.should_custom_all_gather(
+            input, dim, output_dtype
+        ):
+            return self._jit_comm.custom_all_gather(input, dim, output_dtype)
+        return None
+
     def close(self) -> None:
         if self._jit_comm is not None:
             self._jit_comm.close()
@@ -493,3 +790,21 @@ class MusaJitCustomAllreduce:
             self.close()
         except Exception:
             pass
+
+
+def maybe_musa_jit_logits_all_gather(
+    input: torch.Tensor,
+    dim: int = -1,
+    output_dtype: torch.dtype | None = None,
+) -> torch.Tensor | None:
+    """Use the MUSA IPC communicator for a last-dimension logits gather."""
+    from vllm.distributed.parallel_state import get_tp_group
+
+    device_communicator = get_tp_group().device_communicator
+    custom_ar = getattr(device_communicator, "ca_comm", None)
+    if not isinstance(custom_ar, MusaJitCustomAllreduce):
+        return None
+    output = custom_ar.custom_all_gather(input, dim, output_dtype)
+    if output is not None:
+        logger.info_once("Using MUSA JIT IPC all-gather for TP logits.")
+    return output

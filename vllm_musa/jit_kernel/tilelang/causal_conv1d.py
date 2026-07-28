@@ -1,7 +1,6 @@
 """MUSA TileLang causal conv1d forward kernel."""
 
 import functools
-from typing import List, Optional, Union
 
 import tilelang
 import tilelang.language as T
@@ -15,6 +14,7 @@ from vllm_musa.jit_kernel.tilelang.utils import (
 )
 
 PAD_SLOT_ID = -1  # MUSA: match vllm mamba causal_conv1d PAD_SLOT_ID
+NULL_BLOCK_ID = 0  # MUSA: match vllm mamba causal_conv1d NULL_BLOCK_ID
 
 
 def register_custom_op(fn=None, **_kw):
@@ -641,7 +641,6 @@ def _causal_conv1d_prefill_width4_kernel(
             w_base = T.alloc_var("int32")
             state_base = T.alloc_var("int32")
             out_base = T.alloc_var("int32")
-            state_cut = T.alloc_var("int32")
             col0 = T.alloc_var("float32")
             col1 = T.alloc_var("float32")
             col2 = T.alloc_var("float32")
@@ -707,7 +706,6 @@ def _causal_conv1d_prefill_width4_kernel(
                             x_base + (seq_len - 1) * x_stride_token
                         ]
                     else:
-                        state_cut = 3 - seq_len
                         if seq_len == 1:
                             if load_init:
                                 conv_states[state_base] = conv_states[
@@ -941,7 +939,11 @@ _causal_conv1d_prefill_width4_body_kernel.mode = "lazy"
     compile_flags=MUSA_COMPILE_FLAGS,
 )
 def _causal_conv1d_decode_width4_batched_kernel(
-    dtype: str,
+    x_dtype: str,
+    weight_dtype: str,
+    bias_dtype: str,
+    state_dtype: str,
+    out_dtype: str,
     cache_indices_dtype: str,
     x_stride_token: int,
     w_stride_dim: int,
@@ -970,14 +972,14 @@ def _causal_conv1d_decode_width4_batched_kernel(
 
     @T.prim_func
     def musa_causal_conv1d_decode_width4_batched(
-        x: T.Tensor((x_numel,), dtype),
-        weight: T.Tensor((w_numel,), dtype),
-        bias: T.Tensor((bias_numel,), dtype),
-        conv_states: T.Tensor((state_numel,), dtype),
+        x: T.Tensor((x_numel,), x_dtype),
+        weight: T.Tensor((w_numel,), weight_dtype),
+        bias: T.Tensor((bias_numel,), bias_dtype),
+        conv_states: T.Tensor((state_numel,), state_dtype),
         cache_indices: T.Tensor((cache_numel,), cache_indices_dtype),
         cache_index_mapping: T.Tensor((mapping_numel,), "int32"),
         has_initial_state: T.Tensor((init_numel,), "bool"),
-        out: T.Tensor((out_numel,), dtype),
+        out: T.Tensor((out_numel,), out_dtype),
         batch: T.int32,
         dim: T.int32,
         num_cache_lines: T.int32,
@@ -1016,6 +1018,13 @@ def _causal_conv1d_decode_width4_batched_kernel(
             if cache_idx >= num_cache_lines:
                 valid = False
 
+            # The upstream update kernel aliases its output with x and returns
+            # before touching a null cache block.  Preserve that output value
+            # while leaving the null block unchanged.
+            if seq_idx < batch and feat < dim and not valid:
+                x_base = seq_idx * x_stride_token + feat
+                out[seq_idx * o_stride_token + feat] = T.Cast(out_dtype, x[x_base])
+
             if valid:
                 load_init = False
                 if has_initial_states:
@@ -1048,7 +1057,7 @@ def _causal_conv1d_decode_width4_batched_kernel(
                 if silu_activation:
                     acc = acc / (1.0 + T.exp2(-acc * _LOG2E))
 
-                out[seq_idx * o_stride_token + feat] = T.Cast(dtype, acc)
+                out[seq_idx * o_stride_token + feat] = T.Cast(out_dtype, acc)
                 if load_init:
                     conv_states[state_base] = conv_states[
                         state_base + state_stride_token
@@ -1057,9 +1066,13 @@ def _causal_conv1d_decode_width4_batched_kernel(
                         state_base + 2 * state_stride_token
                     ]
                 else:
-                    conv_states[state_base] = T.Cast(dtype, 0.0)
-                    conv_states[state_base + state_stride_token] = T.Cast(dtype, 0.0)
-                conv_states[state_base + 2 * state_stride_token] = T.Cast(dtype, x_cur)
+                    conv_states[state_base] = T.Cast(state_dtype, 0.0)
+                    conv_states[state_base + state_stride_token] = T.Cast(
+                        state_dtype, 0.0
+                    )
+                conv_states[state_base + 2 * state_stride_token] = T.Cast(
+                    state_dtype, x_cur
+                )
 
     return musa_causal_conv1d_decode_width4_batched
 
@@ -1070,14 +1083,14 @@ _causal_conv1d_decode_width4_batched_kernel.mode = "lazy"
 def _check_inputs(
     x: torch.Tensor,
     weight: torch.Tensor,
-    bias: Optional[torch.Tensor],
-    conv_states: Optional[torch.Tensor],
+    bias: torch.Tensor | None,
+    conv_states: torch.Tensor | None,
     query_start_loc: torch.Tensor,
-    cache_indices: Optional[torch.Tensor],
-    has_initial_state: Optional[torch.Tensor],
-    cache_index_mapping: Optional[torch.Tensor],
-    activation: Optional[Union[str, bool]],
-    seq_lens_cpu: List[int],
+    cache_indices: torch.Tensor | None,
+    has_initial_state: torch.Tensor | None,
+    cache_index_mapping: torch.Tensor | None,
+    activation: str | bool | None,
+    seq_lens_cpu: list[int],
 ) -> tuple[int, int, int, int, str]:
     if isinstance(activation, bool) and activation:
         activation = "silu"
@@ -1151,14 +1164,14 @@ def _check_inputs(
 def _causal_conv1d_fwd_impl(
     x: torch.Tensor,
     weight: torch.Tensor,
-    bias: Optional[torch.Tensor],
-    conv_states: Optional[torch.Tensor],
+    bias: torch.Tensor | None,
+    conv_states: torch.Tensor | None,
     query_start_loc: torch.Tensor,
-    seq_lens_cpu: List[int],
-    cache_indices: Optional[torch.Tensor] = None,
-    has_initial_state: Optional[torch.Tensor] = None,
-    cache_index_mapping: Optional[torch.Tensor] = None,
-    activation: Optional[Union[str, bool]] = "silu",
+    seq_lens_cpu: list[int],
+    cache_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
+    cache_index_mapping: torch.Tensor | None = None,
+    activation: str | bool | None = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
 ) -> torch.Tensor:
     if isinstance(activation, bool) and activation:
@@ -1231,7 +1244,11 @@ def _causal_conv1d_fwd_impl(
         and weight.stride(1) == 1
     ):
         _causal_conv1d_decode_width4_batched_kernel(
-            dtype,
+            tilelang_dtype(x.dtype),
+            tilelang_dtype(weight.dtype),
+            tilelang_dtype(bias.dtype if bias is not None else x.dtype),
+            tilelang_dtype(conv_states.dtype),
+            tilelang_dtype(out.dtype),
             cache_indices_dtype,
             int(x.stride(1)),
             int(weight.stride(0)),
@@ -1429,15 +1446,15 @@ def _causal_conv1d_fwd_impl(
 def _causal_conv1d_fwd_custom(
     x: torch.Tensor,
     weight: torch.Tensor,
-    bias: Optional[torch.Tensor],
-    conv_states: Optional[torch.Tensor],
+    bias: torch.Tensor | None,
+    conv_states: torch.Tensor | None,
     query_start_loc: torch.Tensor,
-    seq_lens_cpu: List[int],
-    cache_indices: Optional[torch.Tensor] = None,
-    has_initial_state: Optional[torch.Tensor] = None,
-    activation: Optional[str] = "silu",
+    seq_lens_cpu: list[int],
+    cache_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
+    activation: str | None = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
-    cache_index_mapping: Optional[torch.Tensor] = None,
+    cache_index_mapping: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return _causal_conv1d_fwd_impl(
         x,
@@ -1457,15 +1474,15 @@ def _causal_conv1d_fwd_custom(
 def causal_conv1d_fwd(
     x: torch.Tensor,
     weight: torch.Tensor,
-    bias: Optional[torch.Tensor],
-    conv_states: Optional[torch.Tensor],
+    bias: torch.Tensor | None,
+    conv_states: torch.Tensor | None,
     query_start_loc: torch.Tensor,
-    seq_lens_cpu: List[int],
-    cache_indices: Optional[torch.Tensor] = None,
-    has_initial_state: Optional[torch.Tensor] = None,
-    activation: Optional[Union[str, bool]] = "silu",
+    seq_lens_cpu: list[int],
+    cache_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
+    activation: str | bool | None = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
-    cache_index_mapping: Optional[torch.Tensor] = None,
+    cache_index_mapping: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if isinstance(seq_lens_cpu, torch.Tensor) and seq_lens_cpu.device.type != "cpu":
         # Backward-compatible positional form used by the generic mamba wrapper:
@@ -1502,15 +1519,15 @@ def causal_conv1d_fwd(
 def causal_conv1d_fn(
     x: torch.Tensor,
     weight: torch.Tensor,
-    bias: Optional[torch.Tensor],
-    conv_states: Optional[torch.Tensor],
+    bias: torch.Tensor | None,
+    conv_states: torch.Tensor | None,
     query_start_loc: torch.Tensor,
-    seq_lens_cpu: List[int],
-    cache_indices: Optional[torch.Tensor] = None,
-    has_initial_state: Optional[torch.Tensor] = None,
-    activation: Optional[Union[str, bool]] = "silu",
+    seq_lens_cpu: list[int],
+    cache_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
+    activation: str | bool | None = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
-    cache_index_mapping: Optional[torch.Tensor] = None,
+    cache_index_mapping: torch.Tensor | None = None,
     **_: object,
 ) -> torch.Tensor:
     return causal_conv1d_fwd(
@@ -1572,6 +1589,7 @@ def musa_tilelang_causal_conv1d_fn(
 # decode kernel. Drop-in for vllm Triton causal_conv1d_update; returns None when
 # the fast path does not apply so the caller keeps the Triton path.
 _DECODE_HAS_INIT_BUF = {}
+_DECODE_MIXED_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 
 
 def _decode_has_init_buffer(batch, device):
@@ -1590,6 +1608,7 @@ def musa_tilelang_causal_conv1d_update(
     bias=None,
     activation=None,
     conv_state_indices=None,
+    null_block_id=NULL_BLOCK_ID,
     **_,
 ):
     """Width-4 single-token decode conv. x:[batch,dim], conv_state:[lines,dim,>=3],
@@ -1599,9 +1618,42 @@ def musa_tilelang_causal_conv1d_update(
     if conv_state.dim() != 3 or conv_state.size(2) < 3 or x.dim() != 2:
         return None
     batch, dim = x.shape
-    orig_dtype = x.dtype
-    if x.dtype != conv_state.dtype:
-        x = x.to(conv_state.dtype)
+    if batch == 0 or dim != weight.size(0) or dim != conv_state.size(1):
+        return None
+    if x.device != conv_state.device or x.device != weight.device:
+        return None
+    if x.stride(1) != 1 or weight.stride(1) != 1:
+        return None
+    if bias is not None and (
+        bias.device != x.device
+        or bias.dim() != 1
+        or bias.numel() != dim
+        or bias.stride(0) != 1
+    ):
+        return None
+    if conv_state_indices is not None and (
+        conv_state_indices.device != x.device
+        or conv_state_indices.dim() != 1
+        or conv_state_indices.numel() < batch
+        or conv_state_indices.stride(0) != 1
+        or conv_state_indices.dtype not in (torch.int32, torch.int64)
+    ):
+        return None
+
+    same_dtype = (
+        x.dtype == conv_state.dtype == weight.dtype
+        and (bias is None or bias.dtype == x.dtype)
+        and x.dtype in _DECODE_MIXED_DTYPES
+    )
+    qwen_bf16_fp32_state = (
+        x.dtype == torch.bfloat16
+        and conv_state.dtype == torch.float32
+        and weight.dtype == torch.float32
+        and (bias is None or bias.dtype == torch.float32)
+    )
+    if not (same_dtype or qwen_bf16_fp32_state):
+        return None
+
     xt = x.transpose(0, 1)  # [dim, batch] VIEW, stride(0)==1
     out_bd = torch.empty_like(x)  # [batch, dim]
     outt = out_bd.transpose(0, 1)  # [dim, batch] VIEW, stride(0)==1
@@ -1609,10 +1661,16 @@ def musa_tilelang_causal_conv1d_update(
         idx = torch.arange(batch, device=x.device, dtype=torch.int32)
     else:
         idx = conv_state_indices
+    has_cache_indices = conv_state_indices is not None
+    use_null_block = has_cache_indices and null_block_id is not None
     has_init = _decode_has_init_buffer(batch, x.device)
     silu = activation in ("silu", "swish", True)
     ker = _causal_conv1d_decode_width4_batched_kernel(
         tilelang_dtype(xt.dtype),
+        tilelang_dtype(weight.dtype),
+        tilelang_dtype(bias.dtype if bias is not None else xt.dtype),
+        tilelang_dtype(conv_state.dtype),
+        tilelang_dtype(outt.dtype),
         _tilelang_index_dtype(idx.dtype),
         int(xt.stride(1)),
         int(weight.stride(0)),
@@ -1621,10 +1679,10 @@ def musa_tilelang_causal_conv1d_update(
         int(conv_state.stride(2)),
         int(outt.stride(1)),
         bias is not None,
-        True,
+        has_cache_indices,
         False,
         True,
-        True,
+        use_null_block,
         silu,
         256,
         1,
@@ -1641,6 +1699,6 @@ def musa_tilelang_causal_conv1d_update(
         int(batch),
         int(dim),
         int(conv_state.size(0)),
-        int(PAD_SLOT_ID),
+        int(null_block_id if use_null_block else PAD_SLOT_ID),
     )
-    return out_bd.to(orig_dtype)
+    return out_bd

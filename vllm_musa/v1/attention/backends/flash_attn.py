@@ -5,22 +5,45 @@
 
 import copy
 from dataclasses import dataclass
-from typing import ClassVar
+from importlib.metadata import PackageNotFoundError, version
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 import vllm.envs as envs
+from vllm.config import (
+    VllmConfig,
+    get_current_vllm_config_or_none,
+    get_layers_from_vllm_config,
+)
+from vllm.config.cache import CacheDType
+from vllm.distributed.parallel_state import get_dcp_group
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.platforms import current_platform
+from vllm.platforms.interface import DeviceCapability
+from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.backend import (
     AttentionBackend,
+    AttentionCGSupport,
     AttentionImpl,
+    AttentionMetadataBuilder,
     AttentionType,
+    CommonAttentionMetadata,
     MultipleOf,
 )
+from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
+from vllm.v1.attention.backends.utils import (
+    get_dcp_local_seq_lens,
+    get_kv_cache_layout,
+    split_decodes_and_prefills,
+)
+from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
+from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
+from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_musa.v1.attention.backends.fa_utils import (
     flash_attn_supports_fp8,
@@ -32,38 +55,112 @@ if is_flash_attn_varlen_func_available():
     from vllm_musa.v1.attention.backends.fa_utils import (
         flash_attn_supports_sinks,
         flash_attn_varlen_func,
+        flash_attn_with_kvcache,
         get_scheduler_metadata,
         reshape_and_cache_flash,
-        flash_attn_with_kvcache,
     )
-
-from vllm.config import (
-    VllmConfig,
-    get_current_vllm_config_or_none,
-    get_layers_from_vllm_config,
-)
-from vllm.config.cache import CacheDType
-from vllm.distributed.parallel_state import get_dcp_group
-from vllm.logger import init_logger
-from vllm.platforms.interface import DeviceCapability
-from vllm.utils.math_utils import cdiv, round_up
-from vllm.v1.attention.backend import (
-    AttentionCGSupport,
-    AttentionMetadataBuilder,
-    CommonAttentionMetadata,
-)
-from vllm.v1.attention.backends.utils import (
-    get_dcp_local_seq_lens,
-    get_kv_cache_layout,
-    split_decodes_and_prefills,
-)
-from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
-from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
-from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
 
-from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
+_MUSA_QWEN_TEXT_GENERATION_ARCHITECTURES = frozenset(
+    {
+        "Qwen2ForCausalLM",
+        "Qwen2MoeForCausalLM",
+        "Qwen3ForCausalLM",
+        "Qwen3MoeForCausalLM",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+        "CosyVoice3Model",
+    }
+)
+
+
+def _is_musa_qwen_text_generation_architecture(model_config: Any) -> bool:
+    architectures = getattr(model_config, "architectures", None) or ()
+    return any(
+        architecture in _MUSA_QWEN_TEXT_GENERATION_ARCHITECTURES
+        for architecture in architectures
+    )
+
+
+def _use_musa_qwen_direct_decode_schedule(
+    *,
+    aot_schedule: bool,
+    causal: bool,
+    is_bfloat16: bool,
+    is_qwen_family: bool,
+    use_full_cuda_graph: bool,
+    common_prefix_len: int,
+    dcp_world_size: int,
+    graph_num_reqs: int,
+    graph_num_decodes: int,
+    graph_num_tokens: int,
+    graph_num_decode_tokens: int,
+    max_query_len: int,
+    max_num_splits: int,
+) -> bool:
+    return (
+        aot_schedule
+        and causal
+        and is_bfloat16
+        and is_qwen_family
+        and use_full_cuda_graph
+        and common_prefix_len == 0
+        and dcp_world_size == 1
+        and graph_num_reqs == 64
+        and graph_num_decodes == graph_num_reqs
+        and graph_num_tokens == graph_num_reqs
+        and graph_num_decode_tokens == graph_num_tokens
+        and max_query_len == 1
+        and max_num_splits == 1
+    )
+
+
+def _is_qwen_family_scheduler_lookup_base_config(
+    vllm_config: VllmConfig,
+) -> bool:
+    """Check the Qwen FA3 scheduler configuration envelope."""
+    model_config = getattr(vllm_config, "model_config", None)
+    scheduler_config = getattr(vllm_config, "scheduler_config", None)
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    if model_config is None or scheduler_config is None or parallel_config is None:
+        return False
+
+    max_num_seqs = getattr(scheduler_config, "max_num_seqs", None)
+    is_qwen_family = _is_musa_qwen_text_generation_architecture(model_config)
+
+    return (
+        is_qwen_family
+        and isinstance(max_num_seqs, int)
+        and max_num_seqs >= 1
+        and getattr(vllm_config, "speculative_config", None) is None
+        and all(
+            getattr(parallel_config, name, None) == 1
+            for name in (
+                "tensor_parallel_size",
+                "decode_context_parallel_size",
+                "pipeline_parallel_size",
+            )
+        )
+    )
+
+
+def _is_qwen_family_scheduler_lookup_config(vllm_config: VllmConfig) -> bool:
+    """Gate the direct FA3 scheduler path before runtime shape checks."""
+    return _is_qwen_family_scheduler_lookup_base_config(vllm_config)
+
+
+def _has_supported_fa3_scheduler_layout() -> bool:
+    """The direct builder mirrors the pinned MATE 0.2.4 metadata layout."""
+    try:
+        mate_version = version("mate")
+        flash_attn_version = version("flash_attn_3")
+    except PackageNotFoundError:
+        return False
+    return mate_version == "0.2.4" and flash_attn_version in {
+        "0.2.4",
+        "0.2.4+musa",
+    }
 
 
 def _torch_reduce_scatter_dim(
@@ -113,7 +210,6 @@ def _musa_cp_lse_ag_out_rs(
     return_lse: bool = False,
     is_lse_base_on_e=True,
 ):
-
     safe_group = _DCPGroupWithTorchReduceScatter(cp_group)
     return cp_lse_ag_out_rs(
         cp_attn_out,
@@ -410,6 +506,9 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
 
         self.max_num_splits = 0  # No upper bound on the number of splits.
         self.aot_schedule = get_flash_attn_version() == 3
+        self._musa_qwen_family = _is_musa_qwen_text_generation_architecture(
+            self.model_config
+        )
 
         try:
             from vllm.distributed.parallel_state import get_dcp_group
@@ -431,8 +530,13 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         self.max_cudagraph_size = self.compilation_config.max_cudagraph_capture_size
 
         self._sm_count = 60
+        self._sm_count_query_succeeded = False
         # ==================== MUSA ADAPTATION ====================
         self._cu_seqlens_k_buffer: torch.Tensor | None = None
+        self._use_qwen_single_request_scheduler_lookup = (
+            _is_qwen_family_scheduler_lookup_config(vllm_config)
+            and _has_supported_fa3_scheduler_layout()
+        )
         # ========================== END ==========================
 
         if self.use_full_cuda_graph and self.aot_schedule:
@@ -460,6 +564,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                 self._sm_count = torch.musa.get_device_properties(
                     self.device
                 ).multi_processor_count
+                self._sm_count_query_succeeded = True
             except Exception:
                 self._sm_count = 60
 
@@ -589,6 +694,34 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         if envs.VLLM_BATCH_INVARIANT:
             max_num_splits = 1
 
+        # With one KV split, the FA3 AOT path still selects the persistent
+        # scheduler and launches a combine kernel per attention layer.  The
+        # direct path selects the single-tile scheduler and needs neither AOT
+        # metadata nor that combine step.
+        direct_decode_schedule = _use_musa_qwen_direct_decode_schedule(
+            aot_schedule=aot_schedule,
+            causal=common_attn_metadata.causal is True,
+            is_bfloat16=(
+                self.model_config.dtype == torch.bfloat16
+                and self.kv_cache_dtype in ("auto", "bfloat16", torch.bfloat16)
+            ),
+            is_qwen_family=self._musa_qwen_family,
+            use_full_cuda_graph=self.use_full_cuda_graph,
+            common_prefix_len=common_prefix_len,
+            dcp_world_size=self.dcp_world_size,
+            graph_num_reqs=num_reqs,
+            graph_num_decodes=num_decodes,
+            graph_num_tokens=num_actual_tokens,
+            graph_num_decode_tokens=num_decode_tokens,
+            max_query_len=max_query_len,
+            max_num_splits=max_num_splits,
+        )
+        if direct_decode_schedule:
+            aot_schedule = False
+            logger.info_once(
+                "Using MUSA Qwen direct FA3 decode schedule for graph size 64."
+            )
+
         def schedule(
             batch_size, cu_query_lens, max_query_len, seqlens, max_seq_len, causal
         ):
@@ -626,6 +759,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         prefix_kv_lens = None
         suffix_kv_lens = None
         prefix_scheduler_metadata = None
+        direct_metadata_built = False
 
         if self.dcp_world_size > 1:
             query_kv_lens = query_start_loc[1:] - query_start_loc[:-1]
@@ -680,17 +814,64 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                 causal=True,
             )
         else:
-            scheduler_metadata = schedule(
-                batch_size=num_reqs,
-                cu_query_lens=query_start_loc,
-                max_query_len=max_query_len,
-                seqlens=seq_lens,
-                max_seq_len=max_seq_len,
-                causal=causal,
+            scheduler_metadata = None
+
+            # The direct builder handles only supported Qwen batch-one decode
+            # inputs. All other inputs continue through schedule() below.
+            use_qwen_scheduler_lookup = (
+                self._use_qwen_single_request_scheduler_lookup
+                and self.use_full_cuda_graph
+                and aot_schedule
+                and self._cu_seqlens_k_buffer is not None
+                and num_reqs == 1
+                and num_decodes == 1
+                and num_decode_tokens == 1
+                and num_prefills == 0
+                and max_query_len == 1
+                and 1 <= max_seq_len <= 4096
+                and causal
+                and self.aot_sliding_window == (-1, -1)
+                and self._sm_count_query_succeeded
+                and self._sm_count == 60
+                and 1 <= max_num_splits <= 60
+                and 1 <= self.num_heads_kv <= 32
+                and self.num_heads_q % self.num_heads_kv == 0
+                and 1 <= self.num_heads_q // self.num_heads_kv <= 32
+                and self.headdim in (64, 128)
+                and self.block_size == 64
+                and self.kv_cache_dtype == torch.bfloat16
             )
+            if use_qwen_scheduler_lookup:
+                from vllm_musa.jit_kernel.fa3_metadata import (
+                    try_build_qwen_single_request_fa3_metadata,
+                )
+
+                buf = self._cu_seqlens_k_buffer
+                direct_metadata_built = try_build_qwen_single_request_fa3_metadata(
+                    seq_lens[:1],
+                    buf[:2],
+                    self.scheduler_metadata,
+                    max_seq_len,
+                    self.num_heads_q,
+                    self.num_heads_kv,
+                    self.headdim,
+                    max_num_splits,
+                )
+                if direct_metadata_built:
+                    cu_seqlens_k = buf[:2]
+                    scheduler_metadata = self.scheduler_metadata[:16]
+            if scheduler_metadata is None:
+                scheduler_metadata = schedule(
+                    batch_size=num_reqs,
+                    cu_query_lens=query_start_loc,
+                    max_query_len=max_query_len,
+                    seqlens=seq_lens,
+                    max_seq_len=max_seq_len,
+                    causal=causal,
+                )
 
             # ==================== MUSA ADAPTATION ====================
-            if self.use_full_cuda_graph:
+            if self.use_full_cuda_graph and not direct_metadata_built:
                 if self._cu_seqlens_k_buffer is not None:
                     n = num_reqs + 1
                     buf = self._cu_seqlens_k_buffer
@@ -709,12 +890,13 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         # For FA3 + full cudagraph
         if self.use_full_cuda_graph and scheduler_metadata is not None:
             n = scheduler_metadata.shape[0]
-            self.scheduler_metadata[:n] = scheduler_metadata
-            # NOTE(woosuk): We should zero out the rest of the scheduler
-            # metadata to guarantee the correctness. Otherwise, some thread
-            # blocks may use the invalid scheduler metadata and overwrite the
-            # output buffer.
-            self.scheduler_metadata[n:] = 0
+            if not direct_metadata_built:
+                self.scheduler_metadata[:n] = scheduler_metadata
+                # NOTE(woosuk): We should zero out the rest of the scheduler
+                # metadata to guarantee the correctness. Otherwise, some thread
+                # blocks may use the invalid scheduler metadata and overwrite the
+                # output buffer.
+                self.scheduler_metadata[n:] = 0
             scheduler_metadata = self.scheduler_metadata[:n]
 
         attn_metadata = FlashAttentionMetadata(
@@ -799,6 +981,7 @@ class FlashAttentionImpl(AttentionImpl):
         else:
             self.sliding_window = (sliding_window - 1, 0)
         self.kv_cache_dtype = kv_cache_dtype
+        self.kv_cache_layout = get_kv_cache_layout()
         if logits_soft_cap is None:
             # In flash-attn, setting logits_soft_cap as 0 means no soft cap.
             logits_soft_cap = 0
@@ -999,6 +1182,7 @@ class FlashAttentionImpl(AttentionImpl):
                         k_cache=key_cache,
                         v_cache=value_cache,
                         page_table=attn_metadata.decode_block_table,
+                        _musa_kv_cache_layout=self.kv_cache_layout,
                         cache_seqlens=attn_metadata.decode_seq_lens,
                         cu_seqlens_q=attn_metadata.decode_query_start_loc,
                         max_seqlen_q=1,
@@ -1078,6 +1262,7 @@ class FlashAttentionImpl(AttentionImpl):
                         k_cache=key_cache,
                         v_cache=value_cache,
                         page_table=attn_metadata.decode_block_table,
+                        _musa_kv_cache_layout=self.kv_cache_layout,
                         cache_seqlens=attn_metadata.decode_seq_lens,
                         cu_seqlens_q=attn_metadata.decode_query_start_loc,
                         max_seqlen_q=1,
@@ -1367,11 +1552,8 @@ class FlashAttentionImpl(AttentionImpl):
 
     def fused_rope_kvcache_supported(self) -> bool:
         """Whether this layer is inside the exact Qwen2 fusion envelope."""
-        from vllm_musa.utils.environ import envs as musa_envs
-
         return (
-            musa_envs.VLLM_MUSA_QWEN2_ROPE_KV_FUSION.get()
-            and get_flash_attn_version() == 3
+            get_flash_attn_version() == 3
             and self.num_heads == 14
             and self.num_kv_heads == 2
             and self.head_size == 64
@@ -1383,6 +1565,109 @@ class FlashAttentionImpl(AttentionImpl):
             and self.sinks is None
             and self.kv_sharing_target_layer_name is None
         )
+
+    def qwen3_qk_rope_kvcache_supported(self) -> bool:
+        """Whether this layer is inside the initial dense Qwen3 envelope."""
+        return (
+            get_flash_attn_version() == 3
+            and get_kv_cache_layout() == "NHD"
+            and (self.num_heads, self.num_kv_heads) in ((16, 8), (32, 8))
+            and self.head_size == 128
+            and self.attn_type == AttentionType.DECODER
+            and self.kv_cache_dtype in ("auto", "bfloat16", torch.bfloat16)
+            and self.alibi_slopes is None
+            and self.sliding_window == (-1, -1)
+            and not self.logits_soft_cap
+            and self.sinks is None
+            and self.kv_sharing_target_layer_name is None
+        )
+
+    def do_qwen3_qk_rope_and_kv_cache_update(
+        self,
+        layer: torch.nn.Module,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        q_out: torch.Tensor,
+        k_out: torch.Tensor,
+        kv_cache: torch.Tensor,
+        layer_slot_mapping: torch.Tensor | None,
+    ) -> None:
+        """Run the exact Qwen3 provider, falling back before cache fusion."""
+        from vllm_musa.jit_kernel.csrc.norm import (
+            fused_qk_rmsnorm_mrope_cache_out,
+        )
+
+        positions_3d = (
+            positions if positions.dim() == 2 else positions.unsqueeze(0).expand(3, -1)
+        )
+        can_fuse_cache = (
+            layer_slot_mapping is not None
+            and layer_slot_mapping.shape[0] == q.shape[0]
+            and get_kv_cache_layout() == "NHD"
+        )
+        if can_fuse_cache:
+            key_cache, value_cache = kv_cache.unbind(0)
+            expected_tail = (self.num_kv_heads, self.head_size)
+            flat_cache_supported = (
+                key_cache.is_contiguous()
+                and value_cache.is_contiguous()
+                and tuple(key_cache.shape[-2:]) == expected_tail
+                and tuple(value_cache.shape[-2:]) == expected_tail
+            )
+            if flat_cache_supported:
+                fused_qk_rmsnorm_mrope_cache_out(
+                    q,
+                    k,
+                    v,
+                    q_weight,
+                    k_weight,
+                    positions_3d,
+                    cos_sin_cache,
+                    q_out,
+                    k_out,
+                    key_cache.view(-1, self.num_kv_heads * self.head_size),
+                    value_cache.view(-1, self.num_kv_heads * self.head_size),
+                    layer_slot_mapping,
+                    True,
+                    64,
+                    0,
+                    0,
+                    False,
+                    1e-6,
+                    False,
+                )
+                return
+
+        torch.ops.vllm.musa_csrc_fused_qk_rmsnorm_mrope(
+            q,
+            k,
+            q_weight,
+            k_weight,
+            positions_3d,
+            cos_sin_cache,
+            q_out,
+            k_out,
+            True,
+            64,
+            0,
+            0,
+            False,
+            1e-6,
+            False,
+        )
+        if layer_slot_mapping is not None:
+            self.do_kv_cache_update(
+                layer,
+                k_out,
+                v,
+                kv_cache,
+                layer_slot_mapping,
+            )
 
     def do_rope_and_kv_cache_update(
         self,
@@ -1501,11 +1786,6 @@ class FlashAttentionImpl(AttentionImpl):
         cu_seqlens_k = attn_metadata.query_start_loc
         max_seqlen_q = attn_metadata.max_query_len
         max_seqlen_k = attn_metadata.max_query_len
-
-        descale_shape = (
-            cu_seqlens_q.shape[0] - 1,  # type: ignore[union-attr]
-            self.num_kv_heads,
-        )
 
         # Call flash attention directly on Q, K, V tensors
         sliding_window_size = (
