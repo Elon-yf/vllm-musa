@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""MUSA CAR-RMSNorm fused-op bring-up helpers.
+"""MUSA CAR-RMSNorm fused custom-op bindings.
 
 This module exposes opaque custom ops to Inductor and routes runtime execution
 to the MUSA JIT fused custom-allreduce + RMSNorm implementations. The graph-level

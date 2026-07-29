@@ -20,7 +20,6 @@ graphs and residual output for residual graphs.
 
 from __future__ import annotations
 
-import logging
 import operator
 from typing import Any
 
@@ -255,12 +254,6 @@ class MusaAllReduceResidualRMSNormPattern:
 class MusaAllReduceRMSNormFusionPass(VllmPatternMatcherPass):
     """MUSA-specific no-residual CAR-RMSNorm pattern matcher pass."""
 
-    _candidate_count_calls = 0
-    _candidate_total_car = 0
-    _candidate_total_direct = 0
-    _candidate_total_add = 0
-    _candidate_total_fused_add = 0
-
     def __init__(self, config: VllmConfig) -> None:
         super().__init__(config)
         self.disabled = True
@@ -398,17 +391,6 @@ class MusaAllReduceRMSNormFusionPass(VllmPatternMatcherPass):
         return str(getattr(node, 'target', ''))
 
     @classmethod
-    def _node_debug(cls, node: fx.Node) -> str:
-        val = node.meta.get('val') if hasattr(node, 'meta') else None
-        shape = getattr(val, 'shape', None)
-        dtype = getattr(val, 'dtype', None)
-        users = [f'{user.name}:{cls._target_name(user)}' for user in node.users]
-        return (
-            f'{node.name}:op={node.op}:target={cls._target_name(node)}:'
-            f'shape={shape}:dtype={dtype}:users={users}'
-        )
-
-    @classmethod
     def _is_musa_car_node(cls, node: fx.Node) -> bool:
         return (
             node.op == 'call_function'
@@ -445,132 +427,6 @@ class MusaAllReduceRMSNormFusionPass(VllmPatternMatcherPass):
     @classmethod
     def _is_add_node(cls, node: fx.Node) -> bool:
         return node.op == 'call_function' and 'aten.add' in cls._target_name(node)
-
-    @classmethod
-    def _is_musa_fused_ar_rms_node(cls, node: fx.Node) -> bool:
-        target = cls._target_name(node)
-        return node.op == 'call_function' and (
-            'musa_fused_allreduce_rms_norm' in target
-            or 'musa_fused_allreduce_residual_rms_norm' in target
-        )
-
-    def _collect_candidates(
-        self, graph: fx.Graph
-    ) -> tuple[
-        list[fx.Node],
-        list[fx.Node],
-        list[tuple[fx.Node, fx.Node]],
-        list[tuple[fx.Node, fx.Node, fx.Node]],
-        list[tuple[fx.Node, fx.Node]],
-    ]:
-        direct: list[tuple[fx.Node, fx.Node]] = []
-        add: list[tuple[fx.Node, fx.Node, fx.Node]] = []
-        fused_add: list[tuple[fx.Node, fx.Node]] = []
-        car_nodes = [
-            node for node in graph.nodes if self._is_target_musa_car_node(node)
-        ]
-        fused_nodes = [
-            node for node in graph.nodes if self._is_musa_fused_ar_rms_node(node)
-        ]
-
-        for car in car_nodes:
-            for user in car.users:
-                if self._is_fused_add_rms_norm_node(user):
-                    fused_add.append((car, user))
-                elif self._is_rms_norm_node(user):
-                    direct.append((car, user))
-                elif self._is_add_node(user):
-                    for add_user in user.users:
-                        if self._is_rms_norm_node(add_user):
-                            add.append((car, user, add_user))
-        return car_nodes, fused_nodes, direct, add, fused_add
-
-    def _log_candidate_pattern_counts(
-        self, graph: fx.Graph, *, stage: str, record_totals: bool
-    ) -> None:
-        if not logger.isEnabledFor(logging.DEBUG):
-            return
-        car_nodes, fused_nodes, direct, add, fused_add = self._collect_candidates(
-            graph
-        )
-
-        cls = type(self)
-        if record_totals:
-            cls._candidate_count_calls += 1
-            cls._candidate_total_car += len(car_nodes)
-            cls._candidate_total_direct += len(direct)
-            cls._candidate_total_add += len(add)
-            cls._candidate_total_fused_add += len(fused_add)
-        pass_id = cls._candidate_count_calls
-
-        examples = [
-            f'{car.name}->{rms.name}' for car, rms in direct[:2]
-        ] + [
-            f'{car.name}->{add_node.name}->{rms.name}'
-            for car, add_node, rms in add[:4]
-        ] + [
-            f'{car.name}->{fused_node.name}'
-            for car, fused_node in fused_add[:4]
-        ]
-        logger.debug(
-            'MUSA CAR-RMSNorm candidates %s fusion pass #%d: '
-            'car=%d fused_ar_rms=%d direct_car_rmsnorm=%d '
-            'add_car_rmsnorm=%d fused_add_car_rmsnorm=%d other_car=%d; '
-            'cumulative_car=%d '
-            'cumulative_direct_car_rmsnorm=%d cumulative_add_car_rmsnorm=%d; '
-            'cumulative_fused_add_car_rmsnorm=%d; '
-            'examples=%s',
-            stage,
-            pass_id,
-            len(car_nodes),
-            len(fused_nodes),
-            len(direct),
-            len(add),
-            len(fused_add),
-            len(car_nodes) - len(direct) - len(add) - len(fused_add),
-            cls._candidate_total_car,
-            cls._candidate_total_direct,
-            cls._candidate_total_add,
-            cls._candidate_total_fused_add,
-            examples,
-        )
-        for idx, fused in enumerate(fused_nodes):
-            logger.debug(
-                'MUSA CAR-RMSNorm fused node %s pass #%d idx=%d fused={%s}',
-                stage,
-                pass_id,
-                idx,
-                self._node_debug(fused),
-            )
-        for idx, (car, rms) in enumerate(direct):
-            logger.debug(
-                'MUSA CAR-RMSNorm direct candidate %s pass #%d idx=%d car={%s} rms={%s}',
-                stage,
-                pass_id,
-                idx,
-                self._node_debug(car),
-                self._node_debug(rms),
-            )
-        for idx, (car, add_node, rms) in enumerate(add):
-            logger.debug(
-                'MUSA CAR-RMSNorm add candidate %s pass #%d idx=%d car={%s} add={%s} rms={%s}',
-                stage,
-                pass_id,
-                idx,
-                self._node_debug(car),
-                self._node_debug(add_node),
-                self._node_debug(rms),
-            )
-        for idx, (car, fused_add_node) in enumerate(fused_add):
-            logger.debug(
-                'MUSA CAR-RMSNorm fused-add candidate %s pass #%d idx=%d '
-                'car={%s} fused_add={%s}',
-                stage,
-                pass_id,
-                idx,
-                self._node_debug(car),
-                self._node_debug(fused_add_node),
-            )
 
     @staticmethod
     def _rms_norm_weight(node: fx.Node) -> Any | None:
@@ -627,7 +483,7 @@ class MusaAllReduceRMSNormFusionPass(VllmPatternMatcherPass):
 
     def _manual_rewrite_residual_musa_jit_car_rmsnorm(
         self, graph: fx.Graph
-    ) -> tuple[int, int, int, int]:
+    ) -> tuple[int, int]:
         """Rewrite the 0.22 add IR and 0.24 fused-add IR explicitly.
 
         PatternMatcher can greedily keep matching the full 3-output ABI even when
@@ -638,14 +494,11 @@ class MusaAllReduceRMSNormFusionPass(VllmPatternMatcherPass):
         """
         no_raw_replaced = 0
         raw_replaced = 0
-        skipped_missing_args = 0
-        skipped_bad_add_args = 0
 
         for car in list(graph.nodes):
             if not self._is_target_musa_car_node(car):
                 continue
             if len(car.args) < 1:
-                skipped_bad_add_args += 1
                 continue
 
             # vLLM 0.24 lowers add + RMSNorm to a two-output IR node:
@@ -661,11 +514,9 @@ class MusaAllReduceRMSNormFusionPass(VllmPatternMatcherPass):
             for fused_add in fused_add_users:
                 fused_add_args = self._fused_add_rms_norm_args(fused_add, car)
                 if fused_add_args is None:
-                    skipped_missing_args += 1
                     continue
                 residual, weight, eps, variance_size = fused_add_args
                 if weight is None or eps is None or variance_size is not None:
-                    skipped_missing_args += 1
                     continue
 
                 output_users = list(fused_add.users)
@@ -676,7 +527,6 @@ class MusaAllReduceRMSNormFusionPass(VllmPatternMatcherPass):
                 if not output_users or any(
                     index not in (0, 1) for index in output_indices.values()
                 ):
-                    skipped_missing_args += 1
                     continue
 
                 raw_users = [
@@ -740,7 +590,6 @@ class MusaAllReduceRMSNormFusionPass(VllmPatternMatcherPass):
             for add in [user for user in list(car.users) if self._is_add_node(user)]:
                 residual = self._other_add_arg(add, car)
                 if residual is None:
-                    skipped_bad_add_args += 1
                     continue
 
                 rms_users = [
@@ -758,7 +607,6 @@ class MusaAllReduceRMSNormFusionPass(VllmPatternMatcherPass):
                 eps = self._rms_norm_eps(rms)
                 variance_size = self._rms_norm_variance_size(rms)
                 if weight is None or eps is None or variance_size is not None:
-                    skipped_missing_args += 1
                     continue
 
                 raw_users = [user for user in list(car.users) if user is not add]
@@ -817,49 +665,19 @@ class MusaAllReduceRMSNormFusionPass(VllmPatternMatcherPass):
             graph.lint()
             graph.eliminate_dead_code()
 
-        logger.warning(
-            "MUSA manual residual CAR-RMSNorm rewrite: no_raw=%d raw=%d "
-            "skipped_missing_args=%d skipped_bad_add_args=%d",
-            no_raw_replaced,
-            raw_replaced,
-            skipped_missing_args,
-            skipped_bad_add_args,
-        )
-        return no_raw_replaced, raw_replaced, skipped_missing_args, skipped_bad_add_args
+        return no_raw_replaced, raw_replaced
 
     @VllmInductorPass.time_and_log
     def __call__(self, graph: fx.Graph) -> None:
         if self.disabled:
             return
-        self._log_candidate_pattern_counts(
-            graph, stage='before', record_totals=True
-        )
 
-        manual_no_raw, manual_raw, _, _ = (
+        manual_no_raw, manual_raw = (
             self._manual_rewrite_residual_musa_jit_car_rmsnorm(graph)
         )
         manual_count = manual_no_raw + manual_raw
         if manual_count:
             self.matched_count = manual_count
-            self._log_candidate_pattern_counts(
-                graph, stage='after', record_totals=False
-            )
-            logger.warning(
-                "MUSA allreduce-rmsnorm fusion replaced %s patterns "
-                "(manual_no_raw=%s manual_raw=%s pattern=0)",
-                self.matched_count,
-                manual_no_raw,
-                manual_raw,
-            )
             return
 
         self.matched_count = self.patterns.apply(graph)
-        self._log_candidate_pattern_counts(
-            graph, stage='after', record_totals=False
-        )
-        logger.warning(
-            "MUSA allreduce-rmsnorm fusion replaced %s patterns "
-            "(manual_no_raw=0 manual_raw=0 pattern=%s)",
-            self.matched_count,
-            self.matched_count,
-        )

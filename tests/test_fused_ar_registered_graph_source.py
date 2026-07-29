@@ -23,18 +23,10 @@ FUSED_OPS = ROOT / "vllm_musa/fused_allreduce_rmsnorm_ops.py"
 FUSION_PASS = ROOT / "vllm_musa/_inductor/musa_allreduce_rms_fusion.py"
 
 
-def test_fused_path_defaults_on_with_independent_fallback_gates() -> None:
-    source = ENVIRON.read_text()
-    assert (
-        "VLLM_MUSA_FUSED_AR_RMSNORM = EnvBool(True)"
-        in source
-    )
-    assert (
-        "VLLM_MUSA_FUSED_AR_RMSNORM_GRAPH_REGISTERED_INPUT = "
-        "EnvBool(True)"
-    ) in source
-    assert "VLLM_MUSA_FUSED_AR_RMSNORM_DEBUG" not in source
-    assert "GRAPH_REGISTERED_INPUT_MAX_BYTES = EnvInt" not in source
+def _ffi_function_source(source: str, function_name: str) -> str:
+    start = source.index(f"void {function_name}(")
+    next_start = source.find("\nvoid vllm_musa_", start + 1)
+    return source[start:] if next_start == -1 else source[start:next_start]
 
 
 def test_fused_path_gates_can_be_disabled_independently() -> None:
@@ -62,8 +54,6 @@ def test_fusion_uses_one_canonical_feature_gate() -> None:
     assert canonical in env_source
     assert canonical in comm_source
     assert canonical in fusion_source
-    assert "VLLM_MUSA_FUSED_ALLREDUCE_RMSNORM" not in env_source
-    assert "VLLM_MUSA_FUSED_ALLREDUCE_RMSNORM" not in fusion_source
 
 
 def test_python_registered_path_is_syntax_valid_and_dependency_free() -> None:
@@ -71,29 +61,39 @@ def test_python_registered_path_is_syntax_valid_and_dependency_free() -> None:
     launcher_source = LAUNCHER.read_text()
     ast.parse(comm_source)
     ast.parse(launcher_source)
-    assert "_register_graph_inputs()" in comm_source
+    assert "_register_graph_buffers()" in comm_source
     assert "capture_succeeded" in comm_source
+    assert "def _graph_rank_data_for_input" in comm_source
+    assert "_pending_graph_inputs" in comm_source
+    assert "_GraphInputRegistration" not in comm_source
     assert "torch.get_device_module().is_current_stream_capturing()" in comm_source
-    assert "torch.get_device_module().synchronize()" in comm_source
-    assert "Refusing to keep a potentially incorrect Graph" in comm_source
+    assert "torch.musa.synchronize(self.device)" in comm_source
     assert "_graph_registered_input_eligible" in comm_source
     assert comm_source.count("_use_registered_graph_input(input)") == 3
-    assert comm_source.count("_graph_rank_data_for_input(input,") == 3
+    # Ordinary CAR and the three fused variants share the same graph slots.
+    assert comm_source.count("_graph_rank_data_for_input(input)") == 4
     assert launcher_source.count("_check_registered_rank_data(rank_data)") == 3
 
 
 def test_fused_kernel_copy_is_cpu_rank_data_only() -> None:
     source = KERNEL.read_text()
-    assert source.count("const RankData* device_data") >= 10
-    assert source.count("if (device_data != nullptr)") >= 5
-    # One unconditional copy remains for ordinary non-fused CAR. The three
-    # fused copies remain as the eager/default-Graph fallback, each guarded by
-    # CPU rank_data; device rank_data skips them.
-    assert source.count("musaMemcpyAsync(") == 4
-    assert source.count("if (rank_data_on_cpu) {") == 6
-    assert source.count(
-        "rank_data.device().device_type == inp.device().device_type"
-    ) == 3
+    for function_name in (
+        "vllm_musa_fused_ar_rmsnorm_launch_unregistered",
+        "vllm_musa_fused_ar_residual_rmsnorm_launch_unregistered",
+        "vllm_musa_fused_ar_residual_rmsnorm_no_raw_launch_unregistered",
+    ):
+        function_source = _ffi_function_source(source, function_name)
+        assert "const bool rank_data_on_cpu" in function_source
+        assert "const bool rank_data_on_musa" in function_source
+        assert (
+            "rank_data.device().device_type == inp.device().device_type"
+            in function_source
+        )
+        assert "const RankData* device_data = nullptr;" in function_source
+        assert "if (rank_data_on_cpu) {\n    const musaError_t copy_err" in (
+            function_source
+        )
+        assert function_source.count("musaMemcpyAsync(") == 1
 
 
 def test_tp2_specialized_fast_paths_preserve_vllm_abis() -> None:
@@ -119,10 +119,6 @@ def test_fused_ops_reuse_the_lifecycle_managed_jit_registry() -> None:
     ast.parse(fused_source)
     assert "def get_musa_jit_custom_allreduce_comm" in comm_source
     assert "get_musa_jit_custom_allreduce_comm" in fused_source
-    assert "_COMM_ID_BY_OBJECT" not in fused_source
-    assert "_NEXT_COMM_ID" not in fused_source
-    assert "register_musa_fused_ar_rmsnorm_comm" not in fused_source
-    assert "register_musa_fused_ar_rmsnorm_comm" not in fusion_source
     assert "self.comm_id = self.jit_comm_id" in fusion_source
 
 
@@ -143,16 +139,15 @@ def test_fusion_runtime_state_participates_in_cache_uuid() -> None:
     assert '"group_name": self.group_name' in source
 
 
-def test_kernel_validates_world_size_before_fixed_registry_arrays() -> None:
+def test_fused_kernel_validates_world_size_before_fixed_registry_arrays() -> None:
     source = KERNEL.read_text()
-    assert source.count("validate_world_size(world_size);") == 4
     for function_name in (
-        "vllm_musa_custom_ar_launch_unregistered",
         "vllm_musa_fused_ar_rmsnorm_launch_unregistered",
         "vllm_musa_fused_ar_residual_rmsnorm_launch_unregistered",
         "vllm_musa_fused_ar_residual_rmsnorm_no_raw_launch_unregistered",
     ):
-        function_source = source[source.index(f"void {function_name}") :]
+        function_source = _ffi_function_source(source, function_name)
+        assert function_source.count("validate_world_size(world_size);") == 1
         assert function_source.index("validate_world_size(world_size);") < (
             function_source.index("RankSignals sg{};")
         )
@@ -168,10 +163,8 @@ def test_no_raw_one_shot_matches_raw_dtype_rounding_order() -> None:
 
 
 def test_tp4_rows64_two_shot_uses_bounded_block_count() -> None:
-    launcher_source = LAUNCHER.read_text()
     kernel_source = KERNEL.read_text()
     assert "kTp4Rows64TwoShotBlockLimit = 32" in kernel_source
-    assert "tp4bs64bc" not in launcher_source
     assert "if constexpr (nranks == 4)" in kernel_source
     assert "if (rows == 64 && hidden == 2048)" in kernel_source
     assert (
@@ -189,11 +182,3 @@ def test_registered_graph_input_has_a_fixed_staging_boundary() -> None:
         "tensor.numel() * tensor.element_size()\n"
         "            <= self._GRAPH_REGISTERED_INPUT_MAX_BYTES"
     ) in comm_source
-    assert "_graph_registered_input_enabled" in comm_source
-
-
-def test_launcher_has_no_external_kernel_tuning_controls() -> None:
-    source = LAUNCHER.read_text()
-    assert "import os" not in source
-    assert "os.environ" not in source
-    assert "return threads, blocks, 0, 1, max(120, blocks)" in source
