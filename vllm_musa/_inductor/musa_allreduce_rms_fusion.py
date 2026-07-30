@@ -426,7 +426,73 @@ class MusaAllReduceRMSNormFusionPass(VllmPatternMatcherPass):
 
     @classmethod
     def _is_add_node(cls, node: fx.Node) -> bool:
-        return node.op == 'call_function' and 'aten.add' in cls._target_name(node)
+        if (
+            node.op != "call_function"
+            or node.target is not torch.ops.aten.add.Tensor
+            or len(node.args) != 2
+            or any(name != "alpha" for name in node.kwargs)
+        ):
+            return False
+        alpha = node.kwargs.get("alpha", 1)
+        return isinstance(alpha, (int, float, complex)) and alpha == 1
+
+    @staticmethod
+    def _node_tensor_meta(node: Any) -> torch.Tensor | None:
+        if not isinstance(node, fx.Node):
+            return None
+        value = node.meta.get("val")
+        return value if isinstance(value, torch.Tensor) else None
+
+    def _manual_residual_inputs_supported(
+        self, car: fx.Node, residual: Any, weight: Any
+    ) -> bool:
+        """Fail closed unless manual-rewrite inputs satisfy the fused ABI."""
+        if len(car.args) < 1:
+            return False
+
+        input_value = self._node_tensor_meta(car.args[0])
+        car_value = self._node_tensor_meta(car)
+        residual_value = self._node_tensor_meta(residual)
+        weight_value = self._node_tensor_meta(weight)
+        if any(
+            value is None
+            for value in (input_value, car_value, residual_value, weight_value)
+        ):
+            return False
+
+        assert input_value is not None
+        assert car_value is not None
+        assert residual_value is not None
+        assert weight_value is not None
+        try:
+            hidden_size = input_value.shape[-1]
+            return bool(
+                input_value.device.type == "musa"
+                and car_value.device == input_value.device
+                and residual_value.device == input_value.device
+                and weight_value.device == input_value.device
+                and input_value.dim() == 2
+                and car_value.dim() == 2
+                and residual_value.dim() == 2
+                and weight_value.dim() == 1
+                and car_value.shape == input_value.shape
+                and residual_value.shape == input_value.shape
+                and hidden_size == self.hidden_dim
+                and hidden_size > 0
+                and hidden_size % 8 == 0
+                and hidden_size <= 16384
+                and weight_value.numel() == hidden_size
+                and input_value.dtype in (torch.float16, torch.bfloat16)
+                and car_value.dtype == input_value.dtype
+                and residual_value.dtype == input_value.dtype
+                and weight_value.dtype in (input_value.dtype, torch.float32)
+                and input_value.is_contiguous()
+                and car_value.is_contiguous()
+                and residual_value.is_contiguous()
+                and weight_value.is_contiguous()
+            )
+        except (AttributeError, IndexError, RuntimeError, TypeError):
+            return False
 
     @staticmethod
     def _rms_norm_weight(node: fx.Node) -> Any | None:
@@ -518,6 +584,10 @@ class MusaAllReduceRMSNormFusionPass(VllmPatternMatcherPass):
                 residual, weight, eps, variance_size = fused_add_args
                 if weight is None or eps is None or variance_size is not None:
                     continue
+                if not self._manual_residual_inputs_supported(
+                    car, residual, weight
+                ):
+                    continue
 
                 output_users = list(fused_add.users)
                 output_indices = {
@@ -607,6 +677,10 @@ class MusaAllReduceRMSNormFusionPass(VllmPatternMatcherPass):
                 eps = self._rms_norm_eps(rms)
                 variance_size = self._rms_norm_variance_size(rms)
                 if weight is None or eps is None or variance_size is not None:
+                    continue
+                if not self._manual_residual_inputs_supported(
+                    car, residual, weight
+                ):
                     continue
 
                 raw_users = [user for user in list(car.users) if user is not add]
