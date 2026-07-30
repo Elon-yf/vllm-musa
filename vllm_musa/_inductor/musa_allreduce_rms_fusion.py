@@ -258,6 +258,8 @@ class MusaAllReduceRMSNormFusionPass(VllmPatternMatcherPass):
         super().__init__(config)
         self.disabled = True
         self.max_token_num: int | None = None
+        self.max_tokens_by_comm: int | None = None
+        self.jit_comm_max_size: int | None = None
         if not current_platform.is_musa():
             return
 
@@ -312,23 +314,68 @@ class MusaAllReduceRMSNormFusionPass(VllmPatternMatcherPass):
             )
             return
 
+        jit_comm_max_size = getattr(jit_comm, "max_size", None)
+        if not isinstance(jit_comm_max_size, int) or jit_comm_max_size <= 0:
+            logger.warning_once(
+                "MUSA allreduce-rmsnorm fusion disabled: invalid JIT comm "
+                "max_size=%r.",
+                jit_comm_max_size,
+            )
+            return
+        element_size = torch.empty((), dtype=self.model_dtype).element_size()
+        max_tokens_by_comm = self._max_fusable_tokens(
+            None, jit_comm_max_size, self.hidden_dim, element_size
+        )
+        if max_tokens_by_comm < 1:
+            logger.warning_once(
+                "MUSA allreduce-rmsnorm fusion disabled: JIT comm max_size=%d "
+                "cannot hold one token for hidden_dim=%d dtype=%s.",
+                jit_comm_max_size,
+                self.hidden_dim,
+                self.model_dtype,
+            )
+            return
+
         # Reuse the JIT communicator registry that already owns the compiled
         # custom-allreduce ABI and removes the id during communicator close.
         self.comm_id = self.jit_comm_id
         self.patterns = PatternMatcherPass(pass_name="musa_all_reduce_rms_fusion_pass")
-        self.max_token_num = config.scheduler_config.max_num_batched_tokens
+        self.jit_comm_max_size = jit_comm_max_size
+        self.max_tokens_by_comm = max_tokens_by_comm
+        self.max_token_num = self._max_fusable_tokens(
+            config.scheduler_config.max_num_batched_tokens,
+            jit_comm_max_size,
+            self.hidden_dim,
+            element_size,
+        )
         self.register_patterns()
         self.dump_patterns(config, self.patterns)
         logger.warning_once(
             "MUSA allreduce-rmsnorm fusion pass enabled: group=%s tp_size=%d "
-            "hidden_dim=%d max_token_num=%s comm_id=%d jit_comm_id=%d.",
+            "hidden_dim=%d max_token_num=%s max_tokens_by_comm=%d comm_id=%d "
+            "jit_comm_id=%d.",
             self.group_name,
             self.tp_size,
             self.hidden_dim,
             self.max_token_num,
+            self.max_tokens_by_comm,
             self.comm_id,
             self.jit_comm_id,
         )
+
+    @staticmethod
+    def _max_fusable_tokens(
+        scheduler_limit: int | None,
+        max_size: int,
+        hidden_dim: int,
+        element_size: int,
+    ) -> int:
+        if max_size <= 0 or hidden_dim <= 0 or element_size <= 0:
+            return 0
+        max_tokens = max_size // (hidden_dim * element_size)
+        if scheduler_limit is None:
+            return max_tokens
+        return min(scheduler_limit, max_tokens)
 
     @enable_fake_mode
     def register_patterns(self) -> None:
@@ -372,6 +419,8 @@ class MusaAllReduceRMSNormFusionPass(VllmPatternMatcherPass):
             ),
             "enabled": not self.disabled,
             "max_token_num": self.max_token_num,
+            "max_tokens_by_comm": self.max_tokens_by_comm,
+            "jit_comm_max_size": self.jit_comm_max_size,
         }
         if not self.disabled:
             state.update(

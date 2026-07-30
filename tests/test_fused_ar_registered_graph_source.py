@@ -21,6 +21,10 @@ KERNEL = ROOT / (
 ENVIRON = ROOT / "vllm_musa/utils/environ.py"
 FUSED_OPS = ROOT / "vllm_musa/fused_allreduce_rmsnorm_ops.py"
 FUSION_PASS = ROOT / "vllm_musa/_inductor/musa_allreduce_rms_fusion.py"
+PASS_MANAGER_PATCH = ROOT / (
+    "vllm_musa/patches/series/"
+    "0003-MUSA-vllm.compilation.passes.pass_manager.patch"
+)
 
 
 def _python_function_source(
@@ -61,6 +65,8 @@ def _isolated_fusion_helpers(torch_namespace: object, fx_namespace: object) -> t
     fusion_class = fusion_classes[0]
     helper_names = {
         "_is_add_node",
+        "_max_fusable_tokens",
+        "is_applicable_for_range",
         "_node_tensor_meta",
         "_manual_residual_inputs_supported",
     }
@@ -157,9 +163,12 @@ class _FakeNode:
         self.meta = {} if value is _MISSING else {"val": value}
 
 
-def _fake_fusion_namespaces() -> tuple[object, object, object, object, object]:
+def _fake_fusion_namespaces() -> tuple[
+    object, object, object, object, object, object
+]:
     tensor_overload = object()
     scalar_overload = object()
+    addmm_overload = object()
     add_packet = type(
         "_FakeAddPacket",
         (),
@@ -176,7 +185,20 @@ def _fake_fusion_namespaces() -> tuple[object, object, object, object, object]:
             "ops": type(
                 "_FakeOps",
                 (),
-                {"aten": type("_FakeAten", (), {"add": add_packet})},
+                {
+                    "aten": type(
+                        "_FakeAten",
+                        (),
+                        {
+                            "add": add_packet,
+                            "addmm": type(
+                                "_FakeAddmmPacket",
+                                (),
+                                {"default": addmm_overload},
+                            ),
+                        },
+                    )
+                },
             ),
         },
     )
@@ -186,6 +208,7 @@ def _fake_fusion_namespaces() -> tuple[object, object, object, object, object]:
         fx_namespace,
         tensor_overload,
         scalar_overload,
+        addmm_overload,
         torch_namespace.bfloat16,
     )
 
@@ -424,6 +447,7 @@ def test_manual_add_rewrite_accepts_only_tensor_overload_with_unit_alpha() -> No
         fx_namespace,
         tensor_overload,
         scalar_overload,
+        addmm_overload,
         _,
     ) = _fake_fusion_namespaces()
     helpers = _isolated_fusion_helpers(torch_namespace, fx_namespace)
@@ -443,6 +467,9 @@ def test_manual_add_rewrite_accepts_only_tensor_overload_with_unit_alpha() -> No
         _FakeNode(target=scalar_overload, args=(lhs, 1))
     )
     assert not helpers._is_add_node(
+        _FakeNode(target=addmm_overload, args=(lhs, rhs, lhs))
+    )
+    assert not helpers._is_add_node(
         _FakeNode(target=tensor_overload, args=(lhs, rhs, 1))
     )
     assert not helpers._is_add_node(
@@ -458,6 +485,7 @@ def test_manual_residual_metadata_gate_is_positive_and_fail_closed() -> None:
     (
         torch_namespace,
         fx_namespace,
+        _,
         _,
         _,
         input_dtype,
@@ -513,6 +541,38 @@ def test_fusion_runtime_state_participates_in_cache_uuid() -> None:
     assert '"comm_id": self.comm_id' in source
     assert '"jit_comm_id": self.jit_comm_id' in source
     assert '"group_name": self.group_name' in source
+    assert '"max_tokens_by_comm": self.max_tokens_by_comm' in source
+    assert '"jit_comm_max_size": self.jit_comm_max_size' in source
+
+
+def test_fusion_compile_range_respects_jit_comm_byte_limit() -> None:
+    (
+        torch_namespace,
+        fx_namespace,
+        _,
+        _,
+        _,
+        _,
+    ) = _fake_fusion_namespaces()
+    helpers = _isolated_fusion_helpers(torch_namespace, fx_namespace)()
+    max_size = 512 * 1024 * 1024
+    helpers.max_token_num = helpers._max_fusable_tokens(
+        20_000, max_size, 16_384, 2
+    )
+    assert helpers.max_token_num == 16_384
+    helpers.disabled = False
+    compile_range = type("_FakeRange", (), {"end": 16_384})()
+    assert helpers.is_applicable_for_range(compile_range)
+    compile_range.end = 16_385
+    assert not helpers.is_applicable_for_range(compile_range)
+
+
+def test_musa_fusion_respects_vllm_standard_disable_switch() -> None:
+    source = PASS_MANAGER_PATCH.read_text()
+    assert (
+        "if current_platform.is_musa() and self.pass_config.fuse_allreduce_rms:"
+        in source
+    )
 
 
 def test_fused_kernel_validates_world_size_before_fixed_registry_arrays() -> None:

@@ -35,7 +35,7 @@ index 4b98ac577..3033e46f4 100644
                  self.passes += [RocmAiterTritonAddRMSNormPadFusionPass(config)]
 -
 +
-+            if current_platform.is_musa():
++            if current_platform.is_musa() and self.pass_config.fuse_allreduce_rms:
 +                self.passes += [MusaAllReduceRMSNormFusionPass(config)]
 +
              if self.pass_config.fuse_allreduce_rms:
