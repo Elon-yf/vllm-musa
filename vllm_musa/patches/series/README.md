@@ -17,11 +17,12 @@ is pre-patched.
   the highest prefix. Author headers are normalized to the synthetic
   `musa <musa@local>` identity.
 
-Currently **103 patches**: the base tree already contained 102 after the ModelOpt
-FP8 `0099` patch was added without updating this count, and the sharded-Qwen
-`0100` patch brings the total to 103. These are MUSA source edits against the
-immutable vLLM commit recorded as `VLLM_COMMIT` in `third_party/PINS` (release
-label `v0.24.0`), applied at build. Runtime object/registration patches (which
-patch live objects at import) are kept separately in `vllm_musa/patches/`, not
-in this build-time series. Run `python3 tools/musa_sync.py verify` to replay and
-verify the complete manifest against that exact pinned commit.
+Currently **103 patches**: this branch adds the DeepSeek-V4 shared-expert SwiGLU
+FP8 patch and removes the obsolete auxiliary-overlap patch after making that
+path the model default, so the upstream total remains unchanged. These are MUSA
+source edits against the immutable vLLM commit recorded as `VLLM_COMMIT` in
+`third_party/PINS` (release label `v0.24.0`), applied at build. Runtime
+object/registration patches (which patch live objects at import) are kept
+separately in `vllm_musa/patches/`, not in this build-time series. Run
+`python3 tools/musa_sync.py verify` to replay and verify the complete manifest
+against that exact pinned commit.
