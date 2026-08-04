@@ -18,6 +18,7 @@ import torch
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.worker.gpu_input_batch import InputBatch
 
+from tests.qwen_contract_test_utils import qwen_sampler
 from vllm_musa.v1.sample import topk_topp_sampler as sampler
 
 requires_musa = pytest.mark.skipif(
@@ -71,7 +72,7 @@ def test_uniform_sampler_metadata_patch_is_active_and_qwen_gated() -> None:
 
 
 def test_legacy_qwen_unit_temperature_skip_is_exact_and_vocab_gated() -> None:
-    enabled_sampler = SimpleNamespace(_musa_qwen_skip_unit_temperature=True)
+    enabled_sampler = qwen_sampler()
     metadata = SimpleNamespace(all_random=True, uniform_temperature=1.0)
     assert sampler._can_skip_legacy_qwen_unit_temperature(
         enabled_sampler, torch.empty((4, 248320)), metadata
@@ -98,7 +99,7 @@ def test_legacy_qwen_unit_temperature_skip_is_exact_and_vocab_gated() -> None:
     )
     metadata.all_random = True
     assert not sampler._can_skip_legacy_qwen_unit_temperature(
-        SimpleNamespace(_musa_qwen_skip_unit_temperature=False),
+        qwen_sampler(enabled=False),
         torch.empty((4, 248320)),
         metadata,
     )
@@ -120,7 +121,7 @@ def test_legacy_sample_skips_only_cpu_proven_qwen_unit_temperature(
             forward=SimpleNamespace(__name__="forward_native")
         ),
         use_fp64_gumbel=False,
-        _musa_qwen_skip_unit_temperature=True,
+        _musa_optimization_contract=qwen_sampler()._musa_optimization_contract,
     )
     metadata = SimpleNamespace(
         all_greedy=False,
@@ -150,7 +151,9 @@ def test_legacy_sample_skips_only_cpu_proven_qwen_unit_temperature(
     sampler._sample(fake_sampler, torch.empty((4, 32000)), metadata)
     assert len(temperature_calls) == 2
 
-    fake_sampler._musa_qwen_skip_unit_temperature = False
+    fake_sampler._musa_optimization_contract = qwen_sampler(
+        enabled=False
+    )._musa_optimization_contract
     sampler._sample(fake_sampler, torch.empty((4, 248320)), metadata)
     assert len(temperature_calls) == 3
 
@@ -190,7 +193,9 @@ def _gumbel_gate_sampler(
         num_speculative_tokens=num_speculative_tokens,
         use_fp64_gumbel=use_fp64_gumbel,
         logprobs_mode=logprobs_mode,
-        _musa_qwen_family=is_qwen_family,
+        _musa_optimization_contract=qwen_sampler(
+            enabled=is_qwen_family
+        )._musa_optimization_contract,
     )
 
 
@@ -210,7 +215,9 @@ def _unfiltered_gumbel_gate_sampler(
         num_speculative_tokens=1,
         use_fp64_gumbel=False,
         logprobs_mode="raw_logprobs",
-        _musa_qwen_family=is_qwen_family,
+        _musa_optimization_contract=qwen_sampler(
+            enabled=is_qwen_family
+        )._musa_optimization_contract,
         logit_bias_state=SimpleNamespace(use_logit_bias=np.zeros(rows, dtype=np.bool_)),
         penalties_state=SimpleNamespace(use_penalty=np.zeros(rows, dtype=np.bool_)),
         bad_words_state=SimpleNamespace(
@@ -427,6 +434,57 @@ def test_qwen_legacy_unfiltered_gumbel_rejects_non_qwen_trait(monkeypatch) -> No
     )
 
 
+def test_qwen_sharded_logits_postcondition_recomputes_full_logits(monkeypatch) -> None:
+    rows = 32
+    hidden_states = torch.empty((rows, 2048), dtype=torch.bfloat16)
+    local_logits = torch.empty((rows, 10), dtype=torch.bfloat16)
+    full_logits = torch.empty((rows, 248320), dtype=torch.bfloat16)
+    processor = SimpleNamespace(
+        org_vocab_size=248320,
+        scale=1.0,
+        soft_cap=None,
+        use_all_gather=True,
+        _musa_skip_tp_gather=False,
+    )
+    calls = []
+
+    class FakeModel:
+        def compute_logits(self, _hidden_states):
+            calls.append(processor._musa_skip_tp_gather)
+            return local_logits if len(calls) == 1 else full_logits
+
+    fake_sampler = SimpleNamespace(
+        logprobs_mode="raw_logprobs",
+        use_fp64_gumbel=False,
+    )
+    monkeypatch.setattr(
+        sampler,
+        "can_use_qwen_legacy_unfiltered_metadata",
+        lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(sampler, "prefers_optimization", lambda *args: True)
+    monkeypatch.setattr(sampler, "get_pp_group", lambda: SimpleNamespace(world_size=1))
+    monkeypatch.setattr(sampler, "_musa_jit_pair_gather_available", lambda: True)
+    monkeypatch.setattr(
+        sampler, "_find_logits_processor", lambda _model: (processor, None)
+    )
+    monkeypatch.setattr(sampler, "get_tensor_model_parallel_world_size", lambda: 4)
+    monkeypatch.setattr(sampler, "is_musa_tensor", lambda _tensor: True)
+
+    logits, used_sharded = sampler.musa_compute_logits_if_eligible(
+        FakeModel(),
+        hidden_states,
+        SimpleNamespace(),
+        fake_sampler,
+    )
+
+    assert logits is full_logits
+    assert not used_sharded
+    assert calls == [True, False]
+    assert processor._musa_skip_tp_gather is False
+    assert fake_sampler._musa_qwen_sharded_logits is False
+
+
 def _can_use_qwen_legacy_gumbel(*args, **kwargs) -> bool:
     return sampler.can_use_qwen_legacy_gumbel(*args, **kwargs, is_qwen_family=True)
 
@@ -533,6 +591,26 @@ def test_qwen_legacy_gumbel_accepts_unfiltered_seeded_rows(monkeypatch) -> None:
     assert [generator.get_offset() for generator in metadata.generators.values()] == [
         68
     ] * rows
+
+
+def test_qwen_legacy_gumbel_rejects_partial_unfiltered_generators(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(sampler.current_platform, "is_musa", lambda: True)
+    monkeypatch.setattr(sampler, "is_musa_tensor", lambda _tensor: True)
+    rows = 16
+    logits = torch.randn((rows, 248320))
+    metadata = _legacy_gumbel_metadata(rows, top_k=None)
+    metadata.generators = {0: metadata.generators[0]}
+    metadata.generators[0].set_offset(64)
+
+    assert not _can_use_qwen_legacy_gumbel(
+        logits,
+        metadata,
+        "raw_logprobs",
+        None,
+        False,
+    )
 
 
 def test_qwen_legacy_gumbel_rejects_small_unfiltered_batches(monkeypatch) -> None:
@@ -1200,7 +1278,8 @@ def test_seeded_large_uniform_top_k_top_p_uses_cpu_scalar(monkeypatch) -> None:
         apply_min_p=lambda *_args: None,
     )
     fake_sampler = SimpleNamespace(
-        sampling_states=sampling_states, _musa_qwen_family=True
+        sampling_states=sampling_states,
+        _musa_optimization_contract=qwen_sampler()._musa_optimization_contract,
     )
     mapping = torch.arange(rows, dtype=torch.int64)
     mapping_np = np.arange(rows, dtype=np.int64)
@@ -1235,7 +1314,8 @@ def test_seeded_small_batch_qwen_vocab_uses_cpu_scalar(monkeypatch) -> None:
         apply_min_p=lambda *_args: None,
     )
     fake_sampler = SimpleNamespace(
-        sampling_states=sampling_states, _musa_qwen_family=True
+        sampling_states=sampling_states,
+        _musa_optimization_contract=qwen_sampler()._musa_optimization_contract,
     )
     mapping = torch.arange(rows, dtype=torch.int64)
     mapping_np = np.arange(rows, dtype=np.int64)
@@ -1302,7 +1382,8 @@ def test_non_qwen_vocab_keeps_tensor_top_k_path(monkeypatch) -> None:
         apply_min_p=lambda *_args: None,
     )
     fake_sampler = SimpleNamespace(
-        sampling_states=sampling_states, _musa_qwen_family=True
+        sampling_states=sampling_states,
+        _musa_optimization_contract=qwen_sampler()._musa_optimization_contract,
     )
     mapping = torch.arange(rows, dtype=torch.int64)
     mapping_np = np.arange(rows, dtype=np.int64)

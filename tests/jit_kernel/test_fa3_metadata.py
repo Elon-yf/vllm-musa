@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+from importlib.metadata import PackageNotFoundError, version
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from tests.qwen_contract_test_utils import qwen_sampler
 from vllm_musa.jit_kernel import fa3_metadata
+
+
+def _mate_scheduler_golden_is_current() -> bool:
+    try:
+        return version("mate").split("+", 1)[0] == "0.2.4"
+    except PackageNotFoundError:
+        return False
 
 
 def _make_builder(flash_attn):
@@ -17,6 +26,8 @@ def _make_builder(flash_attn):
     builder.dcp_rank = 0
     builder.cp_kv_cache_interleave_size = 1
     builder.reorder_batch_threshold = 1
+    builder.num_speculative_tokens = 0
+    builder.decode_threshold = 1
     builder.use_full_cuda_graph = True
     builder.max_cudagraph_size = 8
     builder.max_num_splits = 32
@@ -33,7 +44,7 @@ def _make_builder(flash_attn):
     builder.block_size = 64
     builder.kv_cache_dtype = torch.bfloat16
     builder.model_config = SimpleNamespace(dtype=torch.bfloat16)
-    builder._musa_qwen_family = True
+    builder._musa_optimization_contract = qwen_sampler()._musa_optimization_contract
     builder.cache_config = SimpleNamespace(cache_dtype="auto")
     return builder
 
@@ -423,6 +434,13 @@ def test_qwen_single_request_fa3_scheduler_lookup_launches_once(monkeypatch):
     ],
 )
 @pytest.mark.parametrize("seq_len", [1, 64, 65, 384, 385, 4096])
+@pytest.mark.skipif(
+    not _mate_scheduler_golden_is_current(),
+    reason=(
+        "FA3 scheduler golden values are tied to MATE 0.2.4; MATE 0.2.5 "
+        "is fail-closed by the production scheduler gate"
+    ),
+)
 def test_qwen_single_request_fa3_scheduler_lookup_values(
     seq_len,
     num_heads_q,

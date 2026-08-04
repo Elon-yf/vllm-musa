@@ -17,7 +17,9 @@ void musa_fused_gemv_moe(
     bool mul_routed_weight,
     int64_t topk,
     bool use_int4_w4a16,
-    bool use_swigelu);
+    bool use_swigelu,
+    int64_t block_n,
+    int64_t block_k);
 
 void musa_fused_gemv(
     torch::Tensor &A,
@@ -35,7 +37,8 @@ void musa_fused_add_rms_norm(
     torch::Tensor &input,
     torch::Tensor &residual,
     torch::Tensor &weight,
-    double eps);
+    double eps,
+    int64_t block_x);
 
 void musa_reshape_and_cache_flash_nhd(
     torch::Tensor &key,
