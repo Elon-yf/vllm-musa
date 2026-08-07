@@ -15,9 +15,7 @@ if current_platform.is_musa():
     from vllm import _custom_ops as ops
 
     from vllm_musa import _custom_ops as musa_ops
-    from vllm_musa.utils.environ import envs
 
-    _USE_NATIVE_RESHAPE_CACHE_FLASH = envs.VLLM_MUSA_RESHAPE_CACHE_FLASH.get()
     _MUSA_OPS_NAMESPACE = getattr(torch.ops, "_C_musa_ops", None)
     _HAS_NATIVE_RESHAPE_CACHE_FLASH = hasattr(
         _MUSA_OPS_NAMESPACE, "musa_reshape_and_cache_flash_nhd"
@@ -37,8 +35,7 @@ if current_platform.is_musa():
         # Python only filters known fallback cases that are valid upstream.
         head_size = key.shape[2] if key.dim() == 3 else None
         return (
-            _USE_NATIVE_RESHAPE_CACHE_FLASH
-            and _HAS_NATIVE_RESHAPE_CACHE_FLASH
+            _HAS_NATIVE_RESHAPE_CACHE_FLASH
             and kv_cache_dtype in ("auto", "float16", "bfloat16")
             and key.dtype in (torch.float16, torch.bfloat16)
             and value.dtype == key.dtype
@@ -62,6 +59,11 @@ if current_platform.is_musa():
             and value_cache.stride(2) == value_cache.shape[3]
             and key_cache.stride(1) == key_cache.shape[2] * key_cache.shape[3]
             and (value_cache.stride(1) == value_cache.shape[2] * value_cache.shape[3])
+            # The native kernel receives one page/block stride and applies it
+            # to both K and V caches.  Do not dispatch it for independently
+            # padded/as_strided cache tensors.
+            and key_cache.stride(0) == value_cache.stride(0)
+            and key_cache.stride(1) == value_cache.stride(1)
         )
 
     def reshape_and_cache_flash(
