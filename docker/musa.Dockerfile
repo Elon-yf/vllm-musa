@@ -68,7 +68,7 @@ RUN apt-get update && \
     python -m pip install --upgrade pip && \
     rm -rf /var/lib/apt/lists/*
 
-# The torch 2.9.x MUSA wheel links MKL with .so.2 sonames. Ubuntu 22.04 apt
+# The MUSA PyTorch wheel links MKL with .so.2 sonames. Ubuntu 22.04 apt
 # ships the same logical MKL components without that suffix.
 RUN ln -sf /usr/lib/x86_64-linux-gnu/libmkl_intel_lp64.so \
         /usr/lib/x86_64-linux-gnu/libmkl_intel_lp64.so.2 && \
@@ -302,20 +302,31 @@ RUN printf '%s\n' \
         '' \
         'def requirement_prefix(dist_name):' \
         '    pattern = re.compile(rf"^{re.escape(dist_name)}==(.+)$")' \
-        '    for line in Path("requirements/musa_private.txt").read_text().splitlines():' \
-        '        match = pattern.match(line.strip())' \
-        '        if match:' \
-        '            return match.group(1).split("*", 1)[0]' \
-        '    raise RuntimeError(f"missing {dist_name} pin in requirements/musa_private.txt")' \
+        '    requirement_files = (' \
+        '        "requirements/musa_private.txt",' \
+        '        "requirements/common.txt",' \
+        '    )' \
+        '    for requirement_file in requirement_files:' \
+        '        for line in Path(requirement_file).read_text().splitlines():' \
+        '            match = pattern.match(line.strip())' \
+        '            if match:' \
+        '                return match.group(1).split("*", 1)[0]' \
+        '    raise RuntimeError(f"missing {dist_name} pin in {requirement_files}")' \
+        '' \
+        'exact_version_dists = frozenset({"torchada", "torch", "torch_musa", "torchvision", "torchaudio", "deep_ep"})' \
         '' \
         'expected = (' \
+        '    ("torchada", "torchada", requirement_prefix("torchada")),' \
         '    ("numpy", "numpy", "1.26."),' \
         '    ("torch", "torch", requirement_prefix("torch")),' \
         '    ("torch_musa", "torch_musa", requirement_prefix("torch_musa")),' \
+        '    ("torchvision", "torchvision", requirement_prefix("torchvision")),' \
+        '    ("torchaudio", "torchaudio", requirement_prefix("torchaudio")),' \
         '    ("mate", "mate", ""),' \
         '    ("flash_attn_3", "flash_attn_3", ""),' \
         '    ("flash_mla", "flash_mla", ""),' \
         '    ("deep-gemm", "deep_gemm", ""),' \
+        '    ("deep_ep", "deep_ep", requirement_prefix("deep_ep")),' \
         '    ("tilelang_musa", "tilelang", ""),' \
         '    ("triton", "triton", requirement_prefix("triton")),' \
         '    ("uvloop", "uvloop", ""),' \
@@ -328,11 +339,13 @@ RUN printf '%s\n' \
         'for dist_name, module_name, prefix in expected:' \
         '    importlib.import_module(module_name)' \
         '    installed = version(dist_name)' \
-        '    if prefix and not installed.startswith(prefix):' \
+        '    if dist_name in exact_version_dists and installed != prefix:' \
+        '        raise RuntimeError(f"{dist_name} expected exactly {prefix}, got {installed}")' \
+        '    if dist_name not in exact_version_dists and prefix and not installed.startswith(prefix):' \
         '        raise RuntimeError(f"{dist_name} expected {prefix}, got {installed}")' \
         '    print(f"PASS import {module_name} version={installed}")' \
         '' \
-        'for module_name in ("torchada", "vllm", "vllm_musa"):' \
+        'for module_name in ("vllm", "vllm_musa"):' \
         '    module = importlib.import_module(module_name)' \
         '    print("PASS import %s version=%s" % (module_name, getattr(module, "__version__", "unknown")))' \
         > /tmp/vllm_musa_import_check.py && \
