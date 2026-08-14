@@ -64,25 +64,45 @@ def _musa_jit_fused_topk(
     indices_type: torch.dtype | None,
     correction_bias: torch.Tensor | None = None,
     scoring_func: str = "softmax",
+    shared_expert_gate_output: torch.Tensor | None = None,
     num_fused_shared_experts: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    if num_fused_shared_experts and not (
-        num_fused_shared_experts == 1
-        and gating_output.shape[1] == 257
-        and topk == 8
-        and renormalize
-        and correction_bias is None
-        and scoring_func == "softmax"
-    ):
-        return None
     if not _can_use_musa_jit_topk(hidden_states, gating_output, topk, correction_bias):
         return None
 
-    # The MUSA softmax kernel's correction-bias ABI currently returns
-    # probabilities of ``logits + bias``.  vLLM's grouped-top-k contract
-    # selects experts with ``softmax(logits) + bias`` but returns the unbiased
-    # softmax weights.  Keep this combination on the upstream implementation
-    # until the kernel can expose both semantics without a numerical change.
+    has_shared_experts = (
+        shared_expert_gate_output is not None and num_fused_shared_experts > 0
+    )
+    has_combined_shared_experts = (
+        shared_expert_gate_output is None and num_fused_shared_experts > 0
+    )
+    if has_shared_experts and not (
+        scoring_func == "softmax"
+        and correction_bias is None
+        and gating_output.shape[1] == 256
+        and topk == 8
+        and num_fused_shared_experts == 1
+        and shared_expert_gate_output.device == gating_output.device
+        and shared_expert_gate_output.dim() == 2
+        and shared_expert_gate_output.shape == (gating_output.shape[0], 1)
+        and shared_expert_gate_output.dtype
+        in (torch.float32, torch.float16, torch.bfloat16)
+        and shared_expert_gate_output.is_contiguous()
+    ):
+        return None
+    if has_combined_shared_experts and not (
+        scoring_func == "softmax"
+        and renormalize
+        and correction_bias is None
+        and gating_output.shape[1] == 257
+        and topk == 8
+        and num_fused_shared_experts == 1
+    ):
+        return None
+
+    # The MUSA softmax kernel's correction-bias ABI returns probabilities of
+    # ``logits + bias``. vLLM selects with ``softmax(logits) + bias`` while
+    # returning the unbiased softmax weights, so preserve the upstream path.
     if correction_bias is not None and scoring_func == "softmax":
         return None
 
@@ -90,7 +110,11 @@ def _musa_jit_fused_topk(
     if musa_jit_topk is None:
         return None
 
-    output_topk = topk + num_fused_shared_experts
+    output_topk = topk + (
+        num_fused_shared_experts
+        if has_shared_experts or has_combined_shared_experts
+        else 0
+    )
     topk_weights = torch.empty(
         gating_output.shape[0],
         output_topk,
@@ -111,6 +135,7 @@ def _musa_jit_fused_topk(
             gating_output,
             renormalize,
             correction_bias=correction_bias,
+            shared_expert_gate_output=shared_expert_gate_output,
             num_fused_shared_experts=num_fused_shared_experts,
         )
     elif scoring_func == "sigmoid":
@@ -120,6 +145,8 @@ def _musa_jit_fused_topk(
             gating_output,
             renormalize,
             correction_bias=correction_bias,
+            shared_expert_gate_output=shared_expert_gate_output,
+            num_fused_shared_experts=num_fused_shared_experts,
         )
     else:
         return None

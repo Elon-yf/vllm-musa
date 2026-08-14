@@ -1604,12 +1604,15 @@ class FlashAttentionImpl(AttentionImpl):
         )
 
     def qwen3_qk_rope_kvcache_supported(self) -> bool:
-        """Whether this layer is inside the initial dense Qwen3 envelope."""
+        """Whether this layer is inside a validated Qwen3 cache-out envelope."""
+        supported_shape = (
+            (self.num_heads, self.num_kv_heads, self.head_size)
+            in ((16, 8, 128), (32, 8, 128), (4, 1, 256), (32, 2, 256))
+        )
         return (
             get_flash_attn_version() == 3
             and get_kv_cache_layout() == "NHD"
-            and (self.num_heads, self.num_kv_heads) in ((16, 8), (32, 8))
-            and self.head_size == 128
+            and supported_shape
             and self.attn_type == AttentionType.DECODER
             and self.kv_cache_dtype in ("auto", "bfloat16", torch.bfloat16)
             and self.alibi_slopes is None
@@ -1633,6 +1636,13 @@ class FlashAttentionImpl(AttentionImpl):
         k_out: torch.Tensor,
         kv_cache: torch.Tensor,
         layer_slot_mapping: torch.Tensor | None,
+        is_neox: bool = True,
+        mrope_section_t: int = 64,
+        mrope_section_h: int = 0,
+        mrope_section_w: int = 0,
+        is_interleaved: bool = False,
+        eps: float = 1e-6,
+        gemma: bool = False,
     ) -> None:
         """Run the exact Qwen3 provider, falling back before cache fusion."""
         from vllm_musa.jit_kernel.csrc.norm import (
@@ -1656,7 +1666,38 @@ class FlashAttentionImpl(AttentionImpl):
                 and tuple(key_cache.shape[-2:]) == expected_tail
                 and tuple(value_cache.shape[-2:]) == expected_tail
             )
-            if flat_cache_supported:
+            h256_paged_specialization = (
+                gemma
+                and is_interleaved
+                and self.head_size == 256
+                and cos_sin_cache.shape[-1] == 64
+                and (mrope_section_t, mrope_section_h, mrope_section_w)
+                == (11, 11, 10)
+            )
+            paged_cache_supported = (
+                h256_paged_specialization
+                and key_cache.dim() == 4
+                and value_cache.dim() == 4
+                and tuple(key_cache.shape[-2:]) == expected_tail
+                and tuple(value_cache.shape[-2:]) == expected_tail
+                and key_cache.stride(3) == 1
+                and value_cache.stride(3) == 1
+                and key_cache.stride(2) == self.head_size
+                and value_cache.stride(2) == self.head_size
+                and key_cache.stride(1) == self.num_kv_heads * self.head_size
+                and value_cache.stride(1) == self.num_kv_heads * self.head_size
+            )
+            if flat_cache_supported or paged_cache_supported:
+                key_cache_out = (
+                    key_cache.view(-1, self.num_kv_heads * self.head_size)
+                    if flat_cache_supported
+                    else key_cache
+                )
+                value_cache_out = (
+                    value_cache.view(-1, self.num_kv_heads * self.head_size)
+                    if flat_cache_supported
+                    else value_cache
+                )
                 fused_qk_rmsnorm_mrope_cache_out(
                     q,
                     k,
@@ -1667,16 +1708,16 @@ class FlashAttentionImpl(AttentionImpl):
                     cos_sin_cache,
                     q_out,
                     k_out,
-                    key_cache.view(-1, self.num_kv_heads * self.head_size),
-                    value_cache.view(-1, self.num_kv_heads * self.head_size),
+                    key_cache_out,
+                    value_cache_out,
                     layer_slot_mapping,
-                    True,
-                    64,
-                    0,
-                    0,
-                    False,
-                    1e-6,
-                    False,
+                    is_neox,
+                    mrope_section_t,
+                    mrope_section_h,
+                    mrope_section_w,
+                    is_interleaved,
+                    eps,
+                    gemma,
                 )
                 return
 
@@ -1689,13 +1730,13 @@ class FlashAttentionImpl(AttentionImpl):
             cos_sin_cache,
             q_out,
             k_out,
-            True,
-            64,
-            0,
-            0,
-            False,
-            1e-6,
-            False,
+            is_neox,
+            mrope_section_t,
+            mrope_section_h,
+            mrope_section_w,
+            is_interleaved,
+            eps,
+            gemma,
         )
         if layer_slot_mapping is not None:
             self.do_kv_cache_update(
