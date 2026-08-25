@@ -320,7 +320,7 @@ RUN printf '%s\n' \
         '                return match.group(1).split("*", 1)[0]' \
         '    raise RuntimeError(f"missing {dist_name} pin in {requirement_files}")' \
         '' \
-        'exact_version_dists = frozenset({"torchada", "torch", "torch_musa", "torchvision", "torchaudio", "deep_ep"})' \
+        'exact_version_dists = frozenset({"torchada", "torch", "torch_musa", "torchvision", "torchaudio", "mate", "mate-mubin", "flash_attn_3", "flash_mla", "deep-gemm", "flashinfer-python", "sageattention", "deep_ep", "tilelang_musa", "apache-tvm-ffi"})' \
         '' \
         'expected = (' \
         '    ("torchada", "torchada", requirement_prefix("torchada")),' \
@@ -330,9 +330,12 @@ RUN printf '%s\n' \
         '    ("torchvision", "torchvision", requirement_prefix("torchvision")),' \
         '    ("torchaudio", "torchaudio", requirement_prefix("torchaudio")),' \
         '    ("mate", "mate", ""),' \
+        '    ("mate-mubin", "mate_mubin", ""),' \
         '    ("flash_attn_3", "flash_attn_3", ""),' \
         '    ("flash_mla", "flash_mla", ""),' \
         '    ("deep-gemm", "deep_gemm", ""),' \
+        '    ("flashinfer-python", "flashinfer", ""),' \
+        '    ("sageattention", "sageattention", ""),' \
         '    ("deep_ep", "deep_ep", requirement_prefix("deep_ep")),' \
         '    ("tilelang_musa", "tilelang", ""),' \
         '    ("triton", "triton", requirement_prefix("triton")),' \

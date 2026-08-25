@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: musa <musa@local>
+Date: Tue, 25 Aug 2026 18:00:00 +0800
+Subject: [PATCH] MUSA: accept the MATE FlashInfer wrapper without CUDA JIT
+
+---
+ vllm/utils/flashinfer.py | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/vllm/utils/flashinfer.py b/vllm/utils/flashinfer.py
+index 0000000000..0000000000 100644
+--- a/vllm/utils/flashinfer.py
++++ b/vllm/utils/flashinfer.py
+@@ -50,6 +50,13 @@ def has_flashinfer() -> bool:
+     if importlib.util.find_spec("flashinfer") is None:
+         logger.debug_once("FlashInfer unavailable since package was not found")
+         return False
++    if current_platform.is_musa():
++        # MUSA uses the MATE-backed Python wrapper and does not JIT CUDA cubins.
++        return True
+     # When not using flashinfer cubin,
+     # Also check if nvcc is available since it's required to JIT compile flashinfer
+     if not has_flashinfer_cubin() and shutil.which("nvcc") is None:
+         logger.debug_once(
+--
+2.39.0

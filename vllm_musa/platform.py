@@ -104,6 +104,14 @@ def register_attention_backends() -> None:
             "MUSAFlashMLASparseBackend"
         ),
     )
+    if hasattr(AttentionBackendEnum, "FLASHINFER_MLA_SPARSE"):
+        register_backend(
+            AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
+            class_path=(
+                "vllm_musa.v1.attention.backends.mla.flashinfer_sparse."
+                "MUSAFlashInferMLASparseBackend"
+            ),
+        )
     register_backend(
         AttentionBackendEnum.FLASH_ATTN,
         class_path="vllm_musa.v1.attention.backends.flash_attn.MUSAFlashAttentionBackend",
