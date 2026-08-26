@@ -90,6 +90,8 @@ def test_flashinfer_bmm_uses_a_musa_provider_not_a_global_availability_patch() -
     assert "MUSAFlashInferFP8ScaledMMLinearKernel" in provider
     assert "has_musa_flashinfer_bmm_fp8" in provider
     assert "musa_flashinfer_bmm_fp8" in provider
+    assert "_as_mate_scalar_scale" in provider
+    assert "scale.reshape(())" in provider
     assert "compute_capability != 31" in provider
     assert "MUSAFlashInferFP8ScaledMMLinearKernel" in patch
     assert not (
@@ -103,3 +105,10 @@ def test_mate_wrapper_keeps_native_flashinfer_headers_separate() -> None:
     assert "_find_vendored_flashinfer_root" in source
     assert '"third_party/flashinfer"' in source
     assert 'flashinfer_root / "data"' in source
+    assert "PR #188" not in source
+
+
+def test_sparse_backend_matches_mate_lse_and_topk_contracts() -> None:
+    backend = _read("vllm_musa/v1/attention/backends/mla/flashinfer_sparse.py")
+    assert "lse_base_on_e: bool = True" in backend
+    assert backend.count("BLOCK_N=64") == 2

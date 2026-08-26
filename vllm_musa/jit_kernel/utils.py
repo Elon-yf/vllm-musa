@@ -306,7 +306,7 @@ def _find_package_root(package: str) -> Optional[pathlib.Path]:
 
 
 def _find_vendored_flashinfer_root() -> Optional[pathlib.Path]:
-    """Find PR #188's native FlashInfer source beside the editable package."""
+    """Find the pinned native FlashInfer source beside the editable package."""
     candidate = pathlib.Path(__file__).resolve().parents[2] / "third_party/flashinfer"
     if (candidate / "include").is_dir() and (candidate / "csrc").is_dir():
         return candidate

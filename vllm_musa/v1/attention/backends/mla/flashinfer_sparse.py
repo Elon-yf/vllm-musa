@@ -31,6 +31,9 @@ logger = init_logger(__name__)
 class MUSAFlashInferMLASparseImpl(FlashInferMLASparseImpl):
     """Use the MATE provider while retaining vLLM sparse metadata handling."""
 
+    # MATE returns natural-log LSE, matching its torch.logsumexp reference.
+    lse_base_on_e: bool = True
+
     def forward_mqa(
         self,
         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
@@ -73,6 +76,7 @@ class MUSAFlashInferMLASparseImpl(FlashInferMLASparseImpl):
                 dcp_rank=self.dcp_rank,
                 cp_kv_cache_interleave_size=attn_metadata.cp_kv_cache_interleave_size,
                 BLOCK_SIZE=attn_metadata.block_size,
+                BLOCK_N=64,
                 NUM_TOPK_TOKENS=topk_indices.shape[1],
                 return_valid_counts=True,
             )
@@ -86,6 +90,7 @@ class MUSAFlashInferMLASparseImpl(FlashInferMLASparseImpl):
                 attn_metadata.block_table,
                 topk_indices,
                 BLOCK_SIZE=attn_metadata.block_size,
+                BLOCK_N=64,
                 NUM_TOPK_TOKENS=topk_indices.shape[1],
                 return_valid_counts=True,
             )

@@ -22,6 +22,15 @@ from vllm_musa.utils.flashinfer import (
 )
 
 
+def _as_mate_scalar_scale(scale: torch.Tensor, name: str) -> torch.Tensor:
+    if scale.numel() != 1:
+        raise RuntimeError(
+            f"MATE FlashInfer per-tensor BMM requires one {name} value, "
+            f"got shape {tuple(scale.shape)}"
+        )
+    return scale.reshape(())
+
+
 def _musa_flashinfer_bmm_fp8(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -32,8 +41,8 @@ def _musa_flashinfer_bmm_fp8(
     return bmm_fp8(
         a,
         b,
-        a_scale,
-        b_scale,
+        _as_mate_scalar_scale(a_scale, "activation scale"),
+        _as_mate_scalar_scale(b_scale, "weight scale"),
         out_dtype,
         out=None,
         backend="auto",
