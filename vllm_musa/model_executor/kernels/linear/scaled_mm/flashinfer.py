@@ -69,9 +69,14 @@ class MUSAFlashInferFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
     def is_supported(
         cls, compute_capability: int | None = None
     ) -> tuple[bool, str | None]:
-        del compute_capability
         if not current_platform.is_musa():
             return False, "requires MUSA."
+        if compute_capability is None:
+            capability = current_platform.get_device_capability()
+            if capability is not None:
+                compute_capability = capability.major * 10 + capability.minor
+        if compute_capability != 31:
+            return False, "requires an MP31 MUSA device."
         if not has_musa_flashinfer_bmm_fp8():
             return False, "requires MATE flashinfer.bmm_fp8."
         return True, None

@@ -72,10 +72,12 @@ def test_flashinfer_sparse_backend_is_registered_on_musa() -> None:
         'supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["fp8", "fp8_e4m3"]'
         in backend
     )
-    assert "requires block_size=64" in backend
+    assert "return [64]" in backend
     assert "requires head_size=576" in backend
     assert "requires index_topk divisible by 64" in backend
     assert "has_musa_flashinfer_sparse_decode" in backend
+    assert "capability.minor == 1" in backend
+    assert "device_capability.minor != 1" in backend
 
 
 def test_flashinfer_bmm_uses_a_musa_provider_not_a_global_availability_patch() -> None:
@@ -88,6 +90,7 @@ def test_flashinfer_bmm_uses_a_musa_provider_not_a_global_availability_patch() -
     assert "MUSAFlashInferFP8ScaledMMLinearKernel" in provider
     assert "has_musa_flashinfer_bmm_fp8" in provider
     assert "musa_flashinfer_bmm_fp8" in provider
+    assert "compute_capability != 31" in provider
     assert "MUSAFlashInferFP8ScaledMMLinearKernel" in patch
     assert not (
         ROOT

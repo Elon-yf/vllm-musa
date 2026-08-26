@@ -155,7 +155,11 @@ class MUSAFlashInferMLASparseBackend(FlashInferMLASparseTRTLLMBackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        return capability.major == 3 and has_musa_flashinfer_sparse_decode()
+        return (
+            capability.major == 3
+            and capability.minor == 1
+            and has_musa_flashinfer_sparse_decode()
+        )
 
     @classmethod
     def supports_combination(
@@ -172,7 +176,7 @@ class MUSAFlashInferMLASparseBackend(FlashInferMLASparseTRTLLMBackend):
     ) -> str | None:
         if not has_musa_flashinfer_sparse_decode():
             return "MATE FlashInfer Sparse MLA wrapper is unavailable"
-        if device_capability.major != 3:
+        if device_capability.major != 3 or device_capability.minor != 1:
             return "MATE FlashInfer Sparse MLA requires an MP31 MUSA device"
         if not use_mla or not use_sparse:
             return "MATE FlashInfer Sparse MLA requires sparse MLA"
@@ -186,8 +190,6 @@ class MUSAFlashInferMLASparseBackend(FlashInferMLASparseTRTLLMBackend):
             return "MATE FlashInfer Sparse MLA requires FP8 E4M3 KV cache"
         if head_size != 576:
             return "MATE FlashInfer Sparse MLA requires head_size=576"
-        if block_size != 64:
-            return "MATE FlashInfer Sparse MLA requires block_size=64"
 
         config = get_current_vllm_config().model_config
         if config is None:
