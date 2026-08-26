@@ -206,9 +206,15 @@ class MUSAFlashInferMLASparseBackend(FlashInferMLASparseTRTLLMBackend):
             return "MATE FlashInfer Sparse MLA requires qk_rope_head_dim=64"
         if getattr(hf_config, "qk_nope_head_dim", None) not in (128, 192):
             return "MATE FlashInfer Sparse MLA requires qk_nope_head_dim 128 or 192"
+        if getattr(hf_config, "index_n_heads", None) != 32:
+            return "MATE FlashInfer Sparse MLA requires index_n_heads=32 on MUSA"
+        if getattr(hf_config, "index_head_dim", None) != 128:
+            return "MATE FlashInfer Sparse MLA requires index_head_dim=128 on MUSA"
         topk = getattr(hf_config, "index_topk", None)
         if not isinstance(topk, int) or topk <= 0 or topk % 64 != 0:
             return "MATE FlashInfer Sparse MLA requires index_topk divisible by 64"
+        if topk > 2048:
+            return "MATE FlashInfer Sparse MLA requires index_topk<=2048 on MUSA"
         return None
 
 

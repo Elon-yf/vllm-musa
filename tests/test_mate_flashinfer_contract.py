@@ -74,7 +74,10 @@ def test_flashinfer_sparse_backend_is_registered_on_musa() -> None:
     )
     assert "return [64]" in backend
     assert "requires head_size=576" in backend
+    assert "requires index_n_heads=32 on MUSA" in backend
+    assert "requires index_head_dim=128 on MUSA" in backend
     assert "requires index_topk divisible by 64" in backend
+    assert "requires index_topk<=2048 on MUSA" in backend
     assert "has_musa_flashinfer_sparse_decode" in backend
     assert "capability.minor == 1" in backend
     assert "device_capability.minor != 1" in backend
