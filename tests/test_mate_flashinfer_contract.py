@@ -35,6 +35,7 @@ def test_docker_import_check_covers_mate_flashinfer_cohort() -> None:
         ("flashinfer-python", "flashinfer"),
     ):
         assert f'("{distribution}", "{module}"' in dockerfile
+        assert f'requirement_prefix("{distribution}")' in dockerfile
         assert f'"{distribution}"' in dockerfile.split("exact_version_dists =", 1)[1]
 
 

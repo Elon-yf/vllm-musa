@@ -329,20 +329,20 @@ RUN printf '%s\n' \
         '    ("torch_musa", "torch_musa", requirement_prefix("torch_musa")),' \
         '    ("torchvision", "torchvision", requirement_prefix("torchvision")),' \
         '    ("torchaudio", "torchaudio", requirement_prefix("torchaudio")),' \
-        '    ("mate", "mate", ""),' \
-        '    ("mate-mubin", "mate_mubin", ""),' \
-        '    ("flash_attn_3", "flash_attn_3", ""),' \
-        '    ("flash_mla", "flash_mla", ""),' \
-        '    ("deep-gemm", "deep_gemm", ""),' \
-        '    ("flashinfer-python", "flashinfer", ""),' \
-        '    ("sageattention", "sageattention", ""),' \
+        '    ("mate", "mate", requirement_prefix("mate")),' \
+        '    ("mate-mubin", "mate_mubin", requirement_prefix("mate-mubin")),' \
+        '    ("flash_attn_3", "flash_attn_3", requirement_prefix("flash_attn_3")),' \
+        '    ("flash_mla", "flash_mla", requirement_prefix("flash_mla")),' \
+        '    ("deep-gemm", "deep_gemm", requirement_prefix("deep-gemm")),' \
+        '    ("flashinfer-python", "flashinfer", requirement_prefix("flashinfer-python")),' \
+        '    ("sageattention", "sageattention", requirement_prefix("sageattention")),' \
         '    ("deep_ep", "deep_ep", requirement_prefix("deep_ep")),' \
-        '    ("tilelang_musa", "tilelang", ""),' \
+        '    ("tilelang_musa", "tilelang", requirement_prefix("tilelang_musa")),' \
         '    ("triton", "triton", requirement_prefix("triton")),' \
         '    ("uvloop", "uvloop", ""),' \
         '    ("pycountry", "pycountry", ""),' \
         '    ("pytest", "pytest", ""),' \
-        '    ("apache-tvm-ffi", "tvm_ffi", ""),' \
+        '    ("apache-tvm-ffi", "tvm_ffi", requirement_prefix("apache-tvm-ffi")),' \
         '    ("torch_c_dlpack_ext", "torch_c_dlpack_ext", ""),' \
         ')' \
         '' \
