@@ -66,6 +66,7 @@ def _get_backend_priorities(
         return [
             AttentionBackendEnum.FLASHMLA,
             AttentionBackendEnum.FLASHMLA_SPARSE,
+            AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
             AttentionBackendEnum.TRITON_MLA,
         ]
     else:
@@ -574,6 +575,7 @@ class MUSAPlatformBase(Platform):
             # then we default to FlashMLA backend.
             use_flashmla = False
             use_flashmla_sparse = False
+            use_flashinfer_sparse = False
 
             from vllm_musa.v1.attention.ops.flashmla import is_flashmla_dense_supported
 
@@ -586,6 +588,9 @@ class MUSAPlatformBase(Platform):
                 backend = vllm_config.attention_config.backend
                 use_flashmla = backend == AttentionBackendEnum.FLASHMLA
                 use_flashmla_sparse = backend == AttentionBackendEnum.FLASHMLA_SPARSE
+                use_flashinfer_sparse = (
+                    backend == AttentionBackendEnum.FLASHINFER_MLA_SPARSE
+                )
 
             if (
                 use_flashmla
@@ -596,17 +601,24 @@ class MUSAPlatformBase(Platform):
                 logger.info("Forcing kv cache block size to 64 for FlashMLA backend.")
 
             if use_sparse:
-                if not use_flashmla_sparse:
+                if not use_flashmla_sparse and not use_flashinfer_sparse:
                     use_flashmla_sparse = True
 
-                sparse_block_size = (
-                    contract_policy.deepseek_v4_flashmla_sparse_page_size(vllm_config)
-                )
-                if use_flashmla_sparse and cache_config.block_size != sparse_block_size:
+                sparse_block_size = 64
+                sparse_backend_name = "FlashInferMLASparse"
+                if use_flashmla_sparse:
+                    sparse_block_size = (
+                        contract_policy.deepseek_v4_flashmla_sparse_page_size(
+                            vllm_config
+                        )
+                    )
+                    sparse_backend_name = "FlashMLASparse"
+                if cache_config.block_size != sparse_block_size:
                     cache_config.block_size = sparse_block_size
                     logger.info(
-                        "Forcing kv cache block size to %d for FlashMLASparse backend.",
+                        "Forcing kv cache block size to %d for %s backend.",
                         sparse_block_size,
+                        sparse_backend_name,
                     )
 
         scheduler_config = vllm_config.scheduler_config

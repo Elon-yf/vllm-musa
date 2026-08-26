@@ -11,7 +11,7 @@ diff --git a/vllm/model_executor/kernels/linear/__init__.py b/vllm/model_executo
 index 3413d4a69f..01298768cf 100644
 --- a/vllm/model_executor/kernels/linear/__init__.py
 +++ b/vllm/model_executor/kernels/linear/__init__.py
-@@ -643,7 +643,34 @@ def choose_scaled_mm_linear_kernel(
+@@ -643,7 +643,38 @@ def choose_scaled_mm_linear_kernel(
              scope="global",
          )
  
@@ -28,12 +28,16 @@ index 3413d4a69f..01298768cf 100644
 +                TritonFp8BlockScaledMMKernel,
 +            ]
 +        elif possible_kernels is _POSSIBLE_FP8_KERNELS:
++            from vllm_musa.model_executor.kernels.linear.scaled_mm.flashinfer import (
++                MUSAFlashInferFP8ScaledMMLinearKernel,
++            )
 +            from vllm_musa.model_executor.kernels.linear.scaled_mm.torch_scaled_mm import (
 +                MUSAChannelWiseTorchFP8ScaledMMLinearKernel,
 +                MUSAPerTensorTorchFP8ScaledMMLinearKernel,
 +            )
 +
 +            platform_kernels = [
++                MUSAFlashInferFP8ScaledMMLinearKernel,
 +                MUSAPerTensorTorchFP8ScaledMMLinearKernel,
 +                MUSAChannelWiseTorchFP8ScaledMMLinearKernel,
 +            ]

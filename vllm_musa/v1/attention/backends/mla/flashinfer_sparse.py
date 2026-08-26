@@ -3,7 +3,10 @@
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import torch
+from vllm.config import get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.platforms.interface import DeviceCapability
@@ -18,7 +21,7 @@ from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 
 from vllm_musa.utils.flashinfer import (
-    has_musa_flashinfer_sparse_mla,
+    has_musa_flashinfer_sparse_decode,
     trtllm_batch_decode_with_kv_cache_mla,
 )
 
@@ -36,7 +39,21 @@ class MUSAFlashInferMLASparseImpl(FlashInferMLASparseImpl):
         layer: AttentionLayer,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if isinstance(q, tuple):
-            q = torch.cat(q, dim=-1)
+            raise RuntimeError(
+                "MATE FlashInfer Sparse MLA requires the upstream FP8 packed-query "
+                "path; received an unquantized query tuple"
+            )
+        if q.dtype != torch.float8_e4m3fn or not q.is_contiguous():
+            raise RuntimeError(
+                "MATE FlashInfer Sparse MLA requires a contiguous FP8 E4M3 query"
+            )
+        if (
+            kv_c_and_k_pe_cache.dtype != torch.float8_e4m3fn
+            or not kv_c_and_k_pe_cache.is_contiguous()
+        ):
+            raise RuntimeError(
+                "MATE FlashInfer Sparse MLA requires a contiguous FP8 E4M3 KV cache"
+            )
 
         num_actual_toks = q.shape[0]
         if self.topk_indices_buffer is None:
@@ -125,13 +142,20 @@ class MUSAFlashInferMLASparseImpl(FlashInferMLASparseImpl):
 class MUSAFlashInferMLASparseBackend(FlashInferMLASparseTRTLLMBackend):
     """Register the MATE FlashInfer Sparse MLA provider on MUSA."""
 
+    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["fp8", "fp8_e4m3"]
+
+    @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int]:
+        return [64]
+
     @staticmethod
     def get_impl_cls() -> type[MUSAFlashInferMLASparseImpl]:
         return MUSAFlashInferMLASparseImpl
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        return capability.major == 3 and has_musa_flashinfer_sparse_mla()
+        return capability.major == 3 and has_musa_flashinfer_sparse_decode()
 
     @classmethod
     def supports_combination(
@@ -146,19 +170,39 @@ class MUSAFlashInferMLASparseBackend(FlashInferMLASparseTRTLLMBackend):
         use_mm_prefix: bool,
         device_capability: DeviceCapability,
     ) -> str | None:
-        if not has_musa_flashinfer_sparse_mla():
+        if not has_musa_flashinfer_sparse_decode():
             return "MATE FlashInfer Sparse MLA wrapper is unavailable"
-        return super().supports_combination(
-            head_size,
-            dtype,
-            kv_cache_dtype,
-            block_size,
-            use_mla,
-            has_sink,
-            use_sparse,
-            use_mm_prefix,
-            device_capability,
-        )
+        if device_capability.major != 3:
+            return "MATE FlashInfer Sparse MLA requires an MP31 MUSA device"
+        if not use_mla or not use_sparse:
+            return "MATE FlashInfer Sparse MLA requires sparse MLA"
+        if use_mm_prefix:
+            return "MATE FlashInfer Sparse MLA does not support multimodal prefixes"
+        if has_sink:
+            return "MATE FlashInfer Sparse MLA does not support attention sinks"
+        if dtype != torch.bfloat16:
+            return "MATE FlashInfer Sparse MLA requires BF16 model activations"
+        if kv_cache_dtype not in ("fp8", "fp8_e4m3"):
+            return "MATE FlashInfer Sparse MLA requires FP8 E4M3 KV cache"
+        if head_size != 576:
+            return "MATE FlashInfer Sparse MLA requires head_size=576"
+        if block_size != 64:
+            return "MATE FlashInfer Sparse MLA requires block_size=64"
+
+        config = get_current_vllm_config().model_config
+        if config is None:
+            return "MATE FlashInfer Sparse MLA requires model configuration"
+        hf_config = config.hf_text_config
+        if getattr(hf_config, "kv_lora_rank", None) != 512:
+            return "MATE FlashInfer Sparse MLA requires kv_lora_rank=512"
+        if getattr(hf_config, "qk_rope_head_dim", None) != 64:
+            return "MATE FlashInfer Sparse MLA requires qk_rope_head_dim=64"
+        if getattr(hf_config, "qk_nope_head_dim", None) not in (128, 192):
+            return "MATE FlashInfer Sparse MLA requires qk_nope_head_dim 128 or 192"
+        topk = getattr(hf_config, "index_topk", None)
+        if not isinstance(topk, int) or topk <= 0 or topk % 64 != 0:
+            return "MATE FlashInfer Sparse MLA requires index_topk divisible by 64"
+        return None
 
 
 __all__ = ["MUSAFlashInferMLASparseBackend", "MUSAFlashInferMLASparseImpl"]

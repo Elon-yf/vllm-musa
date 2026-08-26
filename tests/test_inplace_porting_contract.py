@@ -105,7 +105,16 @@ def test_musa_image_runtime_dependency_contract():
         ("torch_musa", "torch_musa"),
         ("torchvision", "torchvision"),
         ("torchaudio", "torchaudio"),
+        ("mate", "mate"),
+        ("mate-mubin", "mate_mubin"),
+        ("flash_attn_3", "flash_attn_3"),
+        ("flash_mla", "flash_mla"),
+        ("deep-gemm", "deep_gemm"),
+        ("flashinfer-python", "flashinfer"),
+        ("sageattention", "sageattention"),
         ("deep_ep", "deep_ep"),
+        ("tilelang_musa", "tilelang"),
+        ("apache-tvm-ffi", "tvm_ffi"),
     )
     for dist_name, module_name in exact_import_gates:
         gate = f'("{dist_name}", "{module_name}", requirement_prefix("{dist_name}"))'
@@ -113,7 +122,9 @@ def test_musa_image_runtime_dependency_contract():
 
     exact_version_gate = (
         'exact_version_dists = frozenset({"torchada", "torch", "torch_musa", '
-        '"torchvision", "torchaudio", "deep_ep"})'
+        '"torchvision", "torchaudio", "mate", "mate-mubin", "flash_attn_3", '
+        '"flash_mla", "deep-gemm", "flashinfer-python", "sageattention", '
+        '"deep_ep", "tilelang_musa", "apache-tvm-ffi"})'
     )
     assert exact_version_gate in dockerfile
     torchada_gate = '("torchada", "torchada", requirement_prefix("torchada"))'

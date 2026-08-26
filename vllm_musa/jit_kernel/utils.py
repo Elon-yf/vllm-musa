@@ -305,6 +305,14 @@ def _find_package_root(package: str) -> Optional[pathlib.Path]:
     return pathlib.Path(spec.origin).resolve().parent
 
 
+def _find_vendored_flashinfer_root() -> Optional[pathlib.Path]:
+    """Find PR #188's native FlashInfer source beside the editable package."""
+    candidate = pathlib.Path(__file__).resolve().parents[2] / "third_party/flashinfer"
+    if (candidate / "include").is_dir() and (candidate / "csrc").is_dir():
+        return candidate
+    return None
+
+
 # NOTE: this might also be used in __main__.py for compile flags export
 _REGISTERED_DEPENDENCIES: Dict[str, Callable[[], List[str]]] = {}
 
@@ -321,31 +329,36 @@ def register_dependency(name: str):
 
 @register_dependency("flashinfer")
 def get_flashinfer_include_paths() -> List[str]:
-    include_paths: List[str] = []
     flashinfer_root = _find_package_root("flashinfer")
-    if flashinfer_root is None:
-        raise RuntimeError(
-            "Cannot find flashinfer package. Please install flashinfer to get"
-            "the required headers for JIT compilation."
-        )
+    if flashinfer_root is not None:
+        flashinfer_data = flashinfer_root / "data"
+        package_candidates = [
+            flashinfer_data / "include",
+            flashinfer_data / "csrc",
+            flashinfer_data / "cutlass" / "include",
+            flashinfer_data / "cutlass" / "tools" / "util" / "include",
+            flashinfer_data / "spdlog" / "include",
+        ]
+        if all(path.is_dir() for path in package_candidates):
+            return [str(path) for path in package_candidates]
 
-    flashinfer_data = flashinfer_root / "data"
-    candidates = [
-        flashinfer_data / "include",
-        flashinfer_data / "csrc",
-        flashinfer_data / "cutlass" / "include",
-        flashinfer_data / "cutlass" / "tools" / "util" / "include",
-        flashinfer_data / "spdlog" / "include",
-    ]
+    # The MATE compatibility wheel intentionally contains Python APIs only.
+    # Keep native/JIT headers sourced from the independently pinned checkout.
+    vendored_root = _find_vendored_flashinfer_root()
+    if vendored_root is not None:
+        vendored_candidates = [
+            vendored_root / "include",
+            vendored_root / "csrc",
+            vendored_root / "3rdparty" / "cutlass" / "include",
+            vendored_root / "3rdparty" / "cutlass" / "tools" / "util" / "include",
+            vendored_root / "3rdparty" / "spdlog" / "include",
+        ]
+        return [str(path) for path in vendored_candidates if path.is_dir()]
 
-    for path in candidates:
-        if not path.exists():
-            raise RuntimeError(
-                f"Required header path {path} for flashinfer dependency not found."
-                " Please check your flashinfer installation."
-            )
-        include_paths.append(str(path))
-    return include_paths
+    raise RuntimeError(
+        "Cannot find FlashInfer headers in either package data or the pinned "
+        "third_party/flashinfer source checkout."
+    )
 
 
 @register_dependency("cutlass")
@@ -360,6 +373,15 @@ def get_cutlass_include_paths() -> List[str]:
         ]
         for path in candidates:
             if path.exists():
+                include_paths.append(str(path))
+
+    vendored_root = _find_vendored_flashinfer_root()
+    if vendored_root is not None:
+        for path in (
+            vendored_root / "3rdparty" / "cutlass" / "include",
+            vendored_root / "3rdparty" / "cutlass" / "tools" / "util" / "include",
+        ):
+            if path.is_dir():
                 include_paths.append(str(path))
 
     deep_gemm_root = _find_package_root("deep_gemm")
