@@ -17,7 +17,7 @@ is pre-patched.
   Author headers are normalized to the synthetic
   `musa <musa@local>` identity.
 
-Currently **130 patches**. This branch includes the Qwen3.6 patches for common
+Currently **131 patches**. This branch includes the Qwen3.6 patches for common
 GDN decode metadata reuse, uniform-decode SSM slot-mapping removal, and the
 BF16 W1 tile specialization, plus the contract-bound DeepSeek-V4 MTP
 sparse-prefill headroom and mixed-prefill queue-fence patches. It additionally
@@ -37,3 +37,7 @@ object/registration patches (which patch live objects at import) are kept
 separately in `vllm_musa/patches/`, not in this build-time series. Run
 `python3 tools/musa_sync.py verify` to replay and verify the complete manifest
 against that exact pinned commit.
+
+Patch `0131-MUSA-route-upstream-FlashInfer-callers-to-MATE.patch` is the narrow
+upstream seam for MATE's FP8 BMM and generic Sparse MLA callers; it intentionally
+does not add a second `vllm_musa` provider/backend implementation.

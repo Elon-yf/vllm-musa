@@ -1,17 +1,17 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: musa <musa@local>
-Date: Wed, 3 Jun 2026 11:47:35 +0000
+Date: Thu, 27 Aug 2026 15:10:36 +0800
 Subject: [PATCH] MUSA: vllm.model_executor.kernels.linear
 
 ---
- .../model_executor/kernels/linear/__init__.py | 29 ++++++++++++++++++-
- 1 file changed, 28 insertions(+), 1 deletion(-)
+ .../model_executor/kernels/linear/__init__.py | 30 ++++++++++++++++++-
+ 1 file changed, 29 insertions(+), 1 deletion(-)
 
 diff --git a/vllm/model_executor/kernels/linear/__init__.py b/vllm/model_executor/kernels/linear/__init__.py
-index 3413d4a69f..01298768cf 100644
+index 3413d4a69..443cc4a74 100644
 --- a/vllm/model_executor/kernels/linear/__init__.py
 +++ b/vllm/model_executor/kernels/linear/__init__.py
-@@ -643,7 +643,38 @@ def choose_scaled_mm_linear_kernel(
+@@ -643,7 +643,35 @@ def choose_scaled_mm_linear_kernel(
              scope="global",
          )
  
@@ -28,16 +28,13 @@ index 3413d4a69f..01298768cf 100644
 +                TritonFp8BlockScaledMMKernel,
 +            ]
 +        elif possible_kernels is _POSSIBLE_FP8_KERNELS:
-+            from vllm_musa.model_executor.kernels.linear.scaled_mm.flashinfer import (
-+                MUSAFlashInferFP8ScaledMMLinearKernel,
-+            )
 +            from vllm_musa.model_executor.kernels.linear.scaled_mm.torch_scaled_mm import (
 +                MUSAChannelWiseTorchFP8ScaledMMLinearKernel,
 +                MUSAPerTensorTorchFP8ScaledMMLinearKernel,
 +            )
 +
 +            platform_kernels = [
-+                MUSAFlashInferFP8ScaledMMLinearKernel,
++                FlashInferFP8ScaledMMLinearKernel,
 +                MUSAPerTensorTorchFP8ScaledMMLinearKernel,
 +                MUSAChannelWiseTorchFP8ScaledMMLinearKernel,
 +            ]
