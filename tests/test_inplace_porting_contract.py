@@ -247,6 +247,25 @@ def test_mooncake_uses_the_pinned_upstream_connector():
     assert "from vllm" not in mooncake_compat
 
 
+def test_mooncake_connector_accepts_musa_kv_first_layout():
+    """The v0.28 upstream connector must not reject MUSA's physical cache."""
+    layout_patch = (
+        ROOT
+        / "vllm_musa"
+        / "patches"
+        / "series"
+        / "0134-MUSA-support-Mooncake-with-KV-first-cache.patch"
+    ).read_text()
+
+    assert (
+        "MUSA FlashAttention exposes the legacy K/V-first physical layout"
+        in layout_patch
+    )
+    assert "self._is_kv_layout_blocks_first = self.is_mamba or" in layout_patch
+    assert "def split_k_and_v" in layout_patch
+    assert "cache_list = list(cache_or_caches)" in layout_patch
+
+
 def test_mooncake_example_uses_current_proxy_and_scoped_cleanup():
     script = (
         ROOT / "example" / "disaggregated_serving" / "disaggregated_serving.sh"
