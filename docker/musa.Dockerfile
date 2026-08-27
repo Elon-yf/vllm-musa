@@ -400,7 +400,7 @@ RUN mkdir -p /tmp/vllm-rs-artifacts && \
 # the final image enables it below.
 FROM vllm_musa_installed AS mooncake
 
-ARG MOONCAKE_VERSION=0.3.12.post1
+ARG MOONCAKE_VERSION=0.3.13
 ARG PYPI_INDEX_URL
 
 RUN python -m pip install \
