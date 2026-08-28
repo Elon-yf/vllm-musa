@@ -34,9 +34,8 @@ index b551664..0000000 100644
 -                )
 +        # MUSA FlashAttention exposes the legacy K/V-first physical layout
 +        # [2, num_blocks, block_size, n_kv_heads, head_size].  Mooncake can
-+        # transfer either layout: blocks-first tensors are split into two
-+        # contiguous halves, while K/V-first tensors are registered as two
-+        # separate views below.
++        # transfer either layout: standardized blocks-first caches stay one
++        # packed region, while K/V-first caches are registered as two views.
 +        self._is_kv_layout_blocks_first = self.is_mamba or (
 +            len(kv_cache_shape) == 5 and kv_cache_shape[0] == 1
 +        )

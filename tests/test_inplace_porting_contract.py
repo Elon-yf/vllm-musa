@@ -266,6 +266,8 @@ def test_mooncake_connector_accepts_musa_kv_first_layout():
         "MUSA FlashAttention exposes the legacy K/V-first physical layout"
         in layout_patch
     )
+    assert "standardized blocks-first caches stay one" in layout_patch
+    assert "K/V-first caches are registered as two views" in layout_patch
     assert "self._is_kv_layout_blocks_first = self.is_mamba or" in layout_patch
     assert "def split_k_and_v" in layout_patch
     assert "cache_list = list(cache_or_caches)" in layout_patch
