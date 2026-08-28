@@ -214,6 +214,11 @@ def test_musa_image_stage_and_optional_component_contract():
     final_stage = final_stage.split("FROM mooncake AS final", 1)[1]
     assert 'CMD ["/bin/bash"]' in final_stage
     assert "ENTRYPOINT" not in final_stage
+    assert "ARG MOONCAKE_VERSION=0.3.13" in final_stage
+    assert (
+        'com.mthreads.vllm-musa.mooncake-version="${MOONCAKE_VERSION}"'
+        in final_stage
+    )
     assert 'ENTRYPOINT ["vllm", "serve"]' in openai_stage
 
 
