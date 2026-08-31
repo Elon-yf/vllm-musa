@@ -10,7 +10,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 PRIVATE_REQUIREMENTS = ROOT / "requirements/musa_private.txt"
 DOCKERFILE = ROOT / "docker/musa.Dockerfile"
-PYPROJECT = ROOT / "pyproject.toml"
 
 MATE_026_COHORT = {
     "mate": ("0.2.6", "mate"),
@@ -44,11 +43,6 @@ def test_mate_026_cohort_is_exactly_pinned() -> None:
 
     for distribution, (version, _) in MATE_026_COHORT.items():
         assert requirements.get(distribution) == version
-
-
-def test_offline_extra_bundles_matching_mubin() -> None:
-    pyproject = PYPROJECT.read_text(encoding="utf-8")
-    assert 'offline = ["mate-mubin==0.2.6"]' in pyproject
 
 
 def test_docker_verifies_distribution_and_import_from_requirements() -> None:

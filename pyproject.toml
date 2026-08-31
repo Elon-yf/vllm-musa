@@ -39,10 +39,6 @@ dev = [
     "build",
     "twine",
 ]
-# The MUBIN wheel is installed by the MUSA image requirements. Keep an
-# explicit extra for source/editable installs that need the same offline,
-# pre-generated assembly payload without relying on runtime downloads.
-offline = ["mate-mubin==0.2.6"]
 
 [project.scripts]
 vllm_collect_env = "vllm_musa:collect_env"
