@@ -348,13 +348,15 @@ RUN printf '%s\n' \
         ')' \
         '' \
         'for dist_name, module_name, prefix in expected:' \
-        '    if not (dist_name == "tilelang_musa" and version(dist_name) == "0.1.12+musa.2"): importlib.import_module(module_name)' \
         '    installed = version(dist_name)' \
+        '    skip_import = (dist_name == "tilelang_musa" and installed == "0.1.12+musa.2")' \
+        '    if not skip_import: importlib.import_module(module_name)' \
         '    if dist_name in exact_version_dists and installed != prefix:' \
         '        raise RuntimeError(f"{dist_name} expected exactly {prefix}, got {installed}")' \
         '    if dist_name not in exact_version_dists and prefix and not installed.startswith(prefix):' \
         '        raise RuntimeError(f"{dist_name} expected {prefix}, got {installed}")' \
-        '    print(f"PASS import {module_name} version={installed}")' \
+        '    action = "skip import" if skip_import else "import"' \
+        '    print(f"PASS {action} {module_name} version={installed}")' \
         '' \
         'for module_name in ("vllm", "vllm_musa"):' \
         '    module = importlib.import_module(module_name)' \
