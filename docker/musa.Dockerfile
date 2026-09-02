@@ -303,7 +303,6 @@ RUN python -m pip install \
 
 RUN printf '%s\n' \
         'import importlib' \
-        'import torch' \
         'import re' \
         'from pathlib import Path' \
         'from importlib.metadata import version' \
@@ -322,7 +321,7 @@ RUN printf '%s\n' \
         '    raise RuntimeError(f"missing {dist_name} pin in {requirement_files}")' \
         '' \
         'exact_version_dists = frozenset({"torchada", "torch", "torch_musa", "torchvision", "torchaudio", "deep_ep"})' \
-        'exact_version_dists |= frozenset({"mate", "mate-mubin", "flash_attn_3", "flash_mla", "deep-gemm", "flashinfer-python", "sageattention", "tilelang_musa", "apache-tvm-ffi"})' \
+        'exact_version_dists |= frozenset({"mate", "mate-mubin", "flash_attn_3", "flash_mla", "deep-gemm", "flashinfer-python", "sageattention", "tilelang_musa", "apache-tvm-ffi", "torch_c_dlpack_ext"})' \
         '' \
         'expected = (' \
         '    ("torchada", "torchada", requirement_prefix("torchada")),' \
@@ -345,19 +344,12 @@ RUN printf '%s\n' \
         '    ("pycountry", "pycountry", ""),' \
         '    ("pytest", "pytest", ""),' \
         '    ("apache-tvm-ffi", "tvm_ffi", requirement_prefix("apache-tvm-ffi")),' \
-        '    ("torch_c_dlpack_ext", "torch_c_dlpack_ext", ""),' \
+        '    ("torch_c_dlpack_ext", "torch_c_dlpack_ext", requirement_prefix("torch-c-dlpack-ext")),' \
         ')' \
-        '' \
-        'tilelang_exact = version("tilelang_musa") == "0.1.12+musa.2"' \
-        'try:' \
-        '    gpu_available = bool(torch.musa.is_available())' \
-        'except Exception:' \
-        '    gpu_available = False' \
-        'metadata_only = tilelang_exact and not gpu_available' \
         '' \
         'for dist_name, module_name, prefix in expected:' \
         '    installed = version(dist_name)' \
-        '    skip_import = metadata_only' \
+        '    skip_import = (dist_name in {"flash_mla", "tilelang_musa"} and version("tilelang_musa") == "0.1.12+musa.2")' \
         '    if not skip_import: importlib.import_module(module_name)' \
         '    if dist_name in exact_version_dists and installed != prefix:' \
         '        raise RuntimeError(f"{dist_name} expected exactly {prefix}, got {installed}")' \
@@ -366,12 +358,9 @@ RUN printf '%s\n' \
         '    action = "skip import" if skip_import else "import"' \
         '    print(f"PASS {action} {module_name} version={installed}")' \
         '' \
-        'if metadata_only:' \
-        '    print("PASS metadata-only skip vllm imports")' \
-        'else:' \
-        '    for module_name in ("vllm", "vllm_musa"):' \
-        '        module = importlib.import_module(module_name)' \
-        '        print("PASS import %s version=%s" % (module_name, getattr(module, "__version__", "unknown")))' \
+        'for module_name in ("vllm", "vllm_musa"):' \
+        '    module = importlib.import_module(module_name)' \
+        '    print("PASS import %s version=%s" % (module_name, getattr(module, "__version__", "unknown")))' \
         > /tmp/vllm_musa_import_check.py && \
     python /tmp/vllm_musa_import_check.py && \
     rm /tmp/vllm_musa_import_check.py
