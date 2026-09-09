@@ -17,8 +17,13 @@ def _read(relative_path: str) -> str:
 def test_mate_flashinfer_private_requirements_are_coherent() -> None:
     requirements = _read("requirements/musa_private.txt")
     expected = {
-        "mate==0.2.6",
-        "flashinfer-python==0.2.6+musa",
+        "mate==0.2.7",
+        "mate-mubin==0.2.7",
+        "flash_attn_3==0.2.7+musa",
+        "flash_mla==0.2.7+musa",
+        "deep-gemm==0.2.7+musa",
+        "flashinfer-python==0.2.7+musa",
+        "sageattention==0.2.7+musa",
         "tilelang_musa==0.1.12+musa.2",
         "apache-tvm-ffi==0.1.11.post1+musa.1",
     }

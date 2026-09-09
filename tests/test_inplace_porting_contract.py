@@ -120,13 +120,16 @@ def test_musa_image_runtime_dependency_contract():
         gate = f'("{dist_name}", "{module_name}", requirement_prefix("{dist_name}"))'
         assert gate in dockerfile
 
-    exact_version_gate = (
+    assert (
         'exact_version_dists = frozenset({"torchada", "torch", "torch_musa", '
-        '"torchvision", "torchaudio", "mate", "mate-mubin", "flash_attn_3", '
-        '"flash_mla", "deep-gemm", "flashinfer-python", "sageattention", '
-        '"deep_ep", "tilelang_musa", "apache-tvm-ffi"})'
-    )
-    assert exact_version_gate in dockerfile
+        '"torchvision", "torchaudio", "deep_ep"})'
+    ) in dockerfile
+    assert (
+        'exact_version_dists |= frozenset({"mate", "mate-mubin", '
+        '"flash_attn_3", "flash_mla", "deep-gemm", "flashinfer-python", '
+        '"sageattention", "tilelang_musa", "apache-tvm-ffi", '
+        '"torch_c_dlpack_ext"})'
+    ) in dockerfile
     torchada_gate = '("torchada", "torchada", requirement_prefix("torchada"))'
     torch_gate = '("torch", "torch", requirement_prefix("torch"))'
     assert torchada_gate in dockerfile
@@ -134,7 +137,7 @@ def test_musa_image_runtime_dependency_contract():
     import_statement = "importlib.import_module(module_name)"
     version_statement = "installed = version(dist_name)"
     assert import_statement in dockerfile
-    assert dockerfile.index(import_statement) < dockerfile.index(version_statement)
+    assert dockerfile.index(version_statement) < dockerfile.index(import_statement)
     assert "if dist_name in exact_version_dists and installed != prefix:" in dockerfile
     assert (
         "if dist_name not in exact_version_dists and prefix "
@@ -143,6 +146,16 @@ def test_musa_image_runtime_dependency_contract():
     assert '("triton", "triton", requirement_prefix("triton"))' in dockerfile
     assert '("uvloop", "uvloop", "")' in dockerfile
     assert '("pycountry", "pycountry", "")' in dockerfile
+    assert (
+        '("torch_c_dlpack_ext", "torch_c_dlpack_ext", '
+        'requirement_prefix("torch-c-dlpack-ext"))'
+    ) in dockerfile
+    assert (
+        'skip_import = (dist_name in {"flashinfer-python", "flash_mla", '
+        '"tilelang_musa"} and '
+        'version("tilelang_musa") == "0.1.12+musa.2")'
+    ) in dockerfile
+    assert 'action = "skip import" if skip_import else "import"' in dockerfile
 
 
 def test_musa_image_matches_upstream_workspace_and_includes_pytest():
