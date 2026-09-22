@@ -19,6 +19,7 @@ def maybe_execute_in_parallel(
     event0: torch.cuda.Event,
     event1: torch.cuda.Event,
     aux_stream: torch.cuda.Stream | None = None,
+    use_stream_waits: bool = False,
 ) -> tuple[Any, Any]:
     """Run two functions potentially in parallel on separate CUDA streams.
 
@@ -38,6 +39,8 @@ def maybe_execute_in_parallel(
         aux_stream: The second CUDA stream for fn1.
             Multi-stream is disabled when aux_stream is None or a breakable
             CUDA graph capture is active.
+        use_stream_waits: Use stream-level wait hand-offs instead of explicit
+            event record/wait calls. This is required by MUSA graph replay.
 
     Returns:
         Tuple of (fn0_result, fn1_result).
@@ -48,7 +51,14 @@ def maybe_execute_in_parallel(
         if BreakableCUDAGraphCapture.is_active():
             aux_stream = None
 
-    if aux_stream is not None:
+    if aux_stream is not None and use_stream_waits:
+        current_stream = torch.cuda.current_stream()
+        aux_stream.wait_stream(current_stream)
+        with torch.cuda.stream(aux_stream):
+            result1 = fn1()
+        result0 = fn0()
+        current_stream.wait_stream(aux_stream)
+    elif aux_stream is not None:
         event0.record()
         result0 = fn0()
         with torch.cuda.stream(aux_stream):
@@ -69,6 +79,7 @@ def execute_in_parallel(
     done_events: list[torch.cuda.Event],
     aux_streams: list[torch.cuda.Stream] | None = None,
     enable: bool = False,
+    use_stream_waits: bool = False,
 ) -> tuple[Any, list[Any]]:
     """Run default_fn on the current stream and aux_fns concurrently on
     aux_streams.
@@ -96,6 +107,8 @@ def execute_in_parallel(
             so callers that pass aux_streams must also pass enable=True
             (typically gated by an env var) to actually overlap. When False,
             execution falls back to sequential on the current stream.
+        use_stream_waits: Use stream-level wait hand-offs instead of explicit
+            event record/wait calls. This is required by MUSA graph replay.
 
     Returns:
         Tuple of (default_result, aux_results) where aux_results[i] is the
@@ -110,6 +123,22 @@ def execute_in_parallel(
     assert len(aux_fns) == len(aux_streams) == len(done_events), (
         "aux_fns, aux_streams, and done_events must be the same length"
     )
+
+    if use_stream_waits:
+        current_stream = torch.cuda.current_stream()
+        aux_results = [None] * len(aux_fns)
+        for i, fn in enumerate(aux_fns):
+            if fn is None:
+                continue
+            aux_streams[i].wait_stream(current_stream)
+            with torch.cuda.stream(aux_streams[i]):
+                aux_results[i] = fn()
+
+        default_result = default_fn()
+        for i, fn in enumerate(aux_fns):
+            if fn is not None:
+                current_stream.wait_stream(aux_streams[i])
+        return default_result, aux_results
 
     aux_results = [None] * len(aux_fns)
     pending: list[torch.cuda.Event] = []

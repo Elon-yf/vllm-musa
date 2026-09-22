@@ -1798,6 +1798,7 @@ def test_ir_op_priority_default():
     priority_config = IrOpPriorityConfig.with_default(["vllm_c", "native"])
     assert priority_config.rms_norm == ["vllm_c", "native"]
     assert priority_config.fused_add_rms_norm == ["vllm_c", "native"]
+    assert priority_config.gated_qkv_rms_norm_rope == ["vllm_c", "native"]
 
     # Assert single ops override the default
     priority_config = IrOpPriorityConfig.with_default(
@@ -1805,6 +1806,7 @@ def test_ir_op_priority_default():
     )
     assert priority_config.rms_norm == ["oink", "native"]
     assert priority_config.fused_add_rms_norm == ["native"]
+    assert priority_config.gated_qkv_rms_norm_rope == ["native"]
 
 
 def test_ir_op_priority_str():

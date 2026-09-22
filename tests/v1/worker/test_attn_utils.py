@@ -271,26 +271,40 @@ class FakeKVFirstBackend:
         return 1
 
 
-def _kv_first_setup(shared_by: list[str]):
+class FakeHNDKVFirstBackend(FakeKVFirstBackend):
+    @staticmethod
+    def get_kv_cache_stride_order(
+        include_num_layers_dimension: bool = False,
+    ) -> tuple[int, ...]:
+        assert not include_num_layers_dimension
+        return (0, 1, 3, 2, 4)
+
+
+def _kv_first_setup(
+    shared_by: list[str],
+    page_size_padded: int | None = None,
+    backend: type[FakeKVFirstBackend] = FakeKVFirstBackend,
+):
     num_blocks = 3
     attn_spec = FullAttentionSpec(
         block_size=16,
         num_kv_heads=1,
         head_size=2,
         dtype=torch.float32,
+        page_size_padded=page_size_padded,
     )
     mamba_spec = MambaSpec(
         block_size=16,
-        shapes=((64,),),
+        shapes=((attn_spec.page_size_bytes // 4,),),
         dtypes=(torch.float32,),
     )
-    assert attn_spec.page_size_bytes == mamba_spec.page_size_bytes == 256
+    assert attn_spec.page_size_bytes == mamba_spec.page_size_bytes
 
     raw_tensor = torch.zeros(attn_spec.page_size_bytes * num_blocks, dtype=torch.int8)
     raw_tensors = {name: raw_tensor for name in shared_by}
     attn_groups = [
         AttentionGroup(
-            backend=FakeKVFirstBackend,
+            backend=backend,
             layer_names=["attn"],
             kv_cache_spec=attn_spec,
             kv_cache_group_id=0,
@@ -342,3 +356,40 @@ def test_reshape_kv_first_kv_cache_keeps_layout_without_mamba():
     # Nothing else indexes this allocation by page, so K and V stay split into
     # one contiguous half each.
     assert kv_cache[1, 0].storage_offset() == num_blocks * 16 * 1 * 2
+
+
+def test_reshape_padded_kv_first_cache_pages_blocks_with_mamba():
+    num_blocks, kv_cache = _kv_first_setup(
+        ["attn", "mamba"],
+        page_size_padded=384,
+    )
+
+    assert kv_cache.shape == (2, num_blocks, 16, 1, 2)
+    page_stride = 96
+    kv_half = 16 * 1 * 2
+    assert kv_cache.stride(1) == page_stride
+    for block in range(num_blocks):
+        assert kv_cache[0, block].storage_offset() == block * page_stride
+        assert (
+            kv_cache[1, block].storage_offset() == block * page_stride + kv_half
+        )
+
+
+def test_reshape_padded_hnd_kv_first_cache_without_mamba_marker():
+    num_blocks, kv_cache = _kv_first_setup(
+        ["attn"],
+        page_size_padded=384,
+        backend=FakeHNDKVFirstBackend,
+    )
+
+    assert kv_cache.shape == (2, num_blocks, 16, 1, 2)
+    page_stride = 96
+    kv_half = 16 * 1 * 2
+    assert kv_cache.stride(1) == page_stride
+    assert kv_cache.stride(2) == 2
+    assert kv_cache.stride(3) == 32
+    for block in range(num_blocks):
+        assert kv_cache[0, block].storage_offset() == block * page_stride
+        assert (
+            kv_cache[1, block].storage_offset() == block * page_stride + kv_half
+        )

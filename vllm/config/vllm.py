@@ -85,10 +85,11 @@ def default_v2_model_runner_architectures() -> frozenset[str]:
     """Architectures defaulting to the V2 model runner on this platform."""
     from vllm.platforms import current_platform
 
-    if current_platform.is_rocm():
-        # TODO(rocm): DeepSeek V4 is still faster on MRV1 on ROCm. The
-        # attention layer picks the eager cudagraph region MRV1 needs, so
-        # this is a perf default only; drop it once MRV2 catches up.
+    is_musa = getattr(current_platform, "is_musa", None)
+    if current_platform.is_rocm() or (callable(is_musa) and is_musa()):
+        # DeepSeek V4 is faster on MRV1 on ROCm and MUSA. Its attention layer
+        # selects the eager region MRV1 needs, and MUSA uses FULL_DECODE_ONLY
+        # rather than piecewise graphs for this deployment.
         return DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES - {"DeepseekV4ForCausalLM"}
     return DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES
 

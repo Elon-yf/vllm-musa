@@ -91,7 +91,7 @@ def find_seq_idx(
     we search the plain cumulative-length prefix (used by
     ``reduce_segments`` which iterates over raw query tokens).
     """
-    left: tl.int32 = 0
+    left = 0
     right = num_seqs
     while left < right:
         mid = (left + right) // 2
@@ -182,7 +182,7 @@ def compute_tile_loop_bounds(
         + (BLOCK_M - 1) // num_queries_per_kv
         + 1
     )
-    if USE_MM_PREFIX or USE_PER_SEQ_CAUSAL or (not USE_CAUSAL):
+    if USE_MM_PREFIX or (USE_PER_SEQ_CAUSAL or (not USE_CAUSAL)):
         # Read the full sequence but never past seq_len: the causal-style
         # formula above can overshoot for non-causal sequences, and slots
         # >= seq_len are unwritten KV (last-block tail) that may hold NaN

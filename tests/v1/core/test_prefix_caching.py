@@ -4120,6 +4120,66 @@ def test_mamba_reachable_block_mask_pins_shared_prefix():
     assert retained(0, None) == {14}
 
 
+def test_musa_mamba_pool_preserves_prefix_cache_ownership(monkeypatch):
+    """Dedicated MUSA Mamba pools must retain cache policy and ownership.
+
+    The MUSA layout gives recurrent-state groups a smaller, independent
+    block-id namespace.  This CPU-only regression exercises the coordinator
+    plumbing without requiring a MUSA device: caching must stay enabled on the
+    dedicated pool, and flattened scheduler frees/evictions must be routed by
+    block ownership rather than by the overlapping integer block IDs.
+    """
+    monkeypatch.setattr(
+        "vllm.v1.core.kv_cache_coordinator.musa_mamba_separate_pool_enabled",
+        lambda: True,
+    )
+    block_size = 16
+    kv_cache_config = KVCacheConfig(
+        num_blocks=8,
+        musa_mamba_num_blocks=2,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["attn"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config,
+        max_model_len=128,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    coordinator = manager.coordinator
+    mamba_pool = coordinator.musa_mamba_block_pools[1]
+    assert mamba_pool.enable_caching is True
+    assert coordinator.single_type_managers[1].block_pool is mamba_pool
+
+    attn_block = coordinator.block_pool.get_new_blocks(1)[0]
+    mamba_block = mamba_pool.get_new_blocks(1)[0]
+    coordinator.free_blocks([mamba_block, attn_block])
+    assert mamba_block.ref_cnt == 0
+    assert attn_block.ref_cnt == 0
+
+    # The namespaces overlap at block ID 1; eviction must not assert on the
+    # smaller Mamba pool when the attention pool reports a larger ID.
+    coordinator.evict_blocks({attn_block.block_id, 7})
+
+
 def test_mamba_shared_prefix_survives_zero_retention(monkeypatch):
     """Manager-level check of the full wiring: a pinned shared-prefix boundary
     (``Request.shared_prefix_boundary``, set by the scheduler on Marconi-style

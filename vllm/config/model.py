@@ -983,8 +983,13 @@ class ModelConfig:
         # Check if the architecture we're wrapping has defaults
         runner = None
         task = None
-        if defaults := try_match_architecture_defaults(self.architectures[0]):
-            _, (runner, task) = defaults
+        # Nested multimodal text configs (e.g. Qwen3-VL) legitimately omit
+        # ``architectures``.  They still use the causal-LM Transformers
+        # wrapper, but there is no architecture entry to inspect for defaults.
+        architectures = self.architectures
+        if architectures:
+            if defaults := try_match_architecture_defaults(architectures[0]):
+                _, (runner, task) = defaults
         # User specified value take precedence
         if self.runner != "auto":
             runner = self.runner

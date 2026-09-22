@@ -22,10 +22,12 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import AttentionBackend
+from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
+    from vllm.v1.kv_cache_interface import KVCacheSpec
 
 logger = init_logger(__name__)
 
@@ -427,26 +429,47 @@ class TransferTopology:
 
         self._engines: dict[tuple[EngineId, int], EngineTransferInfo] = {}
 
-        # Figure out whether the first dimension of the cache is K/V
-        # or num_blocks.
-        attn_backend = self.attn_backends[0]
-        if not self.is_mamba:
-            _MOCK_BLOCK_SIZE = 16
-            kv_cache_shape: tuple[int, ...] = attn_backend.get_kv_cache_shape(
-                num_blocks=1,
-                block_size=_MOCK_BLOCK_SIZE,
-                num_kv_heads=1,
-                head_size=1,
+        # Detect the backend's logical cache layout. vLLM standard backends
+        # publish blocks first, while MUSA FlashAttention keeps K/V first.
+        _MOCK_BLOCK_SIZE = 16
+        for attn_backend in self.attn_backends:
+            try:
+                kv_cache_shape: tuple[int, ...] = attn_backend.get_kv_cache_shape(
+                    num_blocks=1,
+                    block_size=_MOCK_BLOCK_SIZE,
+                    num_kv_heads=1,
+                    head_size=1,
+                )
+            except NotImplementedError:
+                continue
+            break
+        else:
+            raise NotImplementedError("No attention backend provides a KV cache shape")
+        logger.debug("Test kv_cache_shape: %s", kv_cache_shape)
+
+        self._is_kv_layout_blocks_first = kv_cache_shape[0] == 1
+        self._is_kv_layout_kv_first = (
+            len(kv_cache_shape) >= 2
+            and kv_cache_shape[0] == 2
+            and kv_cache_shape[1] == 1
+        )
+        if not self.is_mla:
+            assert (
+                self._is_kv_layout_blocks_first or self._is_kv_layout_kv_first
+            ), (
+                "Attention KV cache layout must be blocks-first or K/V-first; "
+                f"got shape {kv_cache_shape}."
             )
-            logger.debug("Test kv_cache_shape: %s", kv_cache_shape)
-            assert kv_cache_shape[0] == 1, (
-                "KV cache layout must be blocks-first; expected mocked "
-                f"num_blocks=1 in leading dim, got shape {kv_cache_shape}."
-            )
-            if not self.is_mla:
+            if self._is_kv_layout_blocks_first:
                 assert len(kv_cache_shape) == 4, (
                     "Attention KV cache layout must be standardized as "
                     "[num_blocks, num_kv_heads, block_size, content_size], "
+                    f"got shape {kv_cache_shape}."
+                )
+            else:
+                assert len(kv_cache_shape) == 5, (
+                    "K/V-first attention KV cache layout must be "
+                    "[2, num_blocks, block_size, num_kv_heads, head_size], "
                     f"got shape {kv_cache_shape}."
                 )
 
@@ -520,6 +543,45 @@ class TransferTopology:
         # separately. Not applicable to cross-layer blocks (per-layer
         # interleaving means a simple half-split does not separate the parts).
         return self.is_mamba and not self._cross_layers_blocks
+
+    def get_transfer_cache_regions(
+        self,
+        cache: Any,
+        layer_spec: "KVCacheSpec",
+    ) -> list[torch.Tensor]:
+        """Return block-indexable regions for connector registration.
+
+        Standard vLLM attention caches are already blocks-first. MUSA
+        FlashAttention exposes a K/V-first logical view and needs either two
+        dense K/V regions or one page-aligned hybrid region.
+        """
+        if isinstance(layer_spec, MambaSpec):
+            # v0.28 allocates one whole page tensor for Mamba/GDN. Keep the
+            # tuple fallback for connectors/tests using the older cache form.
+            if isinstance(cache, torch.Tensor):
+                return [cache]
+
+            conv, _ = cache
+            return [conv]
+
+        if not self._is_kv_layout_kv_first:
+            return [cache]
+
+        assert isinstance(cache, torch.Tensor)
+        assert cache.shape[0] == 2, (
+            "K/V-first attention cache must have a leading dimension of 2."
+        )
+
+        if self.is_mamba:
+            # Hybrid allocation makes pages physically blocks-first and
+            # returns a logical [2, num_blocks, ...] view. Swap the view back
+            # so stride(0) indexes complete K/V pages for Mooncake.
+            return [cache.transpose(0, 1)]
+
+        # Dense K/V-first allocation stores all K blocks followed by all V
+        # blocks. Register the halves separately so each region is indexed by
+        # block id.
+        return [cache[0], cache[1]]
 
     # ============================================================
     # Common methods

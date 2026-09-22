@@ -69,7 +69,7 @@ struct Utils {
 
 #ifndef USE_ROCM
   #define VLLM_DevFuncAttribute_SET_MaxDynamicSharedMemorySize(FUNC, VAL) \
-    cudaFuncSetAttribute(FUNC, cudaFuncAttributeMaxDynamicSharedMemorySize, VAL)
+    musaFuncSetAttribute(FUNC, musaFuncAttributeMaxDynamicSharedMemorySize, VAL)
 #else
   #define VLLM_DevFuncAttribute_SET_MaxDynamicSharedMemorySize(FUNC, VAL) \
     hipFuncSetAttribute(FUNC, hipFuncAttributeMaxDynamicSharedMemorySize, VAL)

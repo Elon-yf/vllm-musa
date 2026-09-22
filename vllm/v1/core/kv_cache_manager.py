@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
 
@@ -344,6 +344,51 @@ class KVCacheManager:
         # Per-group lookups do not detect an uncached shared prefix (boundary 0).
         return blocks, num_local, 0, min(per_group_hits) < num_local
 
+    def _has_enough_free_blocks(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: tuple[Sequence[KVCacheBlock], ...],
+        num_encoder_tokens: int,
+        total_computed_tokens: int,
+        num_local_computed_tokens: int,
+        num_tokens_main_model: int,
+        apply_admission_cap: bool,
+        watermark_blocks: int,
+        reserved_blocks: int,
+    ) -> bool:
+        """Check admission capacity for every coordinator-owned pool.
+
+        ``KVCacheCoordinator.get_num_blocks_to_allocate`` intentionally
+        excludes dedicated Mamba pools from the attention-pool aggregate.  A
+        separate check is therefore required before allocation so a full
+        Mamba pool returns ``None`` (scheduler backpressure) instead of
+        raising from ``BlockPool.get_new_blocks``.
+        """
+        for pool, required_blocks in (
+            self.coordinator.get_num_blocks_to_allocate_by_pool(
+                request_id=request_id,
+                num_tokens=num_tokens,
+                new_computed_blocks=new_computed_blocks,
+                num_encoder_tokens=num_encoder_tokens,
+                total_computed_tokens=total_computed_tokens,
+                num_local_computed_tokens=num_local_computed_tokens,
+                num_tokens_main_model=num_tokens_main_model,
+                apply_admission_cap=apply_admission_cap,
+            )
+        ):
+            # Reserved blocks and the watermark protect requests in the main
+            # attention pool.  Dedicated Mamba pools have their own capacity
+            # check and must not consume that shared reservation.
+            extra = (
+                reserved_blocks + watermark_blocks
+                if pool is self.block_pool
+                else 0
+            )
+            if required_blocks + extra > pool.get_num_free_blocks():
+                return False
+        return True
+
     def allocate_slots(
         self,
         request: Request,
@@ -476,7 +521,7 @@ class KVCacheManager:
             # First check and fail if the full request sequence won't fit.
             full_num_tokens = min(request.num_tokens, self.max_model_len)
 
-            num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
+            if not self._has_enough_free_blocks(
                 request_id=request.request_id,
                 num_tokens=full_num_tokens,
                 new_computed_blocks=new_computed_block_list,
@@ -485,9 +530,9 @@ class KVCacheManager:
                 num_local_computed_tokens=num_local_computed_tokens,
                 num_tokens_main_model=full_num_tokens,
                 apply_admission_cap=True,
-            )
-            required_blocks = num_blocks_to_allocate + watermark_blocks
-            if required_blocks > self.block_pool.get_num_free_blocks():
+                watermark_blocks=watermark_blocks,
+                reserved_blocks=0,
+            ):
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
@@ -510,7 +555,9 @@ class KVCacheManager:
             num_prompt_tokens=request.num_prompt_tokens,
         )
 
-        num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
+        # Keep `reserved_blocks` free for other in-flight sequences, and an
+        # additional watermark of headroom for waiting/preempted admissions.
+        if not self._has_enough_free_blocks(
             request_id=request.request_id,
             num_tokens=num_tokens_need_slot,
             new_computed_blocks=new_computed_block_list,
@@ -519,13 +566,10 @@ class KVCacheManager:
             + num_external_computed_tokens,
             num_local_computed_tokens=num_local_computed_tokens,
             num_tokens_main_model=num_tokens_main_model,
-        )
-
-        # Keep `reserved_blocks` free for other in-flight sequences, and an
-        # additional watermark of headroom for waiting/preempted admissions.
-        available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
-        required_blocks = num_blocks_to_allocate + watermark_blocks
-        if required_blocks > available_blocks:
+            apply_admission_cap=False,
+            watermark_blocks=watermark_blocks,
+            reserved_blocks=reserved_blocks,
+        ):
             # Cannot allocate new blocks
             return None
 
@@ -577,7 +621,7 @@ class KVCacheManager:
         """
         pins = self._partial_tail_pins.pop(request.request_id, None)
         if pins:
-            self.block_pool.free_blocks(pins)
+            self.free_blocks(pins)
         self.coordinator.free(request.request_id)
 
     def remove_skipped_blocks(
@@ -619,13 +663,17 @@ class KVCacheManager:
             blocks = pins + blocks
         return blocks
 
+    def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
+        """Return flattened blocks to their owning KV-cache pools."""
+        self.coordinator.free_blocks(ordered_blocks)
+
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
 
         Args:
             block_ids: Set of block IDs to evict from cache.
         """
-        self.block_pool.evict_blocks(block_ids)
+        self.coordinator.evict_blocks(block_ids)
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
@@ -636,7 +684,7 @@ class KVCacheManager:
             bool: True if the prefix cache is successfully reset,
             False otherwise.
         """
-        if not self.block_pool.reset_prefix_cache():
+        if not self.coordinator.reset_prefix_cache():
             return False
         if self.log_stats:
             assert self.prefix_cache_stats is not None
@@ -875,7 +923,7 @@ class KVCacheManager:
                 block,
                 boundary_tokens,
             ) in mgr.take_pending_partial_tail_offloads():
-                self.block_pool.touch((block,))
+                self.coordinator.touch_block(block)
                 self._partial_tail_pins.setdefault(req_id, []).append(block)
                 offloads.setdefault(req_id, []).append(
                     (group_id, block.block_id, boundary_tokens)

@@ -14,6 +14,14 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 
+def _musa_deepseek_v4_is_musa_tensor(tensor: torch.Tensor) -> bool:
+    return (
+        current_platform.is_musa()
+        or getattr(torch.version, "musa", None) is not None
+        or getattr(tensor.device, "type", None) == "musa"
+    )
+
+
 @triton.jit(do_not_specialize=["num_tokens"])
 def _fused_inv_rope_fp8_quant_per_head(
     o_ptr,
@@ -177,6 +185,21 @@ def fused_inv_rope_fp8_quant(
         o_fp8: [T, G, D] float8_e4m3fn, strides (D, T*D, 1).
         o_scale: Pre-transformed scale tensor for fp8_einsum.
     """
+    if _musa_deepseek_v4_is_musa_tensor(o):
+        from vllm_musa import _custom_ops as _musa_custom_ops
+
+        return _musa_custom_ops.deepseek_v4_fused_inv_rope_fp8_quant(
+            o,
+            positions,
+            cos_sin_cache,
+            n_groups,
+            heads_per_group,
+            nope_dim,
+            rope_dim,
+            quant_group_size,
+            tma_aligned_scales,
+        )
+
     from vllm.utils.deep_gemm import get_tma_aligned_size
 
     num_tokens, num_heads, head_dim = o.shape

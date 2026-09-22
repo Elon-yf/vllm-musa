@@ -294,30 +294,46 @@ def _reshape_attention_kv_cache(
         )
     elif kv_cache_spec.page_size_padded is not None:
         # Use a strided view to skip the padding between physical pages.
-        #
-        # Only num-blocks-first layouts are supported (the block dimension is
-        # dim 0 of the unpermuted shape). kv-first layouts such as ROCm's
-        # ``(2, num_blocks, ...)`` are intentionally not supported here. For a
-        # num-blocks-first layout the only stride that must change is the block
-        # stride: every other (contiguous) stride already steps within the
-        # unpadded region of a page, so no further adjustment is needed.
-        assert kv_cache_shape[0] == num_blocks, (
-            "Padded KV pages require a num-blocks-first KV cache layout (got "
-            f"shape {kv_cache_shape} with num_blocks={num_blocks}); "
-            "kv-first layouts are not supported."
-        )
         dtype_size = get_dtype_size(kv_cache_spec.dtype)
         page_stride = kv_cache_spec.page_size_bytes // dtype_size
 
-        num_blocks_dim = inv_order[0]
-        strides = list(torch.empty(permuted_kv_cache_shape, device="meta").stride())
-        strides[num_blocks_dim] = page_stride
-
-        kv_cache = torch.as_strided(
-            kv_raw_tensor.view(dtype),
-            size=permuted_kv_cache_shape,
-            stride=tuple(strides),
-        )
+        if kv_cache_shape[0] == num_blocks:
+            # Blocks-first: only the block stride changes. Every other
+            # contiguous stride already steps within the unpadded page.
+            num_blocks_dim = inv_order[0]
+            strides = list(
+                torch.empty(permuted_kv_cache_shape, device="meta").stride()
+            )
+            strides[num_blocks_dim] = page_stride
+            kv_cache = torch.as_strided(
+                kv_raw_tensor.view(dtype),
+                size=permuted_kv_cache_shape,
+                stride=tuple(strides),
+            )
+        else:
+            # A padded KV-first attention page is physically page-addressed by
+            # the hybrid allocator. Lay each block out as [K, V, padding],
+            # while preserving the backend-facing [K/V, blocks, ...] view.
+            assert (
+                kv_cache_shape[1] == num_blocks
+                and kv_cache_stride_order[:2] == (0, 1)
+            ), (
+                "Padded KV-first pages require a [2, num_blocks, ...] layout, got "
+                f"shape {kv_cache_shape}, stride order {kv_cache_stride_order}, "
+                f"and num_blocks={num_blocks}."
+            )
+            block_first_shape = (
+                num_blocks,
+                kv_cache_shape[0],
+                *permuted_kv_cache_shape[2:],
+            )
+            strides = list(torch.empty(block_first_shape, device="meta").stride())
+            strides[0] = page_stride
+            kv_cache = torch.as_strided(
+                kv_raw_tensor.view(dtype),
+                size=block_first_shape,
+                stride=tuple(strides),
+            ).transpose(0, 1)
     elif page_aligned_blocks:
         # A KV-first layout such as ROCm's ``(2, num_blocks, ...)`` puts block
         # ``b``'s K and V in two far-apart halves of the allocation, so block
@@ -434,15 +450,29 @@ def _reshape_kv_cache(
                 )
 
             elif isinstance(kv_cache_spec, MambaSpec):
-                page_size_bytes = kv_cache_spec.page_size_bytes
-                # Hold a single contiguous [num_blocks, 1, 1, page_size_bytes]
-                # int8 page view per layer; the layer's bind_kv_cache unpacks
-                # each block's bytes into its conv/ssm state views. Keeping
-                # one tensor per layer lets the KV connector register it
-                # without special-casing Mamba.
-                kv_caches[layer_name] = kv_raw_tensor[
-                    : num_blocks * page_size_bytes
-                ].view(num_blocks, 1, 1, page_size_bytes)
+                # Segregate the Mamba state fields into independent contiguous
+                # block pools.  Packing conv/SSM bytes into every physical page
+                # gives the SSM view a page-sized block stride, so GDN decode
+                # has to gather and scatter state on every layer invocation.
+                # The block-copy path already handles list-valued Mamba caches.
+                kv_raw_tensor = kv_raw_tensor.view(-1)
+                state_tensors: list[torch.Tensor] = []
+                storage_offset = 0
+                for shape, dtype in zip(
+                    kv_cache_spec.shapes, kv_cache_spec.dtypes
+                ):
+                    state_nbytes = prod(shape) * get_dtype_size(dtype)
+                    end = storage_offset + num_blocks * state_nbytes
+                    if end > kv_raw_tensor.numel():
+                        raise RuntimeError(
+                            "Mamba cache backing is too small for contiguous "
+                            f"state pools: end={end}, size={kv_raw_tensor.numel()}, "
+                            f"shape={shape}, dtype={dtype}, num_blocks={num_blocks}"
+                        )
+                    state = kv_raw_tensor[storage_offset:end].view(dtype)
+                    state_tensors.append(state.view(num_blocks, *shape))
+                    storage_offset = end
+                kv_caches[layer_name] = state_tensors
             else:
                 raise NotImplementedError(
                     f"Unsupported KV cache spec type: {type(kv_cache_spec)}"

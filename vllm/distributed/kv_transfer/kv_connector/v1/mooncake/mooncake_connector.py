@@ -1085,7 +1085,9 @@ class MooncakeConnectorWorker:
 
     def shutdown(self):
         """Cleanup background threads on destruction."""
-        self.async_zmq_ctx.term()
+        async_zmq_ctx = getattr(self, "async_zmq_ctx", None)
+        if async_zmq_ctx is not None:
+            async_zmq_ctx.term()
         if not self.is_kv_consumer:
             self._sender_executor.shutdown(wait=False)
             if self.sender_loop.is_running():
@@ -1674,13 +1676,10 @@ class MooncakeConnectorWorker:
                     layer_name,
                 )
                 continue
-            if isinstance(layer_spec, MambaSpec):
-                conv, _ = cache_or_caches
-                cache_list = [conv]
-            else:
-                # K and V are packed into one blocks-first tensor per layer,
-                # so each layer registers as a single region.
-                cache_list = [cache_or_caches]
+            cache_list = self.transfer_topo.get_transfer_cache_regions(
+                cache_or_caches,
+                layer_spec,
+            )
 
             logger.debug(
                 "registering layer %s with %d cache tensor(s)",
@@ -1699,7 +1698,14 @@ class MooncakeConnectorWorker:
                 elif self.transfer_topo.virtually_split_kv_in_blocks and not isinstance(
                     layer_spec, MambaSpec
                 ):
-                    kv_block_len = block_len // 2
+                    # A padded hybrid page is [K, V, padding]. Transfer only
+                    # the actual K/V content; block_len remains the physical
+                    # page stride used to locate the next block.
+                    kv_block_len = cache[0].numel() * cache.element_size() // 2
+                    assert 2 * kv_block_len <= block_len, (
+                        "Mooncake K/V content exceeds the physical block stride: "
+                        f"kv_block_len={kv_block_len}, block_len={block_len}."
+                    )
                 else:
                     kv_block_len = block_len
                 self.block_len_per_layer.append(block_len)

@@ -819,7 +819,7 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
                 f"Padding num_heads from {self.num_heads} to "
                 f"{self.prefill_padding} for BF16 sparse prefill kernel"
             )
-            q_padded = q.new_empty((q.shape[0], self.prefill_padding, q.shape[2]))
+            q_padded = q.new_zeros((q.shape[0], self.prefill_padding, q.shape[2]))
             q_padded[:, : self.num_heads, :] = q
             q = q_padded
 
@@ -848,8 +848,9 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         # Concatenate q if it's a tuple (ql_nope, q_pe)
         if isinstance(q, tuple):
             ql_nope, q_pe = q
-            q = self.q_concat_buffer[: ql_nope.shape[0]]
-            ops.concat_mla_q(ql_nope, q_pe, q)
+            # MUSA: concat_mla_q leaves the reused q_concat_buffer partially written
+            # (stale NaN/garbage); use a fresh full-write cat instead.
+            q = torch.cat([ql_nope, q_pe], dim=-1)
 
         num_actual_toks = q.shape[0]
 

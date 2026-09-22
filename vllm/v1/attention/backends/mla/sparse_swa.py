@@ -26,7 +26,7 @@ from vllm.v1.attention.backends.mla.compressor_utils import (
     get_dspark_swa_index_width,
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
-from vllm.v1.attention.ops.flashmla import FlashMLASchedMeta, get_mla_metadata
+from vllm_musa.v1.attention.ops.flashmla import FlashMLASchedMeta, get_mla_metadata
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
@@ -809,7 +809,7 @@ def _compute_swa_indices_and_lens_kernel(
     pid = tl.program_id(0)
     token_idx = pid + token_offset
     is_valid = tl.load(is_valid_token_ptr + token_idx)
-    if not is_valid:
+    if is_valid == 0:
         tl.store(swa_lens_ptr + pid, 0)
         # Clear the row so a padded token cannot gather through stale indices.
         for i in range(0, window_size, TRITON_BLOCK_SIZE):

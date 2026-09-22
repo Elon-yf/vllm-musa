@@ -221,3 +221,22 @@ def test_full_cudagraph_spec_metadata_uses_request_count():
     assert meta.spec_query_start_loc.shape == (batch.batch_size + 1,)
     assert meta.num_accepted_tokens is not None
     assert meta.num_accepted_tokens.shape == (batch.batch_size,)
+
+
+def test_full_cudagraph_regular_decode_reuses_common_tensors():
+    """Uniform non-spec decode can use stable model-runner buffers directly."""
+    builder = _create_gdn_builder(full_cuda_graph=True)
+    builder.vllm_config.cache_config.mamba_cache_mode = "none"
+    batch = BatchSpec(seq_lens=[40, 30, 20], query_lens=[1, 1, 1])
+    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE)
+
+    meta = builder.build(common_prefix_len=0, common_attn_metadata=common)
+
+    assert meta.non_spec_query_start_loc is not None
+    assert meta.non_spec_query_start_loc.data_ptr() == common.query_start_loc.data_ptr()
+    assert meta.non_spec_state_indices_tensor is not None
+    assert (
+        meta.non_spec_state_indices_tensor.data_ptr()
+        == common.block_table_tensor[:, 0].data_ptr()
+    )
+    assert common._num_computed_tokens_cache is None

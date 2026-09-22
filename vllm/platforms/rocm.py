@@ -1124,7 +1124,10 @@ class RocmPlatform(Platform):
             rms_norm = default
 
         return IrOpPriorityConfig.with_default(
-            default, rms_norm=rms_norm, fused_add_rms_norm=rms_norm
+            default,
+            rms_norm=rms_norm,
+            fused_add_rms_norm=rms_norm,
+            gated_qkv_rms_norm_rope=["native"],
         )
 
     @classmethod

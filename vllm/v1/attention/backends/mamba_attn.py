@@ -83,6 +83,7 @@ class BaseMambaAttentionMetadata:
 
 
 class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
+    supports_dynamic_cudagraph_metadata = True
     kv_cache_spec: MambaSpec
     metadata_cls: type[M]
     reorder_batch_threshold: int = 1
@@ -202,7 +203,12 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             self.supports_update_block_table = False
 
     def build_for_cudagraph_capture(
-        self, common_attn_metadata: CommonAttentionMetadata
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        *,
+        num_accepted_tokens: torch.Tensor | None = None,
+        prev_last_scheduled_idx: torch.Tensor | None = None,
+        num_decode_draft_tokens_cpu: torch.Tensor | None = None,
     ) -> M:
         """
         This method builds the metadata for full cudagraph capture.
@@ -220,12 +226,10 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
 
         assert m.max_query_len == 1 + self.num_spec_tokens  # decode-only
 
-        num_accepted_tokens = None
-        if self.num_spec_tokens > 0:
+        if num_accepted_tokens is None and self.num_spec_tokens > 0:
             num_accepted_tokens = torch.diff(m.query_start_loc)
 
-        prev_last_scheduled_idx = None
-        if (
+        if prev_last_scheduled_idx is None and (
             self.use_spec_decode
             and self.vllm_config.cache_config.mamba_cache_mode == "all"
         ):
@@ -240,6 +244,7 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             m,
             num_accepted_tokens=num_accepted_tokens,
             prev_last_scheduled_idx=prev_last_scheduled_idx,
+            num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
         )
 
     def build(

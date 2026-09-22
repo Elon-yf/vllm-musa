@@ -3033,3 +3033,24 @@ def test_resolve_block_hashes_rejects_mismatched_view():
     mismatched = BlockHashListWithBlockSize(raw, 2, 8)
     with pytest.raises(AssertionError):
         resolve_block_hashes(mismatched, 2, 4)
+
+
+def test_musa_separate_pool_eligibility_is_mooncake_scoped(monkeypatch):
+    monkeypatch.setattr(
+        kv_cache_utils, "musa_mamba_separate_pool_enabled", lambda: True
+    )
+    groups = [
+        KVCacheGroupSpec(["mamba"], new_mamba_spec()),
+        KVCacheGroupSpec(["attn"], new_kv_cache_spec()),
+    ]
+    config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(kv_connector="MooncakeConnector")
+    )
+
+    assert kv_cache_utils._musa_separate_pool_eligible(config, groups)
+
+    config.kv_transfer_config.kv_connector = "NixlConnector"
+    assert not kv_cache_utils._musa_separate_pool_eligible(config, groups)
+
+    config.kv_transfer_config = None
+    assert kv_cache_utils._musa_separate_pool_eligible(config, groups)

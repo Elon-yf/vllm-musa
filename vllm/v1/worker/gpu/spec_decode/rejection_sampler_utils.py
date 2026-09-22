@@ -586,6 +586,8 @@ def _rejection_kernel(
                 else:
                     accepted = target_argmax == draft_sampled
                 accepted &= is_valid_draft
+                accepted |= tl.zeros((1,), tl.int1)
+                accepted = tl.sum(accepted.to(tl.int32), axis=0) != 0
                 verifying = accepted
                 accepted_length += accepted
                 tl.store(
@@ -623,7 +625,10 @@ def _rejection_kernel(
                     h = tl.where(denom > 0.0, residual_mass / denom, 1.0)
                 else:
                     h = prefix_joint_ratio
-                accepted_length = tl.where(u <= h, i + 1, accepted_length)
+                accepted = u <= h
+                accepted |= tl.zeros((1,), tl.int1)
+                accepted = tl.sum(accepted.to(tl.int32), axis=0) != 0
+                accepted_length = tl.where(accepted, i + 1, accepted_length)
                 tl.store(sampled_ptr + req_idx * sampled_stride + i, draft_sampled)
             else:
                 # Speculative decoding (Leviathan et al., 2023): https://arxiv.org/abs/2211.17192
@@ -660,12 +665,14 @@ def _rejection_kernel(
                     # Probability ratio test: p(x) > u * q(x)
                     # Equivalent log form: log_p(x) > log(u) + log_q(x)
                     accepted = target_logprob > tl.log(u) + draft_logprob
+                accepted |= tl.zeros((1,), tl.int1)
+                accepted = tl.sum(accepted.to(tl.int32), axis=0) != 0
                 verifying = accepted
                 accepted_length += accepted
                 tl.store(sampled_ptr + req_idx * sampled_stride + i, draft_sampled)
 
     tl.store(rejected_steps_ptr + req_idx, accepted_length)
-    if USE_BLOCK_VERIFICATION and not is_greedy and accepted_length < num_draft_tokens:
+    if USE_BLOCK_VERIFICATION and ((not is_greedy) & (accepted_length < num_draft_tokens)):
         # Compute the target and draft log exponential sums for the
         # rejected token.
         rejected_idx = start_idx + accepted_length
@@ -826,6 +833,7 @@ def _resample_kernel(
     value, idx = gumbel_block_argmax(
         residual_logits,
         block,
+        block,
         mask,
         resample_token_idx,
         expanded_idx_mapping_ptr,
@@ -954,12 +962,20 @@ def rejection_sample(
     num_logits, vocab_size = target_logits.shape
     draft_logits_stride_0 = 0
     draft_logits_stride_1 = 0
+    synthetic_mode = synthetic_conditional_rates is not None
     if has_draft_logits := draft_logits is not None:
         draft_logits_stride_0 = draft_logits.stride(0)
         draft_logits_stride_1 = draft_logits.stride(1)
         # In some cases (e.g. MiMo v2.5 Pro + DFlash) the target model's
         # vocab size is larger than the draft's due to padding.
         vocab_size = min(vocab_size, draft_logits.size(-1))
+
+    # Triton's MUSA frontend still requires typed pointers for optional tensors
+    # even when constexpr flags disable their loads. DSpark greedy verification
+    # intentionally passes draft_logits=None; this one-element buffer is unused
+    # because HAS_DRAFT_LOGITS remains false.
+    if target_logits.device.type == "musa" and draft_logits is None:
+        draft_logits = target_logits.new_empty((1, 1, 1))
 
     # Compute the per-vocab-block logits stats, such as target argmax
     # (for greedy requests), and target max + softmax exponential
@@ -1084,6 +1100,15 @@ def rejection_sample(
         cumulative_log_p = None
         local_residual_mass = None
 
+    if target_logits.device.type == "musa":
+        # Keep dead constexpr branches typed for the MUSA Triton frontend.
+        if synthetic_conditional_rates is None:
+            synthetic_conditional_rates = target_logits.new_empty((1,))
+        if cumulative_log_p is None:
+            cumulative_log_p = target_logits.new_empty((1,))
+        if local_residual_mass is None:
+            local_residual_mass = target_logits.new_empty((1,))
+
     # Sample up until the first rejected/bonus token, and store
     # the step.
     sampled = draft_sampled.new_empty(
@@ -1126,7 +1151,7 @@ def rejection_sample(
         vocab_num_blocks,
         PADDED_VOCAB_NUM_BLOCKS=padded_vocab_num_blocks,
         HAS_DRAFT_LOGITS=has_draft_logits,
-        SYNTHETIC_MODE=synthetic_conditional_rates is not None,
+        SYNTHETIC_MODE=synthetic_mode,
         USE_BLOCK_VERIFICATION=use_block_verification,
         num_warps=1,
     )

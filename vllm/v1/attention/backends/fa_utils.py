@@ -73,6 +73,10 @@ def get_flash_attn_version(
     head_size_v: int | None = None,
     has_sinks: bool = False,
 ) -> int | None:
+    if current_platform.is_musa():
+        # MUSA uses MATE's FA3 interface, not vllm_flash_attn's CUDA extensions.
+        return 3
+
     if current_platform.is_xpu():
         return 2
     if current_platform.is_rocm():

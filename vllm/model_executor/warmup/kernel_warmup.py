@@ -129,7 +129,10 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     # Run next so input-prep kernels JIT against pristine runner state.
     if worker.vllm_config.kernel_config.enable_jit_warmup:
         kimi_k3_triton_warmup(worker)
-        fa4_cutedsl_warmup(worker)
+        if not current_platform.is_musa():
+            fa4_cutedsl_warmup(worker)
+        else:
+            logger.info_once("Skipping CUDA-only FA4 CuTeDSL warmup on MUSA.")
         sparse_mla_triton_warmup(worker)
 
     if current_platform.has_device_capability(90):

@@ -15,6 +15,7 @@ import pytest
 import torch
 
 from vllm.config import set_current_vllm_config
+from vllm.distributed.kv_transfer.kv_connector.utils import TransferTopology
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import (
     KVConnectorRole,
     MooncakeConnector,
@@ -39,6 +40,117 @@ from .utils import create_request, create_vllm_config
 
 def noop_shutdown():
     pass
+
+
+class KVFirstAttentionBackend:
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> tuple[int, ...]:
+        return (2, num_blocks, block_size, num_kv_heads, head_size)
+
+
+class NoKVCacheAttentionBackend:
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> tuple[int, ...]:
+        raise NotImplementedError
+
+
+def make_kv_first_topology(*, is_mamba: bool) -> TransferTopology:
+    return TransferTopology(
+        tp_rank=0,
+        tp_size=1,
+        block_size=16,
+        engine_id="local-engine",
+        is_mla=False,
+        is_mamba=is_mamba,
+        total_num_kv_heads=1,
+        attn_backends=[KVFirstAttentionBackend],
+    )
+
+
+def test_hybrid_topology_skips_backend_without_kv_cache_shape():
+    topology = TransferTopology(
+        tp_rank=0,
+        tp_size=1,
+        block_size=16,
+        engine_id="local-engine",
+        is_mla=False,
+        is_mamba=True,
+        total_num_kv_heads=1,
+        attn_backends=[NoKVCacheAttentionBackend, KVFirstAttentionBackend],
+    )
+
+    assert topology.virtually_split_kv_in_blocks
+
+
+def test_kv_first_flash_attention_dense_regions():
+    topology = make_kv_first_topology(is_mamba=False)
+    layer_spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=4,
+        dtype=torch.float16,
+    )
+    cache = torch.empty((2, 3, 16, 1, 4), dtype=torch.float16)
+
+    regions = topology.get_transfer_cache_regions(cache, layer_spec)
+
+    assert len(regions) == 2
+    assert [tuple(region.shape) for region in regions] == [
+        (3, 16, 1, 4),
+        (3, 16, 1, 4),
+    ]
+    assert [region.data_ptr() for region in regions] == [
+        cache[0].data_ptr(),
+        cache[1].data_ptr(),
+    ]
+
+
+def test_kv_first_flash_attention_hybrid_region_is_blocks_first():
+    topology = make_kv_first_topology(is_mamba=True)
+    layer_spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=4,
+        dtype=torch.float16,
+    )
+    page_aligned_cache = torch.empty((3, 2, 16, 1, 4), dtype=torch.float16)
+    kernel_view = page_aligned_cache.transpose(0, 1)
+
+    regions = topology.get_transfer_cache_regions(kernel_view, layer_spec)
+
+    assert len(regions) == 1
+    assert tuple(regions[0].shape) == tuple(page_aligned_cache.shape)
+    assert tuple(regions[0].stride()) == tuple(page_aligned_cache.stride())
+    assert regions[0].data_ptr() == page_aligned_cache.data_ptr()
+    assert topology.virtually_split_kv_in_blocks
+
+
+def test_kv_first_hybrid_accepts_v028_mamba_page_tensor():
+    topology = make_kv_first_topology(is_mamba=True)
+    layer_spec = MambaSpec(
+        block_size=16,
+        shapes=((6, 3), (1, 2, 2)),
+        dtypes=(torch.float16, torch.float16),
+        mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+    )
+    page_cache = torch.empty((3, 1, 1, 64), dtype=torch.uint8)
+
+    regions = topology.get_transfer_cache_regions(page_cache, layer_spec)
+
+    assert len(regions) == 1
+    assert regions[0] is page_cache
 
 
 def make_hybrid_gdn_kv_cache_config(block_size: int) -> KVCacheConfig:
@@ -138,7 +250,12 @@ def test_register_kv_caches_emits_fa_and_gdn_regions(monkeypatch):
         )
         worker = connector.connector_worker
 
-        fa_cache = torch.empty((2, 2, 11), dtype=torch.float16)
+        fa_storage = torch.empty(64, dtype=torch.float16)
+        fa_cache = torch.as_strided(
+            fa_storage,
+            size=(2, 2, 11),
+            stride=(11, 32, 1),
+        )
         gdn_conv_state = torch.empty((2, 22), dtype=torch.float16)
         gdn_ssm_state = torch.empty((2, 4), dtype=torch.float16)
 
@@ -159,6 +276,8 @@ def test_register_kv_caches_emits_fa_and_gdn_regions(monkeypatch):
             fa_cache.data_ptr(),
             gdn_conv_state.data_ptr(),
         ]
+        assert worker.block_len_per_layer[0] == 64
+        assert worker.kv_block_len_per_layer[0] == 22
 
         worker.shutdown()
         worker.shutdown = noop_shutdown

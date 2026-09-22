@@ -104,8 +104,6 @@ class Sampler:
         idx_mapping_np = input_batch.idx_mapping_np
         cu_num_logits_np = input_batch.cu_num_logits_np
         expanded_local_pos = input_batch.expanded_local_pos
-        pos = input_batch.positions[input_batch.logits_indices]
-        input_ids = input_batch.input_ids[input_batch.logits_indices]
 
         # NOTE(woosuk): We intentionally compute num_nans before sampling to make clear
         # that num_nans is computed before applying penalties and temperature.
@@ -116,6 +114,23 @@ class Sampler:
             idx_mapping_np
         )
         return_logprobs = max_num_logprobs != NO_LOGPROBS or max_per_req_token_ids > 0
+        selector = getattr(self, "_musa_select_qwen_sample_input_views", None)
+        sample_inputs = (
+            None
+            if selector is None
+            else selector(
+                logits,
+                input_batch,
+                expanded_idx_mapping,
+                idx_mapping_np,
+                return_logprobs,
+            )
+        )
+        if sample_inputs is None:
+            pos = input_batch.positions[input_batch.logits_indices]
+            input_ids = input_batch.input_ids[input_batch.logits_indices]
+        else:
+            pos, input_ids = sample_inputs
 
         sampled, processed_logits = self.sample(
             logits,
@@ -150,20 +165,23 @@ class Sampler:
         # 1 sampled token per request, except chunked-prefill requests
         # (seq_len < prefill_len) which aren't done prefilling and produce no
         # output token. num_rejected is always 0 here (one logit per request).
-        num_sampled, num_rejected = get_num_sampled_and_rejected(
-            input_batch.seq_lens.new_ones(input_batch.num_reqs),
-            input_batch.seq_lens,
-            input_batch.cu_num_logits,
-            input_batch.idx_mapping,
-            self.req_states.prefill_len.gpu,
-        )
+        selector = getattr(self, "_musa_select_num_sampled_and_rejected", None)
+        counts = None if selector is None else selector(logits, input_batch)
+        if counts is None:
+            counts = get_num_sampled_and_rejected(
+                input_batch.seq_lens.new_ones(input_batch.num_reqs),
+                input_batch.seq_lens,
+                input_batch.cu_num_logits,
+                input_batch.idx_mapping,
+                self.req_states.prefill_len.gpu,
+            )
+        num_sampled, num_rejected = counts
 
         sampling_mask_tensors = None
         if self.return_sampling_mask:
             sampling_mask_tensors = SamplingMaskTensors.from_logits(
                 processed_logits, num_sampled
             )
-
         # These are GPU tensors.
         sampler_output = SamplerOutput(
             # The sampled tokens are expanded to 2D tensor with shape

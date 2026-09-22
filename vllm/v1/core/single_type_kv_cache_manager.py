@@ -1694,6 +1694,12 @@ class MambaManager(SingleTypeKVCacheManager):
         num_tokens: int,
         retention_interval: int | None = None,
     ) -> None:
+        # Align-mode Mamba only needs boundary state snapshots for future
+        # prefix hits.  Dense caching would materialize the whole prompt's
+        # block table in the dedicated pool (e.g. every block of a 20k
+        # request), defeating the bounded resident-state design.
+        if self.mamba_cache_mode == "align" and retention_interval is None:
+            retention_interval = 0
         num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
         super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
         num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)

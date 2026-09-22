@@ -1271,6 +1271,27 @@ def _get_packed_kv_cache_layout(
     return block_stride, layers_by_offset
 
 
+def _bucket_layers_by_page_size(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> dict[int, list[list[str]]]:
+    """Bucket layers by page size: ``result[ps][slot_idx] = layer_names``."""
+    buckets: dict[int, list[list[str]]] = defaultdict(list)
+    for group in kv_cache_groups:
+        spec = group.kv_cache_spec
+        slot_count: dict[int, int] = defaultdict(int)
+        for layer_name in group.layer_names:
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                page_size = spec.kv_cache_specs[layer_name].page_size_bytes
+            else:
+                page_size = spec.page_size_bytes
+            slot_idx = slot_count[page_size]
+            slot_count[page_size] += 1
+            if slot_idx == len(buckets[page_size]):
+                buckets[page_size].append([])
+            buckets[page_size][slot_idx].append(layer_name)
+    return buckets
+
+
 def _use_packed_kv_cache_config(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1303,11 +1324,26 @@ def _get_kv_cache_config_packed(
     Cache groups use dense, overlapping layouts within one block slab. Each
     emitted tensor aliases the same physical backing allocation.
     """
-    block_stride, layers_by_offset = _get_packed_kv_cache_layout(kv_cache_groups)
+    if _use_musa_deepseek_v4_zero_offset_kv_tensors(kv_cache_groups):
+        # MATE sparse FlashMLA decode rebuilds page views from the cache tensor
+        # storage. Offset aliases from the packed backing tensor overrun there,
+        # so keep the same per-page layout but give each page-size slot an
+        # offset-zero allocation on MUSA.
+        buckets = _bucket_layers_by_page_size(kv_cache_groups)
+        bytes_per_block = sum(
+            page_size * len(slots) for page_size, slots in buckets.items()
+        )
+        num_blocks = available_memory // bytes_per_block
+        num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+        return num_blocks, [
+            KVCacheTensor(size=page_size * num_blocks, shared_by=slot)
+            for page_size, slots in buckets.items()
+            for slot in slots
+        ]
 
+    block_stride, layers_by_offset = _get_packed_kv_cache_layout(kv_cache_groups)
     num_blocks = available_memory // block_stride
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
-
     total_size = block_stride * num_blocks
 
     kv_cache_tensors: list[KVCacheTensor] = []
@@ -1322,6 +1358,144 @@ def _get_kv_cache_config_packed(
         )
 
     return num_blocks, kv_cache_tensors
+
+
+def _use_musa_deepseek_v4_zero_offset_kv_tensors(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> bool:
+    try:
+        from vllm.platforms import current_platform
+    except Exception:
+        return False
+
+    is_musa = getattr(current_platform, "is_musa", None)
+    if not callable(is_musa) or not is_musa():
+        return False
+
+    found_deepseek_v4 = False
+    found_sparse_swa = False
+    for group in kv_cache_groups:
+        spec = group.kv_cache_spec
+        specs: Iterable[KVCacheSpec]
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            specs = spec.kv_cache_specs.values()
+        else:
+            specs = (spec,)
+        for layer_spec in specs:
+            if getattr(layer_spec, "model_version", None) != "deepseek_v4":
+                continue
+            found_deepseek_v4 = True
+            if isinstance(layer_spec, SlidingWindowMLASpec):
+                found_sparse_swa = True
+
+    return found_deepseek_v4 and found_sparse_swa
+
+
+_get_kv_cache_config_deepseek_v4 = _get_kv_cache_config_packed
+
+
+def musa_mamba_separate_pool_enabled() -> bool:
+    """Whether MUSA may assign Mamba groups dedicated block-id pools."""
+    try:
+        from vllm.platforms import current_platform
+    except Exception:
+        return False
+    is_musa = getattr(current_platform, "is_musa", None)
+    return callable(is_musa) and is_musa()
+
+
+def _musa_has_mamba_and_attention(kv_cache_groups) -> bool:
+    has_mamba = any(isinstance(g.kv_cache_spec, MambaSpec) for g in kv_cache_groups)
+    has_attn = any(not isinstance(g.kv_cache_spec, MambaSpec) for g in kv_cache_groups)
+    return has_mamba and has_attn
+
+
+def _musa_separate_pool_eligible(vllm_config, kv_cache_groups) -> bool:
+    # Non-Mooncake connectors can defer frees through the coordinator's
+    # shared-pool API; keep the shared-pool layout for their free lifecycle.
+    # Mooncake uses the dedicated Mamba BlockPool ownership path below.
+    kv_transfer_config = vllm_config.kv_transfer_config
+    mooncake_connector = (
+        kv_transfer_config is not None
+        and kv_transfer_config.kv_connector == "MooncakeConnector"
+    )
+    return (
+        musa_mamba_separate_pool_enabled()
+        and (kv_transfer_config is None or mooncake_connector)
+        and _musa_has_mamba_and_attention(kv_cache_groups)
+    )
+
+
+def _musa_separated_mamba_attn_tensors(vllm_config, kv_cache_groups, available_memory):
+    """Split KV memory into a small contiguous mamba pool and the attention pool.
+
+    Mamba groups get one dedicated tensor per layer, indexed by their own
+    block-id space. The pool is sized from the MambaSpec admission bound so it
+    never binds (attention admission caps running requests at <= max_num_seqs).
+    Returns (kv_cache_tensors, attn_num_blocks, mamba_num_blocks).
+    """
+    mamba_groups = [g for g in kv_cache_groups if isinstance(g.kv_cache_spec, MambaSpec)]
+    attn_groups = [
+        g for g in kv_cache_groups if not isinstance(g.kv_cache_spec, MambaSpec)
+    ]
+    mamba_page = get_uniform_page_size([g.kv_cache_spec for g in mamba_groups])
+    max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+    # Size the dedicated pool from the resident Mamba state footprint. Align
+    # mode is made sparse in MambaManager.cache_blocks below, so only boundary
+    # snapshots occupy this pool; retain one extra batch for turnover.
+    mamba_blocks_per_request = max(
+        cdiv(
+            group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+            mamba_page,
+        )
+        for group in mamba_groups
+    )
+    # Preserve the pre-0138 sizing when local prefix caching is disabled.
+    # Prefix caching retains completed requests' replay-boundary states, so
+    # use extra turnover headroom only when that cache is actually enabled.
+    pool_batch_factor = (
+        max(4 * max_num_seqs, 32)
+        if vllm_config.cache_config.enable_prefix_caching
+        else max_num_seqs
+    )
+    mamba_num_blocks = pool_batch_factor * mamba_blocks_per_request + 1
+    mamba_layers = [ln for g in mamba_groups for ln in g.layer_names]
+    mamba_bytes = mamba_page * mamba_num_blocks * len(mamba_layers)
+    attn_group_size = max(len(g.layer_names) for g in attn_groups)
+    attn_page = get_uniform_page_size([g.kv_cache_spec for g in attn_groups])
+    profiling_num_blocks = (
+        vllm_config.cache_config.num_gpu_blocks_override
+        if available_memory == 0
+        else None
+    )
+    if profiling_num_blocks is not None:
+        # vLLM v0.28 profiles cudagraph memory with available_memory=0 and a
+        # temporary block override. Build that deliberately minimal attention
+        # cache while retaining the fixed-size Mamba state pool required by
+        # the captured batch, rather than treating zero as the final budget.
+        attn_num_blocks = profiling_num_blocks
+    else:
+        if mamba_bytes >= available_memory:
+            raise ValueError("MUSA separate mamba pool needs more memory than available")
+        remaining = available_memory - mamba_bytes
+        attn_num_blocks = get_num_blocks(
+            vllm_config, attn_group_size, remaining, attn_page
+        )
+    kv_cache_tensors = []
+    for i in range(attn_group_size):
+        shared_by = [g.layer_names[i] for g in attn_groups if i < len(g.layer_names)]
+        kv_cache_tensors.append(
+            KVCacheTensor(size=attn_page * attn_num_blocks, shared_by=shared_by)
+        )
+    for ln in mamba_layers:
+        kv_cache_tensors.append(
+            KVCacheTensor(
+                size=mamba_page * mamba_num_blocks,
+                shared_by=[ln],
+                musa_mamba_pool=True,
+            )
+        )
+    return kv_cache_tensors, attn_num_blocks, mamba_num_blocks
 
 
 def get_kv_cache_config_from_groups(
@@ -1373,6 +1547,19 @@ def get_kv_cache_config_from_groups(
         # layouts can opt in with --enable-cross-layers.
         num_blocks, kv_cache_tensors = _get_kv_cache_config_packed(
             vllm_config, kv_cache_groups, available_memory
+        )
+    elif _musa_separate_pool_eligible(vllm_config, kv_cache_groups):
+        # MUSA: mamba state on its own contiguous pool (own block-id space).
+        kv_cache_tensors, num_blocks, musa_mamba_num_blocks = (
+            _musa_separated_mamba_attn_tensors(
+                vllm_config, kv_cache_groups, available_memory
+            )
+        )
+        return KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=kv_cache_tensors,
+            kv_cache_groups=kv_cache_groups,
+            musa_mamba_num_blocks=musa_mamba_num_blocks,
         )
     else:
         # General case:
@@ -1789,16 +1976,33 @@ def get_kv_cache_groups(
         if not isinstance(v, HiddenStateCacheSpec)
     }
 
-    # Prefer preserving each layer's cache semantics. If physical pages cannot
-    # be unified, try a supported allocation-only fallback before failing.
-    try:
-        filtered_spec = unify_kv_cache_spec_page_size(filtered_spec)
-    except NotImplementedError:
-        fallback_groups = _try_get_full_allocation_fallback_groups(kv_cache_spec)
-        if fallback_groups is None:
-            raise
-        return fallback_groups
-    groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
+    if (
+        musa_mamba_separate_pool_enabled()
+        and (
+            vllm_config.kv_transfer_config is None
+            or vllm_config.kv_transfer_config.kv_connector == "MooncakeConnector"
+        )
+        and not hidden_specs
+        and any(isinstance(spec, MambaSpec) for spec in filtered_spec.values())
+        and any(not isinstance(spec, MambaSpec) for spec in filtered_spec.values())
+    ):
+        # MUSA: the dedicated Mamba BlockPools have independent page sizes and
+        # block-id spaces. Keep the attention spec at its backend-preferred
+        # block size instead of expanding every attention page to one full
+        # recurrent-state page. The grouping algorithm itself does not require
+        # equal page sizes; the separated allocator below handles each family.
+        groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
+    else:
+        # Prefer preserving each layer's cache semantics. If physical pages
+        # cannot be unified, try a supported allocation-only fallback.
+        try:
+            filtered_spec = unify_kv_cache_spec_page_size(filtered_spec)
+        except NotImplementedError:
+            fallback_groups = _try_get_full_allocation_fallback_groups(kv_cache_spec)
+            if fallback_groups is None:
+                raise
+            return fallback_groups
+        groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
 
     # Add hidden-state layers back with page aligned to the common page.
     if hidden_specs:
@@ -1923,6 +2127,59 @@ def _max_memory_usage_bytes_from_groups(
             )
             total_max_mem_usage_bytes += g_max_mem_usage_page_bytes
         return total_max_mem_usage_bytes
+
+    if (
+        musa_mamba_separate_pool_enabled()
+        and _musa_has_mamba_and_attention(kv_cache_groups)
+    ):
+        # MUSA: separate Mamba BlockPools intentionally keep attention and
+        # recurrent-state page sizes independent. Account for the exact fixed
+        # Mamba reservation plus the minimum attention capacity instead of
+        # calling get_uniform_page_size() across both cache families.
+        mamba_groups = [
+            group
+            for group in kv_cache_groups
+            if isinstance(group.kv_cache_spec, MambaSpec)
+        ]
+        attn_groups = [
+            group
+            for group in kv_cache_groups
+            if not isinstance(group.kv_cache_spec, MambaSpec)
+        ]
+        mamba_page = get_uniform_page_size(
+            [group.kv_cache_spec for group in mamba_groups]
+        )
+        # Keep the sizing rule identical to _musa_separated_mamba_attn_tensors:
+        # legacy capacity without local prefix caching, and turnover headroom
+        # when completed requests can remain in the prefix cache.
+        mamba_blocks_per_request = max(
+            cdiv(group.kv_cache_spec.max_memory_usage_bytes(vllm_config), mamba_page)
+            for group in mamba_groups
+        )
+        mamba_num_blocks = (
+            (
+                max(4 * vllm_config.scheduler_config.max_num_seqs, 32)
+                if vllm_config.cache_config.enable_prefix_caching
+                else vllm_config.scheduler_config.max_num_seqs
+            )
+            * mamba_blocks_per_request
+            + 1
+        )
+        mamba_layers = [
+            layer_name for group in mamba_groups for layer_name in group.layer_names
+        ]
+        mamba_required_bytes = mamba_page * mamba_num_blocks * len(mamba_layers)
+
+        attn_page = get_uniform_page_size(
+            [group.kv_cache_spec for group in attn_groups]
+        )
+        attn_group_size = max(len(group.layer_names) for group in attn_groups)
+        attn_blocks_needed = sum(
+            cdiv(group.kv_cache_spec.max_memory_usage_bytes(vllm_config), attn_page)
+            for group in attn_groups
+        )
+        attn_required_bytes = attn_group_size * attn_page * attn_blocks_needed
+        return mamba_required_bytes + attn_required_bytes
 
     # General case: group_size pools, each shared by one layer per group
     # Memory = group_size * page_size * blocks_for_max_len
@@ -2222,6 +2479,10 @@ def get_kv_cache_configs(
 
         # Shrink tensor size proportionally
         for tensor in kv_cache_config.kv_cache_tensors:
+            if getattr(tensor, "musa_mamba_pool", False):
+                # MUSA: mamba pool size is rank-invariant (from max_num_seqs),
+                # not shrunk with the attention pool's num_blocks.
+                continue
             assert tensor.size % num_blocks_old == 0
             tensor.size = tensor.size // num_blocks_old * min_num_blocks
 

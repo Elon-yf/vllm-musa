@@ -14,8 +14,49 @@ from vllm.triton_utils import tl, triton
 TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
 
 
-@triton.autotune(
-    configs=[
+from vllm.triton_utils.musa import is_musa_triton_32
+
+
+def _musa_ssd_early_config_prune(configs, named_args, **kwargs):
+    """Select the wider tile only for the verified Nemotron SSD shape."""
+    if not is_musa_triton_32():
+        return configs
+    args = {**named_args, **kwargs}
+    is_nemotron_shape = (
+        args.get("chunk_size") == 128
+        and args.get("hdim") == 64
+        and args.get("dstate") == 128
+        and args.get("nheads_ngroups_ratio") == 8
+    )
+    tile = 32 if is_nemotron_shape else 16
+    return [
+        config
+        for config in configs
+        if config.kwargs["BLOCK_SIZE_M"] == tile
+        and config.kwargs["BLOCK_SIZE_N"] == tile
+    ]
+
+
+def _ssd_autotune_configs():
+    # MUSA Triton 3.2.x cannot compile the
+    # broad upstream autotune search. Use a conservative tile only for that
+    # stack while preserving CUDA/ROCm and newer Triton behavior.
+
+    if is_musa_triton_32():
+        return [
+            triton.Config(
+                {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 16, "BLOCK_SIZE_K": 32},
+                num_stages=1,
+                num_warps=2,
+            ),
+            triton.Config(
+                {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 32},
+                num_stages=1,
+                num_warps=2,
+            ),
+        ]
+    return [
+
         # =================================================================
         # Higher warp count configs for better latency hiding
         # More warps = more instructions in flight = better memory latency hiding
@@ -141,8 +182,22 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
             num_stages=4,
             num_warps=2,
         ),
-    ],
-    key=["chunk_size", "hdim", "dstate", "IS_CAUSAL"],
+
+    ]
+
+
+def _ssd_autotune_kwargs():
+    if is_musa_triton_32():
+        return {
+            "key": ["chunk_size", "hdim", "dstate", "nheads_ngroups_ratio", "IS_CAUSAL"],
+            "prune_configs_by": {"early_config_prune": _musa_ssd_early_config_prune},
+        }
+    return {"key": ["chunk_size", "hdim", "dstate", "IS_CAUSAL"]}
+
+
+@triton.autotune(
+    configs=_ssd_autotune_configs(),
+    **_ssd_autotune_kwargs(),
 )
 @triton.jit
 def _chunk_scan_fwd_kernel(
@@ -199,6 +254,7 @@ def _chunk_scan_fwd_kernel(
     stride_D_head: tl.constexpr,
     # Meta-parameters
     IS_CAUSAL: tl.constexpr,
+    IS_MUSA: tl.constexpr,
     HAS_D: tl.constexpr,
     D_HAS_HDIM: tl.constexpr,
     HAS_Z: tl.constexpr,
@@ -298,7 +354,11 @@ def _chunk_scan_fwd_kernel(
             )
             prev_states = prev_states.to(C_ptr.dtype.element_ty)
 
-        acc = tl.dot(C, prev_states) * scale_m[:, None]
+        if IS_MUSA:
+            acc = tl.dot(C.to(tl.float32), prev_states.to(tl.float32))
+        else:
+            acc = tl.dot(C, prev_states)
+        acc *= scale_m[:, None]
 
     else:
         prev_states_ptrs = (
@@ -325,7 +385,10 @@ def _chunk_scan_fwd_kernel(
                     other=0.0,
                 )
                 prev_states = prev_states.to(C_ptr.dtype.element_ty)
-            acc += tl.dot(C, prev_states)
+            if IS_MUSA:
+                acc += tl.dot(C.to(tl.float32), prev_states.to(tl.float32))
+            else:
+                acc += tl.dot(C, prev_states)
             C_ptrs += BLOCK_SIZE_K
             prev_states_ptrs += BLOCK_SIZE_K
         acc *= scale_m[:, None]
@@ -465,6 +528,16 @@ def _chunk_scan_fwd(
         else (0, 0, 0, 0)
     )
 
+    # MUSA Triton 3.2.x requires optional pointer arguments to retain a
+    # concrete pointer type even when the constexpr branch is disabled.
+    initstates_ptr = initial_states
+    if is_musa_triton_32() and initial_states is None:
+        initstates_ptr = states
+        initial_states_strides = states.stride()
+
+    # Keep the BF16 dot lowering scoped to the affected MUSA Triton stack.
+    is_musa = is_musa_triton_32()
+
     _chunk_scan_fwd_kernel[grid](
         cb_ptr=cb,
         x_ptr=x,
@@ -476,7 +549,7 @@ def _chunk_scan_fwd(
         C_ptr=C,
         states_ptr=states,
         D_ptr=D,
-        initstates_ptr=initial_states,
+        initstates_ptr=initstates_ptr,
         cu_chunk_seqlens_ptr=cu_chunk_seqlens,
         chunk_size=chunk_size,
         hdim=headdim,
@@ -515,6 +588,7 @@ def _chunk_scan_fwd(
         stride_init_states_dstate=initial_states_strides[3],
         stride_D_head=D.stride(0) if D is not None else 0,
         IS_CAUSAL=True,
+        IS_MUSA=is_musa,
         HAS_D=D is not None,
         D_HAS_HDIM=D.dim() == 2 if D is not None else True,
         HAS_Z=z is not None,

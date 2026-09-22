@@ -416,6 +416,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.speculative_config,
                     self.device,
                 )
+            from vllm_musa.optimization_contract import resolve_optimization_contract
+
+            optimization_contract = resolve_optimization_contract(
+                model_config=self.model_config
+            )
+            self.sampler._musa_optimization_contract = optimization_contract
+            topk_topp_sampler = getattr(self.sampler, "topk_topp_sampler", None)
+            if topk_topp_sampler is not None:
+                topk_topp_sampler._musa_optimization_contract = optimization_contract
             self.prompt_logprobs_worker = PromptLogprobsWorker(
                 self.max_num_reqs,
                 logprobs_mode=self.model_config.logprobs_mode,
@@ -1227,18 +1236,35 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Some input token ids are directly read from the last sampled tokens
         # and draft tokens. Also, get the logits indices to sample tokens from.
-        logits_indices = combine_sampled_and_draft_tokens(
-            self.input_buffers.input_ids,
-            idx_mapping,
-            self.req_states.last_sampled_tokens,
-            query_start_loc,
-            seq_lens,
-            self.req_states.prefill_len.gpu,
-            self.req_states.draft_tokens,
-            cu_num_logits,
-            total_num_logits,
-            self.model_state.num_new_sampled_tokens_per_step,
-        )
+        selector = getattr(self, "_musa_select_uniform_decode_model_inputs", None)
+        model_inputs = None
+        if selector is not None:
+            model_inputs = selector(
+                req_ids,
+                num_scheduled_tokens_np,
+                batch_req_state.is_prefilling_np,
+                total_num_draft_tokens,
+                total_num_logits,
+                num_tokens,
+                num_tokens_after_padding,
+                num_reqs_padded,
+            )
+        if model_inputs is None:
+            logits_indices = combine_sampled_and_draft_tokens(
+                self.input_buffers.input_ids,
+                idx_mapping,
+                self.req_states.last_sampled_tokens,
+                query_start_loc,
+                seq_lens,
+                self.req_states.prefill_len.gpu,
+                self.req_states.draft_tokens,
+                cu_num_logits,
+                total_num_logits,
+                self.model_state.num_new_sampled_tokens_per_step,
+            )
+            input_ids = self.input_buffers.input_ids[:num_tokens_after_padding]
+        else:
+            input_ids, logits_indices = model_inputs
 
         # CPU upper bound on seq_lens; padded entries left at zero.
         num_computed_tokens_np = self.req_states.num_computed_tokens_np[idx_mapping_np]
@@ -1284,7 +1310,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             is_prefilling_np=batch_req_state.is_prefilling_np,
             has_prefill=batch_req_state.has_prefill,
             max_seq_len_np=max_seq_len_np,
-            input_ids=self.input_buffers.input_ids[:num_tokens_after_padding],
+            input_ids=input_ids,
             positions=self.input_buffers.positions[:num_tokens_after_padding],
             is_padding=self.input_buffers.is_padding[:num_tokens_after_padding],
             logits_indices=logits_indices,
@@ -1336,7 +1362,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         input_batch: InputBatch,
         grammar_output: GrammarOutput | None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
-        sample_hidden_states = hidden_states[input_batch.logits_indices]
+        selector = getattr(self, "_musa_select_sample_hidden_states", None)
+        sample_hidden_states = (
+            None if selector is None else selector(hidden_states, input_batch)
+        )
+        if sample_hidden_states is None:
+            sample_hidden_states = hidden_states[input_batch.logits_indices]
         logits = self.model.compute_logits(sample_hidden_states)
         if grammar_output is not None:
             # Apply grammar bitmask to the logits in-place.
@@ -1378,6 +1409,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             output_bin_counts = self.sampler.penalties_state.output_bin_counts
         else:
             output_bin_counts = None
+        selector = getattr(self, "_musa_select_next_input_ids_buffer", None)
+        next_input_ids = None if selector is None else selector()
         post_update(
             idx_mapping,
             self.req_states.num_computed_tokens.gpu,
@@ -1389,6 +1422,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             query_start_loc,
             self.req_states.all_token_ids.gpu,
             self.req_states.total_len.gpu,
+            next_input_ids=next_input_ids,
         )
 
         self.model_state.postprocess_state(
