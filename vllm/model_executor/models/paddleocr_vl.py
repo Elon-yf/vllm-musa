@@ -81,6 +81,10 @@ from .utils import (
     maybe_prefix,
 )
 from .vision import get_vit_attn_backend
+from .paddleocr_vl_musa import (
+    install_paddle_musa_rotary,
+    paddle_musa_fast_path,
+)
 
 
 def smart_resize(
@@ -971,6 +975,11 @@ class PaddleOCRVLForConditionalGeneration(nn.Module, SupportsMultiModal, Support
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+        musa_fast_path = paddle_musa_fast_path(vllm_config)
+        if musa_fast_path:
+            from vllm_musa.platform import register_attention_backends
+
+            register_attention_backends()
         config = vllm_config.model_config.hf_config
         if hasattr(config, "text_config"):
             text_config = config.text_config.to_dict()
@@ -1000,6 +1009,12 @@ class PaddleOCRVLForConditionalGeneration(nn.Module, SupportsMultiModal, Support
             for layer in self.language_model.model.layers:
                 if not isinstance(layer, PPMissingLayer):
                     layer.self_attn.rotary_emb.is_neox_style = True
+
+            install_paddle_musa_rotary(
+                self.visual,
+                self.language_model,
+                fast=musa_fast_path,
+            )
 
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
