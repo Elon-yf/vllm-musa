@@ -1,0 +1,230 @@
+From c0d4039c7c9c1221091f44acbbaec02a555369bf Mon Sep 17 00:00:00 2001
+From: Elon-yf <309721831+Elon-yf@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 19:04:00 +0800
+Subject: [PATCH] MUSA: adapt Ovis vision rotary locally
+
+
+diff --git a/tests/model_executor/test_ovis_qwen3_5_rope_scope.py b/tests/model_executor/test_ovis_qwen3_5_rope_scope.py
+new file mode 100644
+index 0000000..c5f5c50
+--- /dev/null
++++ b/tests/model_executor/test_ovis_qwen3_5_rope_scope.py
+@@ -0,0 +1,73 @@
++from types import SimpleNamespace
++
++import torch
++
++from vllm.model_executor.models.qwen3_5 import _is_ovis_qwen35_config
++from vllm.model_executor.models.ovis_qwen3_5_rope import (
++    OvisVisionApplyRotaryEmb,
++    enable_ovis_vision_rope,
++)
++
++
++def _config():
++    return SimpleNamespace(
++        architectures=["Qwen3_5ForConditionalGeneration"],
++        model_type="qwen3_5",
++        text_config=SimpleNamespace(
++            model_type="qwen3_5_text",
++            hidden_size=1024,
++            intermediate_size=3584,
++            num_hidden_layers=24,
++            num_attention_heads=8,
++            num_key_value_heads=2,
++            head_dim=256,
++            vocab_size=248320,
++        ),
++        vision_config=SimpleNamespace(
++            hidden_size=768,
++            depth=12,
++            num_heads=12,
++            out_hidden_size=1024,
++            patch_size=16,
++            spatial_merge_size=2,
++            temporal_patch_size=2,
++        ),
++    )
++
++
++def test_ovis_guard_accepts_exact_config():
++    assert _is_ovis_qwen35_config(_config(), SimpleNamespace(dtype=torch.bfloat16))
++
++
++def test_ovis_guard_rejects_other_architecture():
++    config = _config()
++    config.architectures = ["Qwen3_5MoeForConditionalGeneration"]
++    assert not _is_ovis_qwen35_config(
++        config, SimpleNamespace(dtype=torch.bfloat16)
++    )
++
++
++def test_ovis_guard_rejects_other_hidden_size():
++    config = _config()
++    config.text_config.hidden_size = 2048
++    assert not _is_ovis_qwen35_config(
++        config, SimpleNamespace(dtype=torch.bfloat16)
++    )
++
++
++def test_ovis_replacement_is_block_local():
++    class ExistingRotary(torch.nn.Module):
++        is_neox_style = True
++        enable_fp32_compute = False
++
++    visual = SimpleNamespace(
++        blocks=[
++            SimpleNamespace(attn=SimpleNamespace(apply_rotary_emb=ExistingRotary()))
++            for _ in range(2)
++        ]
++    )
++    assert enable_ovis_vision_rope(visual) == 2
++    assert all(
++        isinstance(block.attn.apply_rotary_emb, OvisVisionApplyRotaryEmb)
++        for block in visual.blocks
++    )
+diff --git a/vllm/model_executor/models/ovis_qwen3_5_rope.py b/vllm/model_executor/models/ovis_qwen3_5_rope.py
+new file mode 100644
+index 0000000..a6d6499
+--- /dev/null
++++ b/vllm/model_executor/models/ovis_qwen3_5_rope.py
+@@ -0,0 +1,56 @@
++import torch
++from torch import nn
++
++
++class OvisVisionApplyRotaryEmb(nn.Module):
++    """Model-local adapter to the existing MUSA rotary custom op."""
++
++    def __init__(self, is_neox_style: bool = True, enable_fp32_compute: bool = False):
++        super().__init__()
++        self.is_neox_style = is_neox_style
++        self.enable_fp32_compute = enable_fp32_compute
++
++    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
++        if x.device.type != "musa":
++            raise RuntimeError("OvisVisionApplyRotaryEmb is MUSA-only")
++        origin_dtype = x.dtype
++        if self.enable_fp32_compute:
++            x = x.float()
++            cos = cos.float()
++            sin = sin.float()
++        batch, seq_len, num_heads, head_size = x.shape
++        query = x.reshape(batch * seq_len, num_heads * head_size)
++        positions = torch.arange(seq_len, device=x.device, dtype=torch.long)
++        positions = positions.repeat(batch)
++        cos_sin_cache = torch.cat((cos, sin), dim=-1).contiguous()
++        from vllm_musa.jit_kernel.csrc.rope import rotary_embedding
++
++        rotary_embedding(
++            positions,
++            query,
++            None,
++            head_size,
++            cos_sin_cache,
++            self.is_neox_style,
++        )
++        return query.view(batch, seq_len, num_heads, head_size).to(origin_dtype)
++
++
++def enable_ovis_vision_rope(visual: nn.Module) -> int:
++    replaced = 0
++    for block in visual.blocks:
++        attention = getattr(block, "attn", None)
++        rotary = getattr(attention, "apply_rotary_emb", None)
++        if rotary is None:
++            continue
++        attention.apply_rotary_emb = OvisVisionApplyRotaryEmb(
++            is_neox_style=rotary.is_neox_style,
++            enable_fp32_compute=rotary.enable_fp32_compute,
++        )
++        replaced += 1
++    if replaced != len(visual.blocks):
++        raise RuntimeError(
++            f"Ovis vision rotary adaptation replaced {replaced}/"
++            f"{len(visual.blocks)} blocks"
++        )
++    return replaced
+diff --git a/vllm/model_executor/models/qwen3_5.py b/vllm/model_executor/models/qwen3_5.py
+index 28c6a11..d4e4277 100644
+--- a/vllm/model_executor/models/qwen3_5.py
++++ b/vllm/model_executor/models/qwen3_5.py
+@@ -52,6 +52,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
+     VocabParallelEmbedding,
+ )
+ from vllm.multimodal import MULTIMODAL_REGISTRY
++from vllm.platforms import current_platform
+ from vllm.sequence import IntermediateTensors
+ from vllm.tokenizers.registry import cached_tokenizer_from_config
+ from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig
+@@ -102,6 +103,53 @@ from .utils import (
+ logger = init_logger(__name__)
+
+
++def _is_ovis_qwen35_config(config: Qwen3_5Config, model_config=None) -> bool:
++    text = getattr(config, "text_config", config)
++    vision = getattr(config, "vision_config", None)
++    dtype = getattr(model_config, "dtype", None)
++    return (
++        tuple(getattr(config, "architectures", ()) or ())
++        == ("Qwen3_5ForConditionalGeneration",)
++        and getattr(config, "model_type", None) == "qwen3_5"
++        and getattr(text, "model_type", None) == "qwen3_5_text"
++        and getattr(text, "hidden_size", None) == 1024
++        and getattr(text, "intermediate_size", None) == 3584
++        and getattr(text, "num_hidden_layers", None) == 24
++        and getattr(text, "num_attention_heads", None) == 8
++        and getattr(text, "num_key_value_heads", None) == 2
++        and getattr(text, "head_dim", None) == 256
++        and getattr(text, "vocab_size", None) == 248320
++        and vision is not None
++        and getattr(vision, "hidden_size", None) == 768
++        and getattr(vision, "depth", None) == 12
++        and getattr(vision, "num_heads", None) == 12
++        and getattr(vision, "out_hidden_size", None) == 1024
++        and getattr(vision, "patch_size", None) == 16
++        and getattr(vision, "spatial_merge_size", None) == 2
++        and getattr(vision, "temporal_patch_size", None) == 2
++        and dtype in (torch.bfloat16, "bfloat16", "torch.bfloat16")
++    )
++
++
++def _register_ovis_fa(config, model_config) -> bool:
++    if not current_platform.is_musa() or not _is_ovis_qwen35_config(
++        config, model_config
++    ):
++        return False
++    from vllm_musa.platform import register_attention_backends
++
++    register_attention_backends()
++    return True
++
++
++def _enable_ovis_vision_rope(config, model_config, visual) -> None:
++    if not _is_ovis_qwen35_config(config, model_config):
++        return
++    from .ovis_qwen3_5_rope import enable_ovis_vision_rope
++
++    enable_ovis_vision_rope(visual)
++
++
+ class Qwen3_5ProcessingInfo(Qwen3VLProcessingInfo):
+     def get_hf_config(self):
+         return self.ctx.get_hf_config(Qwen3_5Config)
+@@ -492,6 +540,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
+         self.visual_dim = config.vision_config.out_hidden_size
+         self.multiscale_dim = self.visual_dim * self.deepstack_num_level
+
++        ovis_musa = _register_ovis_fa(config, self.model_config)
+         with self._mark_tower_model(vllm_config, {"image", "video"}):
+             self.visual = Qwen3_VisionTransformer(
+                 config.vision_config,
+@@ -499,6 +548,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
+                 quant_config=quant_config,
+                 prefix=maybe_prefix(prefix, "visual"),
+             )
++        if ovis_musa:
++            _enable_ovis_vision_rope(config, self.model_config, self.visual)
+
+         with self._mark_language_model(vllm_config):
+             self.language_model = Qwen3_5ForCausalLM(
