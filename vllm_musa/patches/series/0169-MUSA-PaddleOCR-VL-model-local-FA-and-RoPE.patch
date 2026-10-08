@@ -8,20 +8,27 @@ diff --git a/vllm/model_executor/models/paddleocr_vl.py b/vllm/model_executor/mo
 index bd635aa..721e879 100644
 --- a/vllm/model_executor/models/paddleocr_vl.py
 +++ b/vllm/model_executor/models/paddleocr_vl.py
-@@ -83,0 +84,4 @@ from .vision import get_vit_attn_backend
+@@ -83,2 +83,6 @@ from .utils import (
+ from .vision import get_vit_attn_backend
 +from vllm_musa.model_executor.models.paddleocr_vl_musa import (
 +    install_paddle_musa_rotary,
 +    paddle_musa_fast_path,
 +)
-@@ -973,0 +978,5 @@ class PaddleOCRVLForConditionalGeneration(nn.Module, SupportsMultiModal, Support
+ 
+@@ -973,2 +977,7 @@ class PaddleOCRVLForConditionalGeneration(nn.Module, SupportsMultiModal, Support
+         super().__init__()
 +        musa_fast_path = paddle_musa_fast_path(vllm_config)
 +        if musa_fast_path:
 +            from vllm_musa.platform import register_attention_backends
 +
 +            register_attention_backends()
-@@ -1003,0 +1013,5 @@ class PaddleOCRVLForConditionalGeneration(nn.Module, SupportsMultiModal, Support
+         config = vllm_config.model_config.hf_config
+@@ -1003,2 +1012,8 @@ class PaddleOCRVLForConditionalGeneration(nn.Module, SupportsMultiModal, Support
+ 
 +            install_paddle_musa_rotary(
 +                self.visual,
 +                self.language_model,
 +                fast=musa_fast_path,
 +            )
++
+         self.make_empty_intermediate_tensors = (
