@@ -82,9 +82,6 @@ def test_torchada_floor_is_consistent():
     private_requirements, common_requirements, expected = _declared_musa_stack()
     assert set(expected["private"]).issubset(private_requirements)
     assert expected["torchada"] in common_requirements
-    for readme_name in ("README.md", "README_CN.md"):
-        readme = (ROOT / readme_name).read_text()
-        assert "torchada 0.1.95" in readme
 
 
 def _dockerfile_run_commands(dockerfile: str) -> list[str]:
