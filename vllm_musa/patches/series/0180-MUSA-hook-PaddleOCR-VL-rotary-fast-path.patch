@@ -1,4 +1,4 @@
-From b1ad5a989a277b8d6a3d890025cac8075f07004e Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Elon-yf <309721831+Elon-yf@users.noreply.github.com>
 Date: Thu, 8 Oct 2026 15:23:15 +0800
 Subject: [PATCH] MUSA: hook PaddleOCR-VL rotary fast path
@@ -8,13 +8,17 @@ diff --git a/vllm/model_executor/models/paddleocr_vl.py b/vllm/model_executor/mo
 index bd635aa..336ae0e 100644
 --- a/vllm/model_executor/models/paddleocr_vl.py
 +++ b/vllm/model_executor/models/paddleocr_vl.py
-@@ -83,2 +83,6 @@ from .utils import (
+@@ -83,4 +83,8 @@ from .utils import (
  from .vision import get_vit_attn_backend
 +from vllm_musa.optimization_contract.paddleocr_vl import (
 +    install_paddle_musa_rotary,
 +    paddle_musa_fast_path,
 +)
- 
+-
++
+-
++
+ def smart_resize(
 @@ -973,2 +977,7 @@ class PaddleOCRVLForConditionalGeneration(nn.Module, SupportsMultiModal, Support
          super().__init__()
 +        musa_fast_path = paddle_musa_fast_path(vllm_config)
@@ -24,7 +28,8 @@ index bd635aa..336ae0e 100644
 +            register_attention_backends()
          config = vllm_config.model_config.hf_config
 @@ -1003,2 +1012,8 @@ class PaddleOCRVLForConditionalGeneration(nn.Module, SupportsMultiModal, Support
- 
+-
++
 +            install_paddle_musa_rotary(
 +                self.visual,
 +                self.language_model,

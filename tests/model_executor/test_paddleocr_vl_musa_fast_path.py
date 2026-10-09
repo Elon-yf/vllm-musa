@@ -2,7 +2,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).parents[2]
-PATCH = ROOT / "vllm_musa/patches/series/0169-MUSA-PaddleOCR-VL-model-local-FA-and-RoPE.patch"
+PATCH = ROOT / "vllm_musa/patches/series/0180-MUSA-hook-PaddleOCR-VL-rotary-fast-path.patch"
 HELPER = ROOT / "vllm_musa/optimization_contract/paddleocr_vl.py"
 PROVIDERS = ROOT / "vllm_musa/optimization_contract/providers.py"
 
