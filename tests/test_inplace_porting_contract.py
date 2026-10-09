@@ -16,14 +16,14 @@ SUPPORTED_MUSA_STACKS = {
         ),
         "torchada": "torchada==0.1.77",
     },
-    "torch==2.11.0.post1+musa5.2.0": {
+    "torch==2.11.0.post2+musa5.2.0": {
         "private": (
-            "torch_musa==2.11.0.post1+musa5.2.0",
-            "torchvision==0.26.0.post1+musa5.2.0",
-            "torchaudio==2.11.0+musa5.2.0",
-            "deep_ep==1.1.0+musa5.2.0torch2.11.0.post1",
+            "torch_musa==2.11.0.post2+musa5.2.0",
+            "torchvision==0.26.0.post2+musa5.2.0",
+            "torchaudio==2.11.0.post2+musa5.2.0",
+            "deep_ep==1.1.0+musa5.2.0torch2.11.0.post2",
         ),
-        "torchada": "torchada==0.1.83",
+        "torchada": "torchada==0.1.90",
     },
 }
 
@@ -55,23 +55,23 @@ def _declared_musa_stack():
 def test_supported_musa_stack_contract_cases_are_explicit():
     assert set(SUPPORTED_MUSA_STACKS) == {
         "torch==2.9.1.post1+musa5.2.0",
-        "torch==2.11.0.post1+musa5.2.0",
+        "torch==2.11.0.post2+musa5.2.0",
     }
     assert (
         SUPPORTED_MUSA_STACKS["torch==2.9.1.post1+musa5.2.0"]["torchada"]
         == "torchada==0.1.77"
     )
     assert (
-        SUPPORTED_MUSA_STACKS["torch==2.11.0.post1+musa5.2.0"]["torchada"]
-        == "torchada==0.1.83"
+        SUPPORTED_MUSA_STACKS["torch==2.11.0.post2+musa5.2.0"]["torchada"]
+        == "torchada==0.1.90"
     )
     assert (
         "torchvision==0.24.1.post1+musa5.2.0"
         in SUPPORTED_MUSA_STACKS["torch==2.9.1.post1+musa5.2.0"]["private"]
     )
     assert (
-        "torchvision==0.26.0.post1+musa5.2.0"
-        in SUPPORTED_MUSA_STACKS["torch==2.11.0.post1+musa5.2.0"]["private"]
+        "torchvision==0.26.0.post2+musa5.2.0"
+        in SUPPORTED_MUSA_STACKS["torch==2.11.0.post2+musa5.2.0"]["private"]
     )
     for torch_pin, expected in SUPPORTED_MUSA_STACKS.items():
         assert _select_musa_stack({torch_pin}) is expected
@@ -82,6 +82,59 @@ def test_torchada_floor_is_consistent():
     private_requirements, common_requirements, expected = _declared_musa_stack()
     assert set(expected["private"]).issubset(private_requirements)
     assert expected["torchada"] in common_requirements
+
+
+def _dockerfile_run_commands(dockerfile: str) -> list[str]:
+    """Dockerfile RUN commands with their line continuations joined."""
+    commands: list[str] = []
+    current: list[str] | None = None
+    for raw in dockerfile.splitlines():
+        line = raw.rstrip()
+        if current is not None:
+            current.append(line)
+            if not line.endswith("\\"):
+                commands.append("\n".join(current))
+                current = None
+            continue
+        if line.startswith("RUN "):
+            current = [line]
+            if not line.endswith("\\"):
+                commands.append(line)
+                current = None
+    return commands
+
+
+def test_musa_image_caps_huggingface_hub(dockerfile=None):
+    """Our own pins must govern the vendored install, and the self-check import the pair.
+
+    The pinned upstream file asks for `huggingface_hub >= 1.27.0` with no upper bound,
+    while this image pins `transformers==5.5.3` (requirements/common.txt), whose metadata
+    requires `huggingface-hub<2.0`. docker/musa.Dockerfile installs that upstream file
+    with `--no-deps`, so nothing else would stop that one line resolving to the newest
+    release (2.0.0) and the image could not import transformers (measured in
+    `vllm-musa:pr250-final-8b4cbc997`). The version belongs in requirements/common.txt;
+    this Dockerfile only applies it. Dropping the constraint, the pin, or a module from
+    the self-check loop must fail here.
+    """
+    if dockerfile is None:
+        dockerfile = (ROOT / "docker" / "musa.Dockerfile").read_text()
+    pinned = (ROOT / "requirements" / "common.txt").read_text()
+    assert "huggingface_hub>=1.27.0,<2.0" in pinned, "the pin belongs in requirements/"
+    assert "huggingface_hub>=1.27.0" not in dockerfile, "no version belongs in the Dockerfile"
+    for module in ("transformers", "huggingface_hub"):
+        assert f'"{module}"' in dockerfile, module
+
+    # Per pip *invocation*: the vendored install and the transitive install share one
+    # RUN line, so a check on the RUN would pass even with the constraint moved off the
+    # invocation that resolves the uncapped line.
+    invocations = []
+    for command in _dockerfile_run_commands(dockerfile):
+        for chunk in command.split("python -m pip install")[1:]:
+            invocations.append(chunk.split("&&")[0])
+    vendored = [argv for argv in invocations if "third_party/vllm/requirements/common.txt" in argv]
+    assert vendored, "no pip invocation installs the vendored requirements"
+    for argv in vendored:
+        assert "--constraint requirements/common.txt" in argv, argv
 
 
 def test_musa_image_runtime_dependency_contract():
@@ -271,7 +324,9 @@ def test_mooncake_example_uses_current_proxy_and_scoped_cleanup():
 
 
 def test_mooncake_rdma_container_contract_is_explicit():
-    example_readme = (ROOT / "docs" / "example" / "README.md").read_text()
+    example_readme = (
+        ROOT / "example" / "disaggregated_serving" / "README.md"
+    ).read_text()
     for token in (
         "--detach",
         "--entrypoint /bin/bash",

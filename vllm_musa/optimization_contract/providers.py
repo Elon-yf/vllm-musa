@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import replace
 
 from .deepseek_v4 import resolve_deepseek_v4_contract
+from .glm import resolve_glm_contract
 from .qwen import resolve_qwen_contract
 from .types import (
     ExecutionSignature,
@@ -56,6 +57,7 @@ def resolve_paddleocr_vl_contract(
 # fast paths.
 CONTRACT_PROVIDERS: tuple[ContractProvider, ...] = (
     resolve_deepseek_v4_contract,
+    resolve_glm_contract,
     resolve_paddleocr_vl_contract,
     resolve_qwen_contract,
 )

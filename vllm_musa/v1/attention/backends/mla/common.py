@@ -3,6 +3,7 @@
 
 import functools
 from abc import abstractmethod
+from types import ModuleType
 from typing import Generic, TypeVar
 
 import torch
@@ -11,16 +12,17 @@ from tqdm import tqdm
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import get_current_vllm_config
-from vllm.distributed.parallel_state import get_dcp_group, is_global_first_rank
+from vllm.distributed.parallel_state import is_global_first_rank
 from vllm.logger import init_logger
-from vllm.model_executor.layers.attention import mla_attention as _mla_attention
 from vllm.model_executor.layers.attention.mla_attention import (
     MLAAttentionImpl,
     MLACommonMetadata,
     MLACommonMetadataBuilder,
     MLACommonPrefillMetadata,
+    accumulate_mla_context_chunk,
     dynamic_per_batched_tensor_quant,
     has_flashinfer,
+    init_mla_context_partial,
     reorg_kvcache,
 )
 from vllm.model_executor.layers.linear import (
@@ -29,22 +31,12 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 from vllm.platforms import current_platform
+from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.backend import AttentionLayer
 from vllm.v1.attention.backends.mla.prefill.base import MLAPrefillBackend
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 
 from vllm_musa.v1.attention.backends.fa_utils import get_flash_attn_version
-
-try:
-    from flashinfer import BatchPrefillWithRaggedKVCacheWrapper
-    from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache  # noqa: F401
-
-    flashinfer_available = True
-except ImportError:
-    BatchPrefillWithRaggedKVCacheWrapper = object
-
-    flashinfer_available = False
-
 
 try:
     from flash_attn_interface import flash_attn_varlen_func
@@ -61,36 +53,11 @@ logger = init_logger(__name__)
 M = TypeVar("M", bound=MLACommonMetadata)
 A = TypeVar("A")
 
-CudnnPrefillMetadata = getattr(
-    _mla_attention, "CudnnPrefillMetadata", MLACommonPrefillMetadata
-)
-FlashInferPrefillMetadata = getattr(
-    _mla_attention, "FlashInferPrefillMetadata", MLACommonPrefillMetadata
-)
-
-
-def _disabled_prefill_backend() -> bool:
-    return False
-
-
-use_cudnn_prefill = getattr(
-    _mla_attention, "use_cudnn_prefill", _disabled_prefill_backend
-)
-use_flashinfer_prefill = getattr(
-    _mla_attention, "use_flashinfer_prefill", _disabled_prefill_backend
-)
-use_trtllm_ragged_deepseek_prefill = getattr(
-    _mla_attention, "use_trtllm_ragged_deepseek_prefill", _disabled_prefill_backend
-)
-
-
 class MUSAMLAPrefillBackend(MLAPrefillBackend):
-    """Compatibility backend for vLLM v0.22 MLA prefill selection.
+    """MLA prefill backend for MATE FlashAttention.
 
-    MUSA keeps the prefill execution in this module's MLACommonImpl because
-    mate's FlashAttention interface differs from upstream CUDA FA. v0.22 still
-    requires MLAAttention to own a prefill_backend object, so provide a backend
-    that participates in metadata construction while execution remains here.
+    vLLM dispatches prefill through this object. The MATE FA3 wrapper differs
+    from upstream CUDA FA, so execution helpers are shared with MLACommonImpl.
     """
 
     supported_dtypes = [torch.float16, torch.bfloat16]
@@ -115,6 +82,8 @@ class MUSAMLAPrefillBackend(MLAPrefillBackend):
             v_head_dim=v_head_dim,
             vllm_config=vllm_config,
         )
+        self.flash_attn_varlen_func = flash_attn_varlen_func
+        self._pad_v = False
 
     @staticmethod
     def get_name() -> str:
@@ -141,15 +110,72 @@ class MUSAMLAPrefillBackend(MLAPrefillBackend):
     def prepare_metadata(self, prefill_metadata: MLACommonPrefillMetadata) -> None:
         self._prefill_metadata = prefill_metadata
 
-    def run_prefill_new_tokens(self, *args, **kwargs):
-        raise RuntimeError("MUSA MLA prefill is executed by MLACommonImpl")
+    def _flash_attn_varlen_diff_headdims(self, *args, **kwargs):
+        # Keep the vLLM prefill wrapper (FA3 return/LSE and head-dim contract)
+        # identical to MLACommonImpl while retaining the MUSA backend selector.
+        return MLACommonImpl._flash_attn_varlen_diff_headdims(self, *args, **kwargs)
 
-    def run_prefill_context_chunk(self, *args, **kwargs):
-        raise RuntimeError("MUSA MLA prefill is executed by MLACommonImpl")
+    def run_prefill_new_tokens(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        return_softmax_lse: bool,
+        out: torch.Tensor | None = None,
+        output_scale: torch.Tensor | None = None,
+    ):
+        """Run new-token prefill through MATE FlashAttention."""
+        if output_scale is not None:
+            raise NotImplementedError("MUSA MLA prefill does not support output_scale")
+        prefill = self._prefill_metadata
+        assert prefill is not None
+        return MLACommonImpl._run_prefill_new_tokens_fa(
+            self, prefill, q, k, v, return_softmax_lse
+        )
+
+    def run_prefill_context_chunk(
+        self,
+        chunk: "MLACommonPrefillMetadata.ContextChunk",
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        out: torch.Tensor | None = None,
+    ):
+        """Run one vLLM context chunk through MATE FlashAttention."""
+        return self._flash_attn_varlen_diff_headdims(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=chunk.query_start_loc,
+            cu_seqlens_k=chunk.cu_seq_lens,
+            max_seqlen_q=chunk.max_query_len,
+            max_seqlen_k=chunk.max_seq_len,
+            softmax_scale=self.scale,
+            causal=False,
+            return_softmax_lse=True,
+            out=out,
+        )
 
 
 def _get_musa_mla_prefill_backend(vllm_config):
     return MUSAMLAPrefillBackend
+
+
+def _install_prefill_backend_hook(module: ModuleType) -> None:
+    """Point `module`'s MLA prefill backend selection at MUSA's own backend.
+
+    MUSA MLA always runs MATE FlashAttention prefill (`MUSAMLAPrefillBackend` wraps
+    `MLACommonImpl`), so the selector's answer is discarded. Guard the
+    replacement itself: against a name upstream does not export, a plain
+    assignment would *create* an attribute instead of overriding one, and MUSA
+    would silently serve with upstream's backend selection.
+    """
+    if not hasattr(module, "get_mla_prefill_backend"):
+        raise RuntimeError(
+            f"{module.__name__} does not export get_mla_prefill_backend; MUSA MLA "
+            "cannot route prefill to MUSAMLAPrefillBackend."
+        )
+    module.get_mla_prefill_backend = _get_musa_mla_prefill_backend
 
 
 def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):
@@ -232,58 +258,51 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             and (self.qk_rope_head_dim == 64)
         )
 
-        if use_flashinfer_prefill():
-            logger.debug_once("Using FlashInfer prefill for MLA")
-            self._run_prefill_context_chunk = self._run_prefill_context_chunk_fi
-            self._run_prefill_new_tokens = self._run_prefill_new_tokens_fi
-            self._pad_v = False
-        elif use_trtllm_ragged_deepseek_prefill():
-            logger.debug_once("Using TRT-LLM ragged DeepSeek prefill for MLA")
-            self._run_prefill_context_chunk = (
-                self._run_prefill_context_chunk_trtllm_ragged
-            )
-            self._run_prefill_new_tokens = self._run_prefill_new_tokens_trtllm_ragged
-            self._pad_v = False
-        elif use_cudnn_prefill():
-            logger.debug_once("Using CUDNN prefill for MLA")
-            self._run_prefill_context_chunk = self._run_prefill_context_chunk_cudnn
-            self._run_prefill_new_tokens = self._run_prefill_new_tokens_cudnn
-            self._pad_v = False
-        else:  # Use FlashAttention
-            logger.debug_once("Using FlashAttention prefill for MLA")
-            self._run_prefill_context_chunk = self._run_prefill_context_chunk_fa
-            self._run_prefill_new_tokens = self._run_prefill_new_tokens_fa
+        # MUSA MLA prefill always runs on MATE's FlashAttention, so the selector's
+        # answer is discarded: this module replaces `get_mla_prefill_backend` at
+        # the bottom of the file.
+        logger.debug_once("Using FlashAttention prefill for MLA")
+        self._run_prefill_context_chunk = self._run_prefill_context_chunk_fa
+        self._run_prefill_new_tokens = self._run_prefill_new_tokens_fa
 
-            # Handle the differences between the flash_attn_varlen from
-            # flash_attn and the one from vllm_flash_attn. The former is used on
-            # RoCM and the latter has an additional parameter to control
-            # FA2 vs FA3
-            self.flash_attn_varlen_func = flash_attn_varlen_func
-            self.vllm_flash_attn_version = get_flash_attn_version()
-            if self.vllm_flash_attn_version is not None:
-                # ==================== MUSA ADAPTATION ====================
-                if not current_platform.is_musa():
-                    self.flash_attn_varlen_func = functools.partial(
-                        flash_attn_varlen_func, fa_version=self.vllm_flash_attn_version
-                    )
-                # ========================== END ==========================
-
-            # For MLA the v head dim is smaller than qk head dim so we pad out
-            # v with 0s to match the qk head dim for attention backends that do
-            # not support different headdims
-            # We don't need to pad V if we are on a hopper system with FA3
-            self._pad_v = self.vllm_flash_attn_version is None or not (
-                self.vllm_flash_attn_version == 3
-                and current_platform.get_device_capability()[0] == 9
-            )
+        # Handle the differences between the flash_attn_varlen from
+        # flash_attn and the one from vllm_flash_attn. The former is used on
+        # RoCM and the latter has an additional parameter to control
+        # FA2 vs FA3
+        self.flash_attn_varlen_func = flash_attn_varlen_func
+        self.vllm_flash_attn_version = get_flash_attn_version()
+        if self.vllm_flash_attn_version is not None:
             # ==================== MUSA ADAPTATION ====================
-            self._pad_v &= not current_platform.is_musa()
+            if not current_platform.is_musa():
+                self.flash_attn_varlen_func = functools.partial(
+                    flash_attn_varlen_func, fa_version=self.vllm_flash_attn_version
+                )
             # ========================== END ==========================
+
+        # For MLA the v head dim is smaller than qk head dim so we pad out
+        # v with 0s to match the qk head dim for attention backends that do
+        # not support different headdims
+        # We don't need to pad V if we are on a hopper system with FA3
+        self._pad_v = self.vllm_flash_attn_version is None or not (
+            self.vllm_flash_attn_version == 3
+            and current_platform.get_device_capability()[0] == 9
+        )
+        # ==================== MUSA ADAPTATION ====================
+        self._pad_v &= not current_platform.is_musa()
+        # ========================== END ==========================
 
         parallel_config = get_current_vllm_config().parallel_config
         # Avoid requiring an initialized DCP group in tests and match the
         # vLLM v0.28 MLA initialization contract.
         self.dcp_world_size: int = parallel_config.decode_context_parallel_size
+
+        if self.dcp_world_size > 1 and is_quantized_kv_cache(self.kv_cache_dtype):
+            raise ValueError(
+                "MUSA MLA does not support a quantized KV cache with decode context "
+                f"parallelism (kv_cache_dtype={self.kv_cache_dtype!r}, "
+                f"decode_context_parallel_size={self.dcp_world_size}); the DCP "
+                "gather would read un-dequantized rows."
+            )
 
         self.chunked_prefill_workspace_size = (
             MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size(
@@ -347,179 +366,19 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             return_softmax_lse=return_softmax_lse,
         )
 
-    def _run_prefill_new_tokens_fi(
-        self, prefill: MLACommonPrefillMetadata, q, k, v, return_softmax_lse
-    ):
-        assert isinstance(prefill, FlashInferPrefillMetadata)
-        assert prefill.prefill_main is not None
-
-        ret = prefill.prefill_main.run(
-            q=q,
-            k=k,
-            v=v,
-            return_lse=return_softmax_lse,
-        )
-
-        if isinstance(ret, tuple):
-            return ret[0], ret[1].transpose(0, 1).contiguous()
-        return ret
-
-    def _run_prefill_new_tokens_cudnn(
-        self, prefill: MLACommonPrefillMetadata, q, k, v, return_softmax_lse
-    ):
-        assert isinstance(prefill, CudnnPrefillMetadata)
-        assert prefill.query_seq_lens is not None
-        output, lse = cudnn_batch_prefill_with_kv_cache(
-            q=q,
-            k_cache=k,
-            v_cache=v,
-            scale=self.scale,
-            workspace_buffer=prefill.cudnn_workspace,
-            max_token_per_sequence=prefill.max_query_len,
-            max_sequence_kv=prefill.max_query_len,
-            actual_seq_lens_q=prefill.query_seq_lens.view(-1, 1, 1, 1),
-            actual_seq_lens_kv=prefill.query_seq_lens.view(-1, 1, 1, 1),
-            causal=True,
-            # Do not support False for now
-            return_lse=True,
-            # Indicates actual_seq_lens are on GPU or CPU.
-            is_cuda_graph_compatible=True,
-        )
-        if return_softmax_lse:
-            return output, lse
-        return output
-
-    def _run_prefill_context_chunk_fa(
-        self, prefill: MLACommonPrefillMetadata, chunk_idx: int, q, k, v
-    ):
-        assert prefill.chunked_context is not None
+    def _run_prefill_context_chunk_fa(self, chunk, q, k, v):
         return self._flash_attn_varlen_diff_headdims(
             q=q,
             k=k,
             v=v,
-            cu_seqlens_q=prefill.query_start_loc,
-            cu_seqlens_k=prefill.chunked_context.cu_seq_lens[chunk_idx],
-            max_seqlen_q=prefill.max_query_len,
-            max_seqlen_k=prefill.chunked_context.max_seq_lens[chunk_idx],
+            cu_seqlens_q=chunk.query_start_loc,
+            cu_seqlens_k=chunk.cu_seq_lens,
+            max_seqlen_q=chunk.max_query_len,
+            max_seqlen_k=chunk.max_seq_len,
             softmax_scale=self.scale,
             causal=False,  # Context is unmasked
             return_softmax_lse=True,
         )
-
-    def _run_prefill_context_chunk_fi(
-        self, prefill: MLACommonPrefillMetadata, chunk_idx: int, q, k, v
-    ):
-        assert isinstance(prefill, FlashInferPrefillMetadata)
-
-        attn_out, lse = prefill.prefill_chunks[chunk_idx].run(
-            q=q,
-            k=k,
-            v=v,
-            return_lse=True,
-        )
-
-        # Convert from (q_len, num_heads) to (num_heads, q_len)
-        return attn_out, lse.transpose(0, 1).contiguous()
-
-    def _run_prefill_context_chunk_cudnn(
-        self, prefill: MLACommonPrefillMetadata, chunk_idx: int, q, k, v
-    ):
-        assert isinstance(prefill, CudnnPrefillMetadata)
-        assert prefill.chunked_context is not None
-        assert prefill.chunked_context.seq_lens[chunk_idx] is not None
-        assert prefill.query_seq_lens is not None
-        return cudnn_batch_prefill_with_kv_cache(
-            q=q,
-            k_cache=k,
-            v_cache=v,
-            scale=self.scale,
-            workspace_buffer=prefill.cudnn_workspace,
-            max_token_per_sequence=prefill.max_query_len,
-            max_sequence_kv=prefill.chunked_context.max_seq_lens[chunk_idx],
-            actual_seq_lens_q=prefill.query_seq_lens.view(-1, 1, 1, 1),
-            actual_seq_lens_kv=prefill.chunked_context.seq_lens[chunk_idx].view(
-                -1, 1, 1, 1
-            ),
-            causal=False,
-            return_lse=True,
-            # Indicates actual_seq_lens are on GPU or CPU.
-            is_cuda_graph_compatible=True,
-        )
-
-    def _run_prefill_new_tokens_trtllm_ragged(
-        self, prefill: MLACommonPrefillMetadata, q, k, v, return_softmax_lse
-    ):
-        """TRT-LLM ragged attention for new tokens (causal)."""
-        from flashinfer.prefill import trtllm_ragged_attention_deepseek
-
-        assert prefill.query_seq_lens is not None
-
-        ret = trtllm_ragged_attention_deepseek(
-            query=q,
-            key=k,
-            value=v,
-            workspace_buffer=self._workspace_buffer,
-            seq_lens=prefill.query_seq_lens,
-            max_q_len=prefill.max_query_len,
-            max_kv_len=prefill.max_query_len,
-            bmm1_scale=self.scale,
-            bmm2_scale=1.0,
-            o_sf_scale=1.0,
-            batch_size=prefill.query_seq_lens.shape[0],
-            window_left=-1,
-            cum_seq_lens_q=prefill.query_start_loc,
-            cum_seq_lens_kv=prefill.query_start_loc,
-            enable_pdl=False,
-            is_causal=True,
-            return_lse=return_softmax_lse,
-        )
-
-        if isinstance(ret, tuple):
-            # Convert from (q_len, num_heads) to (num_heads, q_len)
-            return ret[0], ret[1].transpose(0, 1).contiguous()
-        return ret
-
-    def _run_prefill_context_chunk_trtllm_ragged(
-        self, prefill: MLACommonPrefillMetadata, chunk_idx: int, q, k, v
-    ):
-        """TRT-LLM ragged attention for context chunks (non-causal)."""
-        from flashinfer.prefill import trtllm_ragged_attention_deepseek
-
-        assert prefill.chunked_context is not None
-        assert prefill.chunked_context.seq_lens[chunk_idx] is not None
-
-        out = torch.zeros(
-            q.shape[0],
-            q.shape[1],
-            v.shape[2],
-            device=q.device,
-            dtype=q.dtype,
-        )
-        self._workspace_buffer.fill_(0)
-
-        attn_out, lse = trtllm_ragged_attention_deepseek(
-            query=q,
-            key=k,
-            value=v,
-            workspace_buffer=self._workspace_buffer,
-            seq_lens=prefill.chunked_context.seq_lens[chunk_idx],
-            max_q_len=prefill.max_query_len,
-            max_kv_len=prefill.chunked_context.max_seq_lens[chunk_idx],
-            bmm1_scale=self.scale,
-            bmm2_scale=1.0,
-            o_sf_scale=1.0,
-            batch_size=prefill.chunked_context.seq_lens[chunk_idx].shape[0],
-            window_left=-1,
-            cum_seq_lens_q=prefill.query_start_loc,
-            cum_seq_lens_kv=prefill.chunked_context.cu_seq_lens[chunk_idx],
-            enable_pdl=False,
-            is_causal=False,
-            return_lse=True,
-            out=out,
-        )
-
-        # Convert from (q_len, num_heads) to (num_heads, q_len)
-        return attn_out, lse.transpose(0, 1).contiguous()
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         def get_layer_weight(layer):
@@ -652,23 +511,30 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
     ):
         assert attn_metadata.prefill is not None
         prefill_metadata = attn_metadata.prefill
-        assert prefill_metadata.chunked_context is not None
+        chunked_context = prefill_metadata.chunked_context
+        assert chunked_context is not None
+
+        # vLLM v0.28 schedules chunked context per request: `chunks` holds one
+        # entry per (request batch, context window) pair carrying its own q/kv
+        # offsets, and `empty_token_slices` marks prefills that no chunk covers.
+        # Those rows must be neutralized (-inf lse) before the final merge
+        # against the suffix partial, which init_mla_context_partial does.
+        workspace = chunked_context.workspace
 
         output = None
-        iters = len(prefill_metadata.chunked_context.seq_tot)
-        workspace = prefill_metadata.chunked_context.workspace
-        for i in range(iters):
-            toks = prefill_metadata.chunked_context.seq_tot[i]
+        output_lse = None
+        for chunk in chunked_context.chunks:
+            toks = chunk.num_context_tokens
             ops.gather_and_maybe_dequant_cache(
                 src_cache=kv_c_and_k_pe_cache,
                 dst=workspace,
-                block_table=prefill_metadata.block_table,
-                cu_seq_lens=prefill_metadata.chunked_context.cu_seq_lens[i],
-                token_to_seq=prefill_metadata.chunked_context.token_to_seq[i],
-                num_tokens=prefill_metadata.chunked_context.chunk_total_token[i],
+                block_table=prefill_metadata.block_table[chunk.request_slice],
+                cu_seq_lens=chunk.cu_seq_lens,
+                token_to_seq=chunk.token_to_seq,
+                num_tokens=toks,
                 kv_cache_dtype=self.kv_cache_dtype,
                 scale=k_scale,
-                seq_starts=prefill_metadata.chunked_context.starts[i],
+                seq_starts=chunk.starts,
             )
 
             kv_c_normed = workspace[:toks][..., : self.kv_lora_rank]
@@ -682,29 +548,29 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             k = self._concat_k_nope_k_pe(k_nope, k_pe)
 
             attn_output, attn_softmax_lse = self._run_prefill_context_chunk(
-                prefill=prefill_metadata,
-                chunk_idx=i,
-                q=q,
+                chunk=chunk,
+                q=q[chunk.token_slice],
                 k=k,
                 v=v,
             )
 
             if output is None:
-                output = attn_output
-                output_lse = attn_softmax_lse
-            else:
-                output_tmp = torch.empty_like(output)
-                output_lse_tmp = torch.empty_like(output_lse)
-                merge_attn_states(
-                    output=output_tmp,
-                    output_lse=output_lse_tmp,
-                    prefix_output=output,
-                    prefix_lse=output_lse,
-                    suffix_output=attn_output,
-                    suffix_lse=attn_softmax_lse,
+                # A single chunk covering every prefill token is already the
+                # whole context partial.
+                if (
+                    len(chunked_context.chunks) == 1
+                    and not chunked_context.empty_token_slices
+                ):
+                    return attn_output, attn_softmax_lse
+                output, output_lse = init_mla_context_partial(
+                    chunked_context,
+                    attn_output,
+                    attn_softmax_lse,
+                    num_tokens=q.shape[0],
                 )
-                output = output_tmp
-                output_lse = output_lse_tmp
+            accumulate_mla_context_chunk(
+                chunk, attn_output, attn_softmax_lse, output, output_lse
+            )
 
         return output, output_lse
 
@@ -719,28 +585,30 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         assert k_scale is None, "DCP not support scaled kvcache now."
         assert attn_metadata.prefill is not None
         prefill_metadata = attn_metadata.prefill
-        assert prefill_metadata.chunked_context is not None
-        assert prefill_metadata.chunked_context.padded_local_chunk_seq_lens is not None
-        assert prefill_metadata.chunked_context.local_context_lens_allranks is not None
-        assert prefill_metadata.chunked_context.padded_local_cu_seq_lens is not None
-        assert prefill_metadata.chunked_context.cu_seq_lens_lst is not None
-        assert prefill_metadata.chunked_context.chunk_size is not None
+        chunked_context = prefill_metadata.chunked_context
+        assert chunked_context is not None
+        assert chunked_context.dcp_manager is not None
 
+        # Migrated to the v0.28 per-request chunk layout. NOTE: this DCP branch
+        # is source-derived only -- no MUSA DCP MLA run validates it yet.
         output = None
-        iters = len(prefill_metadata.chunked_context.seq_tot)
-        workspace = prefill_metadata.chunked_context.workspace
+        output_lse = None
+        workspace = chunked_context.workspace
 
-        for i in range(iters):
-            toks = prefill_metadata.chunked_context.seq_tot[i]
+        for chunk in chunked_context.chunks:
+            assert chunk.padded_local_seq_lens is not None
+            assert chunk.local_context_lens_allranks is not None
+            assert chunk.padded_local_cu_seq_lens is not None
+            assert chunk.local_starts is not None
+
+            toks = chunk.num_local_context_tokens
             ops.cp_gather_cache(
                 src_cache=kv_c_and_k_pe_cache,
-                dst=workspace,
-                block_table=prefill_metadata.block_table,
-                cu_seq_lens=prefill_metadata.chunked_context.padded_local_cu_seq_lens[
-                    i
-                ],
-                batch_size=attn_metadata.num_prefills,
-                seq_starts=prefill_metadata.chunked_context.starts[i],
+                dst=workspace[:toks],
+                block_table=prefill_metadata.block_table[chunk.request_slice],
+                cu_seq_lens=chunk.padded_local_cu_seq_lens,
+                batch_size=chunk.num_requests,
+                seq_starts=chunk.starts,
             )
             # workspace
             # |------- N tokens --------|--------- N*dcp_size tokens ----------|
@@ -754,8 +622,8 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             ]
             assert toks * dcp_world_size <= cur_allgather_workspace.shape[0]
             cur_allgather_kvcache = cur_allgather_workspace[: toks * dcp_world_size]
-            cur_allgather_kvcache.copy_(
-                get_dcp_group().all_gather(local_gathered_kvcache, dim=0)
+            chunked_context.dcp_manager.kv_gather(
+                cur_allgather_kvcache, local_gathered_kvcache
             )
             assert (
                 cur_allgather_kvcache.shape[-1]
@@ -768,14 +636,11 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             kv_c_normed, k_pe = reorg_kvcache(
                 allgatered_kv_c_normed,
                 allgatered_k_pe,
-                padded_local_chunk_seq_lens_lst=prefill_metadata.chunked_context.padded_local_chunk_seq_lens[
-                    i
-                ],
-                local_context_lens_allranks=prefill_metadata.chunked_context.local_context_lens_allranks,
-                sum_seq_len=prefill_metadata.chunked_context.cu_seq_lens_lst[i][-1],
-                max_seq_len=prefill_metadata.chunked_context.max_seq_lens[i],
-                chunk_size=prefill_metadata.chunked_context.chunk_size,
-                chunk_idx=i,
+                padded_local_chunk_seq_lens_lst=chunk.padded_local_seq_lens,
+                local_context_lens_allranks=chunk.local_context_lens_allranks,
+                local_starts=chunk.local_starts,
+                sum_seq_len=chunk.num_context_tokens,
+                max_seq_len=chunk.max_seq_len,
                 toks=toks,
             )
 
@@ -786,29 +651,27 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             k = self._concat_k_nope_k_pe(k_nope, k_pe)
 
             attn_output, attn_softmax_lse = self._run_prefill_context_chunk(
-                prefill=prefill_metadata,
-                chunk_idx=i,
-                q=q,
+                chunk=chunk,
+                q=q[chunk.token_slice],
                 k=k,
                 v=v,
             )
 
             if output is None:
-                output = attn_output
-                output_lse = attn_softmax_lse
-            else:
-                output_tmp = torch.empty_like(output)
-                output_lse_tmp = torch.empty_like(output_lse)
-                merge_attn_states(
-                    output=output_tmp,
-                    output_lse=output_lse_tmp,
-                    prefix_output=output,
-                    prefix_lse=output_lse,
-                    suffix_output=attn_output,
-                    suffix_lse=attn_softmax_lse,
+                if (
+                    len(chunked_context.chunks) == 1
+                    and not chunked_context.empty_token_slices
+                ):
+                    return attn_output, attn_softmax_lse
+                output, output_lse = init_mla_context_partial(
+                    chunked_context,
+                    attn_output,
+                    attn_softmax_lse,
+                    num_tokens=q.shape[0],
                 )
-                output = output_tmp
-                output_lse = output_lse_tmp
+            accumulate_mla_context_chunk(
+                chunk, attn_output, attn_softmax_lse, output, output_lse
+            )
 
         return output, output_lse
 
@@ -824,7 +687,6 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         output_scale: torch.Tensor | None = None,
     ) -> None:
         assert attn_metadata.prefill is not None
-        assert self.dcp_world_size != -1
 
         has_context = attn_metadata.prefill.chunked_context is not None
         kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
@@ -894,12 +756,6 @@ import vllm.v1.attention.backends.mla.prefill.selector
 
 vllm.model_executor.layers.attention.mla_attention.MLAAttention._v_up_proj = _v_up_proj
 vllm.model_executor.layers.attention.mla_attention.MLACommonImpl = MLACommonImpl
-vllm.model_executor.layers.attention.mla_attention.get_mla_prefill_backend = (
-    _get_musa_mla_prefill_backend
-)
-vllm.v1.attention.backends.mla.prefill.get_mla_prefill_backend = (
-    _get_musa_mla_prefill_backend
-)
-vllm.v1.attention.backends.mla.prefill.selector.get_mla_prefill_backend = (
-    _get_musa_mla_prefill_backend
-)
+_install_prefill_backend_hook(vllm.model_executor.layers.attention.mla_attention)
+_install_prefill_backend_hook(vllm.v1.attention.backends.mla.prefill)
+_install_prefill_backend_hook(vllm.v1.attention.backends.mla.prefill.selector)

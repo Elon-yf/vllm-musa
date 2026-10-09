@@ -17,7 +17,7 @@ is pre-patched.
   Author headers are normalized to the synthetic
   `musa <musa@local>` identity.
 
-Currently **168 patches**. This branch includes the Qwen3.6 patches for common
+Currently **179 patches**. This branch includes the Qwen3.6 patches for common
 GDN decode metadata reuse, uniform-decode SSM slot-mapping removal, and the
 BF16 W1 tile specialization, plus the contract-bound DeepSeek-V4 MTP
 sparse-prefill headroom and mixed-prefill queue-fence patches. It additionally
@@ -25,7 +25,8 @@ adds Qwen3.5-122B/Qwen3-VL MM encoder FlashAttention routing, TP-only shared
 expert folding and shared-gate binding, QK/mRoPE cache-out fusion, and opt-in
 vision-block graph capture. It also serializes DeepSeek-V4 long-prefill
 attention branches on MUSA while preserving decode/MTP auxiliary-stream
-overlap, restores MUSA component-based memory profiling, and routes the v0.28
+overlap, bounds materialized indexer logits past 4k compressed keys,
+restores MUSA component-based memory profiling, and routes the v0.28
 DeepSeek-V4 MHC paths through MUSA providers. DeepSeek-V4 graph capture keeps
 the learned indexer. The metadata-only recent window, its Q/weight skip, and
 the CUDAGraph recent-fill fallback are removed so capture, eager, and native
@@ -37,7 +38,15 @@ custom operator and provide typed optional pointers for greedy rejection samplin
 They also honor the resolved FP8 expert dtype when converted checkpoints omit
 the HF metadata field. The final five patches adapt the v0.28 Model Runner V2 rejection kernels to MUSA Triton scalar-predicate and
 Gumbel-helper contracts without changing the upstream acceptance or resampling
-algorithm. DeepSeek-V4 remains on Model Runner V1 by default on MUSA for its
+algorithm. DeepSeek-V4 score FP32 projections keep the MUSA DeepGEMM path
+through the DSpark-4 decode graph's M=80 ladder shape; larger shapes up to
+the multi-stream token threshold remain on the existing fallback. On contract-matched DeepSeek-V4 DSpark
+deployments, Model Runner V2 replays the uniform decode graph for a remote-
+prefilled request's final prompt token padded to the verify shape. The functional
+fused_experts entry point forwards a model's SwiGLU clamp limit to the routed
+expert activation. DeepSeek-V4 decode rows select their
+indexer top-k with a dedicated MUSA op; GLM-5.2 keeps the shared one. The DFlash/DSpark draft input preparation pads its
+CUDA-graph buffers in fixed 1024-wide blocks. DeepSeek-V4 remains on Model Runner V1 by default on MUSA for its
 faster FULL_DECODE_ONLY serving path; users and V2-only speculative paths can
 still opt into Model Runner V2 explicitly. DeepSeek-V4 512-d sparse C4/C128 compression on decode rows
 1..128 is dispatched to a native MUSA kernel, with Triton kept as the
@@ -45,7 +54,9 @@ shape fallback. On that same native path the compressor also writes
 packed kv/score+ape into the state cache so Triton `save_partial_states`
 is skipped. Interleaved MRoPE rebuilds the T/H/W frequency layout with a
 strided copy rather than per-channel index arithmetic, which keeps the
-per-layer launch count off the eager prefill path. The fused TileLang `hc_head` is
+per-layer launch count off the eager prefill path. Model Runner V2 gives each
+in-flight step its own output copy stream so a step's sampled tokens are not
+held back by a later step's copy-stream wait. The fused TileLang `hc_head` is
 enabled on MUSA by importing TileLang before the eager JIT decorators capture
 their module globals. DeepEP shutdown now drops cached handles before native
 teardown and supports both explicit `destroy()` and legacy destructor-only
@@ -58,6 +69,14 @@ the physical FlashAttention layout. The upstream Mooncake Mamba-pool patch
 keeps the dedicated-pool eligibility scoped to MooncakeConnector, and the
 following MUSA adaptation preserves Mamba pool ownership through prefix-cache
 lookup/store, pin, CoW/deferred-free, reset, and eviction paths.
+`MultiConnector` skips Prometheus observation for a sub-connector that
+reports transfer stats without registering metrics, so `MooncakeConnector`
+can run alongside `MooncakeStoreConnector`.
+The unified attention kernel takes its per-token-head scale strides as
+`tl.int64` zeros rather than `int | None`, which Triton 3.2 rejects as a
+kernel-signature annotation.
+DeepSeek-V4 score GEMMs above the multi-stream token threshold run through
+DeepGEMM instead of an FP32 SIMT sgemm.
 The series contains
 MUSA source edits against the immutable vLLM commit recorded as `VLLM_COMMIT`
 in `third_party/PINS` (release label `v0.28.0`), applied at build. Runtime
