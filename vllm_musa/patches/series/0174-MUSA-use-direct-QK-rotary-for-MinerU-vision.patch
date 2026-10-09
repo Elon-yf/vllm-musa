@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Elon-yf <309721831+Elon-yf@users.noreply.github.com>
+Date: Thu, 09 Oct 2026 12:00:00 +0800
+Subject: [PATCH] MUSA: use direct Q/K rotary for MinerU vision
+
+The model-local helper is a normal vllm-musa source file. This series patch
+only adds the existing upstream Qwen2-VL attention hook.
+
+---
+ vllm/model_executor/models/qwen2_vl.py | 27 +++++++++++++++++++++++----
+ 1 file changed, 19 insertions(+), 8 deletions(-)
+
+diff --git a/vllm/model_executor/models/qwen2_vl.py b/vllm/model_executor/models/qwen2_vl.py
+index 70e0a94..1843526 100644
+--- a/vllm/model_executor/models/qwen2_vl.py
++++ b/vllm/model_executor/models/qwen2_vl.py
+@@ -372,14 +372,24 @@ class Qwen2VisionAttention(nn.Module):
+ 
+         q, k, v = (rearrange(x, "s b ... -> b s ...") for x in (q, k, v))
+ 
+-        # [2 * b, s, heads, head_dim]
+-        qk_concat = torch.cat([q, k], dim=0)
+-        qk_rotated = self.apply_rotary_emb(
+-            qk_concat,
+-            rotary_pos_emb_cos,
+-            rotary_pos_emb_sin,
+-        )
+-        q, k = torch.chunk(qk_rotated, 2, dim=0)
++        if getattr(self, "_musa_direct_qk_rotary", False):
++            # The MinerU model-local MUSA path updates Q and K directly.
++            # Other Qwen2-VL models keep the original concatenation path.
++            q, k = self.apply_rotary_emb.forward_qk(
++                q,
++                k,
++                rotary_pos_emb_cos,
++                rotary_pos_emb_sin,
++            )
++        else:
++            # [2 * b, s, heads, head_dim]
++            qk_concat = torch.cat([q, k], dim=0)
++            qk_rotated = self.apply_rotary_emb(
++                qk_concat,
++                rotary_pos_emb_cos,
++                rotary_pos_emb_sin,
++            )
++            q, k = torch.chunk(qk_rotated, 2, dim=0)
+ 
+         context_layer = self.attn(
+             query=q,

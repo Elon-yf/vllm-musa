@@ -102,6 +102,30 @@ def _musa_visual_rotary(
     return out.squeeze(0) if len(origin_shape) == 3 else out
 
 
+def _musa_visual_rotary_qk(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply the existing MUSA rotary operator directly to Q and K."""
+    from vllm_musa.jit_kernel import rotary_embedding
+
+    batch, seq_len = query.shape[:2]
+    positions = torch.arange(seq_len, device=query.device, dtype=torch.long)
+    positions = positions.expand(batch, seq_len).contiguous()
+    cos_sin_cache = torch.cat((cos, sin), dim=-1).to(query.dtype).contiguous()
+    rotary_embedding(
+        positions,
+        query,
+        key,
+        query.shape[-1],
+        cos_sin_cache,
+        True,
+    )
+    return query, key
+
+
 class _MineruVisualRotary(nn.Module):
     def __init__(self, reference: nn.Module):
         super().__init__()
@@ -119,6 +143,30 @@ class _MineruVisualRotary(nn.Module):
         ):
             return _musa_visual_rotary(x, cos, sin)
         return self.reference.forward_native(x, cos, sin)
+
+    def forward_qk(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if (
+            query.device.type == "musa"
+            and key.device.type == "musa"
+            and query.dtype == torch.bfloat16
+            and query.shape[-1] == 80
+            and key.shape[-1] == 80
+            and cos.shape[-1] == 40
+            and sin.shape == cos.shape
+            and getattr(self.reference, "is_neox_style", True)
+            and not getattr(self.reference, "enable_fp32_compute", False)
+        ):
+            return _musa_visual_rotary_qk(query, key, cos, sin)
+        q_shape, k_shape = query.shape, key.shape
+        qk = torch.cat((query, key), dim=0)
+        out = self.reference.forward_native(qk, cos, sin)
+        return out[: q_shape[0]].reshape(q_shape), out[q_shape[0] :].reshape(k_shape)
 
 
 class _MineruMRotary(nn.Module):
@@ -191,4 +239,8 @@ def patch_mineru_rotary(model: nn.Module) -> tuple[int, int]:
         and getattr(m, "head_size", None) == 64,
         _MineruMRotary,
     )
+    if visual:
+        for module in model.modules():
+            if module.__class__.__name__ == "Qwen2VisionAttention":
+                module._musa_direct_qk_rotary = True
     return visual, language
