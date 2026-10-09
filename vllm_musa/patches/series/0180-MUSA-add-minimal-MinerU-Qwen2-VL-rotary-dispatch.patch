@@ -17,7 +17,8 @@ index 49e026534ca177e95378dbe36578444ec0d118ac..16f7d4e4f8fdb8bf293c734ffd099116
 @@ -1291,6 +1291,24 @@ class Qwen2VLForConditionalGeneration(
          self.config = config
          self.multimodal_config = multimodal_config
- 
+-
++
 +        mineru_qwen2_vl = False
 +        if getattr(torch.version, "musa", None) is not None:
 +            from vllm_musa.optimization_contract import (
@@ -46,7 +47,8 @@ index 49e026534ca177e95378dbe36578444ec0d118ac..16f7d4e4f8fdb8bf293c734ffd099116
 +            if mineru_qwen2_vl:
 +                patch_mineru_rotary(self.visual)
              self.input_norm = FusedInputNorm.from_model_config(self.model_config)
- 
+-
++
          with self._mark_language_model(vllm_config):
 @@ -1306,6 +1326,8 @@ class Qwen2VLForConditionalGeneration(
                  prefix=maybe_prefix(prefix, "language_model"),
@@ -54,6 +56,7 @@ index 49e026534ca177e95378dbe36578444ec0d118ac..16f7d4e4f8fdb8bf293c734ffd099116
              )
 +            if mineru_qwen2_vl:
 +                patch_mineru_rotary(self.language_model)
- 
+-
++
          self.make_empty_intermediate_tensors = (
              self.language_model.make_empty_intermediate_tensors

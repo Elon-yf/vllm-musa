@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / "vllm_musa/models/mineru_qwen2_vl.py"
 PATCH = ROOT / (
     "vllm_musa/patches/series/"
-    "0173-MUSA-add-minimal-MinerU-Qwen2-VL-rotary-dispatch.patch"
+    "0180-MUSA-add-minimal-MinerU-Qwen2-VL-rotary-dispatch.patch"
 )
 
 
