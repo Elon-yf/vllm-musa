@@ -7,6 +7,7 @@ from enum import Enum
 class ModelFamily(str, Enum):
     UNKNOWN = "unknown"
     DEEPSEEK_V4 = "deepseek_v4"
+    PADDLEOCR_VL = "paddleocr_vl"
     QWEN2 = "qwen2"
     QWEN3 = "qwen3"
     QWEN35_36 = "qwen3.5_3.6"
@@ -20,6 +21,7 @@ class ModelRole(str, Enum):
 
 
 class OptimizationFeature(str, Enum):
+    PADDLEOCR_VL_ROTARY = "paddleocr_vl.rotary"
     DEEPSEEK_V4_SHARED_MLP_CLAMP_FP8 = "deepseek_v4.shared_mlp_clamp_fp8"
     DEEPSEEK_V4_NATIVE_SPARSE_INDEXER = "deepseek_v4.native_sparse_indexer"
     DEEPSEEK_V4_MATERIALIZED_PREFILL_INDEXER = (
@@ -97,6 +99,14 @@ class ModelSignature:
     index_topk: int | None = None
     quant_block_shape: tuple[int, ...] | None = None
     is_hybrid: bool | None = None
+    hf_model_type: str | None = None
+    vision_hidden_size: int | None = None
+    vision_num_hidden_layers: int | None = None
+    vision_depth: int | None = None
+    vision_num_attention_heads: int | None = None
+    vision_patch_size: int | None = None
+    vision_image_size: int | None = None
+    mrope_section: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)

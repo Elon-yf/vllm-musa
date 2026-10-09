@@ -17,28 +17,11 @@ def paddle_musa_fast_path(vllm_config: object) -> bool:
     """Narrow PaddleOCR-VL-1.6 MUSA scope; return false for other models."""
     if getattr(torch.version, "musa", None) is None:
         return False
-    model_config = getattr(vllm_config, "model_config", None)
-    hf_config = getattr(model_config, "hf_config", None)
-    if getattr(hf_config, "model_type", None) != "paddleocr_vl":
-        return False
-    vision = getattr(hf_config, "vision_config", None)
-    text = getattr(hf_config, "text_config", hf_config)
-    rope_parameters = getattr(text, "rope_parameters", None) or getattr(
-        hf_config, "rope_parameters", None
-    )
-    return (
-        getattr(vision, "hidden_size", None) == 1152
-        and (
-            getattr(vision, "num_hidden_layers", None) == 27
-            or getattr(vision, "depth", None) == 27
-        )
-        and getattr(vision, "num_attention_heads", None) == 16
-        and getattr(vision, "patch_size", None) == 14
-        and getattr(vision, "image_size", None) == 384
-        and getattr(text, "hidden_size", None) == 1024
-        and getattr(text, "num_attention_heads", None) == 16
-        and getattr(text, "num_key_value_heads", None) == 2
-        and list((rope_parameters or {}).get("mrope_section", ())) == [16, 24, 24]
+    from .resolver import resolve_optimization_contract
+    from .types import OptimizationFeature
+
+    return resolve_optimization_contract(vllm_config).prefers(
+        OptimizationFeature.PADDLEOCR_VL_ROTARY
     )
 
 
