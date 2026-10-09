@@ -1,4 +1,4 @@
-From 40cd3dc3994f79111a1c1c0e3c5f0f849b06b997 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Elon-yf <309721831+Elon-yf@users.noreply.github.com>
 Date: Wed, 30 Sep 2026 17:48:17 +0800
 Subject: [PATCH] [MUSA] OvisOCR2 contract-gated rotary fast path
