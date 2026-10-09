@@ -5,12 +5,12 @@ Subject: [PATCH] MUSA: hook PaddleOCR-VL rotary fast path
 
 
 diff --git a/vllm/model_executor/models/paddleocr_vl.py b/vllm/model_executor/models/paddleocr_vl.py
-index bd635aa..721e879 100644
+index bd635aa..336ae0e 100644
 --- a/vllm/model_executor/models/paddleocr_vl.py
 +++ b/vllm/model_executor/models/paddleocr_vl.py
 @@ -83,2 +83,6 @@ from .utils import (
  from .vision import get_vit_attn_backend
-+from vllm_musa.model_executor.models.paddleocr_vl_musa import (
++from vllm_musa.optimization_contract.paddleocr_vl import (
 +    install_paddle_musa_rotary,
 +    paddle_musa_fast_path,
 +)

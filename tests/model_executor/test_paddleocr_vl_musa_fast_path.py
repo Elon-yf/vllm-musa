@@ -3,13 +3,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).parents[2]
 PATCH = ROOT / "vllm_musa/patches/series/0169-MUSA-PaddleOCR-VL-model-local-FA-and-RoPE.patch"
-HELPER = ROOT / "vllm_musa/model_executor/models/paddleocr_vl_musa.py"
+HELPER = ROOT / "vllm_musa/optimization_contract/paddleocr_vl.py"
 
 
 def test_paddle_fast_path_is_model_local_and_narrow():
     patch = PATCH.read_text(encoding="utf-8")
     helper = HELPER.read_text(encoding="utf-8")
-    assert "vllm_musa.model_executor.models.paddleocr_vl_musa" in patch
+    assert "vllm_musa.optimization_contract.paddleocr_vl" in patch
     assert "paddle_musa_fast_path(vllm_config)" in patch
     assert 'getattr(hf_config, "model_type", None) != "paddleocr_vl"' in helper
     assert 'list((rope_parameters or {}).get("mrope_section", ())) == [16, 24, 24]' in helper

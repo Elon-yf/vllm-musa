@@ -3,7 +3,7 @@
 import torchada  # noqa: F401
 import torch
 
-from vllm_musa.model_executor.models.paddleocr_vl_musa import paddle_apply_rotary
+from vllm_musa.optimization_contract.paddleocr_vl import paddle_apply_rotary
 
 
 def main() -> None:
