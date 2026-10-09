@@ -7,33 +7,39 @@ New adapter and test modules are normal vllm-musa source files.
 Only the existing upstream Qwen2-VL construction hooks belong here.
 
 ---
- vllm/model_executor/models/qwen2_vl.py | 16 +++++++++++++++++
- 1 file changed, 16 insertions(+)
+ vllm/model_executor/models/qwen2_vl.py | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
 
 diff --git a/vllm/model_executor/models/qwen2_vl.py b/vllm/model_executor/models/qwen2_vl.py
-index 49e026534ca177e95378dbe36578444ec0d118ac..c378f0f35defb60f0b7c15bc0cbf20849f47ac57 100644
+index 49e026534ca177e95378dbe36578444ec0d118ac..16f7d4e4f8fdb8bf293c734ffd099116386f4dde 100644
 --- a/vllm/model_executor/models/qwen2_vl.py
 +++ b/vllm/model_executor/models/qwen2_vl.py
-@@ -1291,6 +1291,18 @@ class Qwen2VLForConditionalGeneration(
+@@ -1291,6 +1291,24 @@ class Qwen2VLForConditionalGeneration(
          self.config = config
          self.multimodal_config = multimodal_config
  
 +        mineru_qwen2_vl = False
 +        if getattr(torch.version, "musa", None) is not None:
-+            from vllm_musa.models.mineru_qwen2_vl import (
-+                is_mineru_qwen2_vl_config,
-+                patch_mineru_rotary,
-+                register_mineru_attention_backends,
++            from vllm_musa.optimization_contract import (
++                OptimizationFeature,
++                resolve_optimization_contract,
 +            )
 +
-+            mineru_qwen2_vl = is_mineru_qwen2_vl_config(config)
++            mineru_qwen2_vl = resolve_optimization_contract(vllm_config).prefers(
++                OptimizationFeature.MINERU_QWEN2_VL_ROTARY
++            )
 +            if mineru_qwen2_vl:
++                from vllm_musa.models.mineru_qwen2_vl import (
++                    patch_mineru_rotary,
++                    register_mineru_attention_backends,
++                )
++
 +                register_mineru_attention_backends(config)
 +
          with self._mark_tower_model(vllm_config, {"image", "video"}):
              self.visual = Qwen2VisionTransformer(
                  config.vision_config,
-@@ -1298,6 +1310,8 @@ class Qwen2VLForConditionalGeneration(
+@@ -1298,6 +1316,8 @@ class Qwen2VLForConditionalGeneration(
                  quant_config=quant_config,
                  prefix=maybe_prefix(prefix, "visual"),
              )
@@ -42,7 +48,7 @@ index 49e026534ca177e95378dbe36578444ec0d118ac..c378f0f35defb60f0b7c15bc0cbf2084
              self.input_norm = FusedInputNorm.from_model_config(self.model_config)
  
          with self._mark_language_model(vllm_config):
-@@ -1306,6 +1320,8 @@ class Qwen2VLForConditionalGeneration(
+@@ -1306,6 +1326,8 @@ class Qwen2VLForConditionalGeneration(
                  prefix=maybe_prefix(prefix, "language_model"),
                  architectures=["Qwen2ForCausalLM"],
              )
