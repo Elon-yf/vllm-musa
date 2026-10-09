@@ -19,7 +19,8 @@ index 28c6a11..344cf8b 100644
 +from vllm.platforms import current_platform
  from vllm.sequence import IntermediateTensors
 @@ -104,2 +105,52 @@ logger = init_logger(__name__)
- 
+-
++
 +def _is_ovis_qwen35_config(config: Qwen3_5Config, model_config=None) -> bool:
 +    text = getattr(config, "text_config", config)
 +    vision = getattr(config, "vision_config", None)
@@ -71,7 +72,9 @@ index 28c6a11..344cf8b 100644
 +
 +
  class Qwen3_5ProcessingInfo(Qwen3VLProcessingInfo):
-@@ -501,2 +552,3 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
+@@ -501,3 +552,4 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
              )
+-
 +        _enable_ovis_vision_rope(config, self.model_config, self.visual)
- 
++
+         with self._mark_language_model(vllm_config):
