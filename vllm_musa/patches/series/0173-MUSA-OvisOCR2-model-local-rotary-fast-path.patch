@@ -1,7 +1,7 @@
 From 40cd3dc3994f79111a1c1c0e3c5f0f849b06b997 Mon Sep 17 00:00:00 2001
 From: Elon-yf <309721831+Elon-yf@users.noreply.github.com>
 Date: Wed, 30 Sep 2026 17:48:17 +0800
-Subject: [PATCH] [MUSA] OvisOCR2 model-local rotary fast path
+Subject: [PATCH] [MUSA] OvisOCR2 contract-gated rotary fast path
 
 Reuse the existing MUSA rotary kernel for the exact BF16 Ovis vision geometry.
 Share bounded positions across vision blocks, retain graph-referenced storage,
@@ -11,48 +11,34 @@ and its tests are tracked as normal vLLM-MUSA files.
 Assisted-by: OpenAI Codex
 
 diff --git a/vllm/model_executor/models/qwen3_5.py b/vllm/model_executor/models/qwen3_5.py
-index 28c6a11..344cf8b 100644
+index 28c6a11..74ed2a2 100644
 --- a/vllm/model_executor/models/qwen3_5.py
 +++ b/vllm/model_executor/models/qwen3_5.py
-@@ -54,2 +54,3 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
+@@ -52,6 +52,7 @@
+     VocabParallelEmbedding,
+ )
  from vllm.multimodal import MULTIMODAL_REGISTRY
 +from vllm.platforms import current_platform
  from vllm.sequence import IntermediateTensors
-@@ -104,2 +105,52 @@ logger = init_logger(__name__)
+ from vllm.tokenizers.registry import cached_tokenizer_from_config
+ from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig
+@@ -100,6 +101,34 @@
+ )
 -
 +
-+def _is_ovis_qwen35_config(config: Qwen3_5Config, model_config=None) -> bool:
-+    text = getattr(config, "text_config", config)
-+    vision = getattr(config, "vision_config", None)
-+    dtype = getattr(model_config, "dtype", None)
-+    return (
-+        tuple(getattr(config, "architectures", ()) or ())
-+        == ("Qwen3_5ForConditionalGeneration",)
-+        and getattr(config, "model_type", None) == "qwen3_5"
-+        and getattr(text, "model_type", None) == "qwen3_5_text"
-+        and getattr(text, "hidden_size", None) == 1024
-+        and getattr(text, "intermediate_size", None) == 3584
-+        and getattr(text, "num_hidden_layers", None) == 24
-+        and getattr(text, "num_attention_heads", None) == 8
-+        and getattr(text, "num_key_value_heads", None) == 2
-+        and getattr(text, "head_dim", None) == 256
-+        and getattr(text, "vocab_size", None) == 248320
-+        and vision is not None
-+        and getattr(vision, "hidden_size", None) == 768
-+        and getattr(vision, "depth", None) == 12
-+        and getattr(vision, "num_heads", None) == 12
-+        and getattr(vision, "out_hidden_size", None) == 1024
-+        and getattr(vision, "patch_size", None) == 16
-+        and getattr(vision, "spatial_merge_size", None) == 2
-+        and getattr(vision, "temporal_patch_size", None) == 2
-+        and dtype in (torch.bfloat16, "bfloat16", "torch.bfloat16")
-+    )
+ logger = init_logger(__name__)
 +
 +
 +def _enable_ovis_vision_rope(config, model_config, visual) -> None:
 +    if not current_platform.is_musa():
 +        return
-+    if not _is_ovis_qwen35_config(config, model_config):
++    from vllm_musa.optimization_contract import (
++        OptimizationFeature,
++        resolve_optimization_contract,
++    )
++
++    contract = resolve_optimization_contract(model_config=model_config)
++    if not contract.prefers(OptimizationFeature.OVIS_QWEN35_VISION_ROTARY):
 +        if getattr(config, "model_type", None) in ("qwen3_5", "qwen3_5_moe"):
 +            logger.info_once(
 +                "Ovis vision RoPE adapter disabled: model does not match the "
@@ -69,12 +55,17 @@ index 28c6a11..344cf8b 100644
 +        replaced,
 +        len(visual.blocks),
 +    )
+-
 +
+-
 +
  class Qwen3_5ProcessingInfo(Qwen3VLProcessingInfo):
-@@ -501,3 +552,4 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
+@@ -499,6 +528,7 @@
+                 quant_config=quant_config,
+                 prefix=maybe_prefix(prefix, "visual"),
              )
--
 +        _enable_ovis_vision_rope(config, self.model_config, self.visual)
+-
 +
          with self._mark_language_model(vllm_config):
+             self.language_model = Qwen3_5ForCausalLM(

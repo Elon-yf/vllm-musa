@@ -138,6 +138,9 @@ def _gdn_conv_signature(text_config: Any) -> tuple[int | None, int | None]:
 
 def _model_signature(model_config: Any, vllm_config: Any | None) -> ModelSignature:
     text_config = _text_config(model_config)
+    hf_config = getattr(model_config, "hf_config", None)
+    hf_text_config = getattr(hf_config, "text_config", hf_config)
+    vision_config = getattr(hf_config, "vision_config", None)
     gdn_width, gdn_dim = _gdn_conv_signature(text_config)
     architectures = _architectures(model_config, text_config)
     quant_config = getattr(vllm_config, "quant_config", None)
@@ -208,6 +211,43 @@ def _model_signature(model_config: Any, vllm_config: Any | None) -> ModelSignatu
         index_topk=_int_attr(text_config, "index_topk"),
         quant_block_shape=quant_block_shape,
         is_hybrid=is_hybrid if isinstance(is_hybrid, bool) else None,
+        hf_config_architectures=tuple(
+            str(value) for value in (getattr(hf_config, "architectures", None) or ())
+        ),
+        hf_config_model_type=getattr(hf_config, "model_type", None),
+        hf_config_text_model_type=getattr(hf_text_config, "model_type", None),
+        hf_config_text_geometry=(
+            (
+                _int_attr(hf_text_config, "hidden_size"),
+                _int_attr(hf_text_config, "intermediate_size"),
+                _int_attr(hf_text_config, "num_hidden_layers"),
+                _int_attr(hf_text_config, "num_attention_heads"),
+                _int_attr(hf_text_config, "num_key_value_heads"),
+                _int_attr(hf_text_config, "head_dim"),
+                _int_attr(hf_text_config, "vocab_size"),
+            )
+            if hf_config is not None
+            else None
+        ),
+        config_dtype_literal=(
+            str(model_config.dtype) if getattr(model_config, "dtype", None) is not None
+            else None
+        ),
+        vision_hidden_size=_int_attr(vision_config, "embed_dim", "hidden_size"),
+        vision_embed_dim=_int_attr(vision_config, "embed_dim"),
+        vision_config_hidden_size=_int_attr(vision_config, "hidden_size"),
+        vision_depth=_int_attr(vision_config, "depth"),
+        vision_num_hidden_layers=_int_attr(vision_config, "num_hidden_layers"),
+        vision_num_attention_heads=_int_attr(
+            vision_config, "num_heads", "num_attention_heads"
+        ),
+        vision_config_num_heads=_int_attr(vision_config, "num_heads"),
+        vision_head_dim=_int_attr(vision_config, "head_dim"),
+        vision_patch_size=_int_attr(vision_config, "patch_size"),
+        vision_image_size=_int_attr(vision_config, "image_size"),
+        vision_out_hidden_size=_int_attr(vision_config, "out_hidden_size"),
+        vision_spatial_merge_size=_int_attr(vision_config, "spatial_merge_size"),
+        vision_temporal_patch_size=_int_attr(vision_config, "temporal_patch_size"),
     )
 
 

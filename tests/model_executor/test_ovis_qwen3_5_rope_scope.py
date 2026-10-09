@@ -10,7 +10,6 @@ from vllm_musa.model_executor.models.ovis_qwen3_5_rope import (
     _OvisRotaryPositionCache,
     enable_ovis_vision_rope,
 )
-from vllm.model_executor.models.qwen3_5 import _is_ovis_qwen35_config
 
 
 def _config() -> SimpleNamespace:
@@ -39,26 +38,13 @@ def _config() -> SimpleNamespace:
     )
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, "bfloat16", "torch.bfloat16"])
-def test_ovis_guard_accepts_exact_config(dtype: torch.dtype | str) -> None:
-    assert _is_ovis_qwen35_config(_config(), SimpleNamespace(dtype=dtype))
-
-
-@pytest.mark.parametrize("dtype", [torch.float16, torch.float32, None, "float32"])
-def test_ovis_guard_rejects_other_dtypes(dtype: torch.dtype | str | None) -> None:
-    assert not _is_ovis_qwen35_config(_config(), SimpleNamespace(dtype=dtype))
-
-
-def test_ovis_guard_rejects_other_architecture() -> None:
-    config = _config()
-    config.architectures = ["Qwen3_5MoeForConditionalGeneration"]
-    assert not _is_ovis_qwen35_config(config, SimpleNamespace(dtype=torch.bfloat16))
-
-
-def test_ovis_guard_rejects_other_hidden_size() -> None:
-    config = _config()
-    config.text_config.hidden_size = 2048
-    assert not _is_ovis_qwen35_config(config, SimpleNamespace(dtype=torch.bfloat16))
+def _model_config(config: SimpleNamespace, dtype: object) -> SimpleNamespace:
+    return SimpleNamespace(
+        hf_config=config,
+        hf_text_config=config.text_config,
+        architectures=config.architectures,
+        dtype=dtype,
+    )
 
 
 def _visual(block_count: int = 12) -> SimpleNamespace:
@@ -98,15 +84,17 @@ def test_gate_reports_musa_miss_and_success(monkeypatch: pytest.MonkeyPatch) -> 
         qwen3_5, "current_platform", SimpleNamespace(is_musa=lambda: True)
     )
     visual = _visual()
+    config = _config()
     qwen3_5._enable_ovis_vision_rope(
-        _config(), SimpleNamespace(dtype=torch.float32), visual
+        config, _model_config(config, torch.float32), visual
     )
     assert "disabled" in log.info_once.call_args.args[0]
     assert not isinstance(
         visual.blocks[0].attn.apply_rotary_emb, OvisVisionApplyRotaryEmb
     )
+    config = _config()
     qwen3_5._enable_ovis_vision_rope(
-        _config(), SimpleNamespace(dtype=torch.bfloat16), visual
+        config, _model_config(config, torch.bfloat16), visual
     )
     assert log.info_once.call_args.args[1:] == (12, 12)
     assert all(
@@ -124,8 +112,9 @@ def test_non_musa_and_unrelated_model_remain_untouched_and_quiet(
         qwen3_5, "current_platform", SimpleNamespace(is_musa=lambda: False)
     )
     visual = _visual()
+    config = _config()
     qwen3_5._enable_ovis_vision_rope(
-        _config(), SimpleNamespace(dtype=torch.bfloat16), visual
+        config, _model_config(config, torch.bfloat16), visual
     )
     assert not isinstance(
         visual.blocks[0].attn.apply_rotary_emb, OvisVisionApplyRotaryEmb
@@ -136,7 +125,7 @@ def test_non_musa_and_unrelated_model_remain_untouched_and_quiet(
     config = _config()
     config.model_type = "qwen2_vl"
     qwen3_5._enable_ovis_vision_rope(
-        config, SimpleNamespace(dtype=torch.bfloat16), visual
+        config, _model_config(config, torch.bfloat16), visual
     )
     log.info_once.assert_not_called()
 
