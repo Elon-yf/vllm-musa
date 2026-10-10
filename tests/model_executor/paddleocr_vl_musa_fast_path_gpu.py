@@ -17,9 +17,7 @@ def main() -> None:
     cos = torch.randn((4888, 36), device=device, dtype=torch.float32)
     sin = torch.randn((4888, 36), device=device, dtype=torch.float32)
     before = x.clone()
-    got = MusaVisionApplyRotaryEmb(
-        enforce_enable=True, enable_fp32_compute=True
-    )(x, cos, sin)
+    got = MusaVisionApplyRotaryEmb(enable_fp32_compute=True)(x, cos, sin)
     expected = ApplyRotaryEmb.forward_static(
         x, cos, sin, enable_fp32_compute=True
     )

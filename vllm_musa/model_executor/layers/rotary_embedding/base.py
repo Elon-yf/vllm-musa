@@ -118,7 +118,9 @@ class MusaVisionApplyRotaryEmb(ApplyRotaryEmb):
             ):
                 return self.forward_native(x, cos, sin)
         x, cos, sin, origin_shape, origin_dtype = self._pre_process(x, cos, sin)
-        output = x.contiguous() if self.inplace else x.clone(memory_format=torch.contiguous_format)
+        output = x.contiguous() if self.inplace else x.clone(
+            memory_format=torch.contiguous_format
+        )
         batch, seq_len, num_heads, head_size = output.shape
         cos_sin_cache = torch.cat((cos, sin), dim=-1).to(output.dtype).contiguous()
         if self.flatten:
