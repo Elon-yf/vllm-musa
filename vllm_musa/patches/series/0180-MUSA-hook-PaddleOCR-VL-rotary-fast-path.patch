@@ -23,7 +23,8 @@ index bd635aa..bf5b1cc 100644
 @@ -1001,6 +1007,12 @@ class PaddleOCRVLForConditionalGeneration(nn.Module, SupportsMultiModal, Support
                  if not isinstance(layer, PPMissingLayer):
                      layer.self_attn.rotary_emb.is_neox_style = True
- 
+-
++
 +        if install_rotary:
 +            from vllm_musa.optimization_contract.providers import (
 +                install_paddleocr_vl_rotary,

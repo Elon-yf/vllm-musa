@@ -1,5 +1,4 @@
 import torch
-
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 
 from vllm_musa.jit_kernel import rotary_embedding
