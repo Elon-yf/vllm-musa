@@ -104,11 +104,12 @@ class MusaVisionApplyRotaryEmb(ApplyRotaryEmb):
     def forward_oot(
         self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
     ) -> torch.Tensor:
+        if x.device.type != "musa":
+            return self.forward_native(x, cos, sin)
         if self.required_bf16_neox_shape is not None:
             head_size, cos_width = self.required_bf16_neox_shape
             if (
-                x.device.type != "musa"
-                or x.dtype != torch.bfloat16
+                x.dtype != torch.bfloat16
                 or x.shape[-1] != head_size
                 or cos.ndim != 2
                 or cos.shape[-1] != cos_width
@@ -170,7 +171,8 @@ class MusaMRotaryEmbedding(nn.Module):
             else (positions, query, key, offsets)
         )
         if (
-            positions.ndim == 2
+            query.device.type == "musa"
+            and positions.ndim == 2
             and key is not None
             and (
                 self.qk_hidden_sizes is None

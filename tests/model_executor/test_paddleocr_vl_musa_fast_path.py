@@ -74,3 +74,15 @@ def test_depth_alias_and_outer_rope_fallback(paddle_gate):
     config.text_config.rope_parameters = None
     config.rope_parameters = {"mrope_section": (16, 24, 24)}
     assert paddle_gate(config)
+
+
+def test_rope_scaling_fallback(paddle_gate):
+    config = _config()
+    config.text_config.rope_parameters = {"rope_type": "default"}
+    config.text_config.rope_scaling = {"mrope_section": [16, 24, 24]}
+    assert paddle_gate(config)
+    config.text_config.rope_scaling = {"rope_type": "default"}
+    config.rope_scaling = {"mrope_section": [16, 24, 24]}
+    assert paddle_gate(config)
+    config.text_config.rope_parameters = {"mrope_section": [16, 24, 23]}
+    assert not paddle_gate(config)

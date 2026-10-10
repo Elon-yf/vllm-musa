@@ -4,10 +4,10 @@ Date: Thu, 8 Oct 2026 15:23:15 +0800
 Subject: [PATCH] MUSA: hook PaddleOCR-VL rotary fast path
 
 diff --git a/vllm/model_executor/models/paddleocr_vl.py b/vllm/model_executor/models/paddleocr_vl.py
-index bd635aa..2311040 100644
+index bd635aa..9eef14a 100644
 --- a/vllm/model_executor/models/paddleocr_vl.py
 +++ b/vllm/model_executor/models/paddleocr_vl.py
-@@ -83,6 +83,37 @@
+@@ -83,6 +83,41 @@
  from .vision import get_vit_attn_backend
 -
 +
@@ -21,12 +21,16 @@ index bd635aa..2311040 100644
 +        return False
 +    vision = getattr(config, "vision_config", None)
 +    text = getattr(config, "text_config", config)
-+    rope = (
-+        getattr(text, "rope_parameters", None)
-+        or getattr(config, "rope_parameters", None)
-+        or {}
-+    )
-+    section = rope.get("mrope_section") if isinstance(rope, dict) else None
++    section = None
++    for rope in (
++        getattr(text, "rope_parameters", None),
++        getattr(text, "rope_scaling", None),
++        getattr(config, "rope_parameters", None),
++        getattr(config, "rope_scaling", None),
++    ):
++        if isinstance(rope, dict) and rope.get("mrope_section") is not None:
++            section = rope["mrope_section"]
++            break
 +    return (
 +        getattr(vision, "hidden_size", None) == 1152
 +        and (
@@ -47,7 +51,7 @@ index bd635aa..2311040 100644
  def smart_resize(
      height: int,
      width: int,
-@@ -972,6 +1003,12 @@
+@@ -972,6 +1007,12 @@
      def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
          super().__init__()
          config = vllm_config.model_config.hf_config
@@ -60,7 +64,7 @@ index bd635aa..2311040 100644
          if hasattr(config, "text_config"):
              text_config = config.text_config.to_dict()
              unsafe_keys = ["model_type", "architectures", "tie_word_embeddings"]
-@@ -990,6 +1027,14 @@
+@@ -990,6 +1031,14 @@
                  prefix=maybe_prefix(prefix, "visual"),
              )
              self.mlp_AR = Projector(config, config.vision_config)
@@ -76,7 +80,7 @@ index bd635aa..2311040 100644
 +
          with self._mark_language_model(vllm_config):
              self.language_model = Ernie4_5ForCausalLM(
-@@ -999,7 +1044,10 @@
+@@ -999,7 +1048,10 @@
 -
 +
              for layer in self.language_model.model.layers:
