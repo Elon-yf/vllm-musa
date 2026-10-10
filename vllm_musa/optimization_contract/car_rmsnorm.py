@@ -327,22 +327,16 @@ def can_use_fused_allreduce_rmsnorm(**kwargs: Any) -> bool:
 def car_rmsnorm_default_on(vllm_config: Any) -> bool:
     """Return whether the contract enables CAR-RMSNorm by default.
 
-    This is the single definition of the default-on rule. The platform writes
-    the resolved value into ``pass_config``; every later reader consumes that
-    settled value rather than re-deriving the predicate and drifting from it.
+    Single definition of the default-on rule; the platform writes the result
+    into ``pass_config`` and every later reader consumes that settled value.
+    Family and optimization level both come from one contract resolution,
+    rather than from separate raw attribute reads.
 
-    Both inputs come from one resolution of the contract: the model family from
-    its model signature, and the optimization level from its execution
-    signature. Reading the level from the signature rather than off
-    ``vllm_config`` keeps the gate and the level that justifies it in one object.
-
-    The ``>= 2`` half is not decoration. Upstream derives
-    ``pass_config.fuse_allreduce_rms`` from the same level
-    (``OPTIMIZATION_LEVEL_TO_CONFIG``): on O1/O0 it hard-codes ``False``, and on
-    O2 it delegates to ``enable_allreduce_rms_fusion``, which is CUDA-only and
-    therefore answers ``False`` on MUSA. The platform hook runs first and wins
-    only while the field is still ``None``, so dropping this gate would leave
-    CAR-RMSNorm enabled at ``-O0``/``-O1``.
+    The level gate is load-bearing. Upstream derives the same pass value from
+    ``OPTIMIZATION_LEVEL_TO_CONFIG`` -- ``False`` on O1/O0, and on O2 a
+    CUDA-only predicate that answers ``False`` on MUSA. The platform hook runs
+    first and wins only while the field is ``None``, so without this gate
+    CAR-RMSNorm would stay enabled at ``-O0``/``-O1``.
     """
     from .resolver import resolve_optimization_contract
 

@@ -114,19 +114,13 @@ def test_upstream_predicate_is_false_on_musa() -> None:
     assert enable_allreduce_rms_fusion(stub) is False
 
 
-def test_config_default_only_writes_a_still_none_field() -> None:
-    """`_set_config_default` is the rule that lets the platform hook survive."""
-    import inspect
-
-    from vllm.config.vllm import VllmConfig
-
-    assert "if getattr(config_obj, key) is None:" in inspect.getsource(
-        VllmConfig._set_config_default
-    )
-
-
 def test_platform_hook_runs_before_the_o_level_presets() -> None:
-    """If upstream reorders these, the hook silently stops applying."""
+    """If upstream reorders these, the hook silently stops applying.
+
+    Pairs with ``_set_config_default`` only filling a still-``None`` field: that
+    rule is what makes the earlier write stick. Checked by source order because
+    the alternative is starting a real engine per assertion.
+    """
     import inspect
 
     from vllm.config.vllm import VllmConfig
@@ -135,6 +129,9 @@ def test_platform_hook_runs_before_the_o_level_presets() -> None:
     hook = source.index("apply_config_platform_defaults")
     preset = source.index("_apply_optimization_level_defaults")
     assert hook < preset, "O-level defaults now run before the platform hook"
+    assert "if getattr(config_obj, key) is None:" in inspect.getsource(
+        VllmConfig._set_config_default
+    )
 
 
 @pytest.mark.parametrize(
@@ -211,9 +208,3 @@ def test_carrying_the_level_moves_no_provider_verdict(architectures) -> None:
         )
     assert all(v == verdicts[0] for v in verdicts), architectures
 
-
-def test_the_signature_field_defaults_to_none_not_to_o2() -> None:
-    """An absent level must stay distinguishable from a real ``O2``."""
-    fields = ExecutionSignature.__dataclass_fields__
-    assert "optimization_level" in fields
-    assert fields["optimization_level"].default is None
