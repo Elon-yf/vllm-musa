@@ -330,8 +330,24 @@ def car_rmsnorm_default_on(vllm_config: Any) -> bool:
     This is the single definition of the default-on rule. The platform writes
     the resolved value into ``pass_config``; every later reader consumes that
     settled value rather than re-deriving the predicate and drifting from it.
+
+    Both inputs come from one resolution of the contract: the model family from
+    its model signature, and the optimization level from its execution
+    signature. Reading the level from the signature rather than off
+    ``vllm_config`` keeps the gate and the level that justifies it in one object.
+
+    The ``>= 2`` half is not decoration. Upstream derives
+    ``pass_config.fuse_allreduce_rms`` from the same level
+    (``OPTIMIZATION_LEVEL_TO_CONFIG``): on O1/O0 it hard-codes ``False``, and on
+    O2 it delegates to ``enable_allreduce_rms_fusion``, which is CUDA-only and
+    therefore answers ``False`` on MUSA. The platform hook runs first and wins
+    only while the field is still ``None``, so dropping this gate would leave
+    CAR-RMSNorm enabled at ``-O0``/``-O1``.
     """
-    if int(getattr(vllm_config, "optimization_level", 0) or 0) < 2:
+    from .resolver import resolve_optimization_contract
+
+    contract = resolve_optimization_contract(vllm_config)
+    if (contract.execution.optimization_level or 0) < 2:
         return False
     model_config = getattr(vllm_config, "model_config", None)
     parallel_config = getattr(vllm_config, "parallel_config", None)
@@ -342,7 +358,7 @@ def car_rmsnorm_default_on(vllm_config: Any) -> bool:
         pp_size=getattr(parallel_config, "pipeline_parallel_size", None),
         dtype=getattr(model_config, "dtype", None),
         hidden_size=hidden_size,
-        model_family=infer_car_rmsnorm_model_family(vllm_config),
+        model_family=contract.model.family.value,
     )
 
 

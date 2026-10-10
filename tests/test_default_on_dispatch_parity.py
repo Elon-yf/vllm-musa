@@ -29,6 +29,9 @@ def _with_legacy_env(monkeypatch: pytest.MonkeyPatch, value: str | None) -> None
             monkeypatch.setenv(name, value)
 
 
+QWEN35_ARCH = "Qwen3_5ForConditionalGeneration"
+
+
 def _ar_platform_config(
     *,
     optimization_level: int = 2,
@@ -43,6 +46,11 @@ def _ar_platform_config(
             dtype=torch.bfloat16,
             get_hidden_size=lambda: hidden_size,
             enforce_eager=False,
+            # The default-on rule resolves the family through the contract
+            # resolver, which reads the architecture list. Without it the family
+            # is UNKNOWN and no policy cell matches, so the test would assert
+            # default-off for the wrong reason.
+            architectures=[QWEN35_ARCH],
             hf_config=SimpleNamespace(architectures=[]),
         ),
         parallel_config=SimpleNamespace(
@@ -60,11 +68,12 @@ def _ar_platform_config(
 
 
 def _patch_car_model_family(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pin the CAR family at both seams.
+    """Pin the CAR family where ``platform`` still resolves it itself.
 
-    The compile-range setup resolves the family through ``platform``; the
-    default-on rule resolves it inside the contract module. Patching only one
-    would let the two disagree silently, which is what these tests guard.
+    The compile-range setup resolves the family through ``platform``. The
+    default-on rule no longer does -- it takes the family from the contract
+    resolver, driven by ``architectures`` in ``_ar_platform_config`` -- so
+    patching here only keeps the two from disagreeing silently.
     """
     from vllm_musa.optimization_contract import car_rmsnorm as car_contract
     from vllm_musa import platform as musa_platform
