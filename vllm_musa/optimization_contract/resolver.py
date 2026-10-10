@@ -137,25 +137,7 @@ def _gdn_conv_signature(text_config: Any) -> tuple[int | None, int | None]:
 
 
 def _model_signature(model_config: Any, vllm_config: Any | None) -> ModelSignature:
-    hf_config = getattr(model_config, "hf_config", None)
-    hf_model_type = getattr(hf_config, "model_type", None)
-    # Preserve Paddle's model-local gate: it reads hf_config.text_config,
-    # regardless of the separate hf_text_config selected by generic consumers.
-    text_config = (
-        getattr(hf_config, "text_config", hf_config)
-        if hf_model_type == "paddleocr_vl"
-        else _text_config(model_config)
-    )
-    vision_config = getattr(hf_config, "vision_config", None)
-    rope_parameters = getattr(text_config, "rope_parameters", None) or getattr(
-        hf_config, "rope_parameters", None
-    )
-    section = (
-        rope_parameters.get("mrope_section")
-        if isinstance(rope_parameters, dict)
-        else None
-    )
-    mrope_section = _int_tuple(section)
+    text_config = _text_config(model_config)
     gdn_width, gdn_dim = _gdn_conv_signature(text_config)
     architectures = _architectures(model_config, text_config)
     quant_config = getattr(vllm_config, "quant_config", None)
@@ -226,14 +208,6 @@ def _model_signature(model_config: Any, vllm_config: Any | None) -> ModelSignatu
         index_topk=_int_attr(text_config, "index_topk"),
         quant_block_shape=quant_block_shape,
         is_hybrid=is_hybrid if isinstance(is_hybrid, bool) else None,
-        hf_model_type=hf_model_type,
-        vision_hidden_size=_int_attr(vision_config, "hidden_size"),
-        vision_num_hidden_layers=_int_attr(vision_config, "num_hidden_layers"),
-        vision_depth=_int_attr(vision_config, "depth"),
-        vision_num_attention_heads=_int_attr(vision_config, "num_attention_heads"),
-        vision_patch_size=_int_attr(vision_config, "patch_size"),
-        vision_image_size=_int_attr(vision_config, "image_size"),
-        mrope_section=mrope_section,
     )
 
 

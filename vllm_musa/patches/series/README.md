@@ -77,10 +77,8 @@ The unified attention kernel takes its per-token-head scale strides as
 kernel-signature annotation.
 DeepSeek-V4 score GEMMs above the multi-stream token threshold run through
 DeepGEMM instead of an FP32 SIMT sgemm.
-The PaddleOCR-VL rotary entry hooks the existing upstream model and keeps its
-adapter in the normal tracked `vllm_musa/optimization_contract/paddleocr_vl.py`
-file. It uses the exact Paddle contract feature before installing model-local
-wrappers.
+The PaddleOCR-VL entry selects the existing MUSA rotary path at model
+construction for its exact vision and language geometry.
 The series contains
 MUSA source edits against the immutable vLLM commit recorded as `VLLM_COMMIT`
 in `third_party/PINS` (release label `v0.28.0`), applied at build. Runtime
