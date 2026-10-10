@@ -13,7 +13,7 @@ from vllm.config import VllmConfig, set_current_vllm_config  # noqa: E402
 from vllm.model_executor.layers.rotary_embedding.common import (  # noqa: E402
     ApplyRotaryEmb,
 )
-from vllm_musa.model_executor.layers.rotary_embedding.base import (  # noqa: E402
+from vllm_musa.optimization_contract.rotary import (  # noqa: E402
     MusaVisionApplyRotaryEmb,
     MusaVisionRotaryPositions,
 )

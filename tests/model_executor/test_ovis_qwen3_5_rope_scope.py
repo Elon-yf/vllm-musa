@@ -1,4 +1,4 @@
-"""Behavioral scope checks for Ovis vision RoPE selection."""
+"""Behavioral scope checks for the Qwen3.5 vision RoPE route."""
 
 from types import SimpleNamespace
 
@@ -7,101 +7,95 @@ import pytest
 pytest.importorskip("torchada")
 import torch  # noqa: E402
 
-from vllm_musa.model_executor.layers.rotary_embedding.base import (  # noqa: E402
+from vllm.config import VllmConfig, set_current_vllm_config  # noqa: E402
+from vllm_musa.optimization_contract.qwen import (  # noqa: E402
+    install_qwen35_vision_rotary,
+)
+from vllm_musa.optimization_contract.rotary import (  # noqa: E402
     MusaVisionApplyRotaryEmb,
-    MusaVisionRotaryPositions,
 )
 
 
-def _config() -> SimpleNamespace:
-    return SimpleNamespace(
+def _model_config(dtype=torch.bfloat16) -> SimpleNamespace:
+    hf = SimpleNamespace(
         architectures=["Qwen3_5ForConditionalGeneration"],
         model_type="qwen3_5",
         text_config=SimpleNamespace(
-            model_type="qwen3_5_text",
-            hidden_size=1024,
-            intermediate_size=3584,
-            num_hidden_layers=24,
-            num_attention_heads=8,
-            num_key_value_heads=2,
-            head_dim=256,
-            vocab_size=248320,
+            model_type="qwen3_5_text", hidden_size=1024,
+            intermediate_size=3584, num_hidden_layers=24,
+            num_attention_heads=8, num_key_value_heads=2,
+            head_dim=256, vocab_size=248320,
         ),
         vision_config=SimpleNamespace(
-            hidden_size=768,
-            depth=12,
-            num_heads=12,
-            out_hidden_size=1024,
-            patch_size=16,
-            spatial_merge_size=2,
-            temporal_patch_size=2,
+            hidden_size=768, depth=12, num_heads=12,
+            out_hidden_size=1024, patch_size=16,
+            spatial_merge_size=2, temporal_patch_size=2,
         ),
     )
+    return SimpleNamespace(hf_config=hf, architectures=hf.architectures, dtype=dtype)
 
 
-def _visual() -> SimpleNamespace:
+def _visual(blocks=12) -> SimpleNamespace:
     def block() -> SimpleNamespace:
         rotary = SimpleNamespace(is_neox_style=True, enable_fp32_compute=False)
         return SimpleNamespace(attn=SimpleNamespace(apply_rotary_emb=rotary))
 
-    return SimpleNamespace(blocks=[block() for _ in range(12)])
+    return SimpleNamespace(blocks=[block() for _ in range(blocks)])
+
+
+@pytest.fixture(autouse=True)
+def _vllm_config():
+    with set_current_vllm_config(VllmConfig()):
+        yield
+
+
+def test_installs_twelve_visual_layers_with_shared_graph_positions() -> None:
+    visual = _visual()
+    assert install_qwen35_vision_rotary(visual)
+    layers = [block.attn.apply_rotary_emb for block in visual.blocks]
+    assert all(isinstance(layer, MusaVisionApplyRotaryEmb) for layer in layers)
+    assert all(layer.positions_cache is layers[0].positions_cache for layer in layers)
+    assert layers[0].required_bf16_neox_shape == (64, 32)
+
+
+def test_wrong_block_count_preserves_all_original_layers() -> None:
+    visual = _visual(11)
+    original = [block.attn.apply_rotary_emb for block in visual.blocks]
+    assert not install_qwen35_vision_rotary(visual)
+    assert all(
+        block.attn.apply_rotary_emb is rotary
+        for block, rotary in zip(visual.blocks, original)
+    )
 
 
 @pytest.fixture
-def ovis_hook():
+def patched_hook():
     module = pytest.importorskip("vllm.model_executor.models.qwen3_5")
-    if not hasattr(module, "_enable_musa_ovis_rope"):
+    if not hasattr(module, "_enable_musa_qwen35_vision_rope"):
         pytest.skip("Ovis patch is not applied")
-    from vllm.config import VllmConfig, set_current_vllm_config
-    from vllm.platforms import current_platform
-
-    if not current_platform.is_musa():
-        pytest.skip("requires MUSA platform")
-    with set_current_vllm_config(VllmConfig()):
-        yield module._enable_musa_ovis_rope
+    return module._enable_musa_qwen35_vision_rope
 
 
-def test_exact_ovis_geometry_installs_only_visual_rope(ovis_hook) -> None:
+def test_upstream_hook_is_disabled_on_cpu(patched_hook, monkeypatch) -> None:
+    import vllm.platforms
+
+    monkeypatch.setattr(
+        vllm.platforms, "current_platform", SimpleNamespace(is_musa=lambda: False)
+    )
     visual = _visual()
-    ovis_hook(_config(), SimpleNamespace(dtype=torch.bfloat16), visual)
-    rotary = [block.attn.apply_rotary_emb for block in visual.blocks]
-    assert all(isinstance(item, MusaVisionApplyRotaryEmb) for item in rotary)
-    assert all(item.positions_cache is rotary[0].positions_cache for item in rotary)
+    original = visual.blocks[0].attn.apply_rotary_emb
+    patched_hook(_model_config(), visual)
+    assert visual.blocks[0].attn.apply_rotary_emb is original
 
 
-@pytest.mark.parametrize(
-    ("owner", "name", "value"),
-    [
-        (None, "model_type", "qwen3_5_moe"),
-        ("text_config", "hidden_size", 2048),
-        ("vision_config", "depth", 24),
-        ("vision_config", "num_heads", 8),
-    ],
-)
-def test_other_geometry_keeps_original_layer(ovis_hook, owner, name, value) -> None:
-    config = _config()
-    setattr(getattr(config, owner) if owner else config, name, value)
+def test_upstream_hook_respects_contract_mismatch(patched_hook, monkeypatch) -> None:
+    import vllm.platforms
+
+    monkeypatch.setattr(
+        vllm.platforms, "current_platform", SimpleNamespace(is_musa=lambda: True)
+    )
     visual = _visual()
-    old = visual.blocks[0].attn.apply_rotary_emb
-    ovis_hook(config, SimpleNamespace(dtype=torch.bfloat16), visual)
-    assert visual.blocks[0].attn.apply_rotary_emb is old
+    original = visual.blocks[0].attn.apply_rotary_emb
+    patched_hook(_model_config(torch.float16), visual)
+    assert visual.blocks[0].attn.apply_rotary_emb is original
 
-
-def test_other_dtype_keeps_original_layer(ovis_hook) -> None:
-    visual = _visual()
-    old = visual.blocks[0].attn.apply_rotary_emb
-    ovis_hook(_config(), SimpleNamespace(dtype=torch.float16), visual)
-    assert visual.blocks[0].attn.apply_rotary_emb is old
-
-
-def test_graph_position_buffer_survives_other_shape(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    cache = MusaVisionRotaryPositions()
-    device = torch.device("cpu")
-    original = cache.get(2, 3, device)
-    monkeypatch.setattr(cache, "_is_capturing", lambda _: True)
-    assert cache.get(2, 3, device) is original
-    cache.get(2, 4, device)
-    monkeypatch.setattr(cache, "_is_capturing", lambda _: False)
-    assert cache.get(2, 3, device) is original
