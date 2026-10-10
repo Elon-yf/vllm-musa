@@ -20,7 +20,7 @@ from vllm_musa.optimization_contract import (
 from vllm_musa.optimization_contract.car_rmsnorm import (
     can_use_fused_allreduce_rmsnorm,
     can_use_registered_graph_input_for_generic_car,
-    infer_car_rmsnorm_model_family,
+    current_car_rmsnorm_metadata,
 )
 from vllm_musa.optimization_contract.policy import (
     DeepSeekV4MtpCarGraphStagingPlan,
@@ -111,25 +111,8 @@ def _car_rmsnorm_metadata_for_current_model() -> tuple[
     Missing metadata retains the generic transport default; fused operator
     selection remains fail-closed in the compile contract.
     """
-    try:
-        from vllm.config import get_current_vllm_config_or_none
-
-        vllm_config = get_current_vllm_config_or_none()
-    except (AssertionError, ImportError, RuntimeError):
-        return None, None, None
-    if vllm_config is None:
-        return None, None, None
-    family = infer_car_rmsnorm_model_family(vllm_config)
-    marker = object()
-    quant_config = getattr(vllm_config, "quant_config", marker)
-    quantized = None if quant_config is marker else quant_config is not None
-    model_config = getattr(vllm_config, "model_config", None)
-    get_hidden_size = getattr(model_config, "get_hidden_size", None)
-    try:
-        hidden_size = int(get_hidden_size()) if callable(get_hidden_size) else None
-    except (AttributeError, RuntimeError, TypeError, ValueError):
-        hidden_size = None
-    return family, quantized, hidden_size
+    metadata = current_car_rmsnorm_metadata()
+    return metadata if metadata is not None else (None, None, None)
 
 
 def _car_rmsnorm_pass_enabled_for_current_model() -> bool:
