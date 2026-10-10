@@ -60,15 +60,25 @@ def _ar_platform_config(
 
 
 def _patch_car_model_family(monkeypatch: pytest.MonkeyPatch) -> None:
-    from vllm_musa.optimization_contract.car_rmsnorm import (
-        FUSED_ALLREDUCE_RMSNORM_MODEL_FAMILY,
-    )
+    """Pin the CAR family at both seams.
+
+    The compile-range setup resolves the family through ``platform``; the
+    default-on rule resolves it inside the contract module. Patching only one
+    would let the two disagree silently, which is what these tests guard.
+    """
+    from vllm_musa.optimization_contract import car_rmsnorm as car_contract
     from vllm_musa import platform as musa_platform
 
+    family = car_contract.FUSED_ALLREDUCE_RMSNORM_MODEL_FAMILY
+    monkeypatch.setattr(
+        car_contract,
+        "infer_car_rmsnorm_model_family",
+        lambda _config: family,
+    )
     monkeypatch.setattr(
         musa_platform,
         "infer_car_rmsnorm_model_family",
-        lambda _config: FUSED_ALLREDUCE_RMSNORM_MODEL_FAMILY,
+        lambda _config: family,
     )
 
 
@@ -190,9 +200,7 @@ def test_gemma_ir_path_predicts_the_same_default_as_platform(
     expected: bool,
 ) -> None:
     from vllm_musa.model_executor.layers import layernorm
-    from vllm_musa.optimization_contract.car_rmsnorm import (
-        FUSED_ALLREDUCE_RMSNORM_MODEL_FAMILY,
-    )
+    from vllm_musa.optimization_contract import car_rmsnorm as car_contract
 
     config = _ar_platform_config(
         optimization_level=optimization_level,
@@ -201,10 +209,12 @@ def test_gemma_ir_path_predicts_the_same_default_as_platform(
         pass_value=pass_value,
     )
     monkeypatch.setattr(layernorm, "get_current_vllm_config_or_none", lambda: config)
+    # The default-on rule now lives in the contract, so the family seam moved
+    # there; patching the layer's former copy would no longer take effect.
     monkeypatch.setattr(
-        layernorm,
+        car_contract,
         "infer_car_rmsnorm_model_family",
-        lambda _config: FUSED_ALLREDUCE_RMSNORM_MODEL_FAMILY,
+        lambda _config: car_contract.FUSED_ALLREDUCE_RMSNORM_MODEL_FAMILY,
     )
 
     assert layernorm._car_rmsnorm_ir_fusion_enabled() is expected

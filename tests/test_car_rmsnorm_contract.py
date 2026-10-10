@@ -175,3 +175,94 @@ def test_unknown_metadata_fails_closed_but_known_phases_share_the_contract() -> 
 
 def test_tp1_keeps_non_car_provider_compatibility() -> None:
     assert _allowed(tp=1, hidden=5120, rows=16)
+
+
+def test_compile_endpoints_isolate_every_native_row() -> None:
+    """Guard the hand-listed endpoint tuples against policy-table edits.
+
+    ``fused_allreduce_rmsnorm_compile_endpoints`` spells its cut points out
+    longhand while the deny rows live in ``CAR_RMSNORM_POLICY_TABLE``. Adding a
+    native row without adding its two cuts would silently leave that row inside
+    a fused bucket, so assert the correspondence instead of trusting a comment.
+    """
+    from vllm_musa.optimization_contract.car_rmsnorm import CAR_RMSNORM_POLICY_TABLE
+
+    for rule in CAR_RMSNORM_POLICY_TABLE:
+        endpoints = set(
+            fused_allreduce_rmsnorm_compile_endpoints(
+                tp_size=rule["tp_size"], hidden_size=rule["hidden_size"]
+            )
+        )
+        assert endpoints, rule
+        for row in rule["native_rows"]:
+            # Isolating ``row`` needs the cut below it and the cut that closes it.
+            assert row - 1 in endpoints, (rule, row)
+            assert row in endpoints, (rule, row)
+
+
+def _car_config(
+    *,
+    optimization_level: int = 2,
+    tp_size: int = 2,
+    hidden_size: int = 5120,
+    pp_size: int = 1,
+    dtype: torch.dtype = torch.bfloat16,
+    pass_value: bool | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        optimization_level=optimization_level,
+        model_config=SimpleNamespace(dtype=dtype, get_hidden_size=lambda: hidden_size),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=tp_size, pipeline_parallel_size=pp_size
+        ),
+        compilation_config=SimpleNamespace(
+            pass_config=SimpleNamespace(fuse_allreduce_rms=pass_value)
+        ),
+    )
+
+
+def _pin_family(monkeypatch) -> None:
+    from vllm_musa.optimization_contract import car_rmsnorm as contract
+
+    monkeypatch.setattr(
+        contract,
+        "infer_car_rmsnorm_model_family",
+        lambda _config: FUSED_ALLREDUCE_RMSNORM_MODEL_FAMILY,
+    )
+
+
+def test_default_on_rule_is_owned_by_the_contract(monkeypatch) -> None:
+    """The contract, not each call site, decides when CAR-RMSNorm defaults on."""
+    from vllm_musa.optimization_contract import car_rmsnorm as contract
+
+    _pin_family(monkeypatch)
+
+    assert contract.car_rmsnorm_default_on(_car_config())
+    assert contract.car_rmsnorm_default_on(_car_config(optimization_level=3))
+    # Below the measured optimization level the feature stays off.
+    assert not contract.car_rmsnorm_default_on(_car_config(optimization_level=1))
+    assert not contract.car_rmsnorm_default_on(_car_config(optimization_level=0))
+    # Outside a policy cell nothing defaults on.
+    assert not contract.car_rmsnorm_default_on(_car_config(tp_size=8))
+    assert not contract.car_rmsnorm_default_on(_car_config(hidden_size=4096))
+    assert not contract.car_rmsnorm_default_on(_car_config(pp_size=2))
+    assert not contract.car_rmsnorm_default_on(_car_config(dtype=torch.float32))
+
+
+def test_explicit_pass_value_overrides_the_default(monkeypatch) -> None:
+    """An explicit setting stays authoritative in both directions."""
+    from vllm_musa.optimization_contract import car_rmsnorm as contract
+
+    _pin_family(monkeypatch)
+
+    assert contract.resolve_car_rmsnorm_enabled(
+        _car_config(pass_value=True, optimization_level=0)
+    )
+    assert not contract.resolve_car_rmsnorm_enabled(
+        _car_config(pass_value=False, optimization_level=3)
+    )
+    # Unset falls back to exactly the rule the platform writes out.
+    unset = _car_config(pass_value=None)
+    assert contract.resolve_car_rmsnorm_enabled(unset) is (
+        contract.car_rmsnorm_default_on(unset)
+    )

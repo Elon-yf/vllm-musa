@@ -18,14 +18,10 @@ import torch
 FUSED_ALLREDUCE_RMSNORM_POLICY_VERSION = "car-rmsnorm-operator-gate-v3"
 
 FUSED_ALLREDUCE_RMSNORM_TARGET_HIDDEN_SIZE = 5120
-FUSED_ALLREDUCE_RMSNORM_TP2_MIN_ROWS = 64
 FUSED_ALLREDUCE_RMSNORM_TP4_HIDDEN_SIZE = 2048
-FUSED_ALLREDUCE_RMSNORM_TP4_SINGLETON_ROWS = 64
-FUSED_ALLREDUCE_RMSNORM_TP4_POLICY = "h2048-row64-table-v3"
 
 # Normalize the accepted short and resolver model-family spellings.
 FUSED_ALLREDUCE_RMSNORM_MODEL_FAMILY = "qwen3.5_3.6"
-_MODEL_FAMILY_ALIASES = frozenset({"qwen3.5", "qwen3.5_3.6"})
 
 # ``native_rows`` routes exact shapes to native CAR. ``fused_compile_max_rows``
 # bounds the Inductor bucket that may use fusion. The platform partitions
@@ -326,3 +322,39 @@ def fused_allreduce_rmsnorm_compile_reject_reason(
 def can_use_fused_allreduce_rmsnorm(**kwargs: Any) -> bool:
     """Return whether the shared contract allows the fused operator."""
     return fused_allreduce_rmsnorm_compile_reject_reason(**kwargs) is None
+
+
+def car_rmsnorm_default_on(vllm_config: Any) -> bool:
+    """Return whether the contract enables CAR-RMSNorm by default.
+
+    This is the single definition of the default-on rule. The platform writes
+    the resolved value into ``pass_config``; every later reader consumes that
+    settled value rather than re-deriving the predicate and drifting from it.
+    """
+    if int(getattr(vllm_config, "optimization_level", 0) or 0) < 2:
+        return False
+    model_config = getattr(vllm_config, "model_config", None)
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    get_hidden_size = getattr(model_config, "get_hidden_size", None)
+    hidden_size = get_hidden_size() if callable(get_hidden_size) else None
+    return can_enable_fused_allreduce_rmsnorm(
+        tp_size=getattr(parallel_config, "tensor_parallel_size", None),
+        pp_size=getattr(parallel_config, "pipeline_parallel_size", None),
+        dtype=getattr(model_config, "dtype", None),
+        hidden_size=hidden_size,
+        model_family=infer_car_rmsnorm_model_family(vllm_config),
+    )
+
+
+def resolve_car_rmsnorm_enabled(vllm_config: Any) -> bool:
+    """Return the effective CAR-RMSNorm pass value for ``vllm_config``.
+
+    An explicit ``pass_config.fuse_allreduce_rms`` setting stays authoritative;
+    only an unset value falls back to the contract default.
+    """
+    compilation_config = getattr(vllm_config, "compilation_config", None)
+    pass_config = getattr(compilation_config, "pass_config", None)
+    pass_value = getattr(pass_config, "fuse_allreduce_rms", None)
+    if pass_value is not None:
+        return pass_value is True
+    return car_rmsnorm_default_on(vllm_config)

@@ -12,8 +12,7 @@ from vllm_musa.optimization_contract import (
     bind_optimization_contract,
 )
 from vllm_musa.optimization_contract.car_rmsnorm import (
-    can_enable_fused_allreduce_rmsnorm,
-    infer_car_rmsnorm_model_family,
+    resolve_car_rmsnorm_enabled,
 )
 from vllm_musa.utils.environ import envs
 
@@ -39,30 +38,16 @@ def _can_use_musa_jit_rmsnorm(
 
 
 def _car_rmsnorm_ir_fusion_enabled(config=None) -> bool:
-    """Keep effective Gemma weights visible to the enabled CAR fusion pass."""
+    """Keep effective Gemma weights visible to the enabled CAR fusion pass.
+
+    The default-on rule lives in the contract; this reads the settled value so
+    the layer cannot disagree with the platform's pass default.
+    """
     if config is None:
         config = get_current_vllm_config_or_none()
     if config is None:
         return False
-    compilation_config = getattr(config, "compilation_config", None)
-    pass_config = getattr(compilation_config, "pass_config", None)
-    pass_value = getattr(pass_config, "fuse_allreduce_rms", None)
-    if pass_value is not None:
-        return pass_value is True
-    if int(getattr(config, "optimization_level", 0) or 0) < 2:
-        return False
-
-    model_config = getattr(config, "model_config", None)
-    parallel_config = getattr(config, "parallel_config", None)
-    get_hidden_size = getattr(model_config, "get_hidden_size", None)
-    hidden_size = get_hidden_size() if callable(get_hidden_size) else None
-    return can_enable_fused_allreduce_rmsnorm(
-        tp_size=getattr(parallel_config, "tensor_parallel_size", None),
-        pp_size=getattr(parallel_config, "pipeline_parallel_size", None),
-        dtype=getattr(model_config, "dtype", None),
-        hidden_size=hidden_size,
-        model_family=infer_car_rmsnorm_model_family(config),
-    )
+    return resolve_car_rmsnorm_enabled(config)
 
 
 @RMSNorm.register_oot

@@ -43,6 +43,7 @@ from vllm_musa.optimization_contract import (
 from vllm_musa.optimization_contract.car_rmsnorm import (
     fused_allreduce_rmsnorm_compile_endpoints,
     can_enable_fused_allreduce_rmsnorm,
+    car_rmsnorm_default_on,
     infer_car_rmsnorm_model_family,
 )
 from vllm_musa.tuning import FUSED_ADD_RMSNORM_MIN_ROWS
@@ -525,32 +526,23 @@ class MUSAPlatformBase(Platform):
 
         # Install the pass default only when the shared contract accepts the
         # serving configuration. An explicit pass setting remains authoritative.
+        # The rule itself lives in the contract, so no second copy can drift.
         pass_config = getattr(compilation_config, "pass_config", None)
-        model_config = getattr(vllm_config, "model_config", None)
-        parallel_config = getattr(vllm_config, "parallel_config", None)
-        get_hidden_size = getattr(model_config, "get_hidden_size", None)
-        hidden_size = get_hidden_size() if callable(get_hidden_size) else None
-        model_family = infer_car_rmsnorm_model_family(vllm_config)
-
         if (
             pass_config is not None
             and getattr(pass_config, "fuse_allreduce_rms", None) is None
-            and int(getattr(vllm_config, "optimization_level", 0) or 0) >= 2
-            and can_enable_fused_allreduce_rmsnorm(
-                tp_size=getattr(parallel_config, "tensor_parallel_size", None),
-                pp_size=getattr(parallel_config, "pipeline_parallel_size", None),
-                dtype=getattr(model_config, "dtype", None),
-                hidden_size=hidden_size,
-                model_family=model_family,
-            )
+            and car_rmsnorm_default_on(vllm_config)
         ):
+            parallel_config = getattr(vllm_config, "parallel_config", None)
+            model_config = getattr(vllm_config, "model_config", None)
+            get_hidden_size = getattr(model_config, "get_hidden_size", None)
             pass_config.fuse_allreduce_rms = True
             logger.info(
                 "Enabling MUSA CAR-RMSNorm from the shared optimization contract "
                 "(tp=%s hidden=%s family=%s)",
                 getattr(parallel_config, "tensor_parallel_size", None),
-                hidden_size,
-                model_family,
+                get_hidden_size() if callable(get_hidden_size) else None,
+                infer_car_rmsnorm_model_family(vllm_config),
             )
 
         # torch 2.11's Inductor tiling heuristic turns Qwen3-VL's decode-time
