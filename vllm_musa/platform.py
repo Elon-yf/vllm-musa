@@ -533,16 +533,9 @@ class MUSAPlatformBase(Platform):
             and getattr(pass_config, "fuse_allreduce_rms", None) is None
             and car_rmsnorm_default_on(vllm_config)
         ):
-            parallel_config = getattr(vllm_config, "parallel_config", None)
-            model_config = getattr(vllm_config, "model_config", None)
-            get_hidden_size = getattr(model_config, "get_hidden_size", None)
             pass_config.fuse_allreduce_rms = True
             logger.info(
-                "Enabling MUSA CAR-RMSNorm from the shared optimization contract "
-                "(tp=%s hidden=%s family=%s)",
-                getattr(parallel_config, "tensor_parallel_size", None),
-                get_hidden_size() if callable(get_hidden_size) else None,
-                infer_car_rmsnorm_model_family(vllm_config),
+                "Enabling MUSA CAR-RMSNorm from the shared optimization contract"
             )
 
         # torch 2.11's Inductor tiling heuristic turns Qwen3-VL's decode-time
