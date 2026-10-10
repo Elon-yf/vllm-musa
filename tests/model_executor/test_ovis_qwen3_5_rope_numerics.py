@@ -32,6 +32,8 @@ def _vllm_config():
 
 def _adapter() -> MusaVisionApplyRotaryEmb:
     return MusaVisionApplyRotaryEmb(
+        is_neox_style=True,
+        enable_fp32_compute=False,
         inplace=True,
         flatten=True,
         positions_cache=MusaVisionRotaryPositions(),
