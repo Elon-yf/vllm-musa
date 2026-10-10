@@ -62,6 +62,7 @@ CAR_RMSNORM_POLICY_TABLE: tuple[dict[str, Any], ...] = (
 _VALID_MODEL_FAMILIES = frozenset({"qwen3.5", "qwen3.5_3.6"})
 _VALID_PHASES = frozenset({"decode", "prefill", "mixed"})
 _VALID_PATHS = frozenset({"raw", "no_raw", "registered", "staging"})
+_UNSET = object()
 
 
 def _concrete_int(value: Any) -> bool:
@@ -122,6 +123,43 @@ def infer_car_rmsnorm_model_family(vllm_config: Any) -> str | None:
     except (AttributeError, ImportError, RuntimeError, TypeError, ValueError):
         return None
     return _canonical_model_family(family)
+
+
+def current_car_rmsnorm_compile_range() -> Any | None:
+    """Return the active Inductor compile range, or ``None`` for eager dispatch."""
+    try:
+        from vllm.compilation.passes.inductor_pass import get_pass_context
+
+        return get_pass_context().compile_range
+    except (AssertionError, AttributeError, ImportError, RuntimeError):
+        return None
+
+
+def current_car_rmsnorm_metadata() -> tuple[str | None, bool | None, int | None] | None:
+    """Family, quantization and hidden size for the active serving config.
+
+    These are not on a model signature: at dispatch time the config is only
+    reachable through the global accessor, and a plugin cannot assume one is
+    bound. ``None`` means "no active config", not "not quantized", so each
+    caller keeps its own fail-closed direction instead of inheriting one.
+    """
+    try:
+        from vllm.config import get_current_vllm_config_or_none
+
+        vllm_config = get_current_vllm_config_or_none()
+    except (AssertionError, ImportError, RuntimeError):
+        return None
+    if vllm_config is None:
+        return None
+    quant_config = getattr(vllm_config, "quant_config", _UNSET)
+    quantized = None if quant_config is _UNSET else quant_config is not None
+    model_config = getattr(vllm_config, "model_config", None)
+    get_hidden_size = getattr(model_config, "get_hidden_size", None)
+    try:
+        hidden_size = int(get_hidden_size()) if callable(get_hidden_size) else None
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        hidden_size = None
+    return infer_car_rmsnorm_model_family(vllm_config), quantized, hidden_size
 
 
 def _policy_rule(

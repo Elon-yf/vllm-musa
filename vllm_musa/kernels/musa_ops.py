@@ -31,7 +31,8 @@ from vllm.platforms import current_platform
 
 from vllm_musa.optimization_contract.car_rmsnorm import (
     can_use_fused_allreduce_rmsnorm,
-    infer_car_rmsnorm_model_family,
+    current_car_rmsnorm_compile_range,
+    current_car_rmsnorm_metadata,
 )
 from vllm_musa.tuning import FUSED_ADD_RMSNORM_MIN_ROWS
 
@@ -49,16 +50,6 @@ def _has_C_rms_norm() -> bool:
 
 
 MUSA_RMS_NORM_SUPPORTED = current_platform.is_musa() and _has_C_rms_norm()
-
-
-def _fused_add_rmsnorm_compile_range() -> object | None:
-    """Return the active vLLM compile range, or ``None`` for eager dispatch."""
-    try:
-        from vllm.compilation.passes.inductor_pass import get_pass_context
-
-        return get_pass_context().compile_range
-    except (AssertionError, AttributeError, ImportError, RuntimeError):
-        return None
 
 
 def _fused_add_rmsnorm_tp_size() -> int | None:
@@ -84,18 +75,10 @@ def _fused_add_rmsnorm_contract_metadata() -> tuple[str | None, bool | None] | N
     bound, missing quantization/family metadata is represented as ``None`` so
     the shared contract fails closed for target hidden sizes.
     """
-    try:
-        from vllm.config import get_current_vllm_config_or_none
-
-        config = get_current_vllm_config_or_none()
-    except (AssertionError, ImportError, RuntimeError):
+    metadata = current_car_rmsnorm_metadata()
+    if metadata is None:
         return None
-    if config is None:
-        return None
-    family = infer_car_rmsnorm_model_family(config)
-    marker = object()
-    quant_config = getattr(config, "quant_config", marker)
-    quantized = None if quant_config is marker else quant_config is not None
+    family, quantized, _ = metadata
     return family, quantized
 
 
@@ -121,7 +104,7 @@ def _can_use_fused_add_rmsnorm_under_contract(
         # A symbolic hidden dimension cannot be proven to be outside a target
         # signature; fail closed during compilation.
         return False
-    compile_range = _fused_add_rmsnorm_compile_range()
+    compile_range = current_car_rmsnorm_compile_range()
     rows = None
     if compile_range is None:
         try:

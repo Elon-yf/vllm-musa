@@ -695,8 +695,12 @@ def test_current_config_metadata_wires_registered_input_policy_into_init(
         "get_current_vllm_config_or_none",
         lambda: vllm_config,
     )
+    # The family now comes from the contract's shared metadata accessor, so the
+    # stub belongs on the contract module rather than on the communicator.
+    from vllm_musa.optimization_contract import car_rmsnorm as car_contract
+
     monkeypatch.setattr(
-        custom_ar,
+        car_contract,
         "infer_car_rmsnorm_model_family",
         lambda config: model_family,
     )

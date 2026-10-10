@@ -21,7 +21,7 @@ graphs and residual output for residual graphs.
 from __future__ import annotations
 
 import operator
-from typing import Any
+from typing import Any, Callable
 
 import torch
 import torch._inductor.pattern_matcher as pm
@@ -49,6 +49,7 @@ from vllm_musa.fused_allreduce_rmsnorm_ops import (
 from vllm_musa.optimization_contract.car_rmsnorm import (
     FUSED_ALLREDUCE_RMSNORM_POLICY_VERSION,
     can_use_fused_allreduce_rmsnorm,
+    current_car_rmsnorm_compile_range,
     fused_allreduce_rmsnorm_compile_reject_reason,
     infer_car_rmsnorm_model_family,
 )
@@ -56,14 +57,6 @@ logger = init_logger(__name__)
 _MISSING = object()
 
 
-def _current_compile_range() -> Any | None:
-    """Return the active Inductor compile range without breaking eager mode."""
-    try:
-        from vllm.compilation.passes.inductor_pass import get_pass_context
-
-        return get_pass_context().compile_range
-    except (AssertionError, AttributeError, ImportError, RuntimeError):
-        return None
 
 
 def _can_fuse_allreduce_rmsnorm_match(
@@ -173,7 +166,7 @@ def _can_fuse_allreduce_rmsnorm_match(
                 hidden_size=actual_hidden,
                 dtype=x_dtype,
                 rows=rows,
-                compile_range=_current_compile_range(),
+                compile_range=current_car_rmsnorm_compile_range(),
                 raw_needed=None,
                 registered=None,
                 model_family=model_family,
@@ -183,6 +176,21 @@ def _can_fuse_allreduce_rmsnorm_match(
         return supported
     # A malformed/unrecognized match must never trigger a rewrite.
     return False
+
+
+def _extra_check_for(pattern: Any) -> Callable[[Any], bool]:
+    """Bind the CAR-RMSNorm predicate to one pattern instance.
+
+    Six replacement registrations share this check. Spelling its four arguments
+    out at every site let them drift apart, so they are written once here.
+    """
+    return lambda match: _can_fuse_allreduce_rmsnorm_match(
+        match,
+        tp_size=pattern.tp_size,
+        hidden_dim=pattern.hidden_dim,
+        quantized=pattern.quantized,
+        model_family=pattern.model_family,
+    )
 
 
 class MusaAllReduceRMSNormPattern:
@@ -244,13 +252,7 @@ class MusaAllReduceRMSNormPattern:
             self.get_inputs(),
             pm.fwd_only,
             pm_pass,
-            extra_check=lambda match: _can_fuse_allreduce_rmsnorm_match(
-                match,
-                tp_size=self.tp_size,
-                hidden_dim=self.hidden_dim,
-                quantized=self.quantized,
-                model_family=self.model_family,
-            ),
+            extra_check=_extra_check_for(self),
         )
 
 
@@ -365,13 +367,7 @@ class MusaAllReduceResidualRMSNormPattern:
             fused_add_inputs,
             pm.fwd_only,
             pm_pass,
-            extra_check=lambda match: _can_fuse_allreduce_rmsnorm_match(
-                match,
-                tp_size=self.tp_size,
-                hidden_dim=self.hidden_dim,
-                quantized=self.quantized,
-                model_family=self.model_family,
-            ),
+            extra_check=_extra_check_for(self),
         )
 
         pm.register_replacement(
@@ -380,13 +376,7 @@ class MusaAllReduceResidualRMSNormPattern:
             fused_add_inputs,
             pm.fwd_only,
             pm_pass,
-            extra_check=lambda match: _can_fuse_allreduce_rmsnorm_match(
-                match,
-                tp_size=self.tp_size,
-                hidden_dim=self.hidden_dim,
-                quantized=self.quantized,
-                model_family=self.model_family,
-            ),
+            extra_check=_extra_check_for(self),
         )
 
         pm.register_replacement(
@@ -395,13 +385,7 @@ class MusaAllReduceResidualRMSNormPattern:
             self.get_inputs(),
             pm.fwd_only,
             pm_pass,
-            extra_check=lambda match: _can_fuse_allreduce_rmsnorm_match(
-                match,
-                tp_size=self.tp_size,
-                hidden_dim=self.hidden_dim,
-                quantized=self.quantized,
-                model_family=self.model_family,
-            ),
+            extra_check=_extra_check_for(self),
         )
 
         pm.register_replacement(
@@ -410,13 +394,7 @@ class MusaAllReduceResidualRMSNormPattern:
             self.get_inputs(),
             pm.fwd_only,
             pm_pass,
-            extra_check=lambda match: _can_fuse_allreduce_rmsnorm_match(
-                match,
-                tp_size=self.tp_size,
-                hidden_dim=self.hidden_dim,
-                quantized=self.quantized,
-                model_family=self.model_family,
-            ),
+            extra_check=_extra_check_for(self),
         )
 
         # Keep the full raw-car ABI last for copy-bearing candidates that still
@@ -427,13 +405,7 @@ class MusaAllReduceResidualRMSNormPattern:
             self.get_inputs(),
             pm.fwd_only,
             pm_pass,
-            extra_check=lambda match: _can_fuse_allreduce_rmsnorm_match(
-                match,
-                tp_size=self.tp_size,
-                hidden_dim=self.hidden_dim,
-                quantized=self.quantized,
-                model_family=self.model_family,
-            ),
+            extra_check=_extra_check_for(self),
         )
 
 
@@ -886,7 +858,7 @@ class MusaAllReduceRMSNormFusionPass(VllmPatternMatcherPass):
             hidden_size=self.hidden_dim,
             dtype=input_value.dtype,
             rows=rows,
-            compile_range=_current_compile_range(),
+            compile_range=current_car_rmsnorm_compile_range(),
             raw_needed=raw_needed,
             registered=None,
             model_family=getattr(self, "model_family", None),
@@ -1319,7 +1291,7 @@ class MusaAllReduceRMSNormFusionPass(VllmPatternMatcherPass):
     def __call__(self, graph: fx.Graph) -> None:
         if self.disabled:
             return
-        compile_range = _current_compile_range()
+        compile_range = current_car_rmsnorm_compile_range()
         range_repr = (
             f"({compile_range.start}, {compile_range.end})"
             if compile_range is not None
