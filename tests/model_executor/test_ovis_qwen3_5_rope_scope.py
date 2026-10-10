@@ -8,6 +8,9 @@ pytest.importorskip("torchada")
 import torch  # noqa: E402
 
 from vllm.config import VllmConfig, set_current_vllm_config  # noqa: E402
+from vllm.model_executor.layers.rotary_embedding.common import (  # noqa: E402
+    ApplyRotaryEmb,
+)
 from vllm_musa.optimization_contract.qwen import (  # noqa: E402
     install_qwen35_vision_rotary,
 )
@@ -37,7 +40,11 @@ def _model_config(dtype=torch.bfloat16) -> SimpleNamespace:
 
 def _visual(blocks=12) -> SimpleNamespace:
     def block() -> SimpleNamespace:
-        rotary = SimpleNamespace(is_neox_style=True, enable_fp32_compute=False)
+        rotary = ApplyRotaryEmb(
+            enforce_enable=True,
+            is_neox_style=False,
+            enable_fp32_compute=True,
+        )
         return SimpleNamespace(attn=SimpleNamespace(apply_rotary_emb=rotary))
 
     return SimpleNamespace(blocks=[block() for _ in range(blocks)])
@@ -56,6 +63,8 @@ def test_installs_twelve_visual_layers_with_shared_graph_positions() -> None:
     assert all(isinstance(layer, MusaVisionApplyRotaryEmb) for layer in layers)
     assert all(layer.positions_cache is layers[0].positions_cache for layer in layers)
     assert layers[0].required_bf16_neox_shape == (64, 32)
+    assert all(layer.is_neox_style is False for layer in layers)
+    assert all(layer.enable_fp32_compute is True for layer in layers)
 
 
 def test_wrong_block_count_preserves_all_original_layers() -> None:
@@ -98,4 +107,3 @@ def test_upstream_hook_respects_contract_mismatch(patched_hook, monkeypatch) -> 
     original = visual.blocks[0].attn.apply_rotary_emb
     patched_hook(_model_config(torch.float16), visual)
     assert visual.blocks[0].attn.apply_rotary_emb is original
-
