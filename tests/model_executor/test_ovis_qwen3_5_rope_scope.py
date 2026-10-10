@@ -48,16 +48,15 @@ def _visual() -> SimpleNamespace:
 
 
 @pytest.fixture
-def ovis_hook(monkeypatch: pytest.MonkeyPatch):
+def ovis_hook():
     module = pytest.importorskip("vllm.model_executor.models.qwen3_5")
     if not hasattr(module, "_enable_musa_ovis_rope"):
         pytest.skip("Ovis patch is not applied")
-    import vllm.platforms
     from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.platforms import current_platform
 
-    monkeypatch.setattr(
-        vllm.platforms, "current_platform", SimpleNamespace(is_musa=lambda: True)
-    )
+    if not current_platform.is_musa():
+        pytest.skip("requires MUSA platform")
     with set_current_vllm_config(VllmConfig()):
         yield module._enable_musa_ovis_rope
 
