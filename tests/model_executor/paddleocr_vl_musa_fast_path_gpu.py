@@ -5,7 +5,7 @@ import math
 import torchada  # noqa: F401
 import torch
 
-from vllm_musa.model_executor.layers.rotary_embedding.base import (
+from vllm_musa.optimization_contract.rotary import (
     MusaVisionApplyRotaryEmb,
 )
 
@@ -43,7 +43,9 @@ def main() -> None:
         base = torch.randn((2, 4888, 72, 16), device=device, dtype=dtype)
         x = base.permute(0, 1, 3, 2)
         before = x.clone()
-        got = MusaVisionApplyRotaryEmb(enable_fp32_compute=True)(x, cos, sin)
+        got = MusaVisionApplyRotaryEmb(
+            is_neox_style=True, enable_fp32_compute=True
+        )(x, cos, sin)
         reference, bound = _reference_and_bound(
             x.detach().cpu(), cos.detach().cpu(), sin.detach().cpu()
         )

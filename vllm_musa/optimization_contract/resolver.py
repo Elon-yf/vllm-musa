@@ -136,6 +136,38 @@ def _gdn_conv_signature(text_config: Any) -> tuple[int | None, int | None]:
     return width, 2 * key_heads * key_dim + value_heads * value_dim
 
 
+def _paddleocr_vl_rotary_geometry(model_config: Any) -> tuple[object, ...] | None:
+    """Read the raw HF geometry, not vLLM's normalized text config."""
+    hf_config = getattr(model_config, "hf_config", None)
+    if getattr(hf_config, "model_type", None) != "paddleocr_vl":
+        return None
+    vision = getattr(hf_config, "vision_config", None)
+    text = getattr(hf_config, "text_config", hf_config)
+    section = None
+    for rope in (
+        getattr(text, "rope_parameters", None),
+        getattr(text, "rope_scaling", None),
+        getattr(hf_config, "rope_parameters", None),
+        getattr(hf_config, "rope_scaling", None),
+    ):
+        if isinstance(rope, dict) and rope.get("mrope_section") is not None:
+            value = rope["mrope_section"]
+            section = tuple(value) if isinstance(value, (list, tuple)) else None
+            break
+    return (
+        getattr(vision, "hidden_size", None),
+        getattr(vision, "num_hidden_layers", None),
+        getattr(vision, "depth", None),
+        getattr(vision, "num_attention_heads", None),
+        getattr(vision, "patch_size", None),
+        getattr(vision, "image_size", None),
+        getattr(text, "hidden_size", None),
+        getattr(text, "num_attention_heads", None),
+        getattr(text, "num_key_value_heads", None),
+        section,
+    )
+
+
 def _model_signature(model_config: Any, vllm_config: Any | None) -> ModelSignature:
     text_config = _text_config(model_config)
     gdn_width, gdn_dim = _gdn_conv_signature(text_config)
@@ -208,6 +240,7 @@ def _model_signature(model_config: Any, vllm_config: Any | None) -> ModelSignatu
         index_topk=_int_attr(text_config, "index_topk"),
         quant_block_shape=quant_block_shape,
         is_hybrid=is_hybrid if isinstance(is_hybrid, bool) else None,
+        paddleocr_vl_rotary_geometry=_paddleocr_vl_rotary_geometry(model_config),
     )
 
 

@@ -3,16 +3,25 @@
 from types import SimpleNamespace
 
 import pytest
-
-pytest.importorskip("torchada")
 import torch
+
+from vllm_musa.optimization_contract import (
+    ModelFamily,
+    OptimizationFeature,
+    resolve_optimization_contract,
+)
 
 
 @pytest.fixture
 def paddle_gate(monkeypatch):
-    module = pytest.importorskip("vllm.model_executor.models.paddleocr_vl")
     monkeypatch.setattr(torch.version, "musa", "5.2.0", raising=False)
-    return module._musa_paddle_rotary_enabled
+
+    def enabled(config, *, hf_text_config=None):
+        model_config = SimpleNamespace(hf_config=config, hf_text_config=hf_text_config)
+        contract = resolve_optimization_contract(model_config=model_config)
+        return contract.prefers(OptimizationFeature.PADDLEOCR_VL_ROTARY)
+
+    return enabled
 
 
 def _config():
@@ -36,6 +45,10 @@ def _config():
 
 def test_exact_geometry_selects_paddle_path(paddle_gate):
     assert paddle_gate(_config())
+    contract = resolve_optimization_contract(
+        model_config=SimpleNamespace(hf_config=_config())
+    )
+    assert contract.model.family is ModelFamily.PADDLEOCR_VL
 
 
 @pytest.mark.parametrize(
@@ -86,3 +99,7 @@ def test_rope_scaling_fallback(paddle_gate):
     assert paddle_gate(config)
     config.text_config.rope_parameters = {"mrope_section": [16, 24, 23]}
     assert not paddle_gate(config)
+
+
+def test_gate_reads_raw_hf_config_even_if_normalized_text_differs(paddle_gate):
+    assert paddle_gate(_config(), hf_text_config=SimpleNamespace(hidden_size=2048))

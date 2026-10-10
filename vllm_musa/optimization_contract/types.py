@@ -8,6 +8,7 @@ class ModelFamily(str, Enum):
     UNKNOWN = "unknown"
     DEEPSEEK_V4 = "deepseek_v4"
     GLM5 = "glm5"
+    PADDLEOCR_VL = "paddleocr_vl"
     QWEN2 = "qwen2"
     QWEN3 = "qwen3"
     QWEN35_36 = "qwen3.5_3.6"
@@ -67,6 +68,7 @@ class OptimizationFeature(str, Enum):
     QWEN35_INTERLEAVED_MROPE_QK = "qwen3.5_3.6.interleaved_mrope_qk"
     GLM5_SPARSE_MLA_MATE_PREFILL = "glm5.sparse_mla_mate_prefill"
     GLM5_EAGER_MCCL_INIT = "glm5.eager_mccl_init"
+    PADDLEOCR_VL_ROTARY = "paddleocr_vl.rotary"
     HYBRID_SEPARATE_MAMBA_POOL = "hybrid.separate_mamba_pool"
 
 
@@ -103,6 +105,7 @@ class ModelSignature:
     index_topk: int | None = None
     quant_block_shape: tuple[int, ...] | None = None
     is_hybrid: bool | None = None
+    paddleocr_vl_rotary_geometry: tuple[object, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
