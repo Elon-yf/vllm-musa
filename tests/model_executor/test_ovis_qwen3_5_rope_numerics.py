@@ -12,14 +12,24 @@ import torch  # noqa: E402
 from vllm.model_executor.layers.rotary_embedding.common import (  # noqa: E402
     ApplyRotaryEmb,
 )
-from vllm_musa.model_executor.models.ovis_qwen3_5_rope import (  # noqa: E402
-    OvisVisionApplyRotaryEmb,
+from vllm_musa.model_executor.layers.rotary_embedding.base import (  # noqa: E402
+    MusaVisionApplyRotaryEmb,
+    MusaVisionRotaryPositions,
 )
 
 pytestmark = pytest.mark.skipif(
     not hasattr(torch, "musa") or not torch.musa.is_available(),
     reason="requires a MUSA device",
 )
+
+
+def _adapter() -> MusaVisionApplyRotaryEmb:
+    return MusaVisionApplyRotaryEmb(
+        inplace=True,
+        flatten=True,
+        positions_cache=MusaVisionRotaryPositions(),
+        required_bf16_neox_shape=(64, 32),
+    )
 
 
 def _inputs(
@@ -83,7 +93,7 @@ def test_ovis_packed_qk_matches_reference_with_bf16_roundoff(
 ) -> None:
     x, cos, sin = _inputs(leading, seq, cancellation)
     original = x.clone()
-    candidate = OvisVisionApplyRotaryEmb()(x.clone(), cos, sin)
+    candidate = _adapter()(x.clone(), cos, sin)
     torch.musa.synchronize()
     assert torch.equal(x, original)
     _assert_bounded_rounding(x, cos, sin, candidate)
@@ -96,7 +106,7 @@ def test_ovis_real_shape_cardinal_rotation_is_exact(quarter_turn: bool) -> None:
     cos.fill_(0 if quarter_turn else 1)
     sin.fill_(1 if quarter_turn else 0)
     reference = ApplyRotaryEmb.forward_static(x.clone(), cos, sin)
-    candidate = OvisVisionApplyRotaryEmb()(x.clone(), cos, sin)
+    candidate = _adapter()(x.clone(), cos, sin)
     torch.musa.synchronize()
     assert torch.equal(candidate, reference)
 
@@ -104,7 +114,7 @@ def test_ovis_real_shape_cardinal_rotation_is_exact(quarter_turn: bool) -> None:
 @torch.inference_mode()
 def test_ovis_graph_replay_survives_another_eager_shape() -> None:
     x, cos, sin = _inputs(2, 257)
-    adapter = OvisVisionApplyRotaryEmb()
+    adapter = _adapter()
     query = x.clone()
     stream = torch.musa.Stream()
     stream.wait_stream(torch.musa.current_stream())

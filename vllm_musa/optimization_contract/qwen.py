@@ -279,28 +279,6 @@ def _qwen35_moe_prefill_preferred(
     )
 
 
-def _ovis_qwen35_vision_rotary_preferred(model: ModelSignature) -> bool:
-    # Use the raw HF config fields tested by the original model-local gate.
-    # The general Qwen signature may prefer vLLM's flattened hf_text_config.
-    return (
-        model.family is ModelFamily.QWEN35_36
-        and model.hf_config_architectures == ("Qwen3_5ForConditionalGeneration",)
-        and model.hf_config_model_type == "qwen3_5"
-        and model.hf_config_text_model_type == "qwen3_5_text"
-        and model.hf_config_text_geometry == (1024, 3584, 24, 8, 2, 256, 248320)
-        and (
-            model.vision_config_hidden_size,
-            model.vision_depth,
-            model.vision_config_num_heads,
-            model.vision_out_hidden_size,
-            model.vision_patch_size,
-            model.vision_spatial_merge_size,
-            model.vision_temporal_patch_size,
-        ) == (768, 12, 12, 1024, 16, 2, 2)
-        and model.config_dtype_literal in ("bfloat16", "torch.bfloat16")
-    )
-
-
 def resolve_qwen_contract(
     model: ModelSignature,
     execution: ExecutionSignature,
@@ -379,8 +357,6 @@ def resolve_qwen_contract(
             preferred.add(OptimizationFeature.QWEN35_SHARED_EXPERT_FOLD)
         if model.dtype == "bfloat16":
             preferred.add(OptimizationFeature.QWEN35_INTERLEAVED_MROPE_QK)
-        if _ovis_qwen35_vision_rotary_preferred(model):
-            preferred.add(OptimizationFeature.OVIS_QWEN35_VISION_ROTARY)
 
     if model.vocab_size in (151936, 152064, 248320):
         if OptimizationFeature.QWEN_V2_SAMPLING in preferred:

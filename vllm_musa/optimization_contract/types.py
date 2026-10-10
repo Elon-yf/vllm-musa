@@ -65,7 +65,6 @@ class OptimizationFeature(str, Enum):
     QWEN_TP4_SHARDED_GUMBEL = "qwen.tp4_sharded_gumbel"
     QWEN35_SHARED_EXPERT_FOLD = "qwen3.5_3.6.shared_expert_fold"
     QWEN35_INTERLEAVED_MROPE_QK = "qwen3.5_3.6.interleaved_mrope_qk"
-    OVIS_QWEN35_VISION_ROTARY = "ovis.qwen3.5_vision_rotary"
     GLM5_SPARSE_MLA_MATE_PREFILL = "glm5.sparse_mla_mate_prefill"
     GLM5_EAGER_MCCL_INIT = "glm5.eager_mccl_init"
     HYBRID_SEPARATE_MAMBA_POOL = "hybrid.separate_mamba_pool"
@@ -104,24 +103,6 @@ class ModelSignature:
     index_topk: int | None = None
     quant_block_shape: tuple[int, ...] | None = None
     is_hybrid: bool | None = None
-    hf_config_architectures: tuple[str, ...] = ()
-    hf_config_model_type: str | None = None
-    hf_config_text_model_type: str | None = None
-    hf_config_text_geometry: tuple[int | None, ...] | None = None
-    config_dtype_literal: str | None = None
-    vision_hidden_size: int | None = None
-    vision_embed_dim: int | None = None
-    vision_config_hidden_size: int | None = None
-    vision_depth: int | None = None
-    vision_num_hidden_layers: int | None = None
-    vision_num_attention_heads: int | None = None
-    vision_config_num_heads: int | None = None
-    vision_head_dim: int | None = None
-    vision_patch_size: int | None = None
-    vision_image_size: int | None = None
-    vision_out_hidden_size: int | None = None
-    vision_spatial_merge_size: int | None = None
-    vision_temporal_patch_size: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
