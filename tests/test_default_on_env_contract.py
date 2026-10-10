@@ -61,6 +61,7 @@ def test_car_rmsnorm_uses_standard_pass_config_without_a_process_switch() -> Non
     platform = _source("vllm_musa/platform.py")
     fusion = _source("vllm_musa/_inductor/musa_allreduce_rms_fusion.py")
     layernorm = _source("vllm_musa/model_executor/layers/layernorm.py")
+    contract = _source("vllm_musa/optimization_contract/car_rmsnorm.py")
     communicator = _source(
         "vllm_musa/distributed/device_communicators/"
         "musa_jit_custom_all_reduce.py"
@@ -69,7 +70,10 @@ def test_car_rmsnorm_uses_standard_pass_config_without_a_process_switch() -> Non
     assert 'getattr(pass_config, "fuse_allreduce_rms", None) is None' in platform
     assert 'getattr(pass_config, "fuse_allreduce_rms", None) is not True' in platform
     assert 'getattr(self.pass_config, "fuse_allreduce_rms", None) is not True' in fusion
-    assert 'pass_value = getattr(pass_config, "fuse_allreduce_rms", None)' in layernorm
+    # The layer no longer reads the switch itself; it asks the contract, which
+    # owns the single default-on rule and the only pass-config read.
+    assert "resolve_car_rmsnorm_enabled(config)" in layernorm
+    assert 'pass_value = getattr(pass_config, "fuse_allreduce_rms", None)' in contract
     assert "_car_rmsnorm_pass_enabled_for_current_model()" in communicator
     assert 'getattr(pass_config, "fuse_allreduce_rms", None) is True' in communicator
     assert "CAR-RMSNorm disabled by compilation pass config" in communicator

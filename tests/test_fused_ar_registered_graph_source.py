@@ -525,9 +525,12 @@ def test_qwen_fused_add_provider_shape_is_registered() -> None:
 def test_gemma_residual_path_materializes_effective_weight_for_car() -> None:
     source = LAYERNORM.read_text()
     assert "def _car_rmsnorm_ir_fusion_enabled(config=None)" in source
+    # The layer holds no default-on rule of its own: it must not touch the pass
+    # config nor re-derive capability. Both live in the shared contract.
     assert "pass_config.fuse_allreduce_rms" not in source
-    assert 'pass_value = getattr(pass_config, "fuse_allreduce_rms", None)' in source
-    assert "can_enable_fused_allreduce_rmsnorm(" in source
+    assert "can_enable_fused_allreduce_rmsnorm(" not in source
+    assert "infer_car_rmsnorm_model_family" not in source
+    assert "resolve_car_rmsnorm_enabled(" in source
     gemma_source = _python_function_source(source, "forward_oot", "MusaGemmaRMSNorm")
     assert "getattr(self, \"_car_rmsnorm_ir_enabled\", False)" in gemma_source
     assert "_car_rmsnorm_ir_fusion_enabled()" in gemma_source
