@@ -53,11 +53,13 @@ def ovis_hook(monkeypatch: pytest.MonkeyPatch):
     if not hasattr(module, "_enable_musa_ovis_rope"):
         pytest.skip("Ovis patch is not applied")
     import vllm.platforms
+    from vllm.config import VllmConfig, set_current_vllm_config
 
     monkeypatch.setattr(
         vllm.platforms, "current_platform", SimpleNamespace(is_musa=lambda: True)
     )
-    return module._enable_musa_ovis_rope
+    with set_current_vllm_config(VllmConfig()):
+        yield module._enable_musa_ovis_rope
 
 
 def test_exact_ovis_geometry_installs_only_visual_rope(ovis_hook) -> None:

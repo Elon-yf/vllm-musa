@@ -9,6 +9,7 @@ pytest.importorskip("torchada")
 
 import torch  # noqa: E402
 
+from vllm.config import VllmConfig, set_current_vllm_config  # noqa: E402
 from vllm.model_executor.layers.rotary_embedding.common import (  # noqa: E402
     ApplyRotaryEmb,
 )
@@ -21,6 +22,12 @@ pytestmark = pytest.mark.skipif(
     not hasattr(torch, "musa") or not torch.musa.is_available(),
     reason="requires a MUSA device",
 )
+
+
+@pytest.fixture(autouse=True)
+def _vllm_config():
+    with set_current_vllm_config(VllmConfig()):
+        yield
 
 
 def _adapter() -> MusaVisionApplyRotaryEmb:
