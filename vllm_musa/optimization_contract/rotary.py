@@ -173,3 +173,36 @@ def install_vision_rotary(
             required_bf16_neox_shape=required_bf16_neox_shape,
         )
     return True
+
+
+def install_mrope_rotary(
+    layers: Iterable[nn.Module],
+    *,
+    mrope_section: tuple[int, ...] | None = None,
+    qk_hidden_sizes: tuple[int, int] | None = None,
+    head_size: int | None = None,
+    rotary_dim: int | None = None,
+    set_neox_style: bool = False,
+) -> int:
+    """Wrap eligible language RoPE modules with the shared MUSA adapter."""
+    installed = 0
+    for layer in layers:
+        attention = getattr(layer, "self_attn", None)
+        rotary = getattr(attention, "rotary_emb", None)
+        if rotary is None:
+            continue
+        if mrope_section is not None and tuple(
+            getattr(rotary, "mrope_section", ()) or ()
+        ) != mrope_section:
+            continue
+        if head_size is not None and getattr(rotary, "head_size", None) != head_size:
+            continue
+        if rotary_dim is not None and getattr(rotary, "rotary_dim", None) != rotary_dim:
+            continue
+        if set_neox_style:
+            rotary.is_neox_style = True
+        attention.rotary_emb = MusaMRotaryEmbedding(
+            rotary, qk_hidden_sizes=qk_hidden_sizes
+        )
+        installed += 1
+    return installed

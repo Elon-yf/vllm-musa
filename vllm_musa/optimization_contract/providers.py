@@ -50,7 +50,7 @@ def install_paddleocr_vl_rotary(
     visual: torch.nn.Module, language_model: torch.nn.Module
 ) -> bool:
     """Install adapters only after the Paddle provider selected this contract."""
-    from .rotary import MusaMRotaryEmbedding, install_vision_rotary
+    from .rotary import install_mrope_rotary, install_vision_rotary
 
     encoder = getattr(getattr(visual, "vision_model", None), "encoder", None)
     layers = getattr(encoder, "layers", ())
@@ -58,12 +58,10 @@ def install_paddleocr_vl_rotary(
         (getattr(layer, "self_attn", None) for layer in layers), expected_blocks=27
     ):
         return False
-    for layer in getattr(getattr(language_model, "model", None), "layers", ()):
-        attention = getattr(layer, "self_attn", None)
-        rotary = getattr(attention, "rotary_emb", None)
-        if rotary is not None:
-            rotary.is_neox_style = True
-            attention.rotary_emb = MusaMRotaryEmbedding(rotary)
+    install_mrope_rotary(
+        getattr(getattr(language_model, "model", None), "layers", ()),
+        set_neox_style=True,
+    )
     return True
 
 
