@@ -4,6 +4,7 @@ from dataclasses import replace
 from typing import Any
 
 from .providers import CONTRACT_PROVIDERS
+from .qwen import matches_mineru_qwen2_vl_config
 from .types import (
     ExecutionSignature,
     ModelFamily,
@@ -208,6 +209,9 @@ def _model_signature(model_config: Any, vllm_config: Any | None) -> ModelSignatu
         index_topk=_int_attr(text_config, "index_topk"),
         quant_block_shape=quant_block_shape,
         is_hybrid=is_hybrid if isinstance(is_hybrid, bool) else None,
+        mineru_qwen2_vl_config_match=matches_mineru_qwen2_vl_config(
+            getattr(model_config, "hf_config", None)
+        ),
     )
 
 

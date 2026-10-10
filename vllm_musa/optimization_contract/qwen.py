@@ -54,6 +54,80 @@ _QWEN35_36_MODEL_TYPES = frozenset(
 )
 
 
+def matches_mineru_qwen2_vl_config(config: object) -> bool:
+    """Match MinerU against its raw Qwen2-VL HF config, not hf_text_config."""
+    text = getattr(config, "text_config", config)
+    vision = getattr(config, "vision_config", None)
+    if getattr(config, "model_type", None) != "qwen2_vl" or vision is None:
+        return False
+    if (
+        getattr(text, "hidden_size", None),
+        getattr(text, "num_hidden_layers", None),
+        getattr(text, "num_attention_heads", None),
+        getattr(text, "num_key_value_heads", None),
+        getattr(text, "head_dim", None) or 64,
+        getattr(vision, "embed_dim", None) or getattr(vision, "hidden_size", None),
+        getattr(vision, "depth", None) or getattr(vision, "num_hidden_layers", None),
+        getattr(vision, "num_heads", None)
+        or getattr(vision, "num_attention_heads", None),
+    ) != (896, 24, 14, 2, 64, 1280, 32, 16):
+        return False
+
+    section = None
+    for owner in (config, text):
+        section = getattr(owner, "mrope_section", None)
+        if section is not None:
+            break
+        for name in ("rope_parameters", "rope_scaling"):
+            rope = getattr(owner, name, None)
+            if isinstance(rope, dict) and rope.get("mrope_section") is not None:
+                section = rope["mrope_section"]
+                break
+        if section is not None:
+            break
+    try:
+        return tuple(int(value) for value in section) == (8, 12, 12)
+    except (TypeError, ValueError):
+        return False
+
+
+def install_mineru_qwen2_vl_rotary(owner: object, vllm_config: object) -> None:
+    """Apply the Qwen2-VL rotary route only to the selected model's layers."""
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_musa():
+        return
+    from .resolver import resolve_optimization_contract
+
+    if not resolve_optimization_contract(vllm_config).prefers(
+        OptimizationFeature.MINERU_QWEN2_VL_ROTARY
+    ):
+        return
+    from .rotary import MusaMRotaryEmbedding, install_vision_rotary
+
+    install_vision_rotary(
+        (
+            getattr(block, "attn", None)
+            for block in getattr(getattr(owner, "visual", None), "blocks", ())
+        ),
+        expected_blocks=32,
+        required_bf16_neox_shape=(80, 40),
+    )
+    language = getattr(getattr(owner, "language_model", None), "model", None)
+    for layer in getattr(language, "layers", ()):
+        attention = getattr(layer, "self_attn", None)
+        rotary = getattr(attention, "rotary_emb", None)
+        if (
+            rotary is not None
+            and tuple(getattr(rotary, "mrope_section", ()) or ()) == (8, 12, 12)
+            and getattr(rotary, "head_size", None) == 64
+            and getattr(rotary, "rotary_dim", None) == 64
+        ):
+            attention.rotary_emb = MusaMRotaryEmbedding(
+                rotary, qk_hidden_sizes=(896, 128)
+            )
+
+
 def matches_qwen35_moe_bf16_prefill_layer(
     hidden_states,
     w1,
@@ -284,7 +358,13 @@ def resolve_qwen_contract(
     execution: ExecutionSignature,
 ) -> MusaOptimizationContract | None:
     architectures = set(model.outer_architectures or model.architectures)
-    if "CosyVoice3Model" in architectures or model.model_type == "cosyvoice3":
+    mineru = model.mineru_qwen2_vl_config_match and (
+        "Qwen2VLForConditionalGeneration" in architectures
+    )
+    if mineru:
+        family = ModelFamily.QWEN2
+        role = ModelRole.TEXT
+    elif "CosyVoice3Model" in architectures or model.model_type == "cosyvoice3":
         family = ModelFamily.QWEN2
         role = ModelRole.COSYVOICE_TALKER
     # Current Qwen3.6 checkpoints deliberately reuse the Qwen3.5 HF schema:
@@ -321,6 +401,8 @@ def resolve_qwen_contract(
 
     model = replace(model, family=family, role=role)
     preferred: set[OptimizationFeature] = set()
+    if mineru:
+        preferred.add(OptimizationFeature.MINERU_QWEN2_VL_ROTARY)
     if _has_architecture(model, QWEN_V2_SAMPLING_ARCHITECTURES):
         preferred.add(OptimizationFeature.QWEN_V2_SAMPLING)
     if (

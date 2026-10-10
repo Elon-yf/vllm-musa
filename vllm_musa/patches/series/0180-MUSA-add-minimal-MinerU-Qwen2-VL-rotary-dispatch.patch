@@ -3,92 +3,24 @@ From: Elon-yf <309721831+Elon-yf@users.noreply.github.com>
 Date: Wed, 30 Sep 2026 11:18:03 +0800
 Subject: [PATCH] MUSA: add minimal MinerU Qwen2-VL rotary dispatch
 
-Only the existing upstream Qwen2-VL model is changed here. The vision
-per-head width remains eligible at TP>1; language Q/K widths gate its route.
+Keep the upstream Qwen2-VL model hook minimal. Contract matching and layer
+routing live in vllm_musa.optimization_contract.
 
 ---
 diff --git a/vllm/model_executor/models/qwen2_vl.py b/vllm/model_executor/models/qwen2_vl.py
-index 49e0265..09604e7 100644
+index 49e0265..e233ff0 100644
 --- a/vllm/model_executor/models/qwen2_vl.py
 +++ b/vllm/model_executor/models/qwen2_vl.py
-@@ -1167,6 +1167,43 @@ class Qwen2VLMultiModalProcessor(BaseMultiModalProcessor[Qwen2VLProcessingInfo])
-         )(hf_inputs)
- 
- 
-+def _is_mineru_qwen2_vl_config(config: Qwen2VLConfig) -> bool:
-+    """Match the raw HF text, vision, and MRoPE geometry for MinerU."""
-+    text = getattr(config, "text_config", config)
-+    vision = getattr(config, "vision_config", None)
-+    if getattr(config, "model_type", None) != "qwen2_vl" or vision is None:
-+        return False
-+    if (
-+        getattr(text, "hidden_size", None),
-+        getattr(text, "num_hidden_layers", None),
-+        getattr(text, "num_attention_heads", None),
-+        getattr(text, "num_key_value_heads", None),
-+        getattr(text, "head_dim", None) or 64,
-+        getattr(vision, "embed_dim", None) or getattr(vision, "hidden_size", None),
-+        getattr(vision, "depth", None) or getattr(vision, "num_hidden_layers", None),
-+        getattr(vision, "num_heads", None)
-+        or getattr(vision, "num_attention_heads", None),
-+    ) != (896, 24, 14, 2, 64, 1280, 32, 16):
-+        return False
-+
-+    section = None
-+    for owner in (config, text):
-+        section = getattr(owner, "mrope_section", None)
-+        if section is not None:
-+            break
-+        for name in ("rope_parameters", "rope_scaling"):
-+            rope = getattr(owner, name, None)
-+            if isinstance(rope, dict) and rope.get("mrope_section") is not None:
-+                section = rope["mrope_section"]
-+                break
-+        if section is not None:
-+            break
-+    try:
-+        return tuple(int(value) for value in section) == (8, 12, 12)
-+    except (TypeError, ValueError):
-+        return False
-+
-+
- @MULTIMODAL_REGISTRY.register_processor(
-     Qwen2VLMultiModalProcessor,
-     info=Qwen2VLProcessingInfo,
-@@ -1307,6 +1344,37 @@ class Qwen2VLForConditionalGeneration(
+@@ -1307,6 +1307,13 @@ class Qwen2VLForConditionalGeneration(
                  architectures=["Qwen2ForCausalLM"],
              )
  
-+        if (
-+            getattr(torch.version, "musa", None) is not None
-+            and _is_mineru_qwen2_vl_config(config)
-+        ):
-+            from vllm_musa.model_executor.layers.rotary_embedding.base import (
-+                MusaMRotaryEmbedding,
-+                MusaVisionApplyRotaryEmb,
++        if getattr(torch.version, "musa", None) is not None:
++            from vllm_musa.optimization_contract.qwen import (
++                install_mineru_qwen2_vl_rotary,
 +            )
 +
-+            for block in getattr(self.visual, "blocks", ()):
-+                rotary = block.attn.apply_rotary_emb
-+                block.attn.apply_rotary_emb = MusaVisionApplyRotaryEmb(
-+                    is_neox_style=rotary.is_neox_style,
-+                    enable_fp32_compute=rotary.enable_fp32_compute,
-+                    required_bf16_neox_shape=(80, 40)
-+                )
-+            language = getattr(self.language_model, "model", None)
-+            for layer in getattr(language, "layers", ()):
-+                attention = getattr(layer, "self_attn", None)
-+                if attention is None:
-+                    continue
-+                rotary = attention.rotary_emb
-+                if (
-+                    tuple(getattr(rotary, "mrope_section", ())) == (8, 12, 12)
-+                    and getattr(rotary, "head_size", None) == 64
-+                    and getattr(rotary, "rotary_dim", None) == 64
-+                ):
-+                    attention.rotary_emb = MusaMRotaryEmbedding(
-+                        rotary, qk_hidden_sizes=(896, 128)
-+                    )
++            install_mineru_qwen2_vl_rotary(self, vllm_config)
 +
          self.make_empty_intermediate_tensors = (
              self.language_model.make_empty_intermediate_tensors

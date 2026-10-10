@@ -1,56 +1,67 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Behavioral cases for the build-applied MinerU Qwen2-VL gate."""
+"""The MinerU route is a strict Qwen2-VL optimization contract."""
 
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-PATCH = (
-    Path(__file__).resolve().parents[1]
-    / "vllm_musa/patches/series/0180-MUSA-add-minimal-MinerU-Qwen2-VL-rotary-dispatch.patch"
+from vllm_musa.optimization_contract import (
+    ModelFamily,
+    OptimizationFeature,
+    resolve_optimization_contract,
 )
+from vllm_musa.optimization_contract.qwen import matches_mineru_qwen2_vl_config
 
 
-@pytest.fixture(scope="module")
-def gate():
-    # Load only the real gate from the build patch; no model-constructor mocks.
-    lines = PATCH.read_text().splitlines()
-    start = next(
-        i for i, line in enumerate(lines) if line.startswith("+def _is_mineru_qwen2_vl_config(")
-    )
-    body = []
-    for line in lines[start:]:
-        if not line.startswith("+"):
-            break
-        body.append(line[1:])
-    namespace = {"Qwen2VLConfig": object}
-    exec("\n".join(body), namespace)
-    return namespace["_is_mineru_qwen2_vl_config"]
-
-
-def _config():
+def _raw_config():
     return SimpleNamespace(
         model_type="qwen2_vl",
+        architectures=["Qwen2VLForConditionalGeneration"],
         text_config=SimpleNamespace(
+            model_type="qwen2_vl",
             hidden_size=896,
+            intermediate_size=4864,
             num_hidden_layers=24,
             num_attention_heads=14,
             num_key_value_heads=2,
             head_dim=64,
-            rope_parameters={"mrope_section": [8, 12, 12]},
+            rope_scaling={"mrope_section": [8, 12, 12]},
         ),
         vision_config=SimpleNamespace(embed_dim=1280, depth=32, num_heads=16),
     )
 
 
-def test_exact_raw_hf_gate_ignores_conflicting_normalized_text(gate):
-    raw = _config()
-    model_config = SimpleNamespace(hf_config=raw, hf_text_config=SimpleNamespace(hidden_size=1024))
-    assert gate(model_config.hf_config)
+def _vllm_config(raw=None, *, normalized_text=None, tp=1, pp=1):
+    raw = raw or _raw_config()
+    return SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=raw,
+            hf_text_config=normalized_text or raw.text_config,
+            architectures=raw.architectures,
+            dtype="bfloat16",
+            enforce_eager=True,
+        ),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=tp, pipeline_parallel_size=pp,
+        ),
+    )
+
+
+def test_raw_hf_config_wins_over_normalized_text():
+    raw = _raw_config()
+    normalized = SimpleNamespace(model_type="qwen2", hidden_size=1024)
+    contract = resolve_optimization_contract(
+        _vllm_config(raw, normalized_text=normalized)
+    )
+    assert contract.model.family is ModelFamily.QWEN2
+    assert contract.preferred_features == {
+        OptimizationFeature.MINERU_QWEN2_VL_ROTARY
+    }
     raw.text_config.hidden_size = 1024
-    model_config.hf_text_config.hidden_size = 896
-    assert not gate(model_config.hf_config)
+    normalized.hidden_size = 896
+    assert not resolve_optimization_contract(
+        _vllm_config(raw, normalized_text=normalized)
+    ).prefers(OptimizationFeature.MINERU_QWEN2_VL_ROTARY)
 
 
 @pytest.mark.parametrize(
@@ -66,56 +77,65 @@ def test_exact_raw_hf_gate_ignores_conflicting_normalized_text(gate):
         ("vision_config", "num_heads", 20),
     ],
 )
-def test_geometry_mismatch_misses(gate, owner, field, value):
-    config = _config()
-    setattr(getattr(config, owner), field, value)
-    assert not gate(config)
-
-
-def test_flat_text_and_vision_aliases(gate):
-    config = _config()
-    text = vars(config.text_config).copy()
-    text.pop("head_dim")
-    del config.text_config
-    vars(config).update(text)
-    config.vision_config = SimpleNamespace(
-        hidden_size=1280, num_hidden_layers=32, num_attention_heads=16
+def test_geometry_mismatch_misses(owner, field, value):
+    raw = _raw_config()
+    setattr(getattr(raw, owner), field, value)
+    assert not matches_mineru_qwen2_vl_config(raw)
+    assert not resolve_optimization_contract(_vllm_config(raw)).prefers(
+        OptimizationFeature.MINERU_QWEN2_VL_ROTARY
     )
-    assert gate(config)
 
 
-@pytest.mark.parametrize("field", ["mrope_section", "rope_parameters", "rope_scaling"])
-def test_supported_rope_sections(gate, field):
-    config = _config()
-    del config.text_config.rope_parameters
-    setattr(
-        config,
-        field,
-        [8, 12, 12] if field == "mrope_section" else {"mrope_section": [8, 12, 12]},
-    )
-    assert gate(config)
-
-
-def test_outer_section_precedes_text(gate):
-    config = _config()
-    config.mrope_section = [8, 12, 11]
-    assert not gate(config)
-    config.mrope_section = [8, 12, 12]
-    config.text_config.rope_parameters = {"mrope_section": [8, 12, 11]}
-    assert gate(config)
+def test_outer_mrope_section_takes_precedence():
+    raw = _raw_config()
+    raw.mrope_section = [8, 12, 11]
+    assert not matches_mineru_qwen2_vl_config(raw)
+    raw.mrope_section = [8, 12, 12]
+    raw.text_config.rope_scaling = {"mrope_section": [8, 12, 11]}
+    assert matches_mineru_qwen2_vl_config(raw)
 
 
 @pytest.mark.parametrize("section", [None, [], [12, 8, 12], [8, 12, 12, 0]])
-def test_wrong_section_misses(gate, section):
-    config = _config()
-    config.text_config.rope_parameters = {"mrope_section": section}
-    assert not gate(config)
+def test_wrong_mrope_section_misses(section):
+    raw = _raw_config()
+    raw.text_config.rope_scaling = {"mrope_section": section}
+    assert not matches_mineru_qwen2_vl_config(raw)
 
 
-def test_other_model_or_missing_vision_misses(gate):
-    config = _config()
-    config.model_type = "qwen2_5_vl"
-    assert not gate(config)
-    config.model_type = "qwen2_vl"
-    del config.vision_config
-    assert not gate(config)
+def test_only_exact_qwen2_vl_subclass_gets_feature():
+    raw = _raw_config()
+    raw.model_type = "qwen2_5_vl"
+    assert not resolve_optimization_contract(_vllm_config(raw)).prefers(
+        OptimizationFeature.MINERU_QWEN2_VL_ROTARY
+    )
+    raw.model_type = "qwen2_vl"
+    raw.architectures = ["OtherForConditionalGeneration"]
+    assert not resolve_optimization_contract(_vllm_config(raw)).prefers(
+        OptimizationFeature.MINERU_QWEN2_VL_ROTARY
+    )
+
+
+def test_existing_qwen_feature_survives_mineru_subclass():
+    raw = _raw_config()
+    normalized = SimpleNamespace(
+        model_type="qwen2", hidden_size=896, intermediate_size=4864,
+        num_hidden_layers=24, num_attention_heads=14, num_key_value_heads=2,
+    )
+    config = _vllm_config(raw, normalized_text=normalized)
+    config.model_config.enforce_eager = False
+    features = resolve_optimization_contract(config).preferred_features
+    assert features == {
+        OptimizationFeature.MINERU_QWEN2_VL_ROTARY,
+        OptimizationFeature.QWEN2_ROPE_KV_PRESPLIT,
+    }
+    raw.vision_config.depth = 24
+    assert resolve_optimization_contract(config).preferred_features == {
+        OptimizationFeature.QWEN2_ROPE_KV_PRESPLIT,
+    }
+
+
+@pytest.mark.parametrize(("tp", "pp"), [(2, 1), (1, 2)])
+def test_parallel_configuration_keeps_visual_eligibility(tp, pp):
+    assert resolve_optimization_contract(_vllm_config(tp=tp, pp=pp)).prefers(
+        OptimizationFeature.MINERU_QWEN2_VL_ROTARY
+    )
