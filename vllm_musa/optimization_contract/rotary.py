@@ -211,16 +211,19 @@ def install_model_rotary(owner: nn.Module, vllm_config: object) -> bool:
     from . import OptimizationFeature, resolve_optimization_contract
 
     features = resolve_optimization_contract(vllm_config).preferred_features
-    if OptimizationFeature.PADDLEOCR_VL_ROTARY in features:
+    paddle = getattr(OptimizationFeature, "PADDLEOCR_VL_ROTARY", None)
+    mineru = getattr(OptimizationFeature, "MINERU_QWEN2_VL_ROTARY", None)
+    qwen35 = getattr(OptimizationFeature, "QWEN35_VISION_ROTARY_BF16", None)
+    if paddle is not None and paddle in features:
         visual = getattr(getattr(owner, "visual", None), "vision_model", None)
         visual = getattr(getattr(visual, "encoder", None), "layers", ())
         vision = ((getattr(layer, "self_attn", None) for layer in visual), {"expected_blocks": 27})
         language = (getattr(getattr(getattr(owner, "language_model", None), "model", None), "layers", ()), {"set_neox_style": True})
-    elif OptimizationFeature.MINERU_QWEN2_VL_ROTARY in features:
+    elif mineru is not None and mineru in features:
         visual = getattr(owner, "visual", None)
         vision = ((getattr(block, "attn", None) for block in getattr(visual, "blocks", ())), {"expected_blocks": 32, "required_bf16_neox_shape": (80, 40)})
         language = (getattr(getattr(getattr(owner, "language_model", None), "model", None), "layers", ()), {"mrope_section": (8, 12, 12), "qk_hidden_sizes": (896, 128), "head_size": 64, "rotary_dim": 64})
-    elif OptimizationFeature.QWEN35_VISION_ROTARY_BF16 in features:
+    elif qwen35 is not None and qwen35 in features:
         visual = getattr(owner, "visual", None)
         vision = ((block.attn for block in getattr(visual, "blocks", ())), {"expected_blocks": 12, "inplace": True, "flatten": True, "required_bf16_neox_shape": (64, 32)})
         language = None
