@@ -46,25 +46,6 @@ def resolve_paddleocr_vl_contract(
     )
 
 
-def install_paddleocr_vl_rotary(
-    visual: torch.nn.Module, language_model: torch.nn.Module
-) -> bool:
-    """Install adapters only after the Paddle provider selected this contract."""
-    from .rotary import install_mrope_rotary, install_vision_rotary
-
-    encoder = getattr(getattr(visual, "vision_model", None), "encoder", None)
-    layers = getattr(encoder, "layers", ())
-    if not install_vision_rotary(
-        (getattr(layer, "self_attn", None) for layer in layers), expected_blocks=27
-    ):
-        return False
-    install_mrope_rotary(
-        getattr(getattr(language_model, "model", None), "layers", ()),
-        set_neox_style=True,
-    )
-    return True
-
-
 # Keep provider registration explicit. Providers must fail closed when their
 # exact family metadata is incomplete so one family cannot enable another's
 # fast paths.

@@ -183,26 +183,51 @@ def install_mrope_rotary(
     head_size: int | None = None,
     rotary_dim: int | None = None,
     set_neox_style: bool = False,
-) -> int:
+) -> None:
     """Wrap eligible language RoPE modules with the shared MUSA adapter."""
-    installed = 0
     for layer in layers:
         attention = getattr(layer, "self_attn", None)
         rotary = getattr(attention, "rotary_emb", None)
-        if rotary is None:
-            continue
-        if mrope_section is not None and tuple(
-            getattr(rotary, "mrope_section", ()) or ()
-        ) != mrope_section:
-            continue
-        if head_size is not None and getattr(rotary, "head_size", None) != head_size:
-            continue
-        if rotary_dim is not None and getattr(rotary, "rotary_dim", None) != rotary_dim:
+        if (
+            rotary is None
+            or (mrope_section is not None and tuple(getattr(rotary, "mrope_section", ()) or ()) != mrope_section)
+            or (head_size is not None and getattr(rotary, "head_size", None) != head_size)
+            or (rotary_dim is not None and getattr(rotary, "rotary_dim", None) != rotary_dim)
+        ):
             continue
         if set_neox_style:
             rotary.is_neox_style = True
         attention.rotary_emb = MusaMRotaryEmbedding(
             rotary, qk_hidden_sizes=qk_hidden_sizes
         )
-        installed += 1
-    return installed
+
+
+def install_model_rotary(owner: nn.Module, vllm_config: object) -> bool:
+    """Select and install every supported model rotary route in one place."""
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_musa():
+        return False
+    from . import OptimizationFeature, resolve_optimization_contract
+
+    features = resolve_optimization_contract(vllm_config).preferred_features
+    if OptimizationFeature.PADDLEOCR_VL_ROTARY in features:
+        visual = getattr(getattr(owner, "visual", None), "vision_model", None)
+        visual = getattr(getattr(visual, "encoder", None), "layers", ())
+        vision = ((getattr(layer, "self_attn", None) for layer in visual), {"expected_blocks": 27})
+        language = (getattr(getattr(getattr(owner, "language_model", None), "model", None), "layers", ()), {"set_neox_style": True})
+    elif OptimizationFeature.MINERU_QWEN2_VL_ROTARY in features:
+        visual = getattr(owner, "visual", None)
+        vision = ((getattr(block, "attn", None) for block in getattr(visual, "blocks", ())), {"expected_blocks": 32, "required_bf16_neox_shape": (80, 40)})
+        language = (getattr(getattr(getattr(owner, "language_model", None), "model", None), "layers", ()), {"mrope_section": (8, 12, 12), "qk_hidden_sizes": (896, 128), "head_size": 64, "rotary_dim": 64})
+    elif OptimizationFeature.QWEN35_VISION_ROTARY_BF16 in features:
+        visual = getattr(owner, "visual", None)
+        vision = ((block.attn for block in getattr(visual, "blocks", ())), {"expected_blocks": 12, "inplace": True, "flatten": True, "required_bf16_neox_shape": (64, 32)})
+        language = None
+    else:
+        return False
+    if not install_vision_rotary(vision[0], **vision[1]):
+        return False
+    if language is not None:
+        install_mrope_rotary(language[0], **language[1])
+    return True
