@@ -334,7 +334,9 @@ def resolve_optimization_contract(
             preferred_features=frozenset(),
         )
 
-    if model_config is not None and model.outer_model_type == "paddleocr_vl":
+    if model_config is not None and getattr(
+        getattr(model_config, "hf_config", None), "model_type", None
+    ) == "paddleocr_vl":
         from .rotary import resolve_rotary_contract
 
         contract = resolve_rotary_contract(contract, model_config)
