@@ -11,7 +11,6 @@ ContractProvider = Callable[
     MusaOptimizationContract | None,
 ]
 
-
 # Keep provider registration explicit. Providers must fail closed when their
 # exact family metadata is incomplete so one family cannot enable another's
 # fast paths.
