@@ -1,5 +1,6 @@
 """Minimal fail-closed tests for PaddleOCR-VL RoPE selection."""
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -41,6 +42,13 @@ def test_exact_geometry_selects_paddle_path():
     contract = _contract(_config())
     assert contract.model.family is ModelFamily.PADDLEOCR_VL
     assert contract.prefers(OptimizationFeature.PADDLEOCR_VL_ROTARY)
+
+
+def test_other_model_does_not_import_rotary(monkeypatch):
+    config = _config()
+    config.model_type = "llama"
+    monkeypatch.setitem(sys.modules, "vllm_musa.optimization_contract.rotary", None)
+    assert not _contract(config).prefers(OptimizationFeature.PADDLEOCR_VL_ROTARY)
 
 
 @pytest.mark.parametrize(
