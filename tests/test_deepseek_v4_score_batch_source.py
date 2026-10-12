@@ -8,8 +8,11 @@ PATCH = (
 )
 
 
-def test_dsv4_score_deepgemm_covers_dspark4_decode_graph_ladder() -> None:
+def test_dsv4_score_deepgemm_covers_every_dspark4_decode_batch() -> None:
     source = PATCH.read_text(encoding="utf-8")
-    assert "_MUSA_DEEPSEEK_V4_SCORE_FP32_DEEPGEMM_MAX_TOKENS = 80" in source
-    assert "M=20, 40, and 80" in source
-    assert "long-prefill" in source
+    # The decode bound is the multi-stream token threshold itself (64 DSpark-4
+    # requests are 320 tokens); above it the prefill route takes over.
+    assert "-_MUSA_DEEPSEEK_V4_SCORE_FP32_DEEPGEMM_MAX_TOKENS = 16" in source
+    assert "+        and a.shape[0] <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD" in source
+    assert "multi-stream" in source
+    assert "prefill route" in source
