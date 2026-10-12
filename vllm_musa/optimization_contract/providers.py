@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+
 from .deepseek_v4 import resolve_deepseek_v4_contract
 from .glm import resolve_glm_contract
 from .qwen import resolve_qwen_contract
