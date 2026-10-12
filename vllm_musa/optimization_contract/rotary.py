@@ -1,14 +1,20 @@
 """Shared adapters for model-selected MUSA rotary paths."""
 
 from collections.abc import Iterable
+from dataclasses import replace
 from typing import Any
 
 import torch
 from torch import nn
 
+from vllm.logger import init_logger
 from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
 
 from vllm_musa.jit_kernel import rotary_embedding
+
+from .types import ModelFamily, ModelRole, MusaOptimizationContract, OptimizationFeature
+
+logger = init_logger(__name__)
 
 
 class MusaVisionRotaryPositions(nn.Module):
@@ -18,6 +24,7 @@ class MusaVisionRotaryPositions(nn.Module):
         super().__init__()
         self.register_buffer("_positions", None, persistent=False)
         self._key: tuple[int, int, torch.device] | None = None
+        self._pinned: dict[tuple[int, int, torch.device], torch.Tensor] = {}
         self._graph_pinned = False
 
     def get(self, batch: int, seq_len: int, device: torch.device) -> torch.Tensor:
@@ -28,11 +35,18 @@ class MusaVisionRotaryPositions(nn.Module):
         except (AttributeError, RuntimeError):
             capturing = device.type == "musa"
         key = (batch, seq_len, device)
+        if key in self._pinned:
+            return self._pinned[key]
         if self._positions is not None and self._key == key:
-            self._graph_pinned |= capturing
+            if capturing:
+                self._pinned[key] = self._positions
+                self._graph_pinned = True
             return self._positions
         positions = torch.arange(seq_len, device=device).repeat(batch)
-        if not capturing and not self._graph_pinned:
+        if capturing:
+            self._pinned[key] = positions
+            self._graph_pinned = True
+        else:
             self._positions, self._key = positions, key
         return positions
 
@@ -202,6 +216,145 @@ def install_mrope_rotary(
         )
 
 
+def _paddleocr_vl_geometry(config: object) -> tuple[object, ...]:
+    vision = getattr(config, "vision_config", None)
+    text = getattr(config, "text_config", config)
+    section = None
+    for rope in (
+        getattr(text, "rope_parameters", None),
+        getattr(text, "rope_scaling", None),
+        getattr(config, "rope_parameters", None),
+        getattr(config, "rope_scaling", None),
+    ):
+        if isinstance(rope, dict) and rope.get("mrope_section") is not None:
+            value = rope["mrope_section"]
+            section = tuple(value) if isinstance(value, (list, tuple)) else None
+            break
+    return (
+        getattr(vision, "hidden_size", None),
+        getattr(vision, "num_hidden_layers", None),
+        getattr(vision, "depth", None),
+        getattr(vision, "num_attention_heads", None),
+        getattr(vision, "patch_size", None),
+        getattr(vision, "image_size", None),
+        getattr(text, "hidden_size", None),
+        getattr(text, "num_attention_heads", None),
+        getattr(text, "num_key_value_heads", None),
+        section,
+    )
+
+
+def _mineru_geometry(config: object) -> bool:
+    text = getattr(config, "text_config", config)
+    vision = getattr(config, "vision_config", None)
+    if getattr(config, "model_type", None) != "qwen2_vl" or vision is None:
+        return False
+    if (
+        getattr(text, "hidden_size", None),
+        getattr(text, "num_hidden_layers", None),
+        getattr(text, "num_attention_heads", None),
+        getattr(text, "num_key_value_heads", None),
+        getattr(text, "head_dim", None) or 64,
+        getattr(vision, "embed_dim", None) or getattr(vision, "hidden_size", None),
+        getattr(vision, "depth", None) or getattr(vision, "num_hidden_layers", None),
+        getattr(vision, "num_heads", None)
+        or getattr(vision, "num_attention_heads", None),
+    ) != (896, 24, 14, 2, 64, 1280, 32, 16):
+        return False
+    section = None
+    for owner in (config, text):
+        section = getattr(owner, "mrope_section", None)
+        if section is not None:
+            break
+        for name in ("rope_parameters", "rope_scaling"):
+            rope = getattr(owner, name, None)
+            if isinstance(rope, dict) and rope.get("mrope_section") is not None:
+                section = rope["mrope_section"]
+                break
+        if section is not None:
+            break
+    try:
+        return tuple(int(value) for value in section) == (8, 12, 12)
+    except (TypeError, ValueError):
+        return False
+
+
+def _qwen35_vision_geometry(config: object, dtype: object) -> bool:
+    text = getattr(config, "text_config", None)
+    vision = getattr(config, "vision_config", None)
+    return (
+        tuple(getattr(config, "architectures", ()) or ())
+        == ("Qwen3_5ForConditionalGeneration",)
+        and getattr(config, "model_type", None) == "qwen3_5"
+        and getattr(text, "model_type", None) == "qwen3_5_text"
+        and str(dtype) in ("bfloat16", "torch.bfloat16")
+        and tuple(
+            getattr(text, name, None)
+            for name in (
+                "hidden_size", "intermediate_size", "num_hidden_layers",
+                "num_attention_heads", "num_key_value_heads", "head_dim", "vocab_size",
+            )
+        ) == (1024, 3584, 24, 8, 2, 256, 248320)
+        and tuple(
+            getattr(vision, name, None)
+            for name in (
+                "hidden_size", "depth", "num_heads", "out_hidden_size",
+                "patch_size", "spatial_merge_size", "temporal_patch_size",
+            )
+        ) == (768, 12, 12, 1024, 16, 2, 2)
+    )
+
+
+def resolve_rotary_contract(
+    contract: MusaOptimizationContract, model_config: object
+) -> MusaOptimizationContract:
+    """Select exact model rotary geometry without model rules in the resolver."""
+    config = getattr(model_config, "hf_config", None)
+    if getattr(config, "model_type", None) == "paddleocr_vl":
+        model = replace(contract.model, family=ModelFamily.PADDLEOCR_VL, role=ModelRole.TEXT)
+        geometry = _paddleocr_vl_geometry(config)
+        enabled = (
+            geometry[0] == 1152
+            and 27 in geometry[1:3]
+            and geometry[3:] == (16, 14, 384, 1024, 16, 2, (16, 24, 24))
+            and getattr(torch.version, "musa", None) is not None
+        )
+        features = frozenset({OptimizationFeature.PADDLEOCR_VL_ROTARY} if enabled else ())
+        return replace(
+            contract, model=model, profile="paddleocr_vl",
+            supported_features=features, preferred_features=features,
+        )
+    mineru = getattr(OptimizationFeature, "MINERU_QWEN2_VL_ROTARY", None)
+    if (
+        mineru is not None
+        and contract.model.outer_model_type == "qwen2_vl"
+        and contract.execution.tensor_parallel_size == 1
+        and tuple(getattr(config, "architectures", ()) or ())
+        == ("Qwen2VLForConditionalGeneration",)
+        and _mineru_geometry(config)
+    ):
+        model = replace(contract.model, family=ModelFamily.QWEN2, role=ModelRole.TEXT)
+        return replace(
+            contract,
+            model=model,
+            profile=f"{ModelFamily.QWEN2.value}.{ModelRole.TEXT.value}",
+            supported_features=contract.supported_features | {mineru},
+            preferred_features=contract.preferred_features | {mineru},
+        )
+    qwen35 = getattr(OptimizationFeature, "QWEN35_VISION_ROTARY_BF16", None)
+    if (
+        qwen35 is None
+        or contract.model.family is not ModelFamily.QWEN35_36
+        or not _qwen35_vision_geometry(config, getattr(model_config, "dtype", None))
+    ):
+        return contract
+    return replace(
+        contract,
+        supported_features=contract.supported_features | {qwen35},
+        preferred_features=contract.preferred_features | {qwen35},
+    )
+
+
 def install_model_rotary(owner: nn.Module, vllm_config: object) -> bool:
     """Select and install every supported model rotary route in one place."""
     from vllm.platforms import current_platform
@@ -228,9 +381,16 @@ def install_model_rotary(owner: nn.Module, vllm_config: object) -> bool:
         vision = ((block.attn for block in getattr(visual, "blocks", ())), {"expected_blocks": 12, "inplace": True, "flatten": True, "required_bf16_neox_shape": (64, 32)})
         language = None
     else:
+        config = getattr(getattr(vllm_config, "model_config", None), "hf_config", None)
+        if getattr(config, "model_type", None) == "qwen3_5":
+            logger.info_once("MUSA Qwen3.5 vision rotary skipped: unsupported geometry")
         return False
     if not install_vision_rotary(vision[0], **vision[1]):
+        if qwen35 is not None and qwen35 in features:
+            logger.info_once("MUSA Qwen3.5 vision rotary skipped: incomplete visual blocks")
         return False
     if language is not None:
         install_mrope_rotary(language[0], **language[1])
+    if qwen35 is not None and qwen35 in features:
+        logger.info_once("MUSA Qwen3.5 vision rotary installed on 12 visual blocks")
     return True

@@ -105,7 +105,6 @@ class ModelSignature:
     index_topk: int | None = None
     quant_block_shape: tuple[int, ...] | None = None
     is_hybrid: bool | None = None
-    paddleocr_vl_rotary_geometry: tuple[object, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)

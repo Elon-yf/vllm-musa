@@ -1,49 +1,15 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import replace
-
-import torch
-
 from .deepseek_v4 import resolve_deepseek_v4_contract
 from .glm import resolve_glm_contract
 from .qwen import resolve_qwen_contract
-from .types import (
-    ExecutionSignature,
-    ModelFamily,
-    ModelRole,
-    ModelSignature,
-    MusaOptimizationContract,
-    OptimizationFeature,
-)
+from .types import ExecutionSignature, ModelSignature, MusaOptimizationContract
 
 ContractProvider = Callable[
     [ModelSignature, ExecutionSignature],
     MusaOptimizationContract | None,
 ]
-
-
-def resolve_paddleocr_vl_contract(
-    model: ModelSignature, execution: ExecutionSignature
-) -> MusaOptimizationContract | None:
-    geometry = model.paddleocr_vl_rotary_geometry
-    if geometry is None:
-        return None
-    model = replace(model, family=ModelFamily.PADDLEOCR_VL, role=ModelRole.TEXT)
-    enabled = (
-        geometry[0] == 1152
-        and 27 in geometry[1:3]
-        and geometry[3:] == (16, 14, 384, 1024, 16, 2, (16, 24, 24))
-        and getattr(torch.version, "musa", None) is not None
-    )
-    preferred = frozenset({OptimizationFeature.PADDLEOCR_VL_ROTARY} if enabled else ())
-    return MusaOptimizationContract(
-        model=model,
-        execution=execution,
-        profile="paddleocr_vl",
-        supported_features=preferred,
-        preferred_features=preferred,
-    )
 
 
 # Keep provider registration explicit. Providers must fail closed when their
@@ -52,6 +18,5 @@ def resolve_paddleocr_vl_contract(
 CONTRACT_PROVIDERS: tuple[ContractProvider, ...] = (
     resolve_deepseek_v4_contract,
     resolve_glm_contract,
-    resolve_paddleocr_vl_contract,
     resolve_qwen_contract,
 )
