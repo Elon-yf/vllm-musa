@@ -7,12 +7,47 @@ from typing import Any
 import torch
 from torch import nn
 
+from vllm.logger import init_logger
 from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
 
 from vllm_musa.jit_kernel import rotary_embedding
 from vllm_musa.utils.environ import envs
 
 from .types import ModelFamily, ModelRole, MusaOptimizationContract, OptimizationFeature
+
+logger = init_logger(__name__)
+
+
+class MusaVisionRotaryPositions(nn.Module):
+    """Keep positions alive when a visual rotary call is graph captured."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.register_buffer("_positions", None, persistent=False)
+        self._key: tuple[int, int, torch.device] | None = None
+        self._pinned: dict[tuple[int, int, torch.device], torch.Tensor] = {}
+
+    def get(self, batch: int, seq_len: int, device: torch.device) -> torch.Tensor:
+        try:
+            capturing = device.type == "musa" and bool(
+                torch.cuda.is_current_stream_capturing()
+            )
+        except (AttributeError, RuntimeError):
+            capturing = device.type == "musa"
+        key = (batch, seq_len, device)
+        if key in self._pinned:
+            return self._pinned[key]
+        if self._positions is not None and self._key == key:
+            if capturing:
+                self._pinned[key] = self._positions
+            return self._positions
+        positions = torch.arange(seq_len, device=device).repeat(batch)
+        if capturing:
+            self._pinned[key] = positions
+        else:
+            self._positions, self._key = positions, key
+        return positions
+
 
 class MusaVisionApplyRotaryEmb(ApplyRotaryEmb):
     """Adapt a vision x/cos/sin call to the existing MUSA rotary kernel."""
@@ -22,6 +57,9 @@ class MusaVisionApplyRotaryEmb(ApplyRotaryEmb):
         *,
         is_neox_style: bool,
         enable_fp32_compute: bool,
+        inplace: bool = False,
+        flatten: bool = False,
+        positions_cache: MusaVisionRotaryPositions | None = None,
         required_bf16_neox_shape: tuple[int, int] | None = None,
     ) -> None:
         super().__init__(
@@ -29,6 +67,9 @@ class MusaVisionApplyRotaryEmb(ApplyRotaryEmb):
             is_neox_style=is_neox_style,
             enable_fp32_compute=enable_fp32_compute,
         )
+        self.inplace = inplace
+        self.flatten = flatten
+        self.positions_cache = positions_cache
         self.required_bf16_neox_shape = required_bf16_neox_shape
 
     def forward_oot(
@@ -49,13 +90,21 @@ class MusaVisionApplyRotaryEmb(ApplyRotaryEmb):
             ):
                 return self.forward_native(x, cos, sin)
         x, cos, sin, shape, dtype = self._pre_process(x, cos, sin)
-        output = x.clone()
-        batch, seq_len, _, head_size = output.shape
+        output = x.contiguous() if self.inplace else x.clone()
+        batch, seq_len, heads, head_size = output.shape
         cache = torch.cat((cos, sin), dim=-1).to(output.dtype).contiguous()
-        positions = torch.arange(
-            seq_len, device=output.device, dtype=torch.long
-        ).expand(batch, -1)
-        query = output
+        if self.flatten:
+            positions = (
+                self.positions_cache.get(batch, seq_len, output.device)
+                if self.positions_cache is not None
+                else torch.arange(seq_len, device=output.device).repeat(batch)
+            )
+            query = output.reshape(batch * seq_len, heads * head_size)
+        else:
+            positions = torch.arange(
+                seq_len, device=output.device, dtype=torch.long
+            ).expand(batch, -1)
+            query = output
         rotary_embedding(
             positions, query, None, head_size, cache, self.is_neox_style
         )
@@ -108,6 +157,8 @@ class MusaMRotaryEmbedding(nn.Module):
 def install_vision_rotary(
     attentions: Iterable[nn.Module | None],
     *,
+    inplace: bool = False,
+    flatten: bool = False,
     expected_blocks: int | None = None,
     required_bf16_neox_shape: tuple[int, int] | None = None,
 ) -> bool:
@@ -124,11 +175,15 @@ def install_vision_rotary(
         )
     ):
         return False
+    positions = MusaVisionRotaryPositions() if flatten else None
     for attention in active:
         rotary = attention.apply_rotary_emb
         attention.apply_rotary_emb = MusaVisionApplyRotaryEmb(
             is_neox_style=rotary.is_neox_style,
             enable_fp32_compute=rotary.enable_fp32_compute,
+            inplace=inplace,
+            flatten=flatten,
+            positions_cache=positions,
             required_bf16_neox_shape=required_bf16_neox_shape,
         )
     return True
@@ -224,6 +279,32 @@ def _mineru_geometry(config: object) -> bool:
         return False
 
 
+def _qwen35_vision_geometry(config: object, dtype: object) -> bool:
+    text = getattr(config, "text_config", None)
+    vision = getattr(config, "vision_config", None)
+    return (
+        tuple(getattr(config, "architectures", ()) or ())
+        == ("Qwen3_5ForConditionalGeneration",)
+        and getattr(config, "model_type", None) == "qwen3_5"
+        and getattr(text, "model_type", None) == "qwen3_5_text"
+        and str(dtype) in ("bfloat16", "torch.bfloat16")
+        and tuple(
+            getattr(text, name, None)
+            for name in (
+                "hidden_size", "intermediate_size", "num_hidden_layers",
+                "num_attention_heads", "num_key_value_heads", "head_dim", "vocab_size",
+            )
+        ) == (1024, 3584, 24, 8, 2, 256, 248320)
+        and tuple(
+            getattr(vision, name, None)
+            for name in (
+                "hidden_size", "depth", "num_heads", "out_hidden_size",
+                "patch_size", "spatial_merge_size", "temporal_patch_size",
+            )
+        ) == (768, 12, 12, 1024, 16, 2, 2)
+    )
+
+
 def resolve_rotary_contract(
     contract: MusaOptimizationContract, model_config: object
 ) -> MusaOptimizationContract:
@@ -260,7 +341,18 @@ def resolve_rotary_contract(
             supported_features=contract.supported_features | {mineru},
             preferred_features=contract.preferred_features | {mineru},
         )
-    return contract
+    qwen35 = getattr(OptimizationFeature, "QWEN35_VISION_ROTARY_BF16", None)
+    if (
+        qwen35 is None
+        or contract.model.family is not ModelFamily.QWEN35_36
+        or not _qwen35_vision_geometry(config, getattr(model_config, "dtype", None))
+    ):
+        return contract
+    return replace(
+        contract,
+        supported_features=contract.supported_features | {qwen35},
+        preferred_features=contract.preferred_features | {qwen35},
+    )
 
 
 def install_model_rotary(owner: nn.Module, vllm_config: object) -> bool:
@@ -274,6 +366,7 @@ def install_model_rotary(owner: nn.Module, vllm_config: object) -> bool:
     features = resolve_optimization_contract(vllm_config).preferred_features
     paddle = getattr(OptimizationFeature, "PADDLEOCR_VL_ROTARY", None)
     mineru = getattr(OptimizationFeature, "MINERU_QWEN2_VL_ROTARY", None)
+    qwen35 = getattr(OptimizationFeature, "QWEN35_VISION_ROTARY_BF16", None)
     if paddle is not None and paddle in features:
         visual = getattr(getattr(owner, "visual", None), "vision_model", None)
         visual = getattr(getattr(visual, "encoder", None), "layers", ())
@@ -283,10 +376,21 @@ def install_model_rotary(owner: nn.Module, vllm_config: object) -> bool:
         visual = getattr(owner, "visual", None)
         vision = ((getattr(block, "attn", None) for block in getattr(visual, "blocks", ())), {"expected_blocks": 32, "required_bf16_neox_shape": (80, 40)})
         language = (getattr(getattr(getattr(owner, "language_model", None), "model", None), "layers", ()), {"mrope_section": (8, 12, 12), "qk_hidden_sizes": (896, 128), "head_size": 64, "rotary_dim": 64})
+    elif qwen35 is not None and qwen35 in features:
+        visual = getattr(owner, "visual", None)
+        vision = ((block.attn for block in getattr(visual, "blocks", ())), {"expected_blocks": 12, "inplace": True, "flatten": True, "required_bf16_neox_shape": (64, 32)})
+        language = None
     else:
+        config = getattr(getattr(vllm_config, "model_config", None), "hf_config", None)
+        if getattr(config, "model_type", None) == "qwen3_5":
+            logger.info_once("MUSA Qwen3.5 vision rotary skipped: unsupported geometry")
         return False
     if not install_vision_rotary(vision[0], **vision[1]):
+        if qwen35 is not None and qwen35 in features:
+            logger.info_once("MUSA Qwen3.5 vision rotary skipped: incomplete visual blocks")
         return False
     if language is not None:
         install_mrope_rotary(language[0], **language[1])
+    if qwen35 is not None and qwen35 in features:
+        logger.info_once("MUSA Qwen3.5 vision rotary installed on 12 visual blocks")
     return True
