@@ -291,9 +291,17 @@ def test_fusion_uses_standard_pass_and_runtime_capability_gates() -> None:
     assert "can_enable_fused_allreduce_rmsnorm(" in platform_source
     assert "FUSED_ALLREDUCE_RMSNORM_TARGET_HIDDEN_SIZE" not in platform_source
     assert "FUSED_ALLREDUCE_RMSNORM_TP4_HIDDEN_SIZE" not in platform_source
-    for source in (comm_source, fusion_source, provider_source):
+    for source in (comm_source, fusion_source):
         assert "can_use_fused_allreduce_rmsnorm(" in source
         assert "vllm_musa.optimization_contract.car_rmsnorm" in source
+
+    # The IR provider is deliberately not a contract consumer. Inductor lowers
+    # this op through the IR lowering pass, which runs outside any
+    # ``set_current_vllm_config`` scope, so a contract lookup there could only
+    # ever report "no config" and would gate nothing. The contract's native-row
+    # routing is enforced on the pass and the platform default instead.
+    assert "can_use_fused_allreduce_rmsnorm(" not in provider_source
+    assert "vllm_musa.optimization_contract" not in provider_source
 
 
 def test_python_registered_path_uses_shared_graph_lifecycle() -> None:

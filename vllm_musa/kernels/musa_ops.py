@@ -29,11 +29,6 @@ from torch import Tensor
 from vllm import ir
 from vllm.platforms import current_platform
 
-from vllm_musa.optimization_contract.car_rmsnorm import (
-    can_use_fused_allreduce_rmsnorm,
-    current_car_rmsnorm_compile_range,
-    current_car_rmsnorm_metadata,
-)
 from vllm_musa.tuning import FUSED_ADD_RMSNORM_MIN_ROWS
 
 # vllm._C must be loaded before torch.ops._C.rms_norm is resolvable.
@@ -52,84 +47,31 @@ def _has_C_rms_norm() -> bool:
 MUSA_RMS_NORM_SUPPORTED = current_platform.is_musa() and _has_C_rms_norm()
 
 
-def _fused_add_rmsnorm_tp_size() -> int | None:
-    """Read TP at dispatch time without initializing distributed state."""
-    try:
-        from vllm.distributed.parallel_state import (
-            get_tensor_model_parallel_world_size,
-        )
+def _fused_add_rms_norm_hidden_dim_is_concrete(x: Tensor) -> bool:
+    """Reject a symbolic hidden dimension before the provider predicates run.
 
-        tp_size = int(get_tensor_model_parallel_world_size())
-    except (AssertionError, ImportError, RuntimeError, TypeError, ValueError):
-        return None
-    return tp_size if tp_size > 0 else None
+    The predicates below compare ``x.shape[1]`` against ``weight.numel()`` and
+    apply ``% 8`` to it, which is only meaningful for a concrete dimension; a
+    symbolic one has no truthful answer under vLLM's shape-guard-free compile.
 
+    This guard is not part of the CAR-RMSNorm contract, and cannot be. Inductor
+    lowers this op through ``fx.map_arg(node.args, lambda arg: arg.meta["val"])``
+    in the IR lowering pass, outside any ``set_current_vllm_config`` scope, so no
+    ``VllmConfig`` is current and the contract would report "no config" rather
+    than a decision. The contract's native-row routing is enforced where the
+    config is bound: by the CAR pass over the compile range, and by the platform
+    pass default.
 
-def _fused_add_rmsnorm_contract_metadata() -> tuple[str | None, bool | None] | None:
-    """Return config-backed CAR metadata, or ``None`` outside a vLLM owner.
-
-    The IR provider is also used by standalone unit tests and eager callers
-    which have no current ``VllmConfig``.  In that context the legacy broad
-    provider capability remains authoritative; the compile pass and platform
-    still enforce the contract for real serving graphs.  Once a config is
-    bound, missing quantization/family metadata is represented as ``None`` so
-    the shared contract fails closed for target hidden sizes.
+    ``weight is None`` and ``x.dim() != 2`` are deliberately not checked here:
+    ``_jit_fused_add_rms_norm_supports_args`` and
+    ``_c_ext_fused_add_rms_norm_supports_args`` both reject those, so repeating
+    them would only add a second copy that could drift.
     """
-    metadata = current_car_rmsnorm_metadata()
-    if metadata is None:
-        return None
-    family, quantized, _ = metadata
-    return family, quantized
-
-
-def _can_use_fused_add_rmsnorm_under_contract(
-    x: Tensor,
-    weight: Tensor | None,
-    *,
-    raw_needed: bool | None = None,
-    registered: bool | None = None,
-) -> bool:
-    """Apply the shared gate before choosing JIT or C-extension.
-
-    This ordering is essential: if the low-row JIT rejection runs first, the
-    broad C-extension predicate would otherwise become the selected provider.
-    """
-    if weight is None:
-        return False
     try:
         hidden_size = x.shape[1] if x.dim() == 2 else None
     except (AttributeError, IndexError, RuntimeError, TypeError):
         return False
-    if not isinstance(hidden_size, int) or isinstance(hidden_size, bool):
-        # A symbolic hidden dimension cannot be proven to be outside a target
-        # signature; fail closed during compilation.
-        return False
-    compile_range = current_car_rmsnorm_compile_range()
-    rows = None
-    if compile_range is None:
-        try:
-            candidate = x.shape[0] if x.dim() == 2 else None
-            if isinstance(candidate, int) and not isinstance(candidate, bool):
-                rows = int(candidate)
-        except (AttributeError, IndexError, RuntimeError, TypeError):
-            rows = None
-    metadata = _fused_add_rmsnorm_contract_metadata()
-    if metadata is None:
-        # No active VllmConfig means this is not a serving compile decision;
-        # preserve the existing standalone/provider capability behavior.
-        return True
-    model_family, quantized = metadata
-    return can_use_fused_allreduce_rmsnorm(
-        tp_size=_fused_add_rmsnorm_tp_size(),
-        hidden_size=int(hidden_size),
-        dtype=getattr(x, "dtype", None),
-        rows=rows,
-        compile_range=compile_range,
-        raw_needed=raw_needed,
-        registered=registered,
-        model_family=model_family,
-        quantized=quantized,
-    )
+    return isinstance(hidden_size, int) and not isinstance(hidden_size, bool)
 
 
 def _rms_norm_supports_args(
@@ -266,9 +208,9 @@ def _select_musa_fused_add_rms_norm_impl(
     the kernel chosen for that entire range; it must not branch on a symbolic
     example tensor's row-count hint.
     """
-    # Check the shared contract before either provider.  A low-row TP2 reject
-    # must not fall through from JIT to the broad C-extension implementation.
-    if not _can_use_fused_add_rmsnorm_under_contract(x, weight):
+    # A symbolic hidden dimension has no truthful answer for the weight-numel
+    # and multiple-of-8 comparisons below, so reject it before either runs.
+    if not _fused_add_rms_norm_hidden_dim_is_concrete(x):
         return None
     if _jit_fused_add_rms_norm_supports_args(
         x, x_residual, weight, epsilon, variance_size

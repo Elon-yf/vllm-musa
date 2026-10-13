@@ -4,10 +4,21 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PATCH = (
-    ROOT
-    / "vllm_musa/patches/series/0109-MUSA-keep-compile-warmup-outside-CUDAGraph.patch"
-)
+SERIES = ROOT / "vllm_musa/patches/series"
+PATCH = SERIES / "0189-MUSA-keep-compile-warmup-outside-CUDAGraph.patch"
+
+
+def test_compile_warmup_patch_number_is_unique_in_the_series() -> None:
+    """A duplicated prefix lets ``sorted()`` decide apply order by filename.
+
+    ``tools/musa_sync.py check-series`` already gates on this, but the gate needs
+    a checkout at the pin, so keep a local assertion that fails here instead.
+    """
+    numbers = [p.name.split("-", 1)[0] for p in SERIES.glob("*.patch")]
+    duplicates = sorted({n for n in numbers if numbers.count(n) > 1})
+
+    assert duplicates == [], f"duplicate patch numbers: {duplicates}"
+    assert PATCH.name.split("-", 1)[0] not in duplicates
 
 
 def _added_lines() -> list[str]:
