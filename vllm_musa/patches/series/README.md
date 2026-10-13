@@ -19,7 +19,7 @@ is pre-patched.
   Author headers are normalized to the synthetic
   `musa <musa@local>` identity.
 
-Currently **189 patches**, plus **3 upstream entries** in `upstream/`.
+Currently **190 patches**, plus **3 upstream entries** in `upstream/`.
 This branch includes the Qwen3.6 patches for common
 GDN decode metadata reuse, uniform-decode SSM slot-mapping removal, and the
 BF16 W1 tile specialization, plus the contract-bound DeepSeek-V4 MTP
@@ -82,6 +82,8 @@ DeepSeek-V4 score GEMMs above the multi-stream token threshold run through
 DeepGEMM instead of an FP32 SIMT sgemm.
 The PaddleOCR-VL entry selects the existing MUSA rotary path at model
 construction for its exact vision and language geometry.
+A separate MinerU Qwen2-VL entry selects the shared MUSA rotary path for its
+exact vision and language geometry.
 A sparse-indexer prefill chunk that holds several long requests is split
 into single-request chunks, which the MUSA top-k kernels accept, before the
 per-row PyTorch fallback.

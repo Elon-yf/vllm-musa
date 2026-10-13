@@ -336,7 +336,10 @@ def resolve_optimization_contract(
 
     if model_config is not None and getattr(
         getattr(model_config, "hf_config", None), "model_type", None
-    ) == "paddleocr_vl":
+    ) in (
+        "paddleocr_vl",
+        "qwen2_vl",
+    ):
         from .rotary import resolve_rotary_contract
 
         contract = resolve_rotary_contract(contract, model_config)

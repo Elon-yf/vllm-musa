@@ -22,18 +22,32 @@ class MusaVisionApplyRotaryEmb(ApplyRotaryEmb):
         *,
         is_neox_style: bool,
         enable_fp32_compute: bool,
+        required_bf16_neox_shape: tuple[int, int] | None = None,
     ) -> None:
         super().__init__(
             enforce_enable=True,
             is_neox_style=is_neox_style,
             enable_fp32_compute=enable_fp32_compute,
         )
+        self.required_bf16_neox_shape = required_bf16_neox_shape
 
     def forward_oot(
         self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
     ) -> torch.Tensor:
         if x.device.type != "musa" or envs.VLLM_MUSA_CUSTOM_OP_USE_NATIVE.get():
             return self.forward_native(x, cos, sin)
+        if self.required_bf16_neox_shape is not None:
+            head_size, cos_width = self.required_bf16_neox_shape
+            if (
+                x.dtype != torch.bfloat16
+                or x.shape[-1] != head_size
+                or cos.ndim != 2
+                or cos.shape[-1] != cos_width
+                or sin.shape != cos.shape
+                or not self.is_neox_style
+                or self.enable_fp32_compute
+            ):
+                return self.forward_native(x, cos, sin)
         x, cos, sin, shape, dtype = self._pre_process(x, cos, sin)
         output = x.clone()
         batch, seq_len, _, head_size = output.shape
@@ -51,9 +65,12 @@ class MusaVisionApplyRotaryEmb(ApplyRotaryEmb):
 class MusaMRotaryEmbedding(nn.Module):
     """Use upstream MRoPE except for the validated MUSA 2-D-position case."""
 
-    def __init__(self, inner: nn.Module) -> None:
+    def __init__(
+        self, inner: nn.Module, qk_hidden_sizes: tuple[int, int] | None = None
+    ) -> None:
         super().__init__()
         self.inner = inner
+        self.qk_hidden_sizes = qk_hidden_sizes
 
     def __getattr__(self, name: str) -> Any:
         try:
@@ -75,7 +92,15 @@ class MusaMRotaryEmbedding(nn.Module):
         )
         if envs.VLLM_MUSA_CUSTOM_OP_USE_NATIVE.get():
             return self.inner.forward_native(*args)
-        if query.device.type == "musa" and positions.ndim == 2 and key is not None:
+        if (
+            query.device.type == "musa"
+            and positions.ndim == 2
+            and key is not None
+            and (
+                self.qk_hidden_sizes is None
+                or (query.shape[-1], key.shape[-1]) == self.qk_hidden_sizes
+            )
+        ):
             return self.inner.forward_cuda(*args)
         return self.inner(*args)
 
@@ -84,6 +109,7 @@ def install_vision_rotary(
     attentions: Iterable[nn.Module | None],
     *,
     expected_blocks: int | None = None,
+    required_bf16_neox_shape: tuple[int, int] | None = None,
 ) -> bool:
     """Install one adapter across a complete, already-selected vision stack."""
     active = tuple(attention for attention in attentions if attention is not None)
@@ -103,6 +129,7 @@ def install_vision_rotary(
         attention.apply_rotary_emb = MusaVisionApplyRotaryEmb(
             is_neox_style=rotary.is_neox_style,
             enable_fp32_compute=rotary.enable_fp32_compute,
+            required_bf16_neox_shape=required_bf16_neox_shape,
         )
     return True
 
@@ -110,17 +137,28 @@ def install_vision_rotary(
 def install_mrope_rotary(
     layers: Iterable[nn.Module],
     *,
+    mrope_section: tuple[int, ...] | None = None,
+    qk_hidden_sizes: tuple[int, int] | None = None,
+    head_size: int | None = None,
+    rotary_dim: int | None = None,
     set_neox_style: bool = False,
 ) -> None:
     """Wrap eligible language RoPE modules with the shared MUSA adapter."""
     for layer in layers:
         attention = getattr(layer, "self_attn", None)
         rotary = getattr(attention, "rotary_emb", None)
-        if rotary is None:
+        if (
+            rotary is None
+            or (mrope_section is not None and tuple(getattr(rotary, "mrope_section", ()) or ()) != mrope_section)
+            or (head_size is not None and getattr(rotary, "head_size", None) != head_size)
+            or (rotary_dim is not None and getattr(rotary, "rotary_dim", None) != rotary_dim)
+        ):
             continue
         if set_neox_style:
             rotary.is_neox_style = True
-        attention.rotary_emb = MusaMRotaryEmbedding(rotary)
+        attention.rotary_emb = MusaMRotaryEmbedding(
+            rotary, qk_hidden_sizes=qk_hidden_sizes
+        )
 
 
 def _paddleocr_vl_geometry(config: object) -> tuple[object, ...]:
@@ -151,6 +189,41 @@ def _paddleocr_vl_geometry(config: object) -> tuple[object, ...]:
     )
 
 
+def _mineru_geometry(config: object) -> bool:
+    text = getattr(config, "text_config", config)
+    vision = getattr(config, "vision_config", None)
+    if getattr(config, "model_type", None) != "qwen2_vl" or vision is None:
+        return False
+    if (
+        getattr(text, "hidden_size", None),
+        getattr(text, "num_hidden_layers", None),
+        getattr(text, "num_attention_heads", None),
+        getattr(text, "num_key_value_heads", None),
+        getattr(text, "head_dim", None) or 64,
+        getattr(vision, "embed_dim", None) or getattr(vision, "hidden_size", None),
+        getattr(vision, "depth", None) or getattr(vision, "num_hidden_layers", None),
+        getattr(vision, "num_heads", None)
+        or getattr(vision, "num_attention_heads", None),
+    ) != (896, 24, 14, 2, 64, 1280, 32, 16):
+        return False
+    section = None
+    for owner in (config, text):
+        section = getattr(owner, "mrope_section", None)
+        if section is not None:
+            break
+        for name in ("rope_parameters", "rope_scaling"):
+            rope = getattr(owner, name, None)
+            if isinstance(rope, dict) and rope.get("mrope_section") is not None:
+                section = rope["mrope_section"]
+                break
+        if section is not None:
+            break
+    try:
+        return tuple(int(value) for value in section) == (8, 12, 12)
+    except (TypeError, ValueError):
+        return False
+
+
 def resolve_rotary_contract(
     contract: MusaOptimizationContract, model_config: object
 ) -> MusaOptimizationContract:
@@ -170,6 +243,23 @@ def resolve_rotary_contract(
             contract, model=model, profile="paddleocr_vl",
             supported_features=features, preferred_features=features,
         )
+    mineru = getattr(OptimizationFeature, "MINERU_QWEN2_VL_ROTARY", None)
+    if (
+        mineru is not None
+        and contract.model.outer_model_type == "qwen2_vl"
+        and contract.execution.tensor_parallel_size == 1
+        and tuple(getattr(config, "architectures", ()) or ())
+        == ("Qwen2VLForConditionalGeneration",)
+        and _mineru_geometry(config)
+    ):
+        model = replace(contract.model, family=ModelFamily.QWEN2, role=ModelRole.TEXT)
+        return replace(
+            contract,
+            model=model,
+            profile=f"{ModelFamily.QWEN2.value}.{ModelRole.TEXT.value}",
+            supported_features=contract.supported_features | {mineru},
+            preferred_features=contract.preferred_features | {mineru},
+        )
     return contract
 
 
@@ -183,11 +273,16 @@ def install_model_rotary(owner: nn.Module, vllm_config: object) -> bool:
 
     features = resolve_optimization_contract(vllm_config).preferred_features
     paddle = getattr(OptimizationFeature, "PADDLEOCR_VL_ROTARY", None)
+    mineru = getattr(OptimizationFeature, "MINERU_QWEN2_VL_ROTARY", None)
     if paddle is not None and paddle in features:
         visual = getattr(getattr(owner, "visual", None), "vision_model", None)
         visual = getattr(getattr(visual, "encoder", None), "layers", ())
         vision = ((getattr(layer, "self_attn", None) for layer in visual), {"expected_blocks": 27})
         language = (getattr(getattr(getattr(owner, "language_model", None), "model", None), "layers", ()), {"set_neox_style": True})
+    elif mineru is not None and mineru in features:
+        visual = getattr(owner, "visual", None)
+        vision = ((getattr(block, "attn", None) for block in getattr(visual, "blocks", ())), {"expected_blocks": 32, "required_bf16_neox_shape": (80, 40)})
+        language = (getattr(getattr(getattr(owner, "language_model", None), "model", None), "layers", ()), {"mrope_section": (8, 12, 12), "qk_hidden_sizes": (896, 128), "head_size": 64, "rotary_dim": 64})
     else:
         return False
     if not install_vision_rotary(vision[0], **vision[1]):
