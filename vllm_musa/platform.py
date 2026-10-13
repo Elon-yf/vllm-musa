@@ -993,12 +993,16 @@ class MtmlMUSAPlatform(MUSAPlatformBase):
             return None
 
     @classmethod
-    @with_mtml_context
     def has_device_capability(
         cls,
         capability: tuple[int, int] | int,
         device_id: int = 0,
     ) -> bool:
+        # No @with_mtml_context here: the base implementation only reads
+        # get_device_capability(), which is cached and brings its own MTML
+        # context. Wrapping this method as well would call nvmlInit() on every
+        # call, including calls made per attention layer per step from the
+        # Triton reshape-and-cache path.
         try:
             return super().has_device_capability(capability, device_id)
         except RuntimeError:

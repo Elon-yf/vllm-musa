@@ -857,6 +857,27 @@ class TestWithMtmlContext:
 class TestMtmlMUSAPlatform:
     """Tests for MtmlMUSAPlatform class."""
 
+    def test_has_device_capability_reuses_cached_mtml_query(self, mock_pymtml):
+        """Capability comparisons must not reinitialize MTML on every call."""
+        if "vllm_musa.platform" in sys.modules:
+            del sys.modules["vllm_musa.platform"]
+
+        from vllm_musa.platform import MtmlMUSAPlatform, mtml_available
+
+        if not mtml_available:
+            pytest.skip("MTML not available")
+
+        MtmlMUSAPlatform.get_device_capability.cache_clear()
+        mock_pymtml.nvmlInit.reset_mock()
+
+        results = [
+            MtmlMUSAPlatform.has_device_capability((3, 1)) for _ in range(60)
+        ]
+        results.append(MtmlMUSAPlatform.has_device_capability((4, 0)))
+
+        assert results == [True] * 60 + [False]
+        assert mock_pymtml.nvmlInit.call_count == 1
+
     def test_get_device_capability_returns_3_1(self, mock_pymtml):
         """Test get_device_capability returns (3, 1) for FP8 support."""
         if "vllm_musa.platform" in sys.modules:
