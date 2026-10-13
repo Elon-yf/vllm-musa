@@ -4,13 +4,18 @@ Date: Thu, 8 Oct 2026 15:23:15 +0800
 Subject: [PATCH] MUSA: hook PaddleOCR-VL rotary fast path
 
 Keep the upstream Paddle hook thin; the optimization contract owns the route.
-
 ---
+ vllm/model_executor/models/paddleocr_vl.py | 3 +++
+ 1 file changed, 3 insertions(+)
+
 diff --git a/vllm/model_executor/models/paddleocr_vl.py b/vllm/model_executor/models/paddleocr_vl.py
-index bd635aaada2de26e4752aa9ae7c0fd06a06bfbe2..bc8b6b5e3fbb1f772ab09b35ee11f9906c1fbdd6 100644
+index bd635aaada..bc8b6b5e3f 100644
 --- a/vllm/model_executor/models/paddleocr_vl.py
 +++ b/vllm/model_executor/models/paddleocr_vl.py
-@@ -1004,3 +1004,6 @@
+@@ -1001,6 +1001,9 @@ class PaddleOCRVLForConditionalGeneration(nn.Module, SupportsMultiModal, Support
+                 if not isinstance(layer, PPMissingLayer):
+                     layer.self_attn.rotary_emb.is_neox_style = True
+ 
 +        from vllm_musa.optimization_contract.rotary import install_model_rotary
 +        install_model_rotary(self, vllm_config)
 +

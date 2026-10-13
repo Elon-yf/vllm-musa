@@ -10,6 +10,7 @@ from torch import nn
 from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
 
 from vllm_musa.jit_kernel import rotary_embedding
+from vllm_musa.utils.environ import envs
 
 from .types import ModelFamily, ModelRole, MusaOptimizationContract, OptimizationFeature
 
@@ -31,7 +32,7 @@ class MusaVisionApplyRotaryEmb(ApplyRotaryEmb):
     def forward_oot(
         self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
     ) -> torch.Tensor:
-        if x.device.type != "musa":
+        if x.device.type != "musa" or envs.VLLM_MUSA_CUSTOM_OP_USE_NATIVE.get():
             return self.forward_native(x, cos, sin)
         x, cos, sin, shape, dtype = self._pre_process(x, cos, sin)
         output = x.clone()
@@ -72,6 +73,8 @@ class MusaMRotaryEmbedding(nn.Module):
             if offsets is None
             else (positions, query, key, offsets)
         )
+        if envs.VLLM_MUSA_CUSTOM_OP_USE_NATIVE.get():
+            return self.inner.forward_native(*args)
         if query.device.type == "musa" and positions.ndim == 2 and key is not None:
             return self.inner.forward_cuda(*args)
         return self.inner(*args)
