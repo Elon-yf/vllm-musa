@@ -26,6 +26,14 @@ release line are intentionally not carried over.
 - Use the tensor-parallelism size documented in each recipe; increase TP only
   when memory requires it.
 
+## OCR Models
+
+| Model | Precision | Hardware | Recipe |
+|---|---|---|---|
+| MinerU2.5-Pro-2605-1.2B | BF16 | 1x S5000, TP1 | [Open recipe](ocr/mineru2.5-pro-2605-1.2b.md) |
+| OvisOCR2 | BF16 | 1x S5000, TP1 | [Open recipe](ocr/ovisocr2-bf16.md) |
+| PaddleOCR-VL-1.6 | BF16 | 1x S5000 recognition + 1x H20 layout | [Open recipe](ocr/paddleocr-vl-1.6-bf16-hybrid.md) |
+
 ## Qwen
 
 | Model | Precision | Hardware | Speculative decoding | Recipe |
