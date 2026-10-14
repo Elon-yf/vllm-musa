@@ -5,6 +5,13 @@
 Serve this vision-language OCR model with one S5000 GPU. The configuration uses
 BF16, compiled execution, and CUDA graphs for the language-model path.
 
+> [!TIP]
+> Use BF16, TP1, 0.80 GPU memory utilization, an 8,192-token context, 2,048
+> batched tokens, prefix caching and chunked prefill on, and
+> `VLLM_COMPILE`/`FULL_AND_PIECEWISE`. Keep the vLLM default scheduler sequence
+> limit and the checkpoint's image-processor defaults. MUSA selects FLASH_ATTN
+> for the ViT path.
+
 ## At a glance
 
 | Setting | Value |
@@ -26,9 +33,6 @@ BF16, compiled execution, and CUDA graphs for the language-model path.
 - The MinerU2.5-Pro-2605-1.2B checkpoint available at `MODEL_PATH`.
 - `mineru-vl-utils` installed in the same environment. It provides the
   `MinerULogitsProcessor` used by the serving command.
-
-> **Scheduler setting.** Leave `max_num_seqs` unset for this profile so vLLM uses
-> its default scheduler limit.
 
 ## Launching the server
 
@@ -97,6 +101,7 @@ print(response.choices[0].message.content)
 
 - The model's vLLM integration uses the in-process `AsyncLLM` API; this page
   shows the corresponding `vllm serve` deployment form.
+- Leave `max_num_seqs` unset so vLLM uses its default scheduler limit.
 - MUSA selects `FLASH_ATTN` for ViT and `MMEncoderAttention` automatically.
   Do not add the language-model `--attention-config` option to select it.
 - The image processor uses the checkpoint's own defaults. Do not add a

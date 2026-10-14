@@ -5,6 +5,12 @@
 Serve OvisOCR2 on one S5000 GPU with vLLM-MUSA. The server accepts image and
 text requests through the OpenAI-compatible chat API.
 
+> [!TIP]
+> Use BF16, TP1, 0.80 GPU memory utilization, a 262,144-token context,
+> 16,384 batched tokens, prefix caching off, Triton GDN prefill, the Ovis pixel
+> bounds below, and the vLLM default scheduler sequence limit. MUSA selects
+> FLASH_ATTN for the ViT path.
+
 ## At a glance
 
 | Setting | Value |
@@ -23,9 +29,6 @@ text requests through the OpenAI-compatible chat API.
 
 - vLLM-MUSA v0.28.0-dev with its patched vLLM installed.
 - The OvisOCR2 BF16 checkpoint available at `MODEL_PATH`.
-
-> **Scheduler setting.** Leave `max_num_seqs` unset for this profile so vLLM uses
-> its default scheduler limit.
 
 ## Launching the server
 
@@ -57,6 +60,7 @@ requests handled by this server.
 
 - The model's vLLM integration uses the synchronous in-process `LLM` API; this
   page shows the corresponding `vllm serve` deployment form.
+- Leave `max_num_seqs` unset so vLLM uses its default scheduler limit.
 - MUSA selects `FLASH_ATTN` for ViT and `MMEncoderAttention` automatically.
   Do not add the language-model `--attention-config` option to select it.
 - `--max-num-batched-tokens 16384`, prefix caching off, BF16, TP1, 0.80 GPU

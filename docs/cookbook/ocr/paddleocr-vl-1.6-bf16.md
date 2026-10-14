@@ -7,6 +7,11 @@ The server accepts images through the OpenAI-compatible chat completions API.
 Document layout analysis and page assembly, when needed, are handled by the
 client application.
 
+> [!TIP]
+> Use BF16, TP1, 0.80 GPU memory utilization, an 8,192-token context,
+> `max_num_seqs=512`, 16,384 batched tokens, prefix caching off, and a zero GB
+> multimodal processor cache. MUSA selects FLASH_ATTN for the ViT path.
+
 ## At a glance
 
 | Setting | Single node |
@@ -29,10 +34,6 @@ client application.
 - A Transformers-format PaddleOCR-VL-1.6-0.9B checkpoint. Set `MODEL_PATH` to
   its directory, which contains the model configuration, weights, tokenizer,
   and image processor.
-
-> **Performance configuration.** Keep TP1, BF16, GPU memory utilization 0.80,
-> context 8,192, `max_num_seqs=512`, `max_num_batched_tokens=16384`, prefix
-> caching off, and the multimodal processor cache at 0 together.
 
 ## Single node
 
