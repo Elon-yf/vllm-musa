@@ -2,8 +2,9 @@
 
 ## Overview
 
-Serve this vision-language OCR model with one S5000 GPU. The configuration uses
-BF16, compiled execution, and CUDA graphs for the language-model path.
+Run this vision-language OCR model through the in-process vLLM `AsyncLLM` API on
+one S5000 GPU. The configuration uses BF16, compiled execution, and CUDA graphs
+for the language-model path.
 
 > [!TIP]
 > Use BF16, TP1, 0.80 GPU memory utilization, an 8,192-token context, 2,048
@@ -32,34 +33,9 @@ BF16, compiled execution, and CUDA graphs for the language-model path.
 - vLLM-MUSA v0.28.0-dev with its patched vLLM installed.
 - The MinerU2.5-Pro-2605-1.2B checkpoint available at `MODEL_PATH`.
 - `mineru-vl-utils` installed in the same environment. It provides the
-  `MinerULogitsProcessor` used by the serving command.
+  `MinerULogitsProcessor` used by the request code.
 
-## Launching the server
-
-Replace `<MODEL_PATH>` with the checkpoint directory. Run the command where the
-intended S5000 GPU is visible to vLLM.
-
-```bash
-export MODEL_PATH="<MODEL_PATH>"
-export VLLM_WORKER_MULTIPROC_METHOD=spawn
-
-vllm serve "${MODEL_PATH}" \
-  --host 0.0.0.0 \
-  --port 8000 \
-  --served-model-name MinerU2.5-Pro-2605-1.2B \
-  --tensor-parallel-size 1 \
-  --dtype bfloat16 \
-  --max-model-len 8192 \
-  --max-num-batched-tokens 2048 \
-  --gpu-memory-utilization 0.80 \
-  --enable-prefix-caching \
-  --enable-chunked-prefill \
-  --hf-overrides '{"tie_word_embeddings":true}' \
-  --logits-processors mineru_vl_utils:MinerULogitsProcessor \
-  --compilation-config '{"mode":"VLLM_COMPILE","cudagraph_mode":"FULL_AND_PIECEWISE"}'
-```
-
-## Send an image to vLLM
+## Run an image request
 
 The direct vLLM request uses the model's asynchronous engine client:
 
@@ -77,6 +53,7 @@ engine = AsyncLLM.from_engine_args(AsyncEngineArgs(
     hf_overrides={"tie_word_embeddings": True},
     logits_processors=[MinerULogitsProcessor],
     tensor_parallel_size=1,
+    dtype="bfloat16",
     gpu_memory_utilization=0.80,
     max_model_len=8192,
 ))
@@ -100,9 +77,9 @@ asyncio.run(request())
 
 ## Configuration notes
 
-- The model's vLLM integration uses the in-process `AsyncLLM` API; this page
-  shows the corresponding `vllm serve` deployment form.
-- Leave `max_num_seqs` unset so vLLM uses its default scheduler limit.
+- The request above is the model's in-process `AsyncLLM` path. Leave
+  `max_num_batched_tokens`, `max_num_seqs`, prefix caching, and chunked prefill
+  unset to use the values shown above on this vLLM-MUSA version.
 - MUSA selects `FLASH_ATTN` for ViT and `MMEncoderAttention` automatically.
   Do not add the language-model `--attention-config` option to select it.
 - The image processor uses the checkpoint's own defaults. Do not add a
