@@ -55,8 +55,8 @@ vllm serve "${MODEL_PATH}" \
 
 ## Send an image request
 
-Replace `<IMAGE_PATH>` with a JPEG or PNG file. This verifies the vLLM image
-request path; an application may then send its model-specific prompts.
+Replace `<IMAGE_PATH>` with a JPEG or PNG file. The same OpenAI-compatible
+image format can be used with the model's application-specific prompts.
 
 ```python
 import base64
