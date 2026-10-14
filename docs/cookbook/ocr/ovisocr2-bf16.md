@@ -24,10 +24,8 @@ text requests through the OpenAI-compatible chat API.
 - vLLM-MUSA v0.28.0-dev with its patched vLLM installed.
 - The OvisOCR2 BF16 checkpoint available at `MODEL_PATH`.
 
-> **Performance configuration.** Keep the scheduler sequence limit unset. The
-> historical full-performance contract left `max_num_seqs` at the vLLM default;
-> it resolves to 1,024 in the validated vLLM-MUSA environment. Do not replace it
-> with an application batch value.
+> **Scheduler setting.** Leave `max_num_seqs` unset for this profile so vLLM uses
+> its default scheduler limit.
 
 ## Launching the server
 
@@ -57,9 +55,8 @@ requests handled by this server.
 
 ## Configuration notes
 
-- The historical full path uses vLLM's in-process `LLM` engine. This server
-  command carries the same effective vLLM settings; HTTP transport is not a
-  performance baseline.
+- The model's vLLM integration uses the synchronous in-process `LLM` API; this
+  page shows the corresponding `vllm serve` deployment form.
 - MUSA selects `FLASH_ATTN` for ViT and `MMEncoderAttention` automatically.
   Do not add the language-model `--attention-config` option to select it.
 - `--max-num-batched-tokens 16384`, prefix caching off, BF16, TP1, 0.80 GPU

@@ -27,10 +27,8 @@ BF16, compiled execution, and CUDA graphs for the language-model path.
 - `mineru-vl-utils` installed in the same environment. It provides the
   `MinerULogitsProcessor` used by the serving command.
 
-> **Performance configuration.** Keep `max_num_seqs` at the vLLM default. The
-> validated full engine resolves it to 128; the full contract does not pass an
-> override. Do not replace this scheduler setting with an application batch
-> value.
+> **Scheduler setting.** Leave `max_num_seqs` unset for this profile so vLLM uses
+> its default scheduler limit.
 
 ## Launching the server
 
@@ -97,15 +95,12 @@ print(response.choices[0].message.content)
 
 ## Configuration notes
 
-- The historical full path uses vLLM's in-process `AsyncLLM` API. vLLM supports
-  this path directly; the server command above exposes the same effective
-  scheduler, compilation, and model settings. HTTP transport is not a
-  performance baseline.
+- The model's vLLM integration uses the in-process `AsyncLLM` API; this page
+  shows the corresponding `vllm serve` deployment form.
 - MUSA selects `FLASH_ATTN` for ViT and `MMEncoderAttention` automatically.
   Do not add the language-model `--attention-config` option to select it.
-- The full contract uses the checkpoint's image-processor defaults. No
-  `--mm-processor-kwargs` pixel override is part of the validated MinerU
-  configuration.
+- The image processor uses the checkpoint's own defaults. Do not add a
+  `--mm-processor-kwargs` pixel override to this profile.
 - Keep BF16, TP1, 0.80 GPU memory utilization, context 8,192, 2,048 batched
   tokens, prefix caching on, chunked prefill on, and
   `VLLM_COMPILE`/`FULL_AND_PIECEWISE` together.
