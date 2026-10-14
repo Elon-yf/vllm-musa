@@ -13,7 +13,7 @@ BF16, compiled execution, and CUDA graphs for the language-model path.
 | Precision | BF16 |
 | Tensor parallelism | TP1 |
 | Maximum context | 8,192 tokens |
-| Maximum sequences | 128 |
+| Maximum sequences | vLLM default (left unset in the full contract) |
 | Maximum batched tokens | 2,048 |
 | GPU memory utilization | 0.80 |
 | Prefix cache | On |
@@ -26,6 +26,11 @@ BF16, compiled execution, and CUDA graphs for the language-model path.
 - The MinerU2.5-Pro-2605-1.2B checkpoint available at `MODEL_PATH`.
 - `mineru-vl-utils` installed in the same environment. It provides the
   `MinerULogitsProcessor` used by the serving command.
+
+> **Performance configuration.** Keep `max_num_seqs` at the vLLM default. The
+> validated full engine resolves it to 128; the full contract does not pass an
+> override. Do not replace this scheduler setting with an application batch
+> value.
 
 ## Launching the server
 
@@ -43,7 +48,6 @@ vllm serve "${MODEL_PATH}" \
   --tensor-parallel-size 1 \
   --dtype bfloat16 \
   --max-model-len 8192 \
-  --max-num-seqs 128 \
   --max-num-batched-tokens 2048 \
   --gpu-memory-utilization 0.80 \
   --enable-prefix-caching \
@@ -90,5 +94,20 @@ print(response.choices[0].message.content)
 
 `--hf-overrides` keeps the checkpoint's tied embeddings enabled.
 `--logits-processors` loads the model-specific processor for sampling.
+
+## Configuration notes
+
+- The historical full path uses vLLM's in-process `AsyncLLM` API. vLLM supports
+  this path directly; the server command above exposes the same effective
+  scheduler, compilation, and model settings. HTTP transport is not a
+  performance baseline.
+- MUSA selects `FLASH_ATTN` for ViT and `MMEncoderAttention` automatically.
+  Do not add the language-model `--attention-config` option to select it.
+- The full contract uses the checkpoint's image-processor defaults. No
+  `--mm-processor-kwargs` pixel override is part of the validated MinerU
+  configuration.
+- Keep BF16, TP1, 0.80 GPU memory utilization, context 8,192, 2,048 batched
+  tokens, prefix caching on, chunked prefill on, and
+  `VLLM_COMPILE`/`FULL_AND_PIECEWISE` together.
 
 Return to the [OCR recipe index](README.md).

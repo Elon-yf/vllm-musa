@@ -13,7 +13,7 @@ text requests through the OpenAI-compatible chat API.
 | Precision | BF16 |
 | Tensor parallelism | TP1 |
 | Maximum context | 262,144 tokens |
-| Maximum sequences | 1,024 |
+| Maximum sequences | vLLM default (left unset in the full contract) |
 | Maximum batched tokens | 16,384 |
 | GPU memory utilization | 0.80 |
 | Prefix caching | Off |
@@ -23,6 +23,11 @@ text requests through the OpenAI-compatible chat API.
 
 - vLLM-MUSA v0.28.0-dev with its patched vLLM installed.
 - The OvisOCR2 BF16 checkpoint available at `MODEL_PATH`.
+
+> **Performance configuration.** Keep the scheduler sequence limit unset. The
+> historical full-performance contract left `max_num_seqs` at the vLLM default;
+> it resolves to 1,024 in the validated vLLM-MUSA environment. Do not replace it
+> with an application batch value.
 
 ## Launching the server
 
@@ -40,7 +45,6 @@ vllm serve "${MODEL_PATH}" \
   --tensor-parallel-size 1 \
   --gpu-memory-utilization 0.80 \
   --max-model-len 262144 \
-  --max-num-seqs 1024 \
   --max-num-batched-tokens 16384 \
   --no-enable-prefix-caching \
   --gdn-prefill-backend triton \
@@ -50,6 +54,17 @@ vllm serve "${MODEL_PATH}" \
 
 The image processor bounds above are 448² and 2,880² pixels. They apply to all
 requests handled by this server.
+
+## Configuration notes
+
+- The historical full path uses vLLM's in-process `LLM` engine. This server
+  command carries the same effective vLLM settings; HTTP transport is not a
+  performance baseline.
+- MUSA selects `FLASH_ATTN` for ViT and `MMEncoderAttention` automatically.
+  Do not add the language-model `--attention-config` option to select it.
+- `--max-num-batched-tokens 16384`, prefix caching off, BF16, TP1, 0.80 GPU
+  memory utilization, Triton GDN prefill, and the 262,144-token context are the
+  performance settings shown by the full-run logs.
 
 ## Send an image request
 

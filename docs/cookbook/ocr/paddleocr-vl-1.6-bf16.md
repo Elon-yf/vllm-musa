@@ -30,6 +30,10 @@ client application.
   its directory, which contains the model configuration, weights, tokenizer,
   and image processor.
 
+> **Performance configuration.** Keep TP1, BF16, GPU memory utilization 0.80,
+> context 8,192, `max_num_seqs=512`, `max_num_batched_tokens=16384`, prefix
+> caching off, and the multimodal processor cache at 0 together.
+
 ## Single node
 
 ```bash
@@ -97,6 +101,8 @@ print(response.choices[0].message.content)
   multimodal prefill can span multiple iterations.
 - `--mm-processor-cache-gb 0` disables the multimodal **processor** cache;
   it does not disable the vision encoder or vLLM's CUDA graphs.
+- MUSA selects `FLASH_ATTN` for ViT and `MMEncoderAttention` automatically. Do
+  not add the language-model `--attention-config` option to select it.
 - Leave compilation and CUDA graph settings at the vLLM-MUSA defaults shown
   above; do not add `--enforce-eager` to this performance configuration.
 
