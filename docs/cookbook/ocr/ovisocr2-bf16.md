@@ -50,6 +50,7 @@ vllm serve /model \
 Use the OvisOCR2 OCR prompt without translation or paraphrasing:
 
 ```text
+prompt=Extract all readable content from the image in natural human reading order and output the result as a single Markdown document. Preserve the original text without translation or paraphrasing.
 temperature=0
 enable_thinking=false
 max_tokens=16384

@@ -29,7 +29,14 @@ regions, and serializes the result to Markdown.
 | FULL client | `MinerUClient(backend="vllm-async-engine")` |
 | Dataset | OmniDocBench v1.6 Full, 1,651 original pages |
 
-## Launching the trace server
+The **Trace** profile is a single-request diagnostic server: it uses the
+explicit sequence and token limits in the table and is paired with a direct
+request. The **FULL** profile is the official two-step client below: it creates
+its own in-process `AsyncLLM` with the runner defaults. Choose one profile for a
+run; do not start the trace server while running the FULL client on the same
+GPU.
+
+## Launching the trace server (diagnostic profile)
 
 ```bash
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
@@ -85,3 +92,5 @@ and save Markdown and JSON outputs.
   `(896, 24, 14, 2, 64)`, vision `(1280, 32, 16, 80)`, and MRoPE
   `(8, 12, 12)`.
 - Use the deployment-provided runtime and checkpoint paths.
+
+Return to the [OCR recipe index](README.md).
