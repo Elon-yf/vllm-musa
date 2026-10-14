@@ -141,5 +141,8 @@ def test_ovis_install_respects_selection(
         model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type="qwen3_5"))
     )
     assert install_model_rotary(SimpleNamespace(visual=_visual()), config)
+    incomplete = _visual()
+    del incomplete.blocks[5].attn
+    assert not install_model_rotary(SimpleNamespace(visual=incomplete), config)
     selected.preferred_features = frozenset()
     assert not install_model_rotary(SimpleNamespace(visual=_visual()), config)

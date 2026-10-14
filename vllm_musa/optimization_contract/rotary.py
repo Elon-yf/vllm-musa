@@ -92,6 +92,9 @@ class MusaVisionApplyRotaryEmb(ApplyRotaryEmb):
                 or not self.is_neox_style
                 or self.enable_fp32_compute
             ):
+                logger.info_once(
+                    "MUSA vision rotary skipped: unsupported input geometry"
+                )
                 return self.forward_native(x, cos, sin)
         x, cos, sin, shape, dtype = self._pre_process(x, cos, sin)
         output = x.contiguous() if self.inplace else x.clone()
@@ -385,7 +388,7 @@ def install_model_rotary(owner: nn.Module, vllm_config: object) -> bool:
         language = (getattr(getattr(getattr(owner, "language_model", None), "model", None), "layers", ()), {"mrope_section": (8, 12, 12), "qk_hidden_sizes": (896, 128), "head_size": 64, "rotary_dim": 64})
     elif qwen35 is not None and qwen35 in features:
         visual = getattr(owner, "visual", None)
-        vision = ((block.attn for block in getattr(visual, "blocks", ())), {"expected_blocks": 12, "inplace": True, "flatten": True, "required_bf16_neox_shape": (64, 32)})
+        vision = ((getattr(block, "attn", None) for block in getattr(visual, "blocks", ())), {"expected_blocks": 12, "inplace": True, "flatten": True, "required_bf16_neox_shape": (64, 32)})
         language = None
     else:
         config = getattr(getattr(vllm_config, "model_config", None), "hf_config", None)
