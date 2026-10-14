@@ -7,8 +7,8 @@ vLLM-MUSA.
 
 > [!TIP]
 > Use BF16, TP1, 0.80 GPU memory utilization, a 262,144-token context,
-> 16,384 batched tokens, `max_num_seqs=1024`, prefix caching off, Triton GDN
-> prefill, and the Ovis pixel bounds below. MUSA selects
+> 16,384 batched tokens, prefix caching off, Triton GDN prefill, the Ovis pixel
+> bounds below, and the vLLM default scheduler sequence limit. MUSA selects
 > FLASH_ATTN for the ViT path.
 
 ## At a glance
@@ -19,7 +19,7 @@ vLLM-MUSA.
 | Precision | BF16 |
 | Tensor parallelism | TP1 |
 | Maximum context | 262,144 tokens |
-| Maximum sequences | 1,024 |
+| Maximum sequences | vLLM default |
 | Maximum batched tokens | 16,384 |
 | GPU memory utilization | 0.80 |
 | Prefix caching | Off |
@@ -30,19 +30,18 @@ vLLM-MUSA.
 - vLLM-MUSA v0.28.0-dev with its patched vLLM installed.
 - The OvisOCR2 BF16 checkpoint available at `MODEL_PATH`.
 
-## vLLM server startup (validated baseline)
+## Launching the server
 
-Use this server configuration for deployment. The in-process request code below
-is an alternative path; do not run both on the same GPU.
+Replace `<MODEL_PATH>` with the checkpoint directory.
 
 ```bash
-export MODEL_PATH="<MODEL_PATH>"
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export MODEL_PATH="<MODEL_PATH>"
 
 vllm serve "${MODEL_PATH}" \
   --host 0.0.0.0 \
-  --port 8000 \
   --served-model-name OvisOCR2 \
+  --port 8000 \
   --dtype bfloat16 \
   --tensor-parallel-size 1 \
   --gpu-memory-utilization 0.80 \
@@ -58,18 +57,17 @@ vllm serve "${MODEL_PATH}" \
 
 ## Configuration notes
 
-- The request below starts the model's synchronous in-process `LLM` engine. It
-  pins the current validated baseline values; the full sweep report is the
-  authority for any later parameter change.
+- The request below is the model's synchronous in-process `LLM` path. Leave
+  `max_model_len`, `max_num_batched_tokens`, and `max_num_seqs` unset to use the
+  values shown above on this vLLM-MUSA version.
 - MUSA selects `FLASH_ATTN` for ViT and `MMEncoderAttention` automatically.
   Do not add the language-model `--attention-config` option to select it.
 - Keep prefix caching off, BF16, TP1, 0.80 GPU memory utilization, Triton GDN
   prefill, and the 262,144-token context together.
 
-## Run an image request in-process
+## Run an image request
 
-Run this instead of the server command above. The direct vLLM request uses the
-same fields as the model parser:
+The direct vLLM request uses the same fields as the model parser:
 
 ```python
 from pathlib import Path
