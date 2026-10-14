@@ -101,7 +101,7 @@ def test_positions_cache_reuses_captured_shape(monkeypatch: pytest.MonkeyPatch) 
     assert cache.get(2, 3, device) is pinned
 
 
-def test_positions_cache_pins_when_capture_probe_raises(
+def test_positions_cache_probe_failure_falls_back_to_eager_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class MusaDevice:
@@ -116,8 +116,9 @@ def test_positions_cache_pins_when_capture_probe_raises(
         raise RuntimeError("capture probe unavailable")
 
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", raising_probe)
-    pinned = cache.get(2, 3, device)
-    assert cache.get(2, 3, device) is pinned
+    positions = cache.get(2, 3, device)
+    assert cache.get(2, 3, device) is positions
+    assert cache._pinned == {}
 
 
 def test_ovis_install_respects_selection(

@@ -33,7 +33,7 @@ class MusaVisionRotaryPositions(nn.Module):
                 torch.cuda.is_current_stream_capturing()
             )
         except (AttributeError, RuntimeError):
-            capturing = device.type == "musa"
+            capturing = False
         key = (batch, seq_len, device)
         if key in self._pinned:
             return self._pinned[key]

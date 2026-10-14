@@ -6,7 +6,7 @@ import pytest
 
 pytest.importorskip("torchada")
 
-from vllm_musa.optimization_contract import (
+from vllm_musa.optimization_contract import (  # noqa: E402
     ModelFamily,
     OptimizationFeature,
     resolve_optimization_contract,
