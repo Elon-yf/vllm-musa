@@ -28,15 +28,19 @@ Use deployment-assigned paths and IDs. The placeholders below are intentional an
 
 ```bash
 export VLLM_MUSA_IMAGE="<approved-vllm-musa-image>"
+export VLLM_SERVER_HOST="<s5000-host>"
+export VLLM_SERVER_PORT="<s5000-port>"
+export PADDLE_VLM_SERVER_URL="http://${VLLM_SERVER_HOST}:${VLLM_SERVER_PORT}/v1"
 export PADDLE_LEASE_ID="<active-broker-lease-id>"
 export PADDLE_GPU="<broker-granted-physical-index>"
 export PADDLE_GPU_UUID="<broker-granted-gpu-uuid>"
-export PADDLE_PORT="<unused-authorized-port>"
+export PADDLE_PORT="$VLLM_SERVER_PORT"
 export PADDLE_RUN_ROOT="<fresh-absolute-task-root>"
 export PADDLE_MODEL_DIR="<PaddleOCR-VL-1.6-0.9B-checkpoint>"
 export OMNIDOC_DATA_DIR="<OmniDocBench-root>"
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export PYTHONUNBUFFERED=1
+export VLLM_PLUGINS=musa,musa_custom_ops
 export PYTHONDONTWRITEBYTECODE=1
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
@@ -61,12 +65,12 @@ Do not add `--enforce-eager` to this performance recipe. Confirm a real request 
 
 ## H20 client and full 1,651-page flow
 
-Run on the authorized H20 host. The ticket launcher repeats this flow three times with fresh output directories. It sets `CUDA_VISIBLE_DEVICES=0`, binds the approved H20 UUID, and starts the frozen Paddle CUDA image.
+Run on the authorized H20 host. The ticket launcher repeats this flow three times with fresh output directories. It binds the approved H20 UUID and sets `CUDA_VISIBLE_DEVICES=0` inside the runtime, where index 0 is the bound layout device.
 
 ```bash
 export H20_GPU_UUID="<authorized-h20-gpu-uuid>"
 export H20_PARENT_LEASE="$PADDLE_LEASE_ID"
-export H20_S5000_URL="http://<s5000-host>:<port>/v1"
+export H20_S5000_URL="$PADDLE_VLM_SERVER_URL"
 export H20_PERF_ROOT="<fresh-absolute-h20-output-root>"
 export H20_RUN_ID="<lowercase-run-id>"
 export OMNIDOC_DATA_DIR="<OmniDocBench-root>"
@@ -79,6 +83,7 @@ The underlying client code is equivalent to the following complete workload and 
 
 ```python
 import json
+import os
 from pathlib import Path
 from paddleocr import PaddleOCRVL
 
@@ -93,7 +98,7 @@ assert all(path.is_file() for path in paths)
 pipeline = PaddleOCRVL(
     pipeline_version="v1.6",
     vl_rec_backend="vllm-server",
-    vl_rec_server_url="http://<s5000-host>:<port>/v1",
+    vl_rec_server_url=os.environ["PADDLE_VLM_SERVER_URL"],
     vl_rec_api_model_name="PaddleOCR-VL-1.6-0.9B",
     use_doc_orientation_classify=False,
     use_doc_unwarping=False,

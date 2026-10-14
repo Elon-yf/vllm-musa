@@ -20,6 +20,7 @@ This recipe runs MinerU2.5-Pro-2605-1.2B on one S5000 through the official in-pr
 | Full workload | OmniDocBench v1.6 original images, 1,651 pages |
 | Full P2 batch | 100 |
 | Same-process phases | cold 1, warmup 10, P1 30×3 at batch 1, P2 1,651×3 at batch 100 |
+| Engine defaults | `max_num_seqs=128`, `max_num_batched_tokens=2048` in vLLM 0.28; verify resolved startup values |
 | Prefix / eager mode | runner defaults; do not add a one-page diagnostic override |
 
 The full-run acceptance check requires 1,651 ordered rows, zero inference errors, and preservation of image-only empty Markdown pages. Run three P2 rounds before ranking a current profile.
@@ -38,6 +39,7 @@ export MODEL="<MinerU2.5-Pro-2605-1.2B-checkpoint>"
 export DATA="<OmniDocBench-root>"
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export PYTHONUNBUFFERED=1
+export VLLM_PLUGINS=musa,musa_custom_ops
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 

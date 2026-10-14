@@ -35,6 +35,7 @@ export OVIS_MODEL_DIR="<OvisOCR2-checkpoint>"       # optional launcher override
 export OMNIDOC_DATA_DIR="<OmniDocBench-root>"       # optional launcher override
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export PYTHONUNBUFFERED=1
+export VLLM_PLUGINS=musa,musa_custom_ops
 export PYTHONDONTWRITEBYTECODE=1
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
