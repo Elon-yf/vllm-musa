@@ -1,79 +1,103 @@
-# PaddleOCR-VL-1.6 BF16 on vLLM-MUSA
+# PaddleOCR-VL-1.6 BF16
 
 ## Overview
 
-This recipe configures the PaddleOCR-VL-1.6 recognition model on one S5000
-through the vLLM OpenAI-compatible server. It covers the vLLM process only.
-Document layout and page-level post-processing run outside this server.
-
-> [!TIP]
-> Use the normal compiled serving path. The page count or outer batch size of
-> a document client does not set vLLM's active-sequence or token limits.
+Serve the PaddleOCR-VL-1.6 recognition model with vLLM-MUSA on one S5000 GPU.
+The server accepts images through the OpenAI-compatible chat completions API.
+Document layout analysis and page assembly, when needed, are handled by the
+client application.
 
 ## At a glance
 
-| Setting | Value |
+| Setting | Single node |
 |---|---|
 | Hardware | 1x S5000 |
-| Precision / tensor parallelism | BF16 / TP1 |
+| Precision | BF16 |
+| Tensor parallelism | TP1 |
 | Maximum context | 8,192 tokens |
 | Maximum sequences | 512 |
 | Maximum batched tokens | 16,384 |
-| GPU memory utilization | 0.8 |
+| GPU memory utilization | 0.80 |
 | Prefix caching | Off |
 | Multimodal processor cache | 0 GB |
-| Compilation and CUDAGraph | Normal vLLM defaults; verify the resolved startup configuration |
+| CUDA graphs | `FULL_AND_PIECEWISE` with vLLM-MUSA defaults |
 
-## Launching the server
+## Prerequisites
 
-Use a vLLM-MUSA environment with the matching PaddleOCR-VL-1.6 checkpoint and
-model source installed. Set `MODEL_PATH` to that checkpoint before starting.
+- vLLM-MUSA v0.28.0-dev with its patched vLLM installed.
+- One S5000 GPU visible to the vLLM process.
+- A Transformers-format PaddleOCR-VL-1.6-0.9B checkpoint. Set `MODEL_PATH` to
+  its directory, which contains the model configuration, weights, tokenizer,
+  and image processor.
+
+## Single node
 
 ```bash
-export MODEL_PATH="${MODEL_PATH:?set the PaddleOCR-VL-1.6 checkpoint path}"
-export MTHREADS_VISIBLE_DEVICES="${MTHREADS_VISIBLE_DEVICES:?set the assigned S5000 GPU index}"
+export MODEL_PATH="<MODEL_PATH>"
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
-export PYTHONUNBUFFERED=1
 
-vllm serve "$MODEL_PATH" \
+vllm serve "${MODEL_PATH}" \
+  --trust-remote-code \
+  --tensor-parallel-size 1 \
+  --served-model-name PaddleOCR-VL-1.6-0.9B \
   --host 0.0.0.0 \
   --port 8000 \
-  --served-model-name PaddleOCR-VL-1.6-0.9B \
-  --trust-remote-code \
   --dtype bfloat16 \
-  --tensor-parallel-size 1 \
-  --gpu-memory-utilization 0.8 \
   --max-model-len 8192 \
   --max-num-seqs 512 \
   --max-num-batched-tokens 16384 \
+  --gpu-memory-utilization 0.80 \
   --no-enable-prefix-caching \
   --mm-processor-cache-gb 0
 ```
 
-The frozen full-run launcher sets the same model, dtype, memory, context,
-scheduler, prefix-cache, and processor-cache values. It leaves compilation
-and multimodal attention at the installed vLLM-MUSA defaults; the command
-above does the same. Its TP1 setting is an effective default, made explicit
-here.
+## Send an image
 
-## Verifying the vLLM configuration
+Install the `openai` Python client if needed. Replace `<IMAGE_PATH>` with a
+local JPEG or PNG image:
 
-Check the startup log for `enforce_eager=False`, the resolved
-`max_num_seqs=512` and `max_num_batched_tokens=16384`, and successful graph
-capture. A prior full-run log reported `FULL_AND_PIECEWISE` graphs and
-`FLASH_ATTN` for the visual encoder; confirm those routes in the runtime you
-actually start. A `/v1/models` response confirms that the API is listening,
-but a real image request is needed to validate model execution.
+```python
+import base64
+import mimetypes
+from pathlib import Path
+
+from openai import OpenAI
+
+image_path = Path("<IMAGE_PATH>")
+mime_type = mimetypes.guess_type(image_path.name)[0] or "image/jpeg"
+image_data = base64.b64encode(image_path.read_bytes()).decode("ascii")
+
+client = OpenAI(api_key="EMPTY", base_url="http://localhost:8000/v1")
+response = client.chat.completions.create(
+    model="PaddleOCR-VL-1.6-0.9B",
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{mime_type};base64,{image_data}"
+                    },
+                },
+                {"type": "text", "text": "OCR:"},
+            ],
+        }
+    ],
+    temperature=0,
+    max_tokens=512,
+)
+print(response.choices[0].message.content)
+```
 
 ## Configuration notes
 
-- `max_num_seqs` limits active vLLM sequences. It is independent of an
-  upstream document client's page batch.
-- `max_num_batched_tokens` is the scheduler's per-iteration token budget;
-  chunked multimodal prefill may span iterations.
-- `--mm-processor-cache-gb 0` disables the processor cache. It is separate
-  from the multimodal encoder cache and encoder CUDAGraph settings.
-- Keep `--enforce-eager` off for performance measurements. Record any change
-  to graph mode or capture sizes as a separate serving configuration.
+- `--max-num-seqs` limits active requests in the vLLM scheduler.
+- `--max-num-batched-tokens` limits tokens scheduled in one iteration;
+  multimodal prefill can span multiple iterations.
+- `--mm-processor-cache-gb 0` disables the multimodal **processor** cache;
+  it does not disable the vision encoder or vLLM's CUDA graphs.
+- Leave compilation and CUDA graph settings at the vLLM-MUSA defaults shown
+  above; do not add `--enforce-eager` to this performance configuration.
 
 Return to the [OCR recipe index](README.md).
