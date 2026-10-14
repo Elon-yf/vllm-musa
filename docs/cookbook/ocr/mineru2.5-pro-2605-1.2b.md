@@ -34,14 +34,13 @@ for the language-model path.
 - `mineru-vl-utils` installed in the same environment. It provides the
   `MinerULogitsProcessor` used by the request code.
 
-## Recommended vLLM server configuration
+## vLLM server startup (validated baseline)
 
 Use this server configuration for deployment. The in-process request code below
 is an alternative path; do not run both on the same GPU.
 
 ```bash
 export MODEL_PATH="<MODEL_PATH>"
-export VLLM_PLUGINS=musa,musa_custom_ops
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 
 vllm serve "${MODEL_PATH}" \
@@ -109,8 +108,8 @@ asyncio.run(request())
 ## Configuration notes
 
 - The request above starts the model's in-process `AsyncLLM` engine and pins the
-  validated baseline scheduler and cache values shown above; no tested candidate
-  beat this baseline in the completed scheduler screen.
+  current validated baseline values; the full sweep report is the authority for
+  any later parameter change.
 - MUSA selects `FLASH_ATTN` for ViT and `MMEncoderAttention` automatically.
   Do not add the language-model `--attention-config` option to select it.
 - The image processor uses the checkpoint's own defaults. Do not add a
