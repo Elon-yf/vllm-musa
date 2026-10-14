@@ -28,8 +28,8 @@ Use deployment-assigned paths and IDs. The placeholders below are intentional an
 
 ```bash
 export VLLM_MUSA_IMAGE="<approved-vllm-musa-image>"
-export VLLM_SERVER_HOST="<s5000-host>"
-export VLLM_SERVER_PORT="<s5000-port>"
+export VLLM_SERVER_HOST="${VLLM_SERVER_HOST:?set the reachable S5000 host}"
+export VLLM_SERVER_PORT="${VLLM_SERVER_PORT:-8000}"
 export PADDLE_VLM_SERVER_URL="http://${VLLM_SERVER_HOST}:${VLLM_SERVER_PORT}/v1"
 export PADDLE_LEASE_ID="<active-broker-lease-id>"
 export PADDLE_GPU="<broker-granted-physical-index>"
