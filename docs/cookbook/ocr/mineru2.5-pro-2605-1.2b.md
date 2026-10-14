@@ -21,9 +21,11 @@ regions, and serializes the result to Markdown.
 | Architecture | `Qwen2VLForConditionalGeneration` |
 | Maximum context | 8,192 tokens |
 | Trace maximum sequences / batched tokens | 1 / 4,096 |
+| FULL maximum sequences / batched tokens | Runner defaults / 2,048 in the recorded run |
 | FULL outer page batch | 100 |
 | GPU memory utilization | 0.8 |
 | Trace prefix / multimodal processor cache | Off / 0 GB |
+| FULL prefix cache / eager mode | Runner defaults (compiled path) |
 | FULL client | `MinerUClient(backend="vllm-async-engine")` |
 | Dataset | OmniDocBench v1.6 Full, 1,651 original pages |
 
@@ -33,18 +35,18 @@ regions, and serializes the result to Markdown.
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export PYTHONUNBUFFERED=1
 
-vllm serve /model \\
-  --served-model-name MinerU2.5-Pro-2605-1.2B \\
-  --trust-remote-code \\
-  --dtype bfloat16 \\
-  --tensor-parallel-size 1 \\
-  --gpu-memory-utilization 0.8 \\
-  --max-model-len 8192 \\
-  --max-num-seqs 1 \\
-  --max-num-batched-tokens 4096 \\
-  --no-enable-prefix-caching \\
-  --mm-processor-cache-gb 0 \\
-  --enforce-eager \\
+vllm serve /model \
+  --served-model-name MinerU2.5-Pro-2605-1.2B \
+  --trust-remote-code \
+  --dtype bfloat16 \
+  --tensor-parallel-size 1 \
+  --gpu-memory-utilization 0.8 \
+  --max-model-len 8192 \
+  --max-num-seqs 1 \
+  --max-num-batched-tokens 4096 \
+  --no-enable-prefix-caching \
+  --mm-processor-cache-gb 0 \
+  --enforce-eager \
   --logits-processors mineru_vl_utils:MinerULogitsProcessor
 ```
 
@@ -79,7 +81,7 @@ and save Markdown and JSON outputs.
 - Install the pinned MinerU SDK dependencies before starting the client.
 - `image_analysis=False` disables optional image and chart analysis. It does
   not disable page layout detection or region recognition.
-- PR #267 enables its model-local rotary adapter for text
-  `(896, 24, 14, 2, 64)`, vision `(1280, 32, 16, 80)\), and MRoPE
+- The model-local rotary adapter uses text
+  `(896, 24, 14, 2, 64)`, vision `(1280, 32, 16, 80)`, and MRoPE
   `(8, 12, 12)`.
 - Use the deployment-provided runtime and checkpoint paths.

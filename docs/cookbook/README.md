@@ -28,6 +28,8 @@ release line are intentionally not carried over.
 
 ## OCR Models
 
+See the [OCR cookbook index](ocr/README.md) for the three model recipes.
+
 | Model | Precision | Hardware | Recipe |
 |---|---|---|---|
 | MinerU2.5-Pro-2605-1.2B | BF16 | 1x S5000, TP1 | [Open recipe](ocr/mineru2.5-pro-2605-1.2b.md) |

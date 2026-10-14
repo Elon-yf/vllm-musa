@@ -3,6 +3,8 @@
 The OCR recipes below describe serving configuration only. Use deployment-provided
 paths and runtime details when running them.
 
+Back to the [full serving cookbook](../README.md).
+
 | Model | Precision | Hardware | Recipe |
 |---|---|---|---|
 | MinerU2.5-Pro-2605-1.2B | BF16 | 1x S5000, TP1 | [Open recipe](mineru2.5-pro-2605-1.2b.md) |

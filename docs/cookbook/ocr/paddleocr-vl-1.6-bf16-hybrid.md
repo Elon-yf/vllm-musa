@@ -31,20 +31,20 @@ On the S5000, use the deployment-provided checkpoint at `/model`:
 ```bash
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export PYTHONUNBUFFERED=1
-export VLLM_SERVER_HOST=<SERVER_HOST>
-export VLLM_SERVER_PORT=<SERVER_PORT>
+export VLLM_SERVER_HOST=SERVER_HOST
+export VLLM_SERVER_PORT=SERVER_PORT
 
-vllm serve /model \\
-  --served-model-name PaddleOCR-VL-1.6-0.9B \\
-  --trust-remote-code \\
-  --dtype bfloat16 \\
-  --gpu-memory-utilization 0.8 \\
-  --max-model-len 8192 \\
-  --max-num-seqs 512 \\
-  --max-num-batched-tokens 16384 \\
-  --no-enable-prefix-caching \\
-  --mm-processor-cache-gb 0 \\
-  --host "$VLLM_SERVER_HOST" \\
+vllm serve /model \
+  --served-model-name PaddleOCR-VL-1.6-0.9B \
+  --trust-remote-code \
+  --dtype bfloat16 \
+  --gpu-memory-utilization 0.8 \
+  --max-model-len 8192 \
+  --max-num-seqs 512 \
+  --max-num-batched-tokens 16384 \
+  --no-enable-prefix-caching \
+  --mm-processor-cache-gb 0 \
+  --host "$VLLM_SERVER_HOST" \
   --port "$VLLM_SERVER_PORT"
 ```
 

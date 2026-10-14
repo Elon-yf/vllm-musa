@@ -31,18 +31,18 @@ multimodal architecture. This profile targets one S5000 MPX30.
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export PYTHONUNBUFFERED=1
 
-vllm serve /model \\
-  --trust-remote-code \\
-  --tensor-parallel-size 1 \\
-  --served-model-name OvisOCR2 \\
-  --dtype bfloat16 \\
-  --max-model-len 32768 \\
-  --max-num-seqs 1 \\
-  --max-num-batched-tokens 4096 \\
-  --gpu-memory-utilization 0.80 \\
-  --no-enable-prefix-caching \\
-  --gdn-prefill-backend triton \\
-  --attention-config '{"backend":"FLASH_ATTN"}'
+vllm serve /model \
+  --trust-remote-code \
+  --tensor-parallel-size 1 \
+  --served-model-name OvisOCR2 \
+  --dtype bfloat16 \
+  --max-model-len 32768 \
+  --max-num-seqs 1 \
+  --max-num-batched-tokens 4096 \
+  --gpu-memory-utilization 0.80 \
+  --no-enable-prefix-caching \
+  --gdn-prefill-backend triton \
+  --mm-encoder-attn-backend FLASH_ATTN
 ```
 
 ## Request settings
@@ -62,8 +62,8 @@ image max_pixels=8294400 (2880²)
 - `--no-enable-prefix-caching` keeps independent OCR pages from sharing
   cached prefixes.
 - `--gdn-prefill-backend triton` selects the GDN prefill path.
-- `--attention-config '{"backend":"FLASH_ATTN"}'` selects the vision attention
-  backend used by this profile.
+- `--mm-encoder-attn-backend FLASH_ATTN` selects the vision attention backend
+  used by this profile.
 - `max-num-seqs=1` and `max-num-batched-tokens=4096` provide predictable
   single-request behavior for OCR pages.
 - Keep `max_tokens=16384` to avoid truncating long OCR pages.
