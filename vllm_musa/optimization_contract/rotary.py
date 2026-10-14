@@ -50,7 +50,11 @@ class MusaVisionRotaryPositions(nn.Module):
 
 
 class MusaVisionApplyRotaryEmb(ApplyRotaryEmb):
-    """Adapt a vision x/cos/sin call to the existing MUSA rotary kernel."""
+    """Adapt a vision x/cos/sin call to the existing MUSA rotary kernel.
+
+    ``inplace=True`` writes into the contiguous working tensor; for contiguous
+    inputs, that tensor aliases and mutates ``x``.
+    """
 
     def __init__(
         self,
@@ -279,7 +283,8 @@ def _mineru_geometry(config: object) -> bool:
         return False
 
 
-def _qwen35_vision_geometry(config: object, dtype: object) -> bool:
+def _ovis_qwen35_vision_geometry(config: object, dtype: object) -> bool:
+    """Match the validated OvisOCR2 Qwen3.5 vision/text geometry."""
     text = getattr(config, "text_config", None)
     vision = getattr(config, "vision_config", None)
     return (
@@ -345,7 +350,9 @@ def resolve_rotary_contract(
     if (
         qwen35 is None
         or contract.model.family is not ModelFamily.QWEN35_36
-        or not _qwen35_vision_geometry(config, getattr(model_config, "dtype", None))
+        or not _ovis_qwen35_vision_geometry(
+            config, getattr(model_config, "dtype", None)
+        )
     ):
         return contract
     return replace(
@@ -385,6 +392,7 @@ def install_model_rotary(owner: nn.Module, vllm_config: object) -> bool:
         if getattr(config, "model_type", None) == "qwen3_5":
             logger.info_once("MUSA Qwen3.5 vision rotary skipped: unsupported geometry")
         return False
+    expected_blocks = vision[1]["expected_blocks"]
     if not install_vision_rotary(vision[0], **vision[1]):
         if qwen35 is not None and qwen35 in features:
             logger.info_once("MUSA Qwen3.5 vision rotary skipped: incomplete visual blocks")
@@ -392,5 +400,7 @@ def install_model_rotary(owner: nn.Module, vllm_config: object) -> bool:
     if language is not None:
         install_mrope_rotary(language[0], **language[1])
     if qwen35 is not None and qwen35 in features:
-        logger.info_once("MUSA Qwen3.5 vision rotary installed on 12 visual blocks")
+        logger.info_once(
+            f"MUSA Qwen3.5 vision rotary installed on {expected_blocks} visual blocks"
+        )
     return True

@@ -101,6 +101,25 @@ def test_positions_cache_reuses_captured_shape(monkeypatch: pytest.MonkeyPatch) 
     assert cache.get(2, 3, device) is pinned
 
 
+def test_positions_cache_pins_when_capture_probe_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class MusaDevice:
+        type = "musa"
+
+    cache = MusaVisionRotaryPositions()
+    device = MusaDevice()
+    arange = torch.arange
+    monkeypatch.setattr(torch, "arange", lambda end, **kwargs: arange(end))
+
+    def raising_probe() -> bool:
+        raise RuntimeError("capture probe unavailable")
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", raising_probe)
+    pinned = cache.get(2, 3, device)
+    assert cache.get(2, 3, device) is pinned
+
+
 def test_ovis_install_respects_selection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
