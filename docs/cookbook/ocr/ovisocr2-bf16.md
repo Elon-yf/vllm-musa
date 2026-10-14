@@ -60,7 +60,8 @@ vllm serve "${MODEL_PATH}" \
 ## Configuration notes
 
 - The request below starts the model's synchronous in-process `LLM` engine. It
-  pins the sweep-selected scheduler values shown above.
+  pins the validated baseline scheduler values shown above; no tested candidate
+  beat this baseline in the completed scheduler screen.
 - MUSA selects `FLASH_ATTN` for ViT and `MMEncoderAttention` automatically.
   Do not add the language-model `--attention-config` option to select it.
 - Keep prefix caching off, BF16, TP1, 0.80 GPU memory utilization, Triton GDN

@@ -109,7 +109,8 @@ asyncio.run(request())
 ## Configuration notes
 
 - The request above starts the model's in-process `AsyncLLM` engine and pins the
-  sweep-selected scheduler and cache values shown above.
+  validated baseline scheduler and cache values shown above; no tested candidate
+  beat this baseline in the completed scheduler screen.
 - MUSA selects `FLASH_ATTN` for ViT and `MMEncoderAttention` automatically.
   Do not add the language-model `--attention-config` option to select it.
 - The image processor uses the checkpoint's own defaults. Do not add a
