@@ -19,7 +19,7 @@ text requests through the OpenAI-compatible chat API.
 | Precision | BF16 |
 | Tensor parallelism | TP1 |
 | Maximum context | 262,144 tokens |
-| Maximum sequences | vLLM default (left unset in the full contract) |
+| Maximum sequences | vLLM default |
 | Maximum batched tokens | 16,384 |
 | GPU memory utilization | 0.80 |
 | Prefix caching | Off |
@@ -63,29 +63,48 @@ requests handled by this server.
 - Leave `max_num_seqs` unset so vLLM uses its default scheduler limit.
 - MUSA selects `FLASH_ATTN` for ViT and `MMEncoderAttention` automatically.
   Do not add the language-model `--attention-config` option to select it.
-- `--max-num-batched-tokens 16384`, prefix caching off, BF16, TP1, 0.80 GPU
-  memory utilization, Triton GDN prefill, and the 262,144-token context are the
-  performance settings shown by the full-run logs.
+- Keep `--max-num-batched-tokens 16384`, prefix caching off, BF16, TP1, 0.80
+  GPU memory utilization, Triton GDN prefill, and the 262,144-token context
+  together.
 
-## Send an image request
+## Send an image to vLLM
 
-Replace `<IMAGE_URL>` with an image URL reachable by the server.
+The direct vLLM request uses the same fields as the model parser:
 
-```bash
-curl http://localhost:8000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "OvisOCR2",
-    "messages": [{
-      "role": "user",
-      "content": [
-        {"type": "image_url", "image_url": {"url": "<IMAGE_URL>"}},
-        {"type": "text", "text": "\nExtract all readable content from the image in natural human reading order and output the result as a single Markdown document. For charts or images, represent them using an HTML image tag: <img src=\"images/bbox_{left}_{top}_{right}_{bottom}.jpg\" />, where left, top, right, bottom are bounding box coordinates scaled to [0, 1000). Format formulas as LaTeX. Format tables as HTML: <table>...</table>. Transcribe all other text as standard Markdown. Preserve the original text without translation or paraphrasing."}
-      ]
-    }],
-    "temperature": 0.0,
-    "max_tokens": 16384
-  }'
+```python
+from pathlib import Path
+
+from PIL import Image
+from vllm import LLM, SamplingParams
+
+engine = LLM(
+    model="<MODEL_PATH>",
+    tensor_parallel_size=1,
+    gpu_memory_utilization=0.80,
+    gdn_prefill_backend="triton",
+    enable_prefix_caching=False,
+)
+prompt = engine.get_tokenizer().apply_chat_template(
+    [{"role": "user", "content": [
+        {"type": "image"}, {"type": "text", "text": "<OCR_PROMPT>"}
+    ]}],
+    tokenize=False,
+    add_generation_prompt=True,
+    enable_thinking=False,
+)
+with Image.open(Path("<IMAGE_PATH>")) as image:
+    result = engine.generate(
+        [{
+            "prompt": prompt,
+            "multi_modal_data": {"image": image},
+            "mm_processor_kwargs": {"images_kwargs": {
+                "min_pixels": 448 * 448,
+                "max_pixels": 2880 * 2880,
+            }},
+        }],
+        SamplingParams(max_tokens=16384, temperature=0.0),
+    )
+print(result[0].outputs[0].text)
 ```
 
 Return to the [OCR recipe index](README.md).

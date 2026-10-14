@@ -20,7 +20,7 @@ BF16, compiled execution, and CUDA graphs for the language-model path.
 | Precision | BF16 |
 | Tensor parallelism | TP1 |
 | Maximum context | 8,192 tokens |
-| Maximum sequences | vLLM default (left unset in the full contract) |
+| Maximum sequences | vLLM default |
 | Maximum batched tokens | 2,048 |
 | GPU memory utilization | 0.80 |
 | Prefix cache | On |
@@ -59,43 +59,44 @@ vllm serve "${MODEL_PATH}" \
   --compilation-config '{"mode":"VLLM_COMPILE","cudagraph_mode":"FULL_AND_PIECEWISE"}'
 ```
 
-## Send an image request
+## Send an image to vLLM
 
-Replace `<IMAGE_PATH>` with a JPEG or PNG file. The same OpenAI-compatible
-image format can be used with the model's application-specific prompts.
+The direct vLLM request uses the model's asynchronous engine client:
 
 ```python
-import base64
-import mimetypes
+import asyncio
 from pathlib import Path
 
-from openai import OpenAI
+from PIL import Image
+from mineru_vl_utils import MinerUClient, MinerULogitsProcessor
+from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.v1.engine.async_llm import AsyncLLM
 
-image_path = Path("<IMAGE_PATH>")
-mime_type = mimetypes.guess_type(image_path.name)[0] or "image/jpeg"
-image_data = base64.b64encode(image_path.read_bytes()).decode("ascii")
-
-client = OpenAI(api_key="EMPTY", base_url="http://localhost:8000/v1")
-response = client.chat.completions.create(
-    model="MinerU2.5-Pro-2605-1.2B",
-    messages=[
-        {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": [
-            {"type": "image_url", "image_url": {
-                "url": f"data:{mime_type};base64,{image_data}"}},
-            {"type": "text", "text": "\nLayout Detection:"},
-        ]},
-    ],
-    temperature=0,
-    top_p=0.01,
-    max_tokens=2048,
-    extra_body={"top_k": 1, "skip_special_tokens": False},
+engine = AsyncLLM.from_engine_args(AsyncEngineArgs(
+    model="<MODEL_PATH>",
+    hf_overrides={"tie_word_embeddings": True},
+    logits_processors=[MinerULogitsProcessor],
+    tensor_parallel_size=1,
+    gpu_memory_utilization=0.80,
+    max_model_len=8192,
+))
+client = MinerUClient(
+    backend="vllm-async-engine",
+    vllm_async_llm=engine,
+    image_analysis=False,
+    use_tqdm=False,
 )
-print(response.choices[0].message.content)
-```
 
-`--hf-overrides` keeps the checkpoint's tied embeddings enabled.
-`--logits-processors` loads the model-specific processor for sampling.
+async def request() -> None:
+    with Image.open(Path("<IMAGE_PATH>")) as image:
+        blocks = await client.aio_two_step_extract(image.convert("RGB"))
+    print(blocks)
+    if hasattr(client, "aclose"):
+        await client.aclose()
+    engine.shutdown()
+
+asyncio.run(request())
+```
 
 ## Configuration notes
 
