@@ -8,10 +8,9 @@ for the language-model path.
 
 > [!TIP]
 > Use BF16, TP1, 0.80 GPU memory utilization, an 8,192-token context, 2,048
-> batched tokens, prefix caching and chunked prefill on, and
-> `VLLM_COMPILE`/`FULL_AND_PIECEWISE`. Keep the vLLM default scheduler sequence
-> limit and the checkpoint's image-processor defaults. MUSA selects FLASH_ATTN
-> for the ViT path.
+> batched tokens, `max_num_seqs=128`, prefix caching and chunked prefill on,
+> and `VLLM_COMPILE`/`FULL_AND_PIECEWISE`. Keep the checkpoint's
+> image-processor defaults. MUSA selects FLASH_ATTN for the ViT path.
 
 ## At a glance
 
@@ -21,7 +20,7 @@ for the language-model path.
 | Precision | BF16 |
 | Tensor parallelism | TP1 |
 | Maximum context | 8,192 tokens |
-| Maximum sequences | vLLM default |
+| Maximum sequences | 128 |
 | Maximum batched tokens | 2,048 |
 | GPU memory utilization | 0.80 |
 | Prefix cache | On |
@@ -35,9 +34,37 @@ for the language-model path.
 - `mineru-vl-utils` installed in the same environment. It provides the
   `MinerULogitsProcessor` used by the request code.
 
-## Run an image request
+## Recommended vLLM server configuration
 
-The direct vLLM request uses the model's asynchronous engine client:
+Use this server configuration for deployment. The in-process request code below
+is an alternative path; do not run both on the same GPU.
+
+```bash
+export MODEL_PATH="<MODEL_PATH>"
+export VLLM_PLUGINS=musa,musa_custom_ops
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+
+vllm serve "${MODEL_PATH}" \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --served-model-name MinerU2.5-Pro-2605-1.2B \
+  --dtype bfloat16 \
+  --tensor-parallel-size 1 \
+  --gpu-memory-utilization 0.80 \
+  --max-model-len 8192 \
+  --max-num-seqs 128 \
+  --max-num-batched-tokens 2048 \
+  --enable-prefix-caching \
+  --enable-chunked-prefill \
+  --hf-overrides '{"tie_word_embeddings":true}' \
+  --logits-processors mineru_vl_utils:MinerULogitsProcessor \
+  --compilation-config '{"mode":"VLLM_COMPILE","cudagraph_mode":"FULL_AND_PIECEWISE"}'
+```
+
+## Run an image request in-process
+
+Run this instead of the server command above. The direct vLLM request uses the
+model's asynchronous engine client:
 
 ```python
 import asyncio
@@ -56,6 +83,10 @@ engine = AsyncLLM.from_engine_args(AsyncEngineArgs(
     dtype="bfloat16",
     gpu_memory_utilization=0.80,
     max_model_len=8192,
+    max_num_seqs=128,
+    max_num_batched_tokens=2048,
+    enable_prefix_caching=True,
+    enable_chunked_prefill=True,
 ))
 client = MinerUClient(
     backend="vllm-async-engine",
@@ -77,9 +108,8 @@ asyncio.run(request())
 
 ## Configuration notes
 
-- The request above is the model's in-process `AsyncLLM` path. Leave
-  `max_num_batched_tokens`, `max_num_seqs`, prefix caching, and chunked prefill
-  unset to use the values shown above on this vLLM-MUSA version.
+- The request above starts the model's in-process `AsyncLLM` engine and pins the
+  sweep-selected scheduler and cache values shown above.
 - MUSA selects `FLASH_ATTN` for ViT and `MMEncoderAttention` automatically.
   Do not add the language-model `--attention-config` option to select it.
 - The image processor uses the checkpoint's own defaults. Do not add a
