@@ -339,6 +339,7 @@ def resolve_optimization_contract(
     ) in (
         "paddleocr_vl",
         "qwen2_vl",
+        "qwen3_5",
     ):
         from .rotary import resolve_rotary_contract
 
