@@ -2,15 +2,13 @@
 
 ## Overview
 
-Run this vision-language OCR model with vLLM-MUSA on one S5000 GPU. Use either
-the in-process `AsyncLLM` engine or the `vllm serve` HTTP server; MinerU's
-client handles the two-step extraction pipeline for both.
+Run this vision-language OCR model with vLLM-MUSA on one S5000 GPU. Start the
+HTTP server with `vllm serve`, then use MinerU's client for the two-step
+extraction pipeline.
 
 > [!TIP]
-> Recommended: use the in-process `AsyncLLM` + `vllm-async-engine` entry point
-> for the established full-performance configuration. Use `vllm serve` with
-> `MinerUClient(backend="http-client")` when an HTTP endpoint is needed. Run
-> only one entry point on a GPU.
+> `MinerUClient(backend="http-client")` sends both extraction stages to the
+> vLLM HTTP endpoint. A plain chat completion does not run this pipeline.
 
 ## At a glance
 
@@ -92,37 +90,9 @@ async def request() -> None:
 asyncio.run(request())
 ```
 
-For the in-process engine, use the same packaged two-step pipeline:
-
-```python
-import asyncio
-from pathlib import Path
-
-from PIL import Image
-from mineru_vl_utils import MinerUClient
-from mineru_vl_utils.post_process import json2md
-
-client = MinerUClient(
-    backend="vllm-async-engine",
-    vllm_async_llm=engine,
-    image_analysis=False,
-    use_tqdm=False,
-)
-
-async def request() -> None:
-    with Image.open(Path("<IMAGE_PATH>")) as image:
-        blocks = await client.aio_two_step_extract(image.convert("RGB"))
-    print(json2md(blocks))
-    if hasattr(client, "aclose"):
-        await client.aclose()
-    engine.shutdown()
-
-asyncio.run(request())
-```
-
 ## Configuration notes
 
-- Both client backends call MinerU's two-step extraction method. A direct VLM
+- The HTTP client calls MinerU's two-step extraction method. A direct VLM
   completion does not run the complete pipeline.
 - MUSA selects `FLASH_ATTN` for ViT and `MMEncoderAttention` automatically.
   Do not add the language-model `--attention-config` option to select it.

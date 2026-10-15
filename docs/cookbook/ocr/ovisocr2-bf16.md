@@ -2,14 +2,13 @@
 
 ## Overview
 
-Run OvisOCR2 with vLLM-MUSA on one S5000 GPU. Use either the in-process `LLM`
-engine or the `vllm serve` HTTP server.
+Run OvisOCR2 with vLLM-MUSA on one S5000 GPU through the `vllm serve` HTTP
+server.
 
 > [!TIP]
-> Recommended: use the in-process `LLM` entry point shown in the
-> [OvisOCR2 model card](https://huggingface.co/ATH-MaaS/OvisOCR2#inference).
-> Our fastest completed full-page configuration also uses this entry point.
-> The HTTP server is available when the application needs a separate endpoint.
+> Send an image to the OpenAI-compatible chat endpoint using the OCR prompt
+> and generation settings shown below. The [OvisOCR2 model card](https://huggingface.co/ATH-MaaS/OvisOCR2#inference)
+> provides the source example for these settings.
 
 ## At a glance
 

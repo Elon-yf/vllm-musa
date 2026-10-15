@@ -106,6 +106,24 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
+```python
+from paddleocr import PaddleOCRVL
+
+pipeline = PaddleOCRVL(
+    pipeline_version="v1.6",
+    vl_rec_backend="vllm-server",
+    vl_rec_server_url="http://localhost:8000/v1",
+    vl_rec_api_model_name="PaddleOCR-VL-1.6-0.9B",
+    use_doc_orientation_classify=False,
+    use_doc_unwarping=False,
+    use_layout_detection=True,
+    use_queues=True,
+    device="cpu",
+)
+for index, result in enumerate(pipeline.predict("<IMAGE_PATH>")):
+    result.save_to_markdown(save_path=f"output_{index}.md")
+```
+
 ## Configuration notes
 
 - `max_completion_tokens=4096` matches PaddleOCRVL's default limit for each
