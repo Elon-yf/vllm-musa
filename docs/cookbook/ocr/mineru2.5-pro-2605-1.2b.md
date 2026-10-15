@@ -8,9 +8,9 @@ shows two independent vLLM entry points: an in-process `AsyncLLM` engine and a
 
 > [!TIP]
 > Recommended: use the in-process `AsyncLLM` + `vllm-async-engine` entry point
-> for MinerU2.5-Pro. It produced the fastest completed full-page result with
-> the configuration below. Use `vllm serve` when an HTTP endpoint is needed.
-> Run only one entry point on a GPU.
+> for MinerU2.5-Pro with the full-performance configuration below. Use
+> `vllm serve` when an HTTP endpoint is needed. Run only one entry point on a
+> GPU.
 
 ## At a glance
 
