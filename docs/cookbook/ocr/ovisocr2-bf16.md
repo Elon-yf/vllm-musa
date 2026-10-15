@@ -59,82 +59,12 @@ vllm serve "${MODEL_PATH}" \
   --compilation-config '{"mode":"VLLM_COMPILE","cudagraph_mode":"FULL_AND_PIECEWISE"}'
 ```
 
-## In-process `LLM` engine
-
-This entry point creates the vLLM engine in the caller process; it does not
-start `vllm serve`. Run only one entry point on a GPU. Set
-`VLLM_WORKER_MULTIPROC_METHOD=spawn` before running the Python code.
-
-Use this vLLM parameter fragment when the application creates the in-process
-engine:
-
-```python
-from vllm import LLM
-
-engine = LLM(
-    model="<MODEL_PATH>",
-    tensor_parallel_size=1,
-    dtype="bfloat16",
-    gpu_memory_utilization=0.80,
-    max_model_len=262144,
-    max_num_seqs=1024,
-    max_num_batched_tokens=16384,
-    gdn_prefill_backend="triton",
-    enable_prefix_caching=False,
-    enable_chunked_prefill=True,
-    compilation_config={
-        "mode": "VLLM_COMPILE",
-        "cudagraph_mode": "FULL_AND_PIECEWISE",
-    },
-)
-```
 
 Keep the Ovis image processor bounds at `min_pixels=448 * 448` and
 `max_pixels=2880 * 2880`, and use `temperature=0`, `max_tokens=16384`, and
 `enable_thinking=False` in the application's generation request.
 
 ## Send an image
-
-Use the model's Markdown prompt with the `engine` created above:
-
-```python
-from pathlib import Path
-
-from PIL import Image
-from vllm import SamplingParams
-
-OCR_PROMPT = (
-    '\nExtract all readable content from the image in natural human reading order '
-    'and output the result as a single Markdown document. For charts or images, '
-    'represent them using an HTML image tag: <img '
-    'src="images/bbox_{left}_{top}_{right}_{bottom}.jpg" />, where left, top, '
-    'right, bottom are bounding box coordinates scaled to [0, 1000). Format '
-    'formulas as LaTeX. Format tables as HTML: <table>...</table>. Transcribe '
-    'all other text as standard Markdown. Preserve the original text without '
-    'translation or paraphrasing.'
-)
-prompt = engine.get_tokenizer().apply_chat_template(
-    [{"role": "user", "content": [
-        {"type": "image"}, {"type": "text", "text": OCR_PROMPT}
-    ]}],
-    tokenize=False,
-    add_generation_prompt=True,
-    enable_thinking=False,
-)
-with Image.open(Path("<IMAGE_PATH>")) as image:
-    result = engine.generate(
-        [{
-            "prompt": prompt,
-            "multi_modal_data": {"image": image},
-            "mm_processor_kwargs": {"images_kwargs": {
-                "min_pixels": 448 * 448,
-                "max_pixels": 2880 * 2880,
-            }},
-        }],
-        SamplingParams(max_tokens=16384, temperature=0.0),
-    )
-print(result[0].outputs[0].text)
-```
 
 For the HTTP server, read the image and send the same OCR prompt to the
 OpenAI-compatible chat endpoint:
