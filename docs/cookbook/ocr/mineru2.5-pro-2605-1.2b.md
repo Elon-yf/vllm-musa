@@ -2,14 +2,15 @@
 
 ## Overview
 
-Serve this vision-language OCR model through the vLLM-MUSA HTTP server on one
-S5000 GPU. MinerU's HTTP client handles the two-step extraction pipeline.
+Run this vision-language OCR model with vLLM-MUSA on one S5000 GPU. Use either
+the in-process `AsyncLLM` engine or the `vllm serve` HTTP server; MinerU's
+client handles the two-step extraction pipeline for both.
 
 > [!TIP]
-> Use `vllm serve` with `MinerUClient(backend="http-client")` for the two-step
-> extraction pipeline. Keep BF16, TP1, a 0.80 GPU memory fraction, an
-> 8,192-token context, 128 sequences, 2,048 batched tokens, prefix caching
-> and chunked prefill on, and `VLLM_COMPILE`/`FULL_AND_PIECEWISE`.
+> Recommended: use the in-process `AsyncLLM` + `vllm-async-engine` entry point
+> for the established full-performance configuration. Use `vllm serve` with
+> `MinerUClient(backend="http-client")` when an HTTP endpoint is needed. Run
+> only one entry point on a GPU.
 
 ## At a glance
 
@@ -30,8 +31,8 @@ S5000 GPU. MinerU's HTTP client handles the two-step extraction pipeline.
 
 - vLLM-MUSA v0.28.0-dev with its patched vLLM installed.
 - The MinerU2.5-Pro-2605-1.2B checkpoint available at `MODEL_PATH`.
-- `mineru-vl-utils` installed in the server environment for
-  `MinerULogitsProcessor` and in the client environment for `MinerUClient`.
+- `mineru-vl-utils` installed wherever the vLLM engine runs for
+  `MinerULogitsProcessor`, and wherever the MinerU client runs.
 
 ## HTTP server
 
@@ -57,6 +58,36 @@ vllm serve "${MODEL_PATH}" \
   --hf-overrides '{"tie_word_embeddings":true}' \
   --logits-processors mineru_vl_utils:MinerULogitsProcessor \
   --compilation-config '{"mode":"VLLM_COMPILE","cudagraph_mode":"FULL_AND_PIECEWISE"}'
+```
+
+## In-process `AsyncLLM` engine
+
+This entry point creates the vLLM engine in the caller process; it does not
+start `vllm serve`. Set `VLLM_WORKER_MULTIPROC_METHOD=spawn` before running
+the Python code.
+
+```python
+from mineru_vl_utils import MinerULogitsProcessor
+from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.v1.engine.async_llm import AsyncLLM
+
+engine = AsyncLLM.from_engine_args(AsyncEngineArgs(
+    model="<MODEL_PATH>",
+    hf_overrides={"tie_word_embeddings": True},
+    logits_processors=[MinerULogitsProcessor],
+    tensor_parallel_size=1,
+    dtype="bfloat16",
+    gpu_memory_utilization=0.80,
+    max_model_len=8192,
+    max_num_seqs=128,
+    max_num_batched_tokens=2048,
+    enable_prefix_caching=True,
+    enable_chunked_prefill=True,
+    compilation_config={
+        "mode": "VLLM_COMPILE",
+        "cudagraph_mode": "FULL_AND_PIECEWISE",
+    },
+))
 ```
 
 ## Send an image
@@ -90,9 +121,37 @@ async def request() -> None:
 asyncio.run(request())
 ```
 
+For the in-process engine, use the same packaged two-step pipeline:
+
+```python
+import asyncio
+from pathlib import Path
+
+from PIL import Image
+from mineru_vl_utils import MinerUClient
+from mineru_vl_utils.post_process import json2md
+
+client = MinerUClient(
+    backend="vllm-async-engine",
+    vllm_async_llm=engine,
+    image_analysis=False,
+    use_tqdm=False,
+)
+
+async def request() -> None:
+    with Image.open(Path("<IMAGE_PATH>")) as image:
+        blocks = await client.aio_two_step_extract(image.convert("RGB"))
+    print(json2md(blocks))
+    if hasattr(client, "aclose"):
+        await client.aclose()
+    engine.shutdown()
+
+asyncio.run(request())
+```
+
 ## Configuration notes
 
-- The HTTP client calls MinerU's two-step extraction method. A direct VLM
+- Both client backends call MinerU's two-step extraction method. A direct VLM
   completion does not run the complete pipeline.
 - MUSA selects `FLASH_ATTN` for ViT and `MMEncoderAttention` automatically.
   Do not add the language-model `--attention-config` option to select it.
