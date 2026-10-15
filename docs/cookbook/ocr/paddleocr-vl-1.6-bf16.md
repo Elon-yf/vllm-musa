@@ -35,7 +35,7 @@ client application.
   its directory, which contains the model configuration, weights, tokenizer,
   and image processor.
 
-## Single node
+## HTTP server
 
 ```bash
 export MODEL_PATH="<MODEL_PATH>"
