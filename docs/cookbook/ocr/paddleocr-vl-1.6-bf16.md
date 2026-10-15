@@ -59,7 +59,7 @@ vllm serve "${MODEL_PATH}" \
 ## Send an image
 
 Install the `openai` Python client if needed. Replace `<IMAGE_PATH>` with a
-local JPEG or PNG image:
+local JPEG or PNG image. Select the recognition task with `TASKS`:
 
 ```python
 import base64
@@ -72,7 +72,18 @@ image_path = Path("<IMAGE_PATH>")
 mime_type = mimetypes.guess_type(image_path.name)[0] or "image/jpeg"
 image_data = base64.b64encode(image_path.read_bytes()).decode("ascii")
 
-client = OpenAI(api_key="EMPTY", base_url="http://localhost:8000/v1")
+TASKS = {
+    "ocr": "OCR:",
+    "table": "Table Recognition:",
+    "formula": "Formula Recognition:",
+    "chart": "Chart Recognition:",
+    "spotting": "Spotting:",
+    "seal": "Seal Recognition:",
+}
+
+client = OpenAI(
+    api_key="EMPTY", base_url="http://localhost:8000/v1", timeout=3600
+)
 response = client.chat.completions.create(
     model="PaddleOCR-VL-1.6-0.9B",
     messages=[
@@ -85,11 +96,11 @@ response = client.chat.completions.create(
                         "url": f"data:{mime_type};base64,{image_data}"
                     },
                 },
-                {"type": "text", "text": "OCR:"},
+                {"type": "text", "text": TASKS["ocr"]},
             ],
         }
     ],
-    temperature=0,
+    temperature=0.0,
     max_completion_tokens=4096,
 )
 print(response.choices[0].message.content)
