@@ -60,35 +60,6 @@ vllm serve "${MODEL_PATH}" \
   --compilation-config '{"mode":"VLLM_COMPILE","cudagraph_mode":"FULL_AND_PIECEWISE"}'
 ```
 
-## In-process `AsyncLLM` engine
-
-This entry point creates the vLLM engine in the caller process; it does not
-start `vllm serve`. Set `VLLM_WORKER_MULTIPROC_METHOD=spawn` before running
-the Python code.
-
-```python
-from mineru_vl_utils import MinerULogitsProcessor
-from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.v1.engine.async_llm import AsyncLLM
-
-engine = AsyncLLM.from_engine_args(AsyncEngineArgs(
-    model="<MODEL_PATH>",
-    hf_overrides={"tie_word_embeddings": True},
-    logits_processors=[MinerULogitsProcessor],
-    tensor_parallel_size=1,
-    dtype="bfloat16",
-    gpu_memory_utilization=0.80,
-    max_model_len=8192,
-    max_num_seqs=128,
-    max_num_batched_tokens=2048,
-    enable_prefix_caching=True,
-    enable_chunked_prefill=True,
-    compilation_config={
-        "mode": "VLLM_COMPILE",
-        "cudagraph_mode": "FULL_AND_PIECEWISE",
-    },
-))
-```
 
 ## Send an image
 
