@@ -82,14 +82,16 @@ engine = LLM(
     gdn_prefill_backend="triton",
     enable_prefix_caching=False,
     enable_chunked_prefill=True,
+    compilation_config={
+        "mode": "VLLM_COMPILE",
+        "cudagraph_mode": "FULL_AND_PIECEWISE",
+    },
 )
 ```
 
-The compiled and graph settings are the vLLM-MUSA runtime defaults validated
-for this profile: `VLLM_COMPILE` and `FULL_AND_PIECEWISE`. Keep the Ovis image
-processor bounds at `min_pixels=448 * 448` and `max_pixels=2880 * 2880`, and
-use `temperature=0`, `max_tokens=16384`, and `enable_thinking=False` in the
-application's generation request.
+Keep the Ovis image processor bounds at `min_pixels=448 * 448` and
+`max_pixels=2880 * 2880`, and use `temperature=0`, `max_tokens=16384`, and
+`enable_thinking=False` in the application's generation request.
 
 ## Send an image
 

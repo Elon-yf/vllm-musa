@@ -86,11 +86,12 @@ engine = AsyncLLM.from_engine_args(AsyncEngineArgs(
     max_num_batched_tokens=2048,
     enable_prefix_caching=True,
     enable_chunked_prefill=True,
+    compilation_config={
+        "mode": "VLLM_COMPILE",
+        "cudagraph_mode": "FULL_AND_PIECEWISE",
+    },
 ))
 ```
-
-The compiled and graph settings are the vLLM-MUSA runtime defaults validated
-for this profile: `VLLM_COMPILE` and `FULL_AND_PIECEWISE`.
 
 ## Send an image
 
