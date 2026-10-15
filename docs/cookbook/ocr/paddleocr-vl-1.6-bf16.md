@@ -90,13 +90,15 @@ response = client.chat.completions.create(
         }
     ],
     temperature=0,
-    max_tokens=512,
+    max_completion_tokens=4096,
 )
 print(response.choices[0].message.content)
 ```
 
 ## Configuration notes
 
+- `max_completion_tokens=4096` matches PaddleOCRVL's default limit for each
+  recognition request.
 - `--max-num-seqs` limits active requests in the vLLM scheduler.
 - `--max-num-batched-tokens` limits tokens scheduled in one iteration;
   multimodal prefill can span multiple iterations.
