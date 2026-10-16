@@ -680,8 +680,8 @@ class MUSAPlatformBase(Platform):
             )
         )
         if separate_mamba_pages:
-            backend_cls = cls._find_non_ssm_backend(vllm_config)
-            if backend_cls is not None:
+            backend_classes = cls._find_non_ssm_backends(vllm_config)
+            if backend_classes:
                 from vllm.config.vllm import set_current_vllm_config
 
                 target_block_size = (
@@ -690,7 +690,10 @@ class MUSAPlatformBase(Platform):
                     else 64
                 )
                 with set_current_vllm_config(vllm_config):
-                    supported = backend_cls.supports_block_size(target_block_size)
+                    supported = all(
+                        b.supports_block_size(target_block_size)
+                        for b in backend_classes
+                    )
                 if supported:
                     cache_config.block_size = target_block_size
                     cache_config.mamba_page_size_padded = None
@@ -698,7 +701,7 @@ class MUSAPlatformBase(Platform):
                         "[MUSA]Keeping separate-pool hybrid attention block "
                         "size at %d for %s backend.",
                         target_block_size,
-                        backend_cls.get_name(),
+                        "/".join(b.get_name() for b in backend_classes),
                     )
                     return
 
@@ -721,17 +724,17 @@ class MUSAPlatformBase(Platform):
             or "DeepseekV41ForCausalLM" in (model_config.architectures or ())
         ):
             return
-        backend_cls = cls._find_non_ssm_backend(vllm_config)
-        if backend_cls is None:
+        backend_classes = cls._find_non_ssm_backends(vllm_config)
+        if not backend_classes:
             return
         from vllm.config.vllm import set_current_vllm_config
 
         with set_current_vllm_config(vllm_config):
-            supports_64 = backend_cls.supports_block_size(64)
+            supports_64 = all(b.supports_block_size(64) for b in backend_classes)
         if supports_64 and cache_config.block_size != 64:
             logger.info(
                 "[MUSA]Setting attention block size to 64 for %s backend.",
-                backend_cls.get_name(),
+                "/".join(b.get_name() for b in backend_classes),
             )
             cache_config.block_size = 64
 

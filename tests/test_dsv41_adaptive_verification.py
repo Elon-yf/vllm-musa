@@ -9,9 +9,9 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SERIES = ROOT / "vllm_musa" / "patches" / "series"
-PATCH = SERIES / "0041-MUSA-let-adaptive-verification-trim-the-flattened-DS.patch"
+PATCH = SERIES / "0039-MUSA-let-adaptive-verification-trim-the-flattened-DS.patch"
 CAPTURE_PATCH = (
-    SERIES / "0042-MUSA-profile-adaptive-verification-costs-in-the-real.patch"
+    SERIES / "0040-MUSA-profile-adaptive-verification-costs-in-the-real.patch"
 )
 
 HEADS, HEAD_DIM, BLOCK_SIZE, TOPK = 32, 128, 64, 512
@@ -51,6 +51,8 @@ def test_capture_model_profiles_adaptive_costs_only_in_the_real_capture(
     from contextlib import contextmanager, nullcontext
 
     torch = pytest.importorskip("torch")
+    # The MUSA plugin loads before the V2 runner, as in a server process.
+    pytest.importorskip("vllm_musa.v1")
     model_runner = pytest.importorskip("vllm.v1.worker.gpu.model_runner")
 
     monkeypatch.setattr(model_runner, "freeze_gc_for_cudagraph_capture", nullcontext)
@@ -79,7 +81,9 @@ def test_capture_model_profiles_adaptive_costs_only_in_the_real_capture(
         capture=lambda *args, **kwargs: None,
         captured_token_counts=lambda: [1, 2],
     )
-    runner.model_state = SimpleNamespace(supports_mm_inputs=False)
+    runner.model_state = SimpleNamespace(
+        supports_mm_inputs=False, capture_inner_cudagraphs=lambda *args: None
+    )
     runner.input_buffers = runner.model = runner.intermediate_tensors = None
     runner.block_tables = runner.kv_cache_config = runner.lora_config = None
     runner.pcp_manager = runner.speculator = None

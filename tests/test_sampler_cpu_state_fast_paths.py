@@ -218,11 +218,7 @@ def _unfiltered_gumbel_gate_sampler(
         _musa_optimization_contract=qwen_sampler(
             enabled=is_qwen_family
         )._musa_optimization_contract,
-        logit_bias_state=SimpleNamespace(use_logit_bias=np.zeros(rows, dtype=np.bool_)),
-        penalties_state=SimpleNamespace(use_penalty=np.zeros(rows, dtype=np.bool_)),
-        bad_words_state=SimpleNamespace(
-            num_bad_words=SimpleNamespace(np=np.zeros(rows, dtype=np.int32))
-        ),
+        needs_logits_processing=np.zeros(rows, dtype=np.bool_),
     )
 
 
@@ -415,6 +411,7 @@ def test_qwen_legacy_unfiltered_gumbel_advances_private_stream(monkeypatch) -> N
         == calls[1][1]
         == {
             "apply_temperature": False,
+            "is_drafting": False,
             "use_fp64": False,
         }
     )
@@ -543,7 +540,11 @@ def test_qwen_legacy_gumbel_gate_and_generator_handoff(monkeypatch) -> None:
     assert captured["temperature"].tolist() == [1.0] * rows
     assert captured["seeds"].tolist() == [60043, 60044, 60045, 60046]
     assert captured["positions"].tolist() == [0] * rows
-    assert captured["kwargs"] == {"apply_temperature": False, "use_fp64": False}
+    assert captured["kwargs"] == {
+        "apply_temperature": False,
+        "is_drafting": False,
+        "use_fp64": False,
+    }
     assert [generator.get_offset() for generator in metadata.generators.values()] == [
         4
     ] * rows
@@ -799,7 +800,11 @@ def test_qwen_legacy_gumbel_partitions_seeded_and_unseeded_rows(
     assert captured["mapping"].tolist() == [0, 1]
     assert captured["seeds"].tolist() == [60043, 60045]
     assert captured["positions"].tolist() == [0, 0]
-    assert captured["kwargs"] == {"apply_temperature": False, "use_fp64": False}
+    assert captured["kwargs"] == {
+        "apply_temperature": False,
+        "is_drafting": False,
+        "use_fp64": False,
+    }
     assert torch.allclose(
         captured["unseeded_probs"],
         logits[[1, 3]].softmax(dim=-1, dtype=torch.float32),
@@ -918,16 +923,9 @@ def test_qwen_v2_unfiltered_gumbel_gate_rejects_noncontract(monkeypatch) -> None
     value.sampling_states.min_p.np[0] = 0.05
     rejected.append((value, False))
 
+    # Logit bias, penalties and bad words all set needs_logits_processing.
     value = _unfiltered_gumbel_gate_sampler(rows)
-    value.logit_bias_state.use_logit_bias[0] = True
-    rejected.append((value, False))
-
-    value = _unfiltered_gumbel_gate_sampler(rows)
-    value.penalties_state.use_penalty[0] = True
-    rejected.append((value, False))
-
-    value = _unfiltered_gumbel_gate_sampler(rows)
-    value.bad_words_state.num_bad_words.np[0] = 1
+    value.needs_logits_processing[0] = True
     rejected.append((value, False))
 
     value = _unfiltered_gumbel_gate_sampler(rows)
@@ -1008,6 +1006,7 @@ def test_qwen_v2_unfiltered_gumbel_uses_existing_seed_state(monkeypatch) -> None
     )
     assert captured["kwargs"] == {
         "apply_temperature": False,
+        "is_drafting": False,
         "use_fp64": False,
     }
 

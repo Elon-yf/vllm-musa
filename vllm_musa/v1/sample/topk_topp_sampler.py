@@ -17,6 +17,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.platforms import current_platform
+from vllm.v1.worker.gpu.sample.logits_processor.interface import LogitsContext
 
 from vllm_musa import _custom_ops as _ops
 from vllm_musa.optimization_contract import (
@@ -709,6 +710,7 @@ def sample_qwen_legacy_unfiltered_gumbel(
     sharded = _is_qwen_sharded_logits(sampler, logits)
     gumbel_kwargs = {
         "apply_temperature": False,
+        "is_drafting": False,
         "use_fp64": False,
     }
     if sharded:
@@ -899,6 +901,7 @@ def _sample_qwen_legacy_gumbel_filtered(
         seeds,
         positions,
         apply_temperature=False,
+        is_drafting=False,
         use_fp64=False,
     )
     advanced_rows = []
@@ -1243,16 +1246,7 @@ def can_use_qwen_v2_unfiltered_gumbel(
     ):
         return False
 
-    use_logit_bias = getattr(sampler.logit_bias_state, "use_logit_bias", None)
-    use_penalty = getattr(sampler.penalties_state, "use_penalty", None)
-    num_bad_words = getattr(sampler.bad_words_state, "num_bad_words", None)
-    if use_logit_bias is None or use_penalty is None or num_bad_words is None:
-        return False
-    return bool(
-        not np.any(use_logit_bias[idx_mapping_np])
-        and not np.any(use_penalty[idx_mapping_np])
-        and not np.any(num_bad_words.np[idx_mapping_np])
-    )
+    return not np.any(sampler.needs_logits_processing[idx_mapping_np])
 
 
 def can_use_worker_seeded_multinomial(
@@ -1343,19 +1337,23 @@ def sample_worker_logits_qwen_v2_gumbel(
     sampler: Any,
     logits: torch.Tensor,
     expanded_idx_mapping: torch.Tensor,
+    idx_mapping: torch.Tensor,
     idx_mapping_np: np.ndarray,
     pos: torch.Tensor,
     input_ids: torch.Tensor,
     expanded_local_pos: torch.Tensor,
+    seq_lens_upper_bound_np: np.ndarray,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run pinned V2 Gumbel with CPU-proven uniform Qwen top-k state."""
     processed_logits = sampler.apply_sampling_params(
         logits,
         expanded_idx_mapping,
+        idx_mapping,
         idx_mapping_np,
         pos,
         input_ids,
         expanded_local_pos,
+        seq_lens_upper_bound_np,
         skip_top_k_top_p=True,
     )
     processed_logits = _apply_top_k_top_p(processed_logits, 50, None)
@@ -1366,6 +1364,7 @@ def sample_worker_logits_qwen_v2_gumbel(
         sampler.sampling_states.seeds.gpu,
         pos,
         apply_temperature=False,
+        is_drafting=False,
         use_fp64=False,
     )
     return sampled, processed_logits
@@ -1385,6 +1384,7 @@ def sample_worker_logits_qwen_v2_unfiltered_gumbel(
         sampler.sampling_states.seeds.gpu,
         pos,
         apply_temperature=False,
+        is_drafting=False,
         use_fp64=False,
     )
     return sampled, logits
@@ -1397,9 +1397,9 @@ def _sampling_states_init(self: Any, max_num_reqs: int, vocab_size: int):
     self.musa_generators = {}
 
 
-def _sampling_states_add_request(self: Any, req_idx: int, sampling_params: Any) -> None:
+def _sampling_states_add_request(self: Any, req_idx: int, sampling_params: Any) -> bool:
     original_add_request = vllm_worker_states.SamplingStates._musa_original_add_request
-    original_add_request(self, req_idx, sampling_params)
+    needs_processing = original_add_request(self, req_idx, sampling_params)
     seed = sampling_params.seed
     self.has_user_seed[req_idx] = seed is not None
     if seed is None:
@@ -1408,35 +1408,37 @@ def _sampling_states_add_request(self: Any, req_idx: int, sampling_params: Any) 
         generator = torch.Generator(device="musa")
         generator.manual_seed(seed)
         self.musa_generators[req_idx] = generator
+    return needs_processing
 
 
 def _apply_worker_sampling_params_defer_filters(
     sampler: Any,
     logits: torch.Tensor,
     expanded_idx_mapping: torch.Tensor,
+    idx_mapping: torch.Tensor,
     idx_mapping_np: np.ndarray,
     pos: torch.Tensor,
     input_ids: torch.Tensor,
     expanded_local_pos: torch.Tensor,
+    seq_lens_upper_bound_np: np.ndarray,
 ) -> torch.Tensor:
+    """Sampler.apply_sampling_params up to the temperature; the MUSA sampler
+    applies min_p, top-k and top-p."""
     logits = torch.empty_like(logits, dtype=torch.float32).copy_(logits)
-    sampler.logit_bias_state.apply_logit_bias(
-        logits, expanded_idx_mapping, idx_mapping_np, pos
+    if not np.any(sampler.needs_logits_processing[idx_mapping_np]):
+        return logits
+    ctx = LogitsContext(
+        expanded_idx_mapping=expanded_idx_mapping,
+        idx_mapping=idx_mapping,
+        idx_mapping_np=idx_mapping_np,
+        expanded_local_pos=expanded_local_pos,
+        input_ids=input_ids,
+        pos=pos,
+        seq_lens_upper_bound_np=seq_lens_upper_bound_np,
     )
-    sampler.penalties_state.apply_penalties(
-        logits,
-        expanded_idx_mapping,
-        idx_mapping_np,
-        input_ids,
-        expanded_local_pos,
-    )
-    sampler.bad_words_state.apply_bad_words(
-        logits,
-        expanded_idx_mapping,
-        idx_mapping_np,
-        input_ids,
-        expanded_local_pos,
-    )
+    for processor in sampler.logits_processors:
+        logits = processor.apply(logits, ctx)
+    sampler.thinking_budget_state.apply(logits, ctx)
     sampler.sampling_states.apply_temperature(
         logits, expanded_idx_mapping, idx_mapping_np
     )
@@ -1492,6 +1494,7 @@ def _worker_sample(
     pos: torch.Tensor,
     input_ids: torch.Tensor,
     expanded_local_pos: torch.Tensor,
+    seq_lens_upper_bound_np: np.ndarray,
     return_logprobs: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if can_use_qwen_v2_unfiltered_gumbel(
@@ -1529,10 +1532,12 @@ def _worker_sample(
             self,
             logits,
             expanded_idx_mapping,
+            idx_mapping,
             idx_mapping_np,
             pos,
             input_ids,
             expanded_local_pos,
+            seq_lens_upper_bound_np,
         )
 
     if logits.shape[0] == idx_mapping_np.shape[0] and can_use_worker_seeded_multinomial(
@@ -1546,10 +1551,12 @@ def _worker_sample(
             self,
             logits,
             expanded_idx_mapping,
+            idx_mapping,
             idx_mapping_np,
             pos,
             input_ids,
             expanded_local_pos,
+            seq_lens_upper_bound_np,
         )
         sampling_logits = _apply_worker_sampling_filters_for_seeded_multinomial(
             self,
@@ -1570,10 +1577,12 @@ def _worker_sample(
             self,
             logits,
             expanded_idx_mapping,
+            idx_mapping,
             idx_mapping_np,
             pos,
             input_ids,
             expanded_local_pos,
+            seq_lens_upper_bound_np,
         )
         sampled = sample_worker_logits(
             processed_logits,
@@ -1594,6 +1603,7 @@ def _worker_sample(
         pos,
         input_ids,
         expanded_local_pos,
+        seq_lens_upper_bound_np,
         return_logprobs=return_logprobs,
     )
 
