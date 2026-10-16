@@ -8,20 +8,23 @@ from typing import Any
 import numpy as np
 import pytest
 
+# The MUSA plugin loads before the V2 runner, as in a server process.
+pytest.importorskip("vllm_musa.v1")
 model_runner = pytest.importorskip("vllm.v1.worker.gpu.model_runner")
 GPUModelRunner = model_runner.GPUModelRunner
 
 DECODE_QUERY_LEN = 5
 
 
-def _runner(req_states: dict[str, tuple[int, int]], enabled: bool) -> Any:
+def _runner(req_states: dict[str, tuple[int, int]]) -> Any:
     """Stub from {req_id: (num_computed_tokens, prefill_len)}."""
     prefill_lens = np.array([s[1] for s in req_states.values()], dtype=np.int32)
     num_computed = np.array([s[0] for s in req_states.values()], dtype=np.int32)
     runner: Any = GPUModelRunner.__new__(GPUModelRunner)
     runner.decode_query_len = DECODE_QUERY_LEN
     runner.adaptive_verification = None
-    runner._final_prompt_token_decode_graph = enabled
+    runner.use_pp = False
+    runner.pcp_manager = None
     runner.req_states = SimpleNamespace(
         req_id_to_index={req_id: i for i, req_id in enumerate(req_states)},
         num_computed_prefill_tokens=np.minimum(num_computed, prefill_lens),
@@ -50,7 +53,7 @@ def _batch(new_req_computed: int, prefill_len: int = 32000):
 
 def test_padded_final_prompt_token_replays_decode_graph() -> None:
     states, drafts = _batch(new_req_computed=31999)
-    state, uniform = _gather(_runner(states, enabled=True), drafts)
+    state, uniform = _gather(_runner(states), drafts)
 
     assert uniform == DECODE_QUERY_LEN
     # The prompt token must still be written by prepare_prefill_inputs.
@@ -58,17 +61,11 @@ def test_padded_final_prompt_token_replays_decode_graph() -> None:
     assert state.is_prefilling_np.tolist() == [False] * 4 + [True]
 
 
-def test_padded_final_prompt_token_stays_eager_without_contract() -> None:
-    states, drafts = _batch(new_req_computed=31999)
-    _, uniform = _gather(_runner(states, enabled=False), drafts)
-
-    assert uniform is None
-
-
 def test_prompt_chunk_of_verify_length_stays_eager() -> None:
     # Five real prompt tokens remain: a genuine chunk, not a padded final token.
     states, drafts = _batch(new_req_computed=31995)
-    _, uniform = _gather(_runner(states, enabled=True), drafts)
+    del drafts["new"]
+    _, uniform = _gather(_runner(states), drafts)
 
     assert uniform is None
 
@@ -76,6 +73,6 @@ def test_prompt_chunk_of_verify_length_stays_eager() -> None:
 def test_final_prompt_token_without_draft_slots_stays_eager() -> None:
     states, drafts = _batch(new_req_computed=31999)
     del drafts["new"]
-    _, uniform = _gather(_runner(states, enabled=True), drafts)
+    _, uniform = _gather(_runner(states), drafts)
 
     assert uniform is None
