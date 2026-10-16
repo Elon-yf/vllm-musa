@@ -442,7 +442,7 @@ _DSV4_TP8_MP56_TRITON_CONFIGS: Final = {
 
 
 def _block32_triton_config(
-    block_m: int, block_n: int, group_m: int = 1
+    block_m: int, block_n: int, group_m: int = 1, num_stages: int = 2
 ) -> dict[str, int]:
     # One 32-wide scale group per K step, as the upstream kernel requires.
     return {
@@ -451,7 +451,7 @@ def _block32_triton_config(
         "BLOCK_SIZE_K": 32,
         "GROUP_SIZE_M": group_m,
         "num_warps": 4,
-        "num_stages": 2,
+        "num_stages": num_stages,
     }
 
 
@@ -473,6 +473,68 @@ _DSV41_TP8_MP60_TRITON_CONFIGS: Final = {
     512: _block32_triton_config(64, 32),
     1024: _block32_triton_config(64, 32, 8),
     2048: _block32_triton_config(64, 32, 8),
+}
+
+
+def _folded_config(group_m: int = 1) -> dict[str, int]:
+    # 32x32 tiles with four warps round every row exactly like the default
+    # config above 64 tokens, so a token's output does not depend on its batch.
+    return _block32_triton_config(32, 32, group_m, num_stages=1)
+
+
+# Per-M Triton configs for the DeepSeek-V4.1 TP8 routed experts with the shared
+# expert folded in (385 experts, top-7) on MP56, from DSpark verify batches past
+# the expert-dedup MMA range to prefill chunks: cold weights, worst boundary across
+# unique-random and hot routes.
+_DSV41_TP8_FOLDED_MP56_TRITON_CONFIGS: Final = {
+    10: _folded_config(),
+    15: _folded_config(),
+    20: _folded_config(),
+    25: _folded_config(),
+    30: _folded_config(),
+    35: _folded_config(),
+    40: _folded_config(),
+    50: _folded_config(),
+    60: _folded_config(),
+    70: _folded_config(),
+    80: _folded_config(),
+    100: _folded_config(8),
+    120: _folded_config(),
+    160: _folded_config(),
+    200: _folded_config(8),
+    240: _folded_config(),
+    280: _folded_config(8),
+    320: _folded_config(),
+    512: _folded_config(),
+    1024: _folded_config(),
+    2048: _folded_config(),
+    4096: _folded_config(8),
+}
+
+# The same for the folded DSpark draft experts (129 experts, top-4) past their
+# 16-token MMA range; decode batches carry four tokens per request.
+_DSV41_TP8_FOLDED_DRAFT_MP56_TRITON_CONFIGS: Final = {
+    17: _folded_config(8),
+    20: _folded_config(8),
+    24: _folded_config(),
+    28: _folded_config(),
+    32: _folded_config(8),
+    40: _folded_config(),
+    48: _folded_config(8),
+    56: _folded_config(),
+    64: _folded_config(),
+    80: _folded_config(),
+    96: _folded_config(),
+    128: _folded_config(),
+    160: _folded_config(),
+    192: _folded_config(8),
+    256: _folded_config(8),
+}
+
+# (local experts, top-k) of the folded DeepSeek-V4.1 TP8 MoE layers.
+_DSV41_TP8_FOLDED_MP56_TABLES: Final = {
+    (385, 7): _DSV41_TP8_FOLDED_MP56_TRITON_CONFIGS,
+    (129, 4): _DSV41_TP8_FOLDED_DRAFT_MP56_TRITON_CONFIGS,
 }
 
 # Exact-shape upstream Triton launch configs, keyed by token count. They
@@ -498,6 +560,25 @@ _CALIBRATED_TRITON_CONFIGS: Final[
 _CALIBRATED_TRITON_CONFIGS.update(
     {shape: _DSV41_TP8_MP60_TRITON_CONFIGS for shape in _DSV41_TP8_BLOCK32_SHAPES}
 )
+_CALIBRATED_TRITON_CONFIGS.update(
+    {
+        _s5000_fp8_shape(
+            multiprocessor_count=56,
+            local_experts=local_experts,
+            w1_output_size=576,
+            w2_input_size=288,
+            hidden_size=5120,
+            top_k=top_k,
+            w1_scale_shape=(local_experts, 18, 160),
+            w2_scale_shape=(local_experts, 160, 9),
+            gemv_block="auto",
+            graph_mode=graph_mode,
+            block_size=32,
+        ): table
+        for (local_experts, top_k), table in _DSV41_TP8_FOLDED_MP56_TABLES.items()
+        for graph_mode in ("eager", "capture")
+    }
+)
 
 _CALIBRATED_DIMENSIONS: Final = frozenset(
     (
@@ -507,7 +588,7 @@ _CALIBRATED_DIMENSIONS: Final = frozenset(
         shape.hidden_size,
         shape.top_k,
     )
-    for shape in _CALIBRATED_THRESHOLDS
+    for shape in (*_CALIBRATED_THRESHOLDS, *_CALIBRATED_TRITON_CONFIGS)
 )
 
 

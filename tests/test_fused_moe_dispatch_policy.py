@@ -173,6 +173,70 @@ def test_mp56_dsv4_triton_configs_cover_the_upstream_decode_ladder():
             assert POLICY.triton_config_for_shape(shape, num_tokens) is None
 
 
+def _dsv41_folded_shape(local_experts, top_k, multiprocessor_count, graph_mode):
+    return _shape(
+        multiprocessor_count=multiprocessor_count,
+        local_experts=local_experts,
+        w1_output_size=576,
+        w2_input_size=288,
+        hidden_size=5120,
+        top_k=top_k,
+        block_n=32,
+        block_k=32,
+        w1_scale_shape=(local_experts, 18, 160),
+        w2_scale_shape=(local_experts, 160, 9),
+        graph_mode=graph_mode,
+    )
+
+
+def test_mp56_dsv41_folded_triton_configs_cover_verify_and_prefill_batches():
+    # Target experts: from past the expert-dedup MMA range (9 tokens) to the
+    # 4096-token prefill chunk. Draft experts: from past its 16 tokens.
+    for (experts, top_k), first, last in (((385, 7), 10, 4096), ((129, 4), 17, 256)):
+        table = POLICY._DSV41_TP8_FOLDED_MP56_TABLES[(experts, top_k)]
+        assert (min(table), max(table)) == (first, last)
+        for graph_mode in ("eager", "capture"):
+            shape = _dsv41_folded_shape(experts, top_k, 56, graph_mode)
+            for num_tokens in sorted(table):
+                config = POLICY.triton_config_for_shape(shape, num_tokens)
+                assert config == table[num_tokens], num_tokens
+                # One tile shape for every batch size: the per-row rounding then
+                # matches the default config above 64 tokens at any batch size.
+                tile = (
+                    config["BLOCK_SIZE_M"],
+                    config["BLOCK_SIZE_N"],
+                    config["BLOCK_SIZE_K"],
+                )
+                assert tile == (32, 32, 32)
+                assert config["num_warps"] == 4
+                assert config["num_stages"] == 1
+            for num_tokens in (first - 1, last + 1):
+                assert POLICY.triton_config_for_shape(shape, num_tokens) is None
+        assert POLICY.has_triton_only_calibration(
+            local_experts=experts,
+            w1_output_size=576,
+            w2_input_size=288,
+            hidden_size=5120,
+            top_k=top_k,
+        )
+
+
+def test_dsv41_folded_triton_configs_are_isolated_to_mp56():
+    for multiprocessor_count in (48, 60):
+        shape = _dsv41_folded_shape(385, 7, multiprocessor_count, "capture")
+        assert POLICY.triton_config_for_shape(shape, 40) is None
+    # The unfolded top-6 shape on MP56 has no table either.
+    unfolded = _dsv41_folded_shape(384, 6, 56, "capture")
+    unfolded = _shape(
+        **{
+            **unfolded.__dict__,
+            "w1_scale_shape": (384, 18, 160),
+            "w2_scale_shape": (384, 160, 9),
+        }
+    )
+    assert POLICY.triton_config_for_shape(unfolded, 40) is None
+
+
 def test_triton_config_lookup_uses_nearest_entry_and_returns_a_copy():
     shape = _dsv4_tp8_shape(56, "capture")
     table = POLICY._CALIBRATED_TRITON_CONFIGS[shape]
@@ -279,6 +343,17 @@ def test_calibrated_threshold_boundaries_and_device_identity(monkeypatch):
     assert thresholds_for_shape(_shape(multiprocessor_count=56)).source == (
         "uncalibrated-shape"
     )
+
+
+def test_every_calibrated_shape_passes_the_dimension_prefilter():
+    for shape in (*POLICY._CALIBRATED_THRESHOLDS, *POLICY._CALIBRATED_TRITON_CONFIGS):
+        assert POLICY.has_calibrated_dimensions(
+            local_experts=shape.local_experts,
+            w1_output_size=shape.w1_output_size,
+            w2_input_size=shape.w2_input_size,
+            hidden_size=shape.hidden_size,
+            top_k=shape.top_k,
+        ), shape
 
 
 def test_calibrated_dimension_prefilter(monkeypatch):
