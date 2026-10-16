@@ -56,7 +56,7 @@ def test_without_a_forward_context_or_plan_nothing_is_shared(monkeypatch) -> Non
 
 
 def test_v41_decode_keys_the_plan_by_layer_type_and_cache_layout() -> None:
-    (patch,) = SERIES.glob("0038-*.patch")
+    (patch,) = SERIES.glob("0036-*.patch")
     text = patch.read_text(encoding="utf-8")
     assert "+    shared_decode_plan," in text
     hook = text[text.index("+        tile_metadata = shared_decode_plan(") :]
@@ -94,7 +94,7 @@ def test_global_topk_is_mapped_once_per_key_and_forward(monkeypatch) -> None:
 
 
 def test_v41_decode_keys_the_global_topk_by_index_source_and_cache() -> None:
-    (patch,) = SERIES.glob("0040-*.patch")
+    (patch,) = SERIES.glob("0038-*.patch")
     text = patch.read_text(encoding="utf-8")
     assert "+    shared_global_topk," in text
     start = "+            global_indices, topk_lens = shared_global_topk("

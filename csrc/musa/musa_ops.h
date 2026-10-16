@@ -1,5 +1,6 @@
 #include <optional>
 #include <tuple>
+#include <torch/all.h>
 #include <torch/library.h>
 
 #include "core/scalar_type.hpp"

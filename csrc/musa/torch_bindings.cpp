@@ -1,5 +1,3 @@
-#include "cache.h"
-#include "cuda_utils.h"
 #include "musa_ops.h"
 #include "core/registration.h"
 

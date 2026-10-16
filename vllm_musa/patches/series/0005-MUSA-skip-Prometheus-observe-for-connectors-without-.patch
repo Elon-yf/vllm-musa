@@ -8,10 +8,10 @@ Subject: [PATCH] MUSA: skip Prometheus observe for connectors without metrics
  1 file changed, 5 insertions(+), 5 deletions(-)
 
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py
-index d291d38..d0aad27 100644
+index 1ded62adda..48710ef0e7 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py
-@@ -124,11 +124,11 @@ class MultiKVConnectorPromMetrics(KVConnectorPromMetrics):
+@@ -125,11 +125,11 @@ class MultiKVConnectorPromMetrics(KVConnectorPromMetrics):
  
      def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0):
          for connector_id, stats_data in transfer_stats_data.items():

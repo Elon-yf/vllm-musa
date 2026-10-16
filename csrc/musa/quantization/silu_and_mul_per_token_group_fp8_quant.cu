@@ -4,7 +4,7 @@
 #include <cuda_fp8.h>
 #include <torch/all.h>
 
-#include "dispatch_utils.h"
+#include "../include/dispatch_utils.h"
 
 // Warp-segment max reduce within a 16-thread group (THREADS_PER_GROUP=16).
 __device__ __forceinline__ float GroupReduceMax(float val) {
@@ -177,7 +177,7 @@ void silu_and_mul_per_token_group_fp8_quant_impl(
             static_cast<float>(swiglu_limit));                            \
   } while (0)
 
-  VLLM_DISPATCH_FLOATING_TYPES(
+  MUSA_DISPATCH_FLOATING_TYPES(
       input.scalar_type(), "silu_and_mul_per_token_group_fp8_quant", ([&] {
         if (dst_type == at::ScalarType::Float8_e4m3fn) {
           LAUNCH_SILU_QUANT_KERNEL(scalar_t, __nv_fp8_e4m3);

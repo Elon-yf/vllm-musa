@@ -2,10 +2,10 @@
 torchada==0.1.95
 mthreads-ml-py>=2.4.3
 numpy==1.26
-openai>=2.24.0
-transformers==5.15.0
-huggingface_hub>=1.27.0,<2.0
-tokenizers==0.22.2
+openai>=2.25.0
+transformers==5.19.0
+huggingface_hub>=1.31.0,<2.0
+tokenizers==0.23.3
 einops
 ray>=2.47.1,<=2.48.0
 click==8.4.2

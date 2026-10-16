@@ -149,58 +149,50 @@ INCLUDE_DIRS = [
 # =============================================================================
 
 VLLM_CSRC_SOURCES = [
-    # paged_attention_v1/v2: CUDA-only, unused on MUSA (mate FlashAttention);
-    # skipped + impl-stripped in torch_bindings.cpp (cat-2 patch).
-    # str(_VLLM_REPO.source_dir / "csrc/attention/paged_attention_v1.cu"),
-    # str(_VLLM_REPO.source_dir / "csrc/attention/paged_attention_v2.cu"),
-    str(_VLLM_REPO.source_dir / "csrc/cuda_view.cu"),
-    str(_VLLM_REPO.source_dir / "csrc/torch_bindings.cpp"),
+    # vllm._C carries the regular-ABI CPU-to-device view op; the other _C ops
+    # are registered by _C_stable_libtorch.
+    str(_VLLM_REPO.source_dir / "csrc/musa_cuda_view.cu"),
+    str(_VLLM_REPO.source_dir / "csrc/musa_torch_bindings.cpp"),
 ]
 
 VLLM_STABLE_CSRC_SOURCES = [
-    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/torch_bindings.cpp"),
-    # v0.28 registers _C_cuda_utils from the stable bindings, so its
-    # implementation must be linked into _C_stable_libtorch as upstream does.
-    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/cuda_utils_kernels.cu"),
+    str(_VLLM_REPO.source_dir / "csrc/torch_bindings.cpp"),
+    # The stable bindings register _C_cuda_utils, so its implementation is
+    # linked into _C_stable_libtorch as upstream does.
+    str(_VLLM_REPO.source_dir / "csrc/cuda_utils_kernels.cu"),
     # gptq q_gemm: GPTQ is unused by the FP8/bf16 model matrix and its CUDA half2
     # path does not port cleanly to mcc; its gptq_gemm/gptq_shuffle impls are
     # dropped from the stable bindings to match.
-    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/activation_kernels.cu"),
-    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/layernorm_kernels.cu"),
-    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/pos_encoding_kernels.cu"),
-    str(_VLLM_REPO.source_dir
-        / "csrc/libtorch_stable/quantization/w8a8/fp8/per_token_group_quant.cu"),
-    str(_VLLM_REPO.source_dir
-        / "csrc/libtorch_stable/quantization/w8a8/int8/per_token_group_quant.cu"),
+    str(_VLLM_REPO.source_dir / "csrc/activation_kernels.cu"),
+    str(_VLLM_REPO.source_dir / "csrc/layernorm_kernels.cu"),
+    str(_VLLM_REPO.source_dir / "csrc/pos_encoding_kernels.cu"),
+    # FP8 and INT8 per-token-group quant kernels.
+    str(_VLLM_REPO.source_dir / "csrc/quantization/w8a8/fp8/per_token_group_quant.cu"),
     # Scaled FP8/INT8 quant kernels (dynamic_scaled_fp8_quant,
     # dynamic_per_token_scaled_fp8_quant, static/dynamic_scaled_int8_quant): the
     # dynamic paths back _custom_ops.scaled_fp8_quant / scaled_int8_quant, used by
     # FP8/INT8 activation quantization. static_scaled_fp8_quant is also built here
     # but stays CUDA-only (its int[] group_shape arg is unboxable on the stable ABI).
+    str(_VLLM_REPO.source_dir / "csrc/quantization/w8a8/fp8/common.cu"),
+    str(_VLLM_REPO.source_dir / "csrc/quantization/w8a8/int8/scaled_quant.cu"),
+    str(_VLLM_REPO.source_dir / "csrc/mamba/selective_scan_fwd.cu"),
+    str(_VLLM_REPO.source_dir / "csrc/cache_kernels.cu"),
+    str(_VLLM_REPO.source_dir / "csrc/cache_kernels_fused.cu"),
+    str(_VLLM_REPO.source_dir / "csrc/musa_cache_ops_reg.cu"),
+    str(_VLLM_REPO.source_dir / "csrc/attention/merge_attn_states.cu"),
+    str(_VLLM_REPO.source_dir / "csrc/sampler.cu"),
+    str(_VLLM_REPO.source_dir / "csrc/topk.cu"),
     str(_VLLM_REPO.source_dir
-        / "csrc/libtorch_stable/quantization/w8a8/fp8/common.cu"),
-    str(_VLLM_REPO.source_dir
-        / "csrc/libtorch_stable/quantization/w8a8/int8/scaled_quant.cu"),
-    # Relocated from csrc/* into csrc/libtorch_stable/* by the v0.24.0 stable-ABI
-    # consolidation; compiled into the stable extension at their new paths.
-    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/mamba/selective_scan_fwd.cu"),
-    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/cache_kernels.cu"),
-    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/cache_kernels_fused.cu"),
-    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/musa_cache_ops_reg.cu"),
-    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/attention/merge_attn_states.cu"),
-    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/sampler.cu"),
-    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/topk.cu"),
-    str(_VLLM_REPO.source_dir
-        / "csrc/libtorch_stable/quantization/fused_kernels/fused_silu_mul_block_quant.cu"),
+        / "csrc/quantization/fused_kernels/fused_silu_mul_block_quant.cu"),
     # Layernorm+quant fusion kernels (rms_norm_static_fp8_quant,
     # fused_add_rms_norm_static_fp8_quant, rms_norm_dynamic_per_token_quant,
     # rms_norm_per_block_quant): emitted by the rms_quant_fusion compile pass.
-    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/layernorm_quant_kernels.cu"),
+    str(_VLLM_REPO.source_dir / "csrc/layernorm_quant_kernels.cu"),
     str(_VLLM_REPO.source_dir
-        / "csrc/libtorch_stable/quantization/fused_kernels/fused_layernorm_dynamic_per_token_quant.cu"),
-    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/quantization/activation_kernels.cu"),
-    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/custom_all_reduce.cu"),
-    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/minimax_reduce_rms_kernel.cu"),
+        / "csrc/quantization/fused_kernels/fused_layernorm_dynamic_per_token_quant.cu"),
+    str(_VLLM_REPO.source_dir / "csrc/quantization/activation_kernels.cu"),
+    str(_VLLM_REPO.source_dir / "csrc/custom_all_reduce.cu"),
+    str(_VLLM_REPO.source_dir / "csrc/minimax_reduce_rms_kernel.cu"),
 ]
 
 VLLM_MUSA_CSRC_SOURCES = [
@@ -232,15 +224,14 @@ VLLM_MUSA_CSRC_SOURCES = [
 ]
 
 VLLM_MOE_CSRC_SOURCES = [
-    # Relocated from csrc/moe/* into csrc/libtorch_stable/moe/* by the v0.24.0
-    # stable-ABI consolidation. On MUSA these are built as a regular (at::Tensor)
-    # extension: the kernels are converted off the stable ABI (the stable path
-    # needs torch::stable::sum_out with an int[] dim that torch_musa 2.9 cannot
-    # box), the bindings are a regular TORCH_LIBRARY, and moe_ops.h is at::Tensor.
-    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/moe/moe_align_sum_kernels.cu"),
-    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/moe/topk_softmax_kernels.cu"),
-    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/moe/topk_softplus_sqrt_kernels.cu"),
-    str(_VLLM_REPO.source_dir / "csrc/libtorch_stable/moe/torch_bindings.cpp"),
+    # On MUSA the MoE kernels are built as a regular (at::Tensor) extension: the
+    # stable path needs torch::stable::sum_out with an int[] dim that torch_musa
+    # 2.9 cannot box, so the kernels use the ATen API, the bindings are a regular
+    # TORCH_LIBRARY, and moe_ops.h is at::Tensor.
+    str(_VLLM_REPO.source_dir / "csrc/moe/moe_align_sum_kernels.cu"),
+    str(_VLLM_REPO.source_dir / "csrc/moe/topk_softmax_kernels.cu"),
+    str(_VLLM_REPO.source_dir / "csrc/moe/topk_softplus_sqrt_kernels.cu"),
+    str(_VLLM_REPO.source_dir / "csrc/moe/torch_bindings.cpp"),
 ]
 
 # =============================================================================
@@ -426,7 +417,7 @@ class _CustomBuildExt(BuildExtension):
         # its local Git object set may not contain the corresponding tag.
         # Always provide the pinned release version so setuptools-scm does not
         # derive a stale development version from the nearest available tag.
-        env.setdefault("VLLM_VERSION_OVERRIDE", "0.28.0")
+        env.setdefault("VLLM_VERSION_OVERRIDE", _PINS["VLLM_TAG"].lstrip("v"))
 
         # always editable; compat (path-based .pth) -- the default PEP 660 finder
         # mis-resolves vLLM's submodules and loses to a system vLLM.
@@ -450,7 +441,7 @@ class _CustomBuildExt(BuildExtension):
         steps = [
             {
                 "name": "Install vllm use existing torch",
-                "cmd": f"cd {source_dir} && python use_existing_torch.py",
+                "cmd": f"cd {source_dir} && python tools/use_existing_torch.py",
                 "shell": True,
                 "env": None,
             },

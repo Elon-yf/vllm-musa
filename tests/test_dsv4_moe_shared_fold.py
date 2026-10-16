@@ -75,7 +75,7 @@ def test_router_override_keeps_hash_routing_upstream() -> None:
 
 def test_biased_dsv4_gates_keep_bf16_logits_on_musa() -> None:
     (patch,) = (ROOT / "vllm_musa" / "patches" / "series").glob(
-        "0039-MUSA-let-the-DeepSeek-V4-router-read-the-BF16-gate-o.patch"
+        "0037-MUSA-let-the-DeepSeek-V4-router-read-the-BF16-gate-o.patch"
     )
     text = patch.read_text(encoding="utf-8")
     assert "+++ b/vllm/models/deepseek_v4/nvidia/model.py" in text
@@ -83,7 +83,7 @@ def test_biased_dsv4_gates_keep_bf16_logits_on_musa() -> None:
     hook = hook[: hook.index("+            self.gate.out_dtype = None\n")]
     for cond in (
         "current_platform.is_musa()",
-        "not self.use_mega_moe",
+        "not self.use_native_mega_moe",
         "self.gate.tid2eid is None",
         "self.gate.e_score_correction_bias is not None",
     ):

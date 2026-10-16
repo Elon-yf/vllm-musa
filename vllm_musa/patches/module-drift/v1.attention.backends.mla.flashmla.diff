@@ -104,7 +104,7 @@
 
          num_sms = num_compute_units(self.device.index)
 
-@@ -163,40 +159,52 @@
+@@ -164,40 +160,52 @@
          query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
          # we use the max but all should be the same due to uniform length requirement
          max_query_len = query_lens_cpu.max().item()
@@ -183,7 +183,7 @@
          return FlashMLADecodeMetadata(
              block_table=block_table_tensor,
              seq_lens=seq_lens_device,
-@@ -207,7 +215,6 @@
+@@ -208,7 +216,6 @@
 
  class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
      can_return_lse_for_decode: bool = True
@@ -191,7 +191,7 @@
 
      def __init__(
          self,
-@@ -275,9 +282,9 @@
+@@ -276,9 +283,9 @@
 
          num_decodes = attn_metadata.num_decodes
          q = reshape_query_for_spec_decode(q, num_decodes)
@@ -203,7 +203,7 @@
              device = q.device
              dtype = torch.int32
 
-@@ -304,48 +311,20 @@
+@@ -305,48 +312,20 @@
              # Non-split path ignores num_splits, but the API requires it:
              # zeros of length B+1
              num_splits = torch.zeros((B + 1,), dtype=dtype, device=device)

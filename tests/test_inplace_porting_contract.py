@@ -110,8 +110,8 @@ def _dockerfile_run_commands(dockerfile: str) -> list[str]:
 def test_musa_image_caps_huggingface_hub(dockerfile=None):
     """Our own pins must govern the vendored install, and the self-check import the pair.
 
-    The pinned upstream file asks for `huggingface_hub >= 1.27.0` with no upper bound,
-    while this image pins `transformers==5.5.3` (requirements/common.txt), whose metadata
+    The pinned upstream file asks for `huggingface_hub >= 1.31.0` with no upper bound,
+    while this image pins `transformers==5.19.0` (requirements/common.txt), whose metadata
     requires `huggingface-hub<2.0`. docker/musa.Dockerfile installs that upstream file
     with `--no-deps`, so nothing else would stop that one line resolving to the newest
     release (2.0.0) and the image could not import transformers (measured in
@@ -122,8 +122,8 @@ def test_musa_image_caps_huggingface_hub(dockerfile=None):
     if dockerfile is None:
         dockerfile = (ROOT / "docker" / "musa.Dockerfile").read_text()
     pinned = (ROOT / "requirements" / "common.txt").read_text()
-    assert "huggingface_hub>=1.27.0,<2.0" in pinned, "the pin belongs in requirements/"
-    assert "huggingface_hub>=1.27.0" not in dockerfile, "no version belongs in the Dockerfile"
+    assert "huggingface_hub>=1.31.0,<2.0" in pinned, "the pin belongs in requirements/"
+    assert "huggingface_hub>=1.31.0" not in dockerfile, "no version belongs in the Dockerfile"
     for module in ("transformers", "huggingface_hub"):
         assert f'"{module}"' in dockerfile, module
 
@@ -424,7 +424,8 @@ def test_setup_activates_torchada_without_installing_dependencies():
 
 def test_archive_vllm_install_uses_upstream_version_override():
     setup = (ROOT / "setup.py").read_text()
-    assert 'env.setdefault("VLLM_VERSION_OVERRIDE", "0.28.0")' in setup
+    override = 'env.setdefault("VLLM_VERSION_OVERRIDE", _PINS["VLLM_TAG"].lstrip("v"))'
+    assert override in setup
     assert "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM" not in setup
 
 
