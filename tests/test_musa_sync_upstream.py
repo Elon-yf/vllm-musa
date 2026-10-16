@@ -660,11 +660,13 @@ def test_shipped_upstream_entries():
         e for e in manifest.ENTRIES if e.category in manifest.BUILD_APPLIED_CATEGORIES
     ]
     upstream = [e for e in series if e.id.startswith("upstream/")]
-    assert upstream and series[-len(upstream) :] == upstream  # applied last
-    assert upstream[0].upstream_commits, "upstream/ starts with an upstream commit"
+    musa = series[: len(series) - len(upstream)]
+    assert series[len(musa) :] == upstream  # applied last
+    if upstream:
+        assert upstream[0].upstream_commits, "upstream/ starts with an upstream commit"
     for e in upstream:
         pick = manifest.upstream_pick(ROOT / e.path)
         assert pick.commits == e.upstream_commits, e.id
         assert bool(pick.commits) == bool(pick.pr), e.id
-    for e in series[: -len(upstream)]:
+    for e in musa:
         assert not manifest.upstream_pick(ROOT / e.path).commits, e.id

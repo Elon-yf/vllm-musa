@@ -51,7 +51,7 @@ editable or wheel install. They are source patches; runtime registrations in
 | `0041-MUSA-let-adaptive-verification-trim-the-flattened-DS.patch` | On MUSA the flattened DSA indexer decode accepts device-decided verify lengths: each verify token is its own indexer row built from device metadata, so adaptive verification can trim DSpark verify batches. |
 | `0042-MUSA-profile-adaptive-verification-costs-in-the-real.patch` | The CUDA graph memory profile skips the adaptive verification step timings: as eager dummy runs inside that pass, their cached activations would count as graph memory and shrink the KV cache. The real capture profiles them. |
 
-Currently **42 patches**.
+Currently **42 patches** and **0 upstream entries** in `upstream/`.
 
 Keep each patch as a `git format-patch` artifact with its `index` lines. To
 verify the stack, use a **pristine** checkout or archive of the pinned vLLM
