@@ -50,8 +50,19 @@ editable or wheel install. They are source patches; runtime registrations in
 | `0040-MUSA-map-the-DeepSeek-V4.1-decode-top-k-once-per-ind.patch` | The DeepSeek-V4.1 layers after an index source read its top-k indices through the same compressed cache until the next source; the MUSA decode attention maps them to global KV slots once per index source and cache in a forward pass instead of once per layer. |
 | `0041-MUSA-let-adaptive-verification-trim-the-flattened-DS.patch` | On MUSA the flattened DSA indexer decode accepts device-decided verify lengths: each verify token is its own indexer row built from device metadata, so adaptive verification can trim DSpark verify batches. |
 | `0042-MUSA-profile-adaptive-verification-costs-in-the-real.patch` | The CUDA graph memory profile skips the adaptive verification step timings: as eager dummy runs inside that pass, their cached activations would count as graph memory and shrink the KV cache. The real capture profiles them. |
+| `0043-MUSA-enable-AWQ-GPTQ-W4A16-via-the-Triton-kernel.patch` | AWQ and GPTQ 4-bit checkpoints run through the Triton W4A16 kernel on MUSA: the WNA16 kernel selector offers it to the out-of-tree MUSA platform, and the AWQ/GPTQ configs accept the MUSA capability and skip the Marlin check. |
+| `0044-MUSA-constrain-the-Triton-W4A16-wide-tile.patch` | Above 64 rows the MUSA W4A16 GEMM uses a 128x64x32 tile; MUSA Triton 3.2 computes the `BLOCK_N=128` tile incorrectly. |
+| `0045-MUSA-run-the-Triton-W4A16-kernel-tests-on-MUSA.patch` | The Triton W4A16 kernel tests run on MUSA. |
+| `0046-MUSA-use-a-block-size-the-MUSA-backend-supports.patch` | The test runner's default KV block size is 64 on MUSA, whose attention backend needs a multiple of 64. |
+| `0047-MUSA-split-K-on-the-W4A16-kernel-for-decode-speed.patch` | Up to 64 rows the MUSA W4A16 GEMM splits K into up to eight group-aligned pieces, chosen from the static shape, and sums them in FP32, so the narrow decode projections expose enough programs. |
+| `0048-MUSA-route-small-M-W4A16-GEMMs-to-the-cheap-unpack.patch` | Every MUSA W4A16 GEMM up to 64 rows takes the split kernel and its reshape unpack; with one piece it writes the output directly. |
+| `0049-MUSA-decode-tile-for-the-widest-W4A16-projection.patch` | MUSA W4A16 GEMMs up to 16 rows with `N >= 8192` use a 16x64 tile with `BLOCK_K=64`. |
+| `0050-MUSA-hook-PaddleOCR-VL-rotary-fast-path.patch` | PaddleOCR-VL asks the optimization contract for the MUSA rotary path at model construction, for its exact vision and language geometry. |
+| `0051-MUSA-add-minimal-MinerU-Qwen2-VL-rotary-dispatch.patch` | MinerU Qwen2-VL selects the shared MUSA rotary path for its exact vision and language geometry. |
+| `0052-MUSA-OvisOCR2-model-local-rotary-route.patch` | OvisOCR2 installs the MUSA rotary path on the selected Qwen3.5 vision blocks with the exact BF16 geometry. |
+| `0053-MUSA-keep-DeepSeek-V4-aux-stream-overlap-in-FULL-dec.patch` | DeepSeek-V4 and DeepSeek-V4.1 attention overlap their aux streams only in FULL CUDA graphs, which hold decode and verify batches; prefill and mixed steps run serially, because overlapping them can stall the compute queue until the GPU run timeout fires. |
 
-Currently **42 patches** and **0 upstream entries** in `upstream/`.
+Currently **53 patches** and **0 upstream entries** in `upstream/`.
 
 Keep each patch as a `git format-patch` artifact with its `index` lines. To
 verify the stack, use a **pristine** checkout or archive of the pinned vLLM
@@ -60,3 +71,62 @@ The verifier checks every patch in order; an already-patched tree is not a
 valid input for that command. A strict replay is `git apply --check` followed
 by `git apply` for each patch in filename order. Compare the resulting source
 hashes with the runtime import tree when reporting hardware evidence.
+
+## Upstream commits and pin bumps
+
+Step-by-step commands, conflict handling and the checks to run are in
+`docs/mdm-developer-guide.md`: §4a backports an upstream commit, §5 bumps the pin.
+
+`upstream/` holds upstream vLLM commits that the pin predates. The build and
+`rebase` apply them after the MUSA entries (`0001…`, then `upstream/0001…`),
+in the order they were generated, so adding or dropping one changes no MUSA
+entry. Each directory is numbered from `0001` on its own. vLLM v0.30.0
+contains every upstream commit the series needs, so `upstream/` is empty.
+
+An upstream entry is a `git cherry-pick -x` of its upstream commit: the
+message keeps the upstream subject, whose `(#N)` names the pull request, and
+git's `(cherry picked from commit <sha>)` line. An `upstream/` entry without
+that line is a MUSA fix for the upstream commit before it. `check-series`
+fails a MUSA entry with the line, and an `upstream/` that does not start with
+one. `report` lists the upstream entries.
+
+Add one with `musa_sync backport <sha> [--from <vLLM clone>]` while
+`third_party/vllm` holds the series (after `musa_sync rebase`). It
+cherry-picks the commit on top of the series and regenerates it. After
+resolving a cherry-pick conflict, or amending the commit after `--no-regen`,
+run `musa_sync regen`. A MUSA commit made on top of the clone stays a MUSA
+entry unless it changes a file that an upstream entry changes; such a commit
+stays in `upstream/` after them, as a fix. Backport a commit's upstream
+prerequisites first, oldest first. When entries are added or removed, update
+the counts above; the tests check them.
+
+A pin bump:
+
+1. Run `musa_sync upgrade-plan <new ref> --history <full vLLM clone>`. For each
+   entry it prints `keep`, `drop` or `review` with the evidence, and fails
+   while anything needs review. An upstream entry counts as present when the
+   new ref contains:
+   - its commit;
+   - a commit whose subject ends in its `(#N)`, which is how release branches
+     carry it;
+   - a `(cherry picked from commit …)` of it;
+   - a commit with the same `git patch-id --stable`.
+
+   It is dropped when it changes what its upstream commit changes, and
+   reviewed when it carries local changes or the change was reverted. A MUSA
+   fix in `upstream/` is reviewed unless every upstream entry before it is
+   kept. The series is also
+   applied in order to the pristine new ref. A MUSA entry whose change is
+   already there is flagged for review, and the result settles any upstream
+   entry the history cannot place.
+2. While `third_party/PINS` still names the old pin, run `musa_sync rebase
+   <new ref> --drop-upstreamed --history <clone>`. It skips the `drop`
+   entries and replays the rest with `git am -3`. To drop a `review` entry
+   too, delete its file first. A conflict stops at that entry; the guide's §5
+   shows how to resolve it and apply the rest.
+3. Set `VLLM_COMMIT` and `VLLM_TAG` in `third_party/PINS` to the new ref, then
+   run `musa_sync regen`. `regen` exports the commits after the `PINS` commit,
+   so it must name the ref the series now sits on.
+
+Without a target, `upgrade-plan` checks the current pin. It lists anything
+the series still carries that the pin already contains.

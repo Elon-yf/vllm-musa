@@ -15,34 +15,39 @@ PATCH = next(
     )
 )
 GATE = "_musa_deepseek_v4_aux_overlap()"
+V4_ATTENTION = "vllm/models/deepseek_v4/attention.py"
+V41_ATTENTION = "vllm/models/deepseek_v41/attention.py"
 
 
-def _lines(prefix: str) -> list[str]:
-    return [
-        line[1:]
-        for line in PATCH.read_text().splitlines()
-        if line.startswith(prefix) and not line.startswith(prefix * 3)
-    ]
+def _added_by_file() -> dict[str, list[str]]:
+    added: dict[str, list[str]] = {}
+    current = None
+    for line in PATCH.read_text().splitlines():
+        if line.startswith("+++ b/"):
+            current = line[len("+++ b/") :]
+            added[current] = []
+        elif current is not None and line.startswith("+") and not line.startswith("+++"):
+            added[current].append(line[1:])
+    return added
 
 
-def test_patch_only_changes_attention() -> None:
-    text = PATCH.read_text()
-    changed = {
-        line[len("+++ b/") :]
-        for line in text.splitlines()
-        if line.startswith("+++ b/")
-    }
-    assert changed == {"vllm/models/deepseek_v4/attention.py"}
-    assert "From: musa <musa@local>" in text
+def test_patch_only_changes_the_attention_layers() -> None:
+    assert set(_added_by_file()) == {V4_ATTENTION, V41_ATTENTION}
+    assert "From: musa <musa@local>" in PATCH.read_text()
 
 
-def test_gate_is_used_at_the_three_overlap_sites() -> None:
-    added = _lines("+")
-    added_text = "\n".join(added)
+def test_gate_is_used_at_every_overlap_site() -> None:
+    added = _added_by_file()
+    added_text = "\n".join(line for lines in added.values() for line in lines)
     for gate in ("kv_role", "device_type", "is_forward_context_available"):
         assert gate not in added_text
-    calls = [line for line in added if GATE in line and "def " not in line]
-    assert len(calls) == 3
+    assert "_musa_deepseek_v4_serialize_long_prefill" not in added_text
+    calls = {
+        path: [line for line in lines if GATE in line and "def " not in line]
+        for path, lines in added.items()
+    }
+    assert len(calls[V4_ATTENTION]) == 3
+    assert len(calls[V41_ATTENTION]) == 2
 
 
 def test_gate_under_real_graph_capture(monkeypatch: pytest.MonkeyPatch) -> None:
