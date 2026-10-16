@@ -35,11 +35,9 @@ import pymtml as pynvml
 from vllm_musa.optimization_contract import (
     ModelFamily,
     OptimizationFeature,
-)
-from vllm_musa.optimization_contract import policy as contract_policy
-from vllm_musa.optimization_contract import (
     resolve_optimization_contract,
 )
+from vllm_musa.optimization_contract import policy as contract_policy
 from vllm_musa.tuning import FUSED_ADD_RMSNORM_MIN_ROWS
 
 logger = init_logger(__name__)
@@ -83,10 +81,7 @@ def with_mtml_context(fn: Callable[_P, _R]) -> Callable[_P, _R]:
         try:
             return fn(*args, **kwargs)
         finally:
-            # Note: We intentionally do NOT call nvmlShutdown() here because
-            # pymtml has a bug where nvmlInit() fails after nvmlShutdown()
-            # has been called. The library handles cleanup on process exit.
-            pass
+            pynvml.nvmlShutdown()
 
     return wrapper
 
@@ -1000,9 +995,8 @@ class MtmlMUSAPlatform(MUSAPlatformBase):
     ) -> bool:
         # No @with_mtml_context here: the base implementation only reads
         # get_device_capability(), which is cached and brings its own MTML
-        # context. Wrapping this method as well would call nvmlInit() on every
-        # call, including calls made per attention layer per step from the
-        # Triton reshape-and-cache path.
+        # context. Wrapping this method as well would cost an nvmlInit()/
+        # nvmlShutdown() pair on every call.
         try:
             return super().has_device_capability(capability, device_id)
         except RuntimeError:
@@ -1233,10 +1227,8 @@ try:
         # MTML may not be supported on all systems.
         mtml_available = False
 finally:
-    # Note: We intentionally do NOT call nvmlShutdown() here because
-    # pymtml has a bug where nvmlInit() fails after nvmlShutdown()
-    # has been called. The library handles cleanup on process exit.
-    pass
+    if mtml_available:
+        pynvml.nvmlShutdown()
 
 MUSAPlatform = MtmlMUSAPlatform if mtml_available else NonMtmlMUSAPlatform
 
