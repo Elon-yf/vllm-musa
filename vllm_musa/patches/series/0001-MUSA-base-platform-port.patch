@@ -65,7 +65,7 @@ platform.
  vllm/model_executor/layers/layernorm.py       |    4 +-
  .../model_executor/layers/logits_processor.py |   84 +-
  vllm/model_executor/layers/mamba/abstract.py  |   14 +-
- .../layers/mamba/ops/ssd_chunk_scan.py        |   89 +-
+ .../layers/mamba/ops/ssd_chunk_scan.py        |   87 +-
  vllm/model_executor/layers/mhc.py             |   46 +
  .../minimax_rms_norm/lamport_workspace.py     |   15 +-
  .../model_executor/layers/quantization/fp8.py |   12 +-
@@ -147,7 +147,7 @@ platform.
  vllm/v1/worker/gpu_worker.py                  |   62 +-
  vllm/v1/worker/mamba_utils.py                 |    5 +-
  vllm/v1/worker/utils.py                       |   27 +-
- 141 files changed, 7022 insertions(+), 1338 deletions(-)
+ 141 files changed, 7020 insertions(+), 1338 deletions(-)
  create mode 100644 csrc/musa_cache_ops_reg.cu
  create mode 100644 csrc/musa_cuda_view.cu
  create mode 100644 csrc/musa_dispatch_utils.h
@@ -6096,15 +6096,15 @@ index 5322f899dd..85ef2ec333 100644
          states: list[torch.Tensor] = []
          offset = 0
 diff --git a/vllm/model_executor/layers/mamba/ops/ssd_chunk_scan.py b/vllm/model_executor/layers/mamba/ops/ssd_chunk_scan.py
-index bd554ede5a..33514fe159 100644
+index 237dd33b52..680f578b15 100644
 --- a/vllm/model_executor/layers/mamba/ops/ssd_chunk_scan.py
 +++ b/vllm/model_executor/layers/mamba/ops/ssd_chunk_scan.py
-@@ -14,8 +14,50 @@ from vllm.triton_utils import tl, triton
- TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
+@@ -35,8 +35,49 @@ def _drop_racy_wgmma_configs(configs: list[triton.Config]) -> list[triton.Config
+     ]
  
  
 -@triton.autotune(
--    configs=[
+-    configs=_drop_racy_wgmma_configs(
 +from vllm.triton_utils.musa import is_musa_triton_32
 +
 +
@@ -6147,19 +6147,17 @@ index bd554ede5a..33514fe159 100644
 +                num_warps=8,
 +            ),
 +        ]
-+    return [
-+
-         # =================================================================
-         # Higher warp count configs for better latency hiding
-         # More warps = more instructions in flight = better memory latency hiding
-@@ -141,8 +183,22 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
-             num_stages=4,
-             num_warps=2,
-         ),
--    ],
++    return _drop_racy_wgmma_configs(
+         [
+             # =================================================================
+             # Higher warp count configs for better latency hiding
+@@ -164,8 +205,21 @@ def _drop_racy_wgmma_configs(configs: list[triton.Config]) -> list[triton.Config
+                 num_warps=2,
+             ),
+         ]
+-    ),
 -    key=["chunk_size", "hdim", "dstate", "IS_CAUSAL"],
-+
-+    ]
++    )
 +
 +
 +def _ssd_autotune_kwargs():
@@ -6177,7 +6175,7 @@ index bd554ede5a..33514fe159 100644
  )
  @triton.jit
  def _chunk_scan_fwd_kernel(
-@@ -199,6 +255,7 @@ def _chunk_scan_fwd_kernel(
+@@ -222,6 +276,7 @@ def _chunk_scan_fwd_kernel(
      stride_D_head: tl.constexpr,
      # Meta-parameters
      IS_CAUSAL: tl.constexpr,
@@ -6185,7 +6183,7 @@ index bd554ede5a..33514fe159 100644
      HAS_D: tl.constexpr,
      D_HAS_HDIM: tl.constexpr,
      HAS_Z: tl.constexpr,
-@@ -298,7 +355,11 @@ def _chunk_scan_fwd_kernel(
+@@ -321,7 +376,11 @@ def _chunk_scan_fwd_kernel(
              )
              prev_states = prev_states.to(C_ptr.dtype.element_ty)
  
@@ -6198,7 +6196,7 @@ index bd554ede5a..33514fe159 100644
  
      else:
          prev_states_ptrs = (
-@@ -325,7 +386,10 @@ def _chunk_scan_fwd_kernel(
+@@ -348,7 +407,10 @@ def _chunk_scan_fwd_kernel(
                      other=0.0,
                  )
                  prev_states = prev_states.to(C_ptr.dtype.element_ty)
@@ -6210,7 +6208,7 @@ index bd554ede5a..33514fe159 100644
              C_ptrs += BLOCK_SIZE_K
              prev_states_ptrs += BLOCK_SIZE_K
          acc *= scale_m[:, None]
-@@ -465,6 +529,16 @@ def _chunk_scan_fwd(
+@@ -488,6 +550,16 @@ def _chunk_scan_fwd(
          else (0, 0, 0, 0)
      )
  
@@ -6227,7 +6225,7 @@ index bd554ede5a..33514fe159 100644
      _chunk_scan_fwd_kernel[grid](
          cb_ptr=cb,
          x_ptr=x,
-@@ -476,7 +550,7 @@ def _chunk_scan_fwd(
+@@ -499,7 +571,7 @@ def _chunk_scan_fwd(
          C_ptr=C,
          states_ptr=states,
          D_ptr=D,
@@ -6236,7 +6234,7 @@ index bd554ede5a..33514fe159 100644
          cu_chunk_seqlens_ptr=cu_chunk_seqlens,
          chunk_size=chunk_size,
          hdim=headdim,
-@@ -515,6 +589,7 @@ def _chunk_scan_fwd(
+@@ -538,6 +610,7 @@ def _chunk_scan_fwd(
          stride_init_states_dstate=initial_states_strides[3],
          stride_D_head=D.stride(0) if D is not None else 0,
          IS_CAUSAL=True,

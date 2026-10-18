@@ -86,7 +86,7 @@ def test_probe_upstream(ms, tmp_path):
 
 
 def test_read_pin(ms):
-    assert ms.read_pin("VLLM_TAG") == "v0.32.0rc2"
+    assert ms.read_pin("VLLM_TAG") == "v0.32.0"
     assert ms.read_pin("DOES_NOT_EXIST", "fallback") == "fallback"
 
 

@@ -1,8 +1,8 @@
 # vLLM v0.32.0 build-time patch series
 
 The files in this directory apply to the immutable vLLM commit named by
-`VLLM_COMMIT` in `third_party/PINS` (`7960eeb9de293137b7fca35cd4ae92c4c50ea286`,
-release tag `v0.32.0rc2`, the head of `releases/v0.32.0`). `setup.py` applies
+`VLLM_COMMIT` in `third_party/PINS` (`5df63a7203cdb9328d824a27b682e77c7b9928be`,
+release tag `v0.32.0`, the head of `releases/v0.32.0`). `setup.py` applies
 them in filename order before the editable or wheel install. They are source patches; runtime registrations in
 `vllm_musa/patches/` are separate.
 
@@ -80,7 +80,7 @@ Step-by-step commands, conflict handling and the checks to run are in
 `upstream/` holds upstream vLLM commits that the pin predates. The build and
 `rebase` apply them after the MUSA entries (`0001…`, then `upstream/0001…`),
 in the order they were generated, so adding or dropping one changes no MUSA
-entry. Each directory is numbered from `0001` on its own. vLLM v0.32.0rc2
+entry. Each directory is numbered from `0001` on its own. vLLM v0.32.0
 contains every upstream commit the series needs, so `upstream/` is empty.
 
 An upstream entry is a `git cherry-pick -x` of its upstream commit: the
