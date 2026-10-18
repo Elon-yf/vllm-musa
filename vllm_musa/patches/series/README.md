@@ -61,8 +61,9 @@ them in filename order before the editable or wheel install. They are source pat
 | `0051-MUSA-keep-DeepSeek-V4-aux-stream-overlap-in-FULL-dec.patch` | DeepSeek-V4 and DeepSeek-V4.1 attention overlap their aux streams only in FULL CUDA graphs, which hold decode and verify batches; prefill and mixed steps run serially, because overlapping them can stall the compute queue until the GPU run timeout fires. |
 | `0052-MUSA-run-on-Python-3.10.patch` | The MUSA image runs Python 3.10: the package metadata accepts it, and `vllm/__init__.py` backfills the Python 3.11 `typing` names and `datetime.UTC` from `typing_extensions` before any other vLLM module loads. |
 | `0053-MUSA-keep-the-allocator-settings-while-loading-weigh.patch` | The worker's allocator split-size cap during weight loading uses the CUDA/ROCm accelerator allocator-settings API; MUSA keeps its allocator settings. |
+| `0054-MUSA-number-warmup-blocks-within-each-dedicated-Mamb.patch` | The V2 kernel warmups number the blocks of each dedicated MUSA Mamba pool from 1 inside that pool, so hybrid Mamba models warm up without writing state past it; groups in the shared KV pool draw from one counter. |
 
-Currently **53 patches** and **0 upstream entries** in `upstream/`.
+Currently **54 patches** and **0 upstream entries** in `upstream/`.
 
 Keep each patch as a `git format-patch` artifact with its `index` lines. To
 verify the stack, use a **pristine** checkout or archive of the pinned vLLM
