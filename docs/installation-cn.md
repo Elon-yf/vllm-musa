@@ -7,9 +7,9 @@
 
 - x86_64 Linux、CPython 3.10（固定版本的 MUSA wheel 针对这一组合发布）。
 - 配备兼容 MUSA 驱动和工具包的摩尔线程（Moore Threads）GPU。
-- vLLM-MUSA v0.28.0-dev 及对应的 PyTorch/MUSA wheel。
+- vLLM-MUSA v0.32.0-dev 及对应的 PyTorch/MUSA wheel。
 
-v0.28.0-dev 依赖栈使用 PyTorch 2.11.x。驱动、工具包和 wheel 应来自同一版本系列。
+v0.32.0-dev 依赖栈使用 PyTorch 2.11.x。驱动、工具包和 wheel 应来自同一版本系列。
 
 ## 软件包索引
 
@@ -25,7 +25,7 @@ v0.28.0-dev 依赖栈使用 PyTorch 2.11.x。驱动、工具包和 wheel 应来�
 
 ## 容器
 
-要运行与 v0.28.0-dev 兼容的服务，最快的方式是使用 v0.28.0 正式镜像：
+最快的启动方式是使用已发布的 v0.28.0 正式镜像：
 
 ```bash
 export VLLM_MUSA_IMAGE=registry.mthreads.com/mcconline/inference/vllm/vllm-openai:v0.28.0
@@ -47,12 +47,12 @@ docker pull "${VLLM_MUSA_IMAGE}"
 
 ## 源码安装
 
-MUSA wheel 位于摩尔线程软件包索引中。对于 v0.28.0 系列版本，请克隆对应的
+MUSA wheel 位于摩尔线程软件包索引中。对于 v0.32.0 开发系列，请克隆对应的
 源码分支（也可以替换为部署所用的确切 release tag 或 commit），再安装
 MUSA wheel 和公共依赖：
 
 ```bash
-git clone --branch v0.28.0-dev --single-branch \
+git clone --branch v0.32.0-dev --single-branch \
   https://github.com/MooreThreads/vllm-musa.git
 cd vllm-musa
 

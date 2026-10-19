@@ -92,7 +92,7 @@ use the [serving cookbook](docs/cookbook/README.md).
 
 The V1 engine may automatically select Model Runner V2 for supported model
 architectures; both runners are supported on MUSA.
-This branch tracks the upstream releases/v0.32.0 commit in `third_party/PINS` and
+This branch tracks the upstream v0.32.0 commit in `third_party/PINS` and
 intentionally keeps the MUSA PyTorch 2.11.x stack; promote it to a supported
 release only after build and model-smoke validation.
 

@@ -8,9 +8,9 @@ model-specific launch command, start with the [serving cookbook](cookbook/README
 - x86_64 Linux and CPython 3.10 (the pinned MUSA wheels target this
   interpreter/platform pair).
 - A Moore Threads GPU with a compatible MUSA driver and toolkit.
-- vLLM-MUSA v0.28.0-dev and its matching PyTorch/MUSA wheels.
+- vLLM-MUSA v0.32.0-dev and its matching PyTorch/MUSA wheels.
 
-The v0.28.0-dev dependency stack uses PyTorch 2.11.x. Keep the driver, toolkit,
+The v0.32.0-dev dependency stack uses PyTorch 2.11.x. Keep the driver, toolkit,
 and wheel versions from the same release family.
 
 ## Package indexes
@@ -28,7 +28,7 @@ build instead of the MUSA build.
 
 ## Container
 
-The quickest path for v0.28.0-dev-compatible serving is the v0.28.0 release image:
+The quickest way to start serving is the published v0.28.0 release image:
 
 ```bash
 export VLLM_MUSA_IMAGE=registry.mthreads.com/mcconline/inference/vllm/vllm-openai:v0.28.0
@@ -54,13 +54,13 @@ arguments and image compatibility notes are maintained in
 
 ## Source install
 
-MUSA wheels are hosted on the Moore Threads package index. For the v0.28.0
-release line, clone the matching source branch (or replace it with the exact
+MUSA wheels are hosted on the Moore Threads package index. For the v0.32.0
+development line, clone the matching source branch (or replace it with the exact
 release tag or commit used by your deployment), then install the MUSA wheels
 before the public dependencies:
 
 ```bash
-git clone --branch v0.28.0-dev --single-branch \
+git clone --branch v0.32.0-dev --single-branch \
   https://github.com/MooreThreads/vllm-musa.git
 cd vllm-musa
 
