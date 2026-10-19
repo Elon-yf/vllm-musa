@@ -316,9 +316,14 @@ def _try_musa_fp8_einsum_fine_blocks(
         fp8_block_gemv,
         fp8_block_gemv_supported,
     )
+    from vllm_musa.kernels.fp8_block_splitk import fp8_block_splitk_config
 
-    if tokens <= _BLOCK_GEMV_MAX_TOKENS and all(
-        fp8_block_gemv_supported(act_scale[:, g, :], weight[g], scales[g])
+    if all(
+        (
+            tokens <= _BLOCK_GEMV_MAX_TOKENS
+            or fp8_block_splitk_config(weight[g], scales[g], tokens) is not None
+        )
+        and fp8_block_gemv_supported(act_scale[:, g, :], weight[g], scales[g])
         for g in range(groups)
     ):
         for group_idx in range(groups):

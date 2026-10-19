@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Split-K FP8 GEMM for small M and 32x32 block-scaled weights.
 
-Each program multiplies all rows (up to 16) by a BLOCK_N x (K / SPLIT) weight
-slice, one 32-wide scale group per FP8 dot, so the weights are read once with
-enough programs to keep the GPU busy at decode M. A BF16 activation is quantized
-per 32-wide group inside the kernel with the arithmetic of
-``per_token_group_quant_fp8``; each group lies inside one K slice. A second
-kernel sums the SPLIT partials in a fixed order and rounds once.
+Each program multiplies a 16- or 32-row tile by a BLOCK_N x (K / SPLIT) weight
+slice, one 32-wide scale group per FP8 dot, so there are enough programs to keep
+the GPU busy at decode M; row tiles that share a weight slice run back to back.
+A BF16 activation is quantized per 32-wide group inside the kernel with the
+arithmetic of ``per_token_group_quant_fp8``; each group lies inside one K slice.
+A second kernel sums the SPLIT partials in a fixed order and rounds once, so a
+row's result depends on neither M nor the tile height.
 """
 
 from __future__ import annotations
@@ -18,19 +19,21 @@ from vllm.triton_utils import tl, triton
 
 _FP8_MAX = 448.0
 _QUANT_EPS = 1e-10
-MAX_ROWS = 16
+BLOCK_M = 16
 
-# (SPLIT, BLOCK_N, num_warps, UNROLL, MIN_ROWS) measured on MTT S5000 with a cold
-# L2 for the DeepSeek-V4.1 TP8 projections, keyed by (N, K). The reduction is a
-# second launch, so below MIN_ROWS the single-kernel GEMV wins.
+# (SPLIT, BLOCK_N, num_warps, UNROLL, MIN_ROWS, MAX_ROWS, TILE_M) measured on MTT
+# S5000 with a cold L2 for the DeepSeek-V4.1 TP8 projections, keyed by (N, K). The
+# reduction is a second launch, so below MIN_ROWS the single-kernel GEMV wins; past
+# MAX_ROWS the block GEMM does. TILE_M rows per program where that pads no more
+# rows than BLOCK_M-row tiles.
 _CONFIGS = {
-    (1792, 5120): (16, 64, 4, 2, 2),
-    (576, 5120): (16, 64, 4, 2, 4),
-    (1024, 4096): (16, 64, 4, 2, 3),
-    (4096, 1280): (8, 64, 4, 1, 4),
-    (5120, 1024): (8, 64, 4, 2, 4),
-    (5120, 15360): (8, 64, 4, 2, 2),
-    (25600, 768): (2, 64, 4, 1, 2),
+    (1792, 5120): (16, 64, 4, 2, 2, 192, 32),
+    (576, 5120): (16, 64, 4, 2, 4, 320, 16),
+    (1024, 4096): (16, 64, 4, 2, 3, 320, 16),
+    (4096, 1280): (8, 64, 4, 1, 4, 96, 32),
+    (5120, 1024): (8, 64, 4, 2, 4, 48, 16),
+    (5120, 15360): (8, 64, 4, 2, 2, 96, 16),
+    (25600, 768): (2, 64, 4, 1, 2, 32, 16),
 }
 _ENABLED = os.environ.get("VLLM_MUSA_FP8_SPLITK_MM", "1") != "0"
 
@@ -59,9 +62,10 @@ def _fp8_block_splitk_kernel(
     FP8_MAX: tl.constexpr,
     QUANT_EPS: tl.constexpr,
 ):
-    pid_n = tl.program_id(0)
-    pid_k = tl.program_id(1)
-    offs_m = tl.arange(0, BLOCK_M)
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_k = tl.program_id(2)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, 32)
     m_mask = offs_m < M
@@ -119,12 +123,12 @@ def _fp8_block_splitk_reduce_kernel(
 
 def fp8_block_splitk_config(
     weight: torch.Tensor, weight_scale: torch.Tensor, rows: int
-) -> tuple[int, int, int, int, int] | None:
+) -> tuple[int, int, int, int, int, int, int] | None:
     """Measured config for ``rows`` activation rows, or None when the GEMM does not apply."""
-    if not _ENABLED or not 2 <= rows <= MAX_ROWS or weight.dim() != 2:
+    if not _ENABLED or weight.dim() != 2:
         return None
     config = _CONFIGS.get(tuple(weight.shape))
-    if config is None or rows < config[4]:
+    if config is None or not config[4] <= rows <= config[5]:
         return None
     n, k = weight.shape
     if (
@@ -139,26 +143,35 @@ def fp8_block_splitk_config(
     return config
 
 
+def _tile_rows(rows: int, tile_m: int) -> int:
+    """``tile_m`` unless it pads more rows than ``BLOCK_M``-row tiles."""
+    if triton.cdiv(rows, tile_m) * tile_m == triton.cdiv(rows, BLOCK_M) * BLOCK_M:
+        return tile_m
+    return BLOCK_M
+
+
 def fp8_block_splitk_mm(
     a: torch.Tensor,
     a_scale: torch.Tensor | None,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     output: torch.Tensor,
-    config: tuple[int, int, int, int, int],
+    config: tuple[int, int, int, int, int, int, int],
 ) -> torch.Tensor:
-    """``output = dequant(a) @ dequant(weight).T`` for up to 16 rows.
+    """``output = dequant(a) @ dequant(weight).T`` for the rows ``config`` admits.
 
     Without ``a_scale``, ``a`` is BF16 and quantized like
     ``per_token_group_quant_fp8(a, 32)``. With it, ``a`` is FP8 with 32/64/128-wide
     group scales.
     """
-    split, block_n, num_warps, unroll, _ = config
+    split, block_n, num_warps, unroll, _, _, tile_m = config
     m = a.shape[0]
     n, k = weight.shape
+    block_m = _tile_rows(m, tile_m)
     parts = torch.empty((split, m, n), dtype=torch.float32, device=a.device)
     quant = a_scale is None
-    _fp8_block_splitk_kernel[(triton.cdiv(n, block_n), split)](
+    grid = (triton.cdiv(m, block_m), triton.cdiv(n, block_n), split)
+    _fp8_block_splitk_kernel[grid](
         a,
         a if quant else a_scale,
         weight,
@@ -174,7 +187,7 @@ def fp8_block_splitk_mm(
         A_GROUP=32 if quant else k // a_scale.shape[-1],
         GROUP_N=32,
         K_PER=k // split,
-        BLOCK_M=MAX_ROWS,
+        BLOCK_M=block_m,
         BLOCK_N=block_n,
         UNROLL=unroll,
         EVEN_N=n % block_n == 0,

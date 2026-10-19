@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import re
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -242,12 +243,25 @@ MOE_MMA = ROOT / "vllm_musa" / "kernels" / "fp8_moe_mma.py"
 
 def test_splitk_configs_tile_k_and_keep_one_row_on_the_gemv() -> None:
     configs = _literal(SPLITK, "_CONFIGS")
-    for (n, k), (split, block_n, warps, unroll, min_rows) in configs.items():
+    for (n, k), config in configs.items():
+        split, block_n, warps, unroll, min_rows, max_rows, tile_m = config
         assert k % (split * 32 * unroll) == 0
-        assert min_rows >= 2
+        assert 2 <= min_rows <= 16 <= max_rows
+        assert tile_m in (16, 32)
     source = _function(SPLITK, "fp8_block_splitk_config")
-    assert "rows < config[4]" in source
-    assert "2 <= rows <= MAX_ROWS" in source
+    assert "config[4] <= rows <= config[5]" in source
+
+
+def test_splitk_row_tiles_add_no_padding() -> None:
+    namespace = {
+        "BLOCK_M": _literal(SPLITK, "BLOCK_M"),
+        "triton": SimpleNamespace(cdiv=lambda a, b: -(-a // b)),
+    }
+    exec(_function(SPLITK, "_tile_rows"), namespace)
+    tile_rows = namespace["_tile_rows"]
+    rows = (1, 16, 17, 32, 40, 48, 64, 80, 96, 160)
+    assert [tile_rows(r, 32) for r in rows] == [16, 16, 32, 32, 16, 16, 32, 16, 32, 32]
+    assert {tile_rows(r, 16) for r in range(1, 321)} == {16}
 
 
 def test_splitk_reduction_sums_partials_in_a_fixed_order() -> None:
@@ -310,3 +324,34 @@ def test_moe_dot_path_matches_triton(tokens) -> None:
         fp8_moe_mma._ENABLED = True
     got = fp8_moe_mma.fp8_moe_mma(x, w1, w2, weights, ids, w1s, w2s, 10.0)
     torch.testing.assert_close(got.float(), ref.float(), rtol=3e-2, atol=3e-2)
+
+
+@requires_mp31
+@pytest.mark.parametrize("shape", [(1792, 5120), (4096, 1280), (1024, 4096)])
+def test_splitk_row_tiles_keep_each_row_result(shape) -> None:
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        per_token_group_quant_fp8,
+    )
+
+    from vllm_musa.kernels import fp8_block_splitk as sk
+
+    torch.manual_seed(shape[0])
+    n, k = shape
+    weight, scale = _block_fp8_weight(n, k)
+    max_rows = sk._CONFIGS[shape][5]
+    x = torch.randn(max_rows, k).to(torch.bfloat16).to("musa")
+    xq, xs = per_token_group_quant_fp8(x, 32, use_ue8m0=False)
+    ref = (xq.float() * xs.repeat_interleave(32, -1)) @ _dequant(weight, scale).T
+    for rows in (17, 40, 64, max_rows):
+        config = sk.fp8_block_splitk_config(weight, scale, rows)
+        assert config is not None
+        out = torch.empty((rows, n), dtype=torch.bfloat16, device="musa")
+        sk.fp8_block_splitk_mm(x[:rows], None, weight, scale, out, config)
+        torch.testing.assert_close(out.float(), ref[:rows], rtol=3e-2, atol=3e-2)
+        for row in (0, rows // 2, rows - 1):
+            single = torch.empty((1, n), dtype=torch.bfloat16, device="musa")
+            sk.fp8_block_splitk_mm(
+                x[row : row + 1], None, weight, scale, single, config
+            )
+            assert torch.equal(single[0], out[row])
+    assert sk.fp8_block_splitk_config(weight, scale, max_rows + 1) is None
