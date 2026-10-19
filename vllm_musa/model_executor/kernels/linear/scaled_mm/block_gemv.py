@@ -14,17 +14,21 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 
+from vllm_musa.kernels.fp8_block_bf16 import (
+    fp8_block_bf16_linear,
+    fp8_block_bf16_supported,
+)
 from vllm_musa.kernels.fp8_block_gemm import (
     fp8_block_scaled_mm,
     fp8_block_scaled_mm_supported,
 )
-from vllm_musa.kernels.fp8_block_splitk import fp8_block_splitk_config
 from vllm_musa.kernels.fp8_block_gemv import (
     fp8_block_gemv,
     fp8_block_gemv_quant,
     fp8_block_gemv_quant_supported,
     fp8_block_gemv_supported,
 )
+from vllm_musa.kernels.fp8_block_splitk import fp8_block_splitk_config
 
 # The GEMV re-reads the weight per row (or per few rows); past a few rows the
 # block GEMM wins. Crossovers measured on MTT S5000 for the DeepSeek-V4.1 TP8
@@ -75,7 +79,8 @@ class MUSAFp8BlockGemvScaledMMKernel(TritonFp8BlockScaledMMKernel):
 
     Small M runs the block GEMV, which also quantizes the activation; larger M
     keeps the separate activation quantization and runs a block GEMM whose K
-    tile spans several scale groups.
+    tile spans several scale groups; prefill row counts run the BF16 GEMM on a
+    dequantized weight.
     """
 
     @classmethod
@@ -138,6 +143,17 @@ class MUSAFp8BlockGemvScaledMMKernel(TritonFp8BlockScaledMMKernel):
             )
             fp8_block_gemv_quant(
                 x_2d, params.weight, params.block_scale, output, group_size
+            )
+            if bias is not None:
+                output = output + bias
+            return output.view(*x.shape[:-1], params.weight.shape[0])
+        if (
+            x.dtype == torch.bfloat16
+            and params.input_scale is None
+            and fp8_block_bf16_supported(params.weight, params.block_scale, rows)
+        ):
+            output = fp8_block_bf16_linear(
+                x.reshape(rows, x.shape[-1]), params.weight, params.block_scale
             )
             if bias is not None:
                 output = output + bias

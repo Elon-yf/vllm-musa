@@ -336,6 +336,31 @@ def _try_musa_fp8_einsum_fine_blocks(
             )
         return True, "musa_fp8_block_gemv"
 
+    from vllm_musa.kernels.fp8_block_bf16 import (
+        fp8_block_bf16_linear,
+        fp8_block_bf16_supported,
+    )
+
+    if (
+        activation.stride(-1) == 1
+        and act_scale.stride(-1) == 1
+        and in_dim % act_scale.shape[2] == 0
+        and all(
+            fp8_block_bf16_supported(weight[g], scales[g], tokens)
+            for g in range(groups)
+        )
+    ):
+        for group_idx in range(groups):
+            out[:, group_idx, :].copy_(
+                fp8_block_bf16_linear(
+                    activation[:, group_idx, :],
+                    weight[group_idx],
+                    scales[group_idx],
+                    act_scale[:, group_idx, :],
+                )
+            )
+        return True, "musa_fp8_block_bf16_gemm"
+
     # The block GEMM takes one activation scale per weight K block; expand
     # coarser activation groups to the weight's K block.
     block_n = out_dim // scales.shape[1]

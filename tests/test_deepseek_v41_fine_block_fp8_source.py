@@ -112,6 +112,11 @@ def test_o_proj_fine_blocks_run_before_the_dequant_fallback() -> None:
     fine = _function(EINSUM, "_try_musa_fp8_einsum_fine_blocks")
     assert "tokens <= _BLOCK_GEMV_MAX_TOKENS" in fine
     assert "fp8_block_splitk_config(weight[g], scales[g], tokens)" in fine
+    assert (
+        fine.index("fp8_block_gemv(")
+        < fine.index("fp8_block_bf16_supported(")
+        < fine.index("fp8_block_scaled_mm_supported(")
+    )
     assert "repeat_interleave(act_group // block_k" in fine
 
 

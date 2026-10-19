@@ -238,6 +238,7 @@ def test_native_moe_gemv_matches_triton(tokens) -> None:
 
 
 SPLITK = ROOT / "vllm_musa" / "kernels" / "fp8_block_splitk.py"
+BF16 = ROOT / "vllm_musa" / "kernels" / "fp8_block_bf16.py"
 MOE_MMA = ROOT / "vllm_musa" / "kernels" / "fp8_moe_mma.py"
 
 
@@ -262,6 +263,17 @@ def test_splitk_row_tiles_add_no_padding() -> None:
     rows = (1, 16, 17, 32, 40, 48, 64, 80, 96, 160)
     assert [tile_rows(r, 32) for r in rows] == [16, 16, 32, 32, 16, 16, 32, 16, 32, 32]
     assert {tile_rows(r, 16) for r in range(1, 321)} == {16}
+
+
+def test_prefill_rows_take_the_bf16_gemm_past_the_splitk_rows() -> None:
+    max_rows = max(config[5] for config in _literal(SPLITK, "_CONFIGS").values())
+    assert _literal(BF16, "MIN_ROWS") > max_rows
+    body = _function(LINEAR, "apply_weights")
+    assert (
+        body.index("_small_m_path(")
+        < body.index("fp8_block_bf16_supported(")
+        < body.index("super().apply_weights(")
+    )
 
 
 def test_splitk_reduction_sums_partials_in_a_fixed_order() -> None:
@@ -355,3 +367,29 @@ def test_splitk_row_tiles_keep_each_row_result(shape) -> None:
             )
             assert torch.equal(single[0], out[row])
     assert sk.fp8_block_splitk_config(weight, scale, max_rows + 1) is None
+
+
+@requires_mp31
+@pytest.mark.parametrize("shape", [(1792, 5120), (1024, 4096)])
+def test_bf16_gemm_dequantizes_power_of_two_scales_exactly(shape) -> None:
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        per_token_group_quant_fp8,
+    )
+
+    from vllm_musa.kernels import fp8_block_bf16 as bf
+
+    torch.manual_seed(shape[1])
+    n, k = shape
+    weight, scale = _block_fp8_weight(n, k)
+    dense = _dequant(weight, scale)
+    assert torch.equal(bf._dequant(weight, scale, 32, 32).float(), dense)
+    rows = bf.MIN_ROWS + 88
+    assert not bf.fp8_block_bf16_supported(weight, scale, bf.MIN_ROWS - 1)
+    assert bf.fp8_block_bf16_supported(weight, scale, rows)
+    x = torch.randn(rows, k).to(torch.bfloat16).to("musa")
+    out = bf.fp8_block_bf16_linear(x, weight, scale)
+    torch.testing.assert_close(out.float(), x.float() @ dense.T, rtol=2e-2, atol=2e-2)
+    xq, xs = per_token_group_quant_fp8(x, 128, use_ue8m0=False)
+    out = bf.fp8_block_bf16_linear(xq, weight, scale, xs)
+    ref = (xq.float() * xs.repeat_interleave(128, -1)) @ dense.T
+    torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2)
