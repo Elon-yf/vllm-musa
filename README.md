@@ -44,10 +44,10 @@ providing an OpenAI-compatible inference and serving engine for MUSA GPUs.
 
 ### Install
 
-Use the published v0.28.0 release image:
+Use the published v0.32.0 release image:
 
 ```bash
-export VLLM_MUSA_IMAGE=registry.mthreads.com/mcconline/inference/vllm/vllm-openai:v0.28.0
+export VLLM_MUSA_IMAGE=registry.mthreads.com/mcconline/inference/vllm/vllm-openai:v0.32.0
 docker pull "${VLLM_MUSA_IMAGE}"
 ```
 

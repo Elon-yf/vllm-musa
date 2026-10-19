@@ -43,10 +43,10 @@ vLLM-MUSA 是摩尔线程为 [vLLM](https://github.com/vllm-project/vllm) 提供
 
 ### 安装
 
-使用已发布的 v0.28.0 正式镜像：
+使用已发布的 v0.32.0 正式镜像：
 
 ```bash
-export VLLM_MUSA_IMAGE=registry.mthreads.com/mcconline/inference/vllm/vllm-openai:v0.28.0
+export VLLM_MUSA_IMAGE=registry.mthreads.com/mcconline/inference/vllm/vllm-openai:v0.32.0
 docker pull "${VLLM_MUSA_IMAGE}"
 ```
 

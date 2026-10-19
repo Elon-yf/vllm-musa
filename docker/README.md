@@ -39,10 +39,10 @@ retains `CMD ["/bin/bash"]` for tests and interactive use.
 
 ## Quick start
 
-For v0.28.0 deployments, use the release `vllm-openai` image:
+For v0.32.0 deployments, use the release `vllm-openai` image:
 
 ```bash
-export VLLM_MUSA_IMAGE=registry.mthreads.com/mcconline/inference/vllm/vllm-openai:v0.28.0
+export VLLM_MUSA_IMAGE=registry.mthreads.com/mcconline/inference/vllm/vllm-openai:v0.32.0
 docker pull "${VLLM_MUSA_IMAGE}"
 ```
 
@@ -69,7 +69,7 @@ must provide the MUSA container runtime; this generic example relies on the
 host's runtime configuration rather than selecting a runtime by name.
 
 ```bash
-export VLLM_MUSA_IMAGE=registry.mthreads.com/mcconline/inference/vllm/vllm-openai:v0.28.0
+export VLLM_MUSA_IMAGE=registry.mthreads.com/mcconline/inference/vllm/vllm-openai:v0.32.0
 MODEL_PATH=/path/to/model
 VISIBLE_DEVICES=0
 docker run --rm --privileged --ipc=host --network=host \

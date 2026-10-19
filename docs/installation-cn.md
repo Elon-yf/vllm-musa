@@ -25,17 +25,15 @@ v0.32.0-dev 依赖栈使用 PyTorch 2.11.x。驱动、工具包和 wheel 应来�
 
 ## 容器
 
-最快的启动方式是使用已发布的 v0.28.0 正式镜像：
+最快的启动方式是使用已发布的 v0.32.0 正式镜像：
 
 ```bash
-export VLLM_MUSA_IMAGE=registry.mthreads.com/mcconline/inference/vllm/vllm-openai:v0.28.0
+export VLLM_MUSA_IMAGE=registry.mthreads.com/mcconline/inference/vllm/vllm-openai:v0.32.0
 docker pull "${VLLM_MUSA_IMAGE}"
 ```
 
 该 registry tag 独立于当前分支发布，可能使用不同的依赖版本。请将镜像内已安装的
 软件包版本与分支固定版本核对；需要完全一致时，请使用下文构建的本地镜像。
-在本次 backport 时，已发布标签中的 MATE/Flash 为 0.2.4、tilelang_musa 为 0.1.8，
-而当前分支分别固定为 0.2.7 和 0.1.12。
 
 镜像以 `vllm serve` 为入口点；在模型路径后追加
 [服务配置示例（英文）](cookbook/README.md)中的引擎参数，并为 `docker run`

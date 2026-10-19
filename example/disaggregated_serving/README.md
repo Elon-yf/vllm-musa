@@ -45,7 +45,7 @@ The registry image is maintained independently of this branch; use the
 source-built image when the exact branch dependency stack is required.
 
 ```bash
-IMAGE=registry.mthreads.com/mcconline/inference/vllm/vllm-openai:v0.28.0
+IMAGE=registry.mthreads.com/mcconline/inference/vllm/vllm-openai:v0.32.0
 # Run this block in bash; the device numbers are hexadecimal in stat output.
 read -r VERBS_MAJOR_HEX _ < \
   <(stat -c '%t %T' /dev/infiniband/uverbs0)
