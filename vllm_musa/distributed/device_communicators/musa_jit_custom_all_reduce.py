@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -32,6 +33,25 @@ _MAX_GRAPH_RANK_DATA_BYTES = 8 * 1024 * 1024
 _MAX_RANKS = 8
 _MU_POINTER_ATTRIBUTE_RANGE_START_ADDR = 11
 _GRAPH_STAGING_ALIGNMENT = 256
+
+# 可选的 v2（SGLang MR 577）push 路径。默认关闭；打开后只有 push 形态的
+# payload 走 v2，其余仍走 v1（v2 的 pull 入口需要 pybind 导出，本移植没有导）。
+_CUSTOM_AR_V2_ENV = "VLLM_MUSA_CUSTOM_AR_V2"
+_CUSTOM_AR_V2_PUSH_BYTES_ENV = "VLLM_MUSA_CUSTOM_AR_V2_PUSH_BYTES"
+_CUSTOM_AR_V2_PULL_BYTES_ENV = "VLLM_MUSA_CUSTOM_AR_V2_PULL_BYTES"
+# decode 单 token 的 payload = hidden * dtype 字节（27B/35B 都在 8~10 KB 量级）。
+_CUSTOM_AR_V2_DEFAULT_PUSH_BYTES = 16 * 1024
+# v2 对象自带一份 pull 工作区；push-only 实验只需要占位，不需要 512 MB。
+_CUSTOM_AR_V2_DEFAULT_PULL_BYTES = 1 << 20
+
+
+def _custom_ar_v2_enabled() -> bool:
+    return os.environ.get(_CUSTOM_AR_V2_ENV, "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 cudaError_t = ctypes.c_int
@@ -608,12 +628,65 @@ class _MusaJitCustomAllreduceImpl:
                 "Using fixed-staging MUSA JIT custom all-reduce for "
                 "DeepSeek-V4 CUDA graph capture."
             )
+        self._v2_obj = None
+        self._v2_push_slot_bytes = 0
+        if _custom_ar_v2_enabled():
+            self._init_custom_ar_v2()
         self._comm_id = _register_comm(self)
         self.disabled = False
         logger.info_once(
             "Using MUSA JIT custom all-reduce for world_size=%d max_size=%d.",
             self.world_size,
             self.max_size,
+        )
+
+    def _init_custom_ar_v2(self) -> None:
+        """按 MR 577 组装 v2 all-reduce 对象并完成 IPC 握手。
+
+        显式失败优先于静默降级：既然调用方要求了 v2，装不上就抛错，
+        不允许"看起来跑起来了其实还在跑 v1"。
+        """
+        from vllm_musa.distributed.device_communicators.musa_custom_all_reduce_v2 import (
+            MusaCustomAllReduceV2Obj,
+        )
+
+        if self.world_size not in (2, 4, 8):
+            raise RuntimeError(
+                "VLLM_MUSA_CUSTOM_AR_V2 supports world sizes 2/4/8 only, "
+                f"got {self.world_size}"
+            )
+        push_bytes = int(
+            os.environ.get(
+                _CUSTOM_AR_V2_PUSH_BYTES_ENV, _CUSTOM_AR_V2_DEFAULT_PUSH_BYTES
+            )
+        )
+        pull_bytes = int(
+            os.environ.get(
+                _CUSTOM_AR_V2_PULL_BYTES_ENV, _CUSTOM_AR_V2_DEFAULT_PULL_BYTES
+            )
+        )
+        graph_input_count = int(
+            getattr(self, "graph_input_count", 0) or _MAX_RANKS * 8
+        )
+        obj = MusaCustomAllReduceV2Obj(
+            rank=self.rank,
+            world_size=self.world_size,
+            pull_buffer_bytes=pull_bytes,
+            push_buffer_bytes=push_bytes,
+            graph_input_count=graph_input_count,
+        )
+        handles: list[Any] = [None] * self.world_size
+        dist.all_gather_object(handles, obj.share_storage(), group=self.group)
+        obj.post_init(handles)
+        self._v2_obj = obj
+        self._v2_push_slot_bytes = push_bytes
+        logger.info_once(
+            "MUSA custom all-reduce v2 push enabled: world_size=%d "
+            "push_slot_bytes=%d pull_buffer_bytes=%d (payloads larger than the "
+            "push slot stay on the v1 two-shot path).",
+            self.world_size,
+            push_bytes,
+            pull_bytes,
         )
 
     def _configure_graph_staging_arena(self) -> None:
@@ -1350,6 +1423,14 @@ class _MusaJitCustomAllreduceImpl:
     def _custom_all_reduce_impl(self, input: torch.Tensor) -> torch.Tensor:
         assert self.buffer_rank_data is not None
         assert self.signal_ptrs_cpu is not None
+        if self._v2_obj is not None:
+            nbytes = input.numel() * input.element_size()
+            if nbytes <= self._v2_push_slot_bytes:
+                # v2 push 是就地归约（output == input），对 graph capture 反而更友好：
+                # 不需要 v1 那种"把变化的指针搬进固定 staging"的中间拷贝。
+                from vllm_musa.jit_kernel.csrc.allreduce_algo import AllReduceAlgo
+
+                return self._v2_obj.all_reduce(input, AllReduceAlgo.ONE_SHOT_PUSH)
         self._require_custom_ar_graph_path()
         if self._IS_CAPTURING and self._use_registered_graph_input(input):
             return self._graph_custom_all_reduce_impl(input)
