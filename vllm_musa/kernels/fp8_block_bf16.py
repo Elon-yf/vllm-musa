@@ -17,15 +17,16 @@ from vllm.triton_utils import tl, triton
 
 # Rows from which dequantization plus the BF16 GEMM beats the split-K and block
 # GEMMs, measured in CUDA graphs on MTT S5000 for the DeepSeek-V4.1 TP8 projections
-# and keyed by (N, K); other shapes switch at MIN_ROWS. The split-K row ranges end
-# below these.
+# and keyed by (N, K); other shapes switch at MIN_ROWS. They apply only while a CUDA
+# graph is captured (decode); eager steps, prefill included, switch at MIN_ROWS. The
+# split-K row ranges end below these.
 MIN_ROWS = 512
 _MIN_ROWS_BY_SHAPE = {
-    (1792, 5120): 33,
+    (1792, 5120): 60,
     (576, 5120): 65,
     (1024, 4096): 192,
-    (4096, 1280): 33,
-    (5120, 1024): 33,
+    (4096, 1280): 60,
+    (5120, 1024): 60,
     (5120, 15360): 65,
     (25600, 768): 65,
 }
@@ -98,7 +99,10 @@ def fp8_block_bf16_supported(
     if not _ENABLED or weight.dim() != 2:
         return False
     n, k = weight.shape
-    if rows < _MIN_ROWS_BY_SHAPE.get((n, k), MIN_ROWS):
+    min_rows = MIN_ROWS
+    if torch.cuda.is_current_stream_capturing():
+        min_rows = _MIN_ROWS_BY_SHAPE.get((n, k), MIN_ROWS)
+    if rows < min_rows:
         return False
     return (
         weight.dtype == torch.float8_e4m3fn
