@@ -737,36 +737,64 @@ __global__ void __launch_bounds__(kMaxThreadsPerBlock, 1) cross_device_reduce_2s
   int stride = gridDim.x * blockDim.x;
   using P = typename packed_t<T>::P;
   using A = typename packed_t<T>::A;
-  // CUDA v2 assigns a warp-aligned shard to each rank, reduces that shard,
-  // and broadcasts it directly into every rank's pull buffer. This avoids a
-  // second scratch/all-gather phase and works for non-power-of-two TP sizes.
-  constexpr int warp = 32;
-  const int vec_per_rank = ((size + nranks - 1) / nranks + warp - 1) / warp * warp;
-  const int start = min(rank * vec_per_rank, size);
-  const int end = min(start + vec_per_rank, size);
-  multi_rank_barrier<nranks, true>(sg, self_sg, rank);
-  for (int idx = start + tid; idx < end; idx += stride) {
-    const void* rank0_data =
-        data_ptr != nullptr ? data_ptr->ptrs[0] : data.ptrs[0];
-    A reduced_acc =
-        upcast(reinterpret_cast<const P*>(rank0_data)[idx]);
+  if (data_ptr != nullptr) data = *data_ptr;
+  // Qwen3.5 TP4 decode at bs=128 is exactly 512 KiB.  The direct
+  // broadcast path is measurably faster for this aligned payload, while
+  // Gemma's non-aligned 405,504-byte payload needs the peer-gather path
+  // below for both correctness and throughput.
+  if constexpr (nranks == 4) {
+    constexpr int kDirectBroadcastSize = (512 * 1024) / sizeof(P);
+    if (size == kDirectBroadcastSize) {
+      constexpr int warp = 32;
+      const int vec_per_rank =
+          ((size + nranks - 1) / nranks + warp - 1) / warp * warp;
+      const int start = min(rank * vec_per_rank, size);
+      const int end = min(start + vec_per_rank, size);
+      multi_rank_barrier<nranks, true>(sg, self_sg, rank);
+      for (int idx = start + tid; idx < end; idx += stride) {
+        A reduced_acc = upcast(
+            reinterpret_cast<const P*>(data.ptrs[0])[idx]);
 #pragma unroll
-    for (int i = 1; i < nranks; ++i) {
-      const void* rank_data =
-          data_ptr != nullptr ? data_ptr->ptrs[i] : data.ptrs[i];
-      packed_assign_add(
-          reduced_acc, upcast(reinterpret_cast<const P*>(rank_data)[idx]));
-    }
-    const P reduced = downcast<P>(reduced_acc);
+        for (int i = 1; i < nranks; ++i) {
+          packed_assign_add(
+              reduced_acc,
+              upcast(reinterpret_cast<const P*>(data.ptrs[i])[idx]));
+        }
+        const P reduced = downcast<P>(reduced_acc);
 #pragma unroll
-    for (int i = 0; i < nranks; ++i) {
-      const void* rank_data =
-          data_ptr != nullptr ? data_ptr->ptrs[i] : data.ptrs[i];
-      auto* peer = reinterpret_cast<P*>(const_cast<void*>(rank_data));
-      peer[idx] = reduced;
+        for (int i = 0; i < nranks; ++i) {
+          auto* peer = reinterpret_cast<P*>(
+              const_cast<void*>(data.ptrs[i]));
+          peer[idx] = reduced;
+        }
+      }
+      multi_rank_barrier<nranks, false, true>(sg, self_sg, rank);
+      return;
     }
   }
+  int part = size / nranks;
+  int start = rank * part;
+  int end = rank == nranks - 1 ? size : start + part;
+  int largest_part = part + size % nranks;
+  const P* ptrs[nranks];
+  P* tmp = get_tmp_buf<P>(sg.signals[rank]);
+#pragma unroll
+  for (int i = 0; i < nranks; ++i) {
+    ptrs[i] = reinterpret_cast<const P*>(data.ptrs[i]);
+  }
+  multi_rank_barrier<nranks, true>(sg, self_sg, rank);
+  for (int idx = start + tid; idx < end; idx += stride) {
+    tmp[idx - start] = packed_reduce<P, nranks, A>(ptrs, idx);
+  }
   multi_rank_barrier<nranks, false, true>(sg, self_sg, rank);
+  const int local_part = rank == nranks - 1 ? largest_part : part;
+  for (int idx = tid; idx < local_part; idx += stride) {
+#pragma unroll
+    for (int i = 0; i < nranks; ++i) {
+      auto* peer = reinterpret_cast<P*>(const_cast<void*>(data.ptrs[i]));
+      peer[rank * part + idx] = tmp[idx];
+    }
+  }
 }
 
 template <typename T, int nranks, int vlen = 8>

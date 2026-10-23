@@ -37,6 +37,7 @@ RUNTIME = ROOT / "vllm_musa/distributed/device_communicators/musa_rt_v2.py"
 FUSED = ROOT / (
     "vllm_musa/distributed/device_communicators/musa_allreduce_rmsnorm_v2.py"
 )
+RESOLVER = ROOT / "vllm_musa/optimization_contract/resolver.py"
 
 _SIGNAL_SLOTS = 512
 _PULL_SEMAPHORE_BYTES = 128
@@ -125,18 +126,39 @@ def test_env_switch_is_off_by_default() -> None:
     """The switch is one explicit opt-in env var, read at construction only."""
     source = _source(COMM)
     assert 'VLLM_MUSA_CUSTOM_AR_V2"' in source
+    on_line = next(
+        line for line in source.splitlines() if line.startswith("_CUSTOM_AR_V2_ON")
+    )
+    off_line = next(
+        line for line in source.splitlines() if line.startswith("_CUSTOM_AR_V2_OFF")
+    )
+    assert '"1"' in on_line
+    assert '"0"' in off_line
     assert "def _custom_ar_v2_enabled()" in source
-    helper = source.split("def _custom_ar_v2_enabled()", 1)[1].split("\n\n", 1)[0]
-    assert "os.environ.get" in helper
-    assert '"1"' in helper
+    helper = source.split("def _custom_ar_v2_enabled()", 1)[1].split("\ndef ", 1)[0]
+    assert "os.environ.get(_CUSTOM_AR_V2_ENV" in helper
+    # An unset or unrecognized value falls through to the contract.  The v2
+    # feature is supported there but never preferred, so the default stays v1.
+    assert "return _contract_prefers_v2()" in helper
     # Both implementations are chosen in the same constructor, exactly like
-    # MR 577's dispatch_custom_allreduce() returns one class and lets the caller
+    # Upstream's dispatch_custom_allreduce() returns one class and lets the caller
     # instantiate it; nothing is selected later.
     ctor = source.split("if _custom_ar_v2_enabled():", 1)[1].split(
         "except Exception:", 1
     )[0]
     assert "_MusaCustomAllreduceV2Impl(" in ctor
     assert "_MusaJitCustomAllreduceImpl(" in ctor
+
+
+def test_contract_advertises_v2_without_preferring_it() -> None:
+    """Availability is not preference: TP models can opt in, defaults stay v1."""
+    source = _source(RESOLVER)
+    block = source.split(
+        "if execution.tensor_parallel_size > 1 and not execution.is_pooling_model:",
+        1,
+    )[1].split("return contract", 1)[0]
+    assert "supported_features=contract.supported_features" in block
+    assert "preferred_features" not in block
 
 
 def test_switch_never_mixes_implementations() -> None:
@@ -152,7 +174,7 @@ def test_switch_never_mixes_implementations() -> None:
 
     v2_impl = _source(V2_IMPL)
     assert "_v2_push_slot_bytes" not in v2_impl
-    # Algorithm choice follows the MR's ModeConfig table, including the TP2
+    # Algorithm choice follows upstream's ModeConfig table, including the TP2
     # rule that the push threshold is 0.
     assert "mode_configs" in v2_impl
     assert "def _pick_algo(self, nbytes: int)" in v2_impl
@@ -186,3 +208,24 @@ def test_fused_rmsnorm_refuses_instead_of_falling_back() -> None:
     source = _source(FUSED)
     assert source.count("NotImplementedError") >= 2
     assert "MusaCustomAllReduceV2RMSNorm" in source
+
+
+def test_two_stage_keeps_the_tp4_fast_path_and_generic_reduce_scatter() -> None:
+    """The 2stage kernel must keep both paths of the reference algorithm.
+
+    The reference revision generalises nothing: a warp-aligned direct broadcast
+    is only correct to prefer for the aligned TP4 512 KiB payload, while the
+    generic path stays a reduce-scatter into local scratch followed by a
+    broadcast. Promoting the fast path to the only path changes the algorithm.
+    """
+    source = _source(KERNEL)
+    body = source.split("cross_device_reduce_2stage(", 1)[1].split(
+        "template <typename T, int nranks, int vlen = 8>", 1
+    )[0]
+    assert "constexpr int kDirectBroadcastSize = (512 * 1024) / sizeof(P);" in body
+    assert "if constexpr (nranks == 4) {" in body
+    assert "if (size == kDirectBroadcastSize) {" in body
+    assert "P* tmp = get_tmp_buf<P>(sg.signals[rank]);" in body
+    assert "tmp[idx - start] = packed_reduce<P, nranks, A>(ptrs, idx);" in body
+    assert "peer[rank * part + idx] = tmp[idx];" in body
+    assert "if (data_ptr != nullptr) data = *data_ptr;" in body
