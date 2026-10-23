@@ -33,6 +33,18 @@ cudaMemcpyHostToDevice = 1
 cudaMemcpyDeviceToDevice = 3
 
 
+def _as_void_p(value):
+    """Return ``value`` as a ``ctypes.c_void_p`` without double-wrapping."""
+    if isinstance(value, ctypes.c_void_p):
+        return value
+    if isinstance(value, int):
+        return ctypes.c_void_p(value)
+    data_ptr = getattr(value, "data_ptr", None)
+    if callable(data_ptr):
+        return ctypes.c_void_p(int(data_ptr()))
+    return ctypes.cast(value, ctypes.c_void_p)
+
+
 class _MusaRTLibraryV2(_MusaRTLibrary):
     """给 v2 对象提供 CUDA 原名牌的 runtime 访问（复用 v1 的 ctypes 绑定）。"""
 
@@ -74,10 +86,14 @@ class _MusaRTLibraryV2(_MusaRTLibrary):
         self.ipc_close_mem_handle(ptr)
 
     def cudaMemcpy(self, dst, src, count: int, kind: int = cudaMemcpyHostToDevice) -> None:
+        # The v2 object passes ``ctypes.c_void_p`` for both ends (it builds the
+        # host staging buffer itself), while tensors and plain ints also reach
+        # this shim.  Normalise instead of re-wrapping, because wrapping an
+        # existing c_void_p raises "cannot be converted to pointer".
         self.check(
             self.funcs["cudaMemcpy"](
-                ctypes.c_void_p(dst),
-                ctypes.c_void_p(src),
+                _as_void_p(dst),
+                _as_void_p(src),
                 int(count),
                 int(kind),
             )

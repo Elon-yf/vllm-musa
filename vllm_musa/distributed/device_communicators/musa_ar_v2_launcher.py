@@ -4,11 +4,11 @@ P2 阶段本文件只做名字与 ABI 常量的适配；P3 落地了 v2 的 devi
 发射路径：`distributed/custom_all_reduce_v2.mu`（移植自 SGLang MR 577）+ 
 `vllm_musa/jit_kernel/csrc/allreduce_v2.py`（JIT 构建与 FFI 包装）。
 
-仍然保持"不许静默回退"的原则：
+仍然保持"不许静默回退"的原则：开 v2 就只用 v2 的 kernel。
 - push（`SHOT_PUSH` / `SHOT_PUSH_WIDE`）走 v2 的 `launch_device_descriptor`；
-- pull（`SHOT_ONE_STAGE` / `SHOT_TWO_STAGE` / `SHOT_TWO_STAGE_512`）走 v1 的
-  `launch_unregistered` / `launch_registered`，这是 MR 577 的实际分发结果
-  （v2 kernel 只导出 device-descriptor 入口）；
+- pull（`SHOT_ONE_STAGE` / `SHOT_TWO_STAGE` / `SHOT_TWO_STAGE_512`）走 v2 自己的
+  `launch_unregistered` / `launch_registered`——即 `.mu` 里导出的两个
+  ``extern "C"`` 入口，用 ctypes 绑定（上游用 pybind11 绑同一对符号）；
 - 融合 AR+RMSNorm 的 v2 变体尚未移植，调用方会拿到明确的 NotImplementedError。
 
 来源：SGLang MR 577 `python/sglang/srt/hardware_backend/musa/jit_kernel/csrc/allreduce.py`
@@ -99,29 +99,97 @@ def preferred_shot(world_size: int, nbytes: int) -> int:
 
 
 def ensure_compiled(world_size: int) -> None:
-    """预热两个模块：v1（pull 路径）与 v2（push/device-descriptor 路径）。
+    """预热 v2 的 pull 模块（TP2 默认算法），避免首个 decode 步触发 JIT。
 
-    两者都要预热，否则第一次 decode 步会在真实请求路径上触发 JIT 编译
-    （历史上这个冷编译首请求要 120 s，已经让一次 smoke 假红过）。
+    push 只在显式 override 时才会用到，按需编译即可。
     """
-    from vllm_musa.jit_kernel.csrc import allreduce as _v1_ar
     from vllm_musa.jit_kernel.csrc import allreduce_v2 as _v2_ar
 
-    _v1_ar.ensure_compiled(int(world_size))
-    _v2_ar.ensure_compiled(int(world_size), SHOT_PUSH)
+    _v2_ar.ensure_compiled(int(world_size), SHOT_ONE_STAGE)
 
 
 def launch_unregistered_pybind_func(world_size: int, shot: int):
-    """v2 的未注册发射入口：v1 已存在同名能力，先直接复用。"""
-    from vllm_musa.jit_kernel.csrc import allreduce as _v1_ar
+    """v2 的未注册发射入口（对齐上游 pybind 的 ``launch_unregistered``）。
 
-    return _v1_ar.launch_unregistered
+    上游从 pybind11 模块里取这个函数；vllm-musa 用 ctypes 绑同一对
+    ``extern "C"`` 符号，kernel 与参数完全一致。
+    """
+    from vllm_musa.jit_kernel.csrc import allreduce_v2 as _v2_ar
+
+    world_size = int(world_size)
+    shot = int(shot)
+    _v2_ar.ensure_compiled(world_size, shot)
+    launch = _v2_ar.launch_unregistered_func(world_size, shot)
+
+    def _launch(
+        rank_data,
+        signal_ptrs_cpu,
+        input,
+        out,
+        self_signal_ptr: int,
+        self_buffer_ptr: int,
+        push_buffer_bytes: int,
+        rank: int,
+        world_size_arg: int,
+        shot_arg: int,
+    ) -> None:
+        if int(world_size_arg) != world_size or int(shot_arg) != shot:
+            raise RuntimeError(
+                "MUSA custom AR v2 unregistered launch 绑定的是 "
+                f"(world_size={world_size}, shot={shot})，调用时传入 "
+                f"(world_size={world_size_arg}, shot={shot_arg})"
+            )
+        launch(
+            rank_data,
+            signal_ptrs_cpu,
+            input,
+            out,
+            int(self_signal_ptr),
+            int(self_buffer_ptr),
+            int(push_buffer_bytes),
+            int(rank),
+            world_size,
+            shot,
+        )
+
+    return _launch
 
 
 def launch_registered_pybind_func(world_size: int, shot: int):
-    from vllm_musa.jit_kernel.csrc import allreduce as _v1_ar
+    """v2 的已注册（图捕获）发射入口，对齐上游 ``launch_registered``。"""
+    from vllm_musa.jit_kernel.csrc import allreduce_v2 as _v2_ar
 
-    return _v1_ar.launch_registered
+    world_size = int(world_size)
+    shot = int(shot)
+    _v2_ar.ensure_compiled(world_size, shot)
+    launch = _v2_ar.launch_registered_func(world_size, shot)
+
+    def _launch(
+        rank_data,
+        signal_ptrs_cpu,
+        out,
+        self_signal_ptr: int,
+        rank: int,
+        world_size_arg: int,
+        shot_arg: int,
+    ) -> None:
+        if int(world_size_arg) != world_size or int(shot_arg) != shot:
+            raise RuntimeError(
+                "MUSA custom AR v2 registered launch 绑定的是 "
+                f"(world_size={world_size}, shot={shot})，调用时传入 "
+                f"(world_size={world_size_arg}, shot={shot_arg})"
+            )
+        launch(
+            rank_data,
+            signal_ptrs_cpu,
+            out,
+            int(self_signal_ptr),
+            int(rank),
+            world_size,
+            shot,
+        )
+
+    return _launch
 
 
 def launch_device_descriptor_func(world_size: int, shot: int):

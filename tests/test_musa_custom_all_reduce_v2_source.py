@@ -1,4 +1,4 @@
-"""Source-level guards for the ported MUSA custom all-reduce v2 (push) path.
+"""Source-level guards for the ported MUSA custom all-reduce v2 path.
 
 The v2 kernel, its launcher and its runtime adapter are only exercised on real
 MUSA hardware; CI has none. These guards keep the parts that must never drift
@@ -27,6 +27,9 @@ KERNEL = ROOT / "vllm_musa/jit_kernel/csrc/distributed/custom_all_reduce_v2.mu"
 JIT = ROOT / "vllm_musa/jit_kernel/csrc/allreduce_v2.py"
 ALGO = ROOT / "vllm_musa/jit_kernel/csrc/allreduce_algo.py"
 COMM = ROOT / "vllm_musa/distributed/device_communicators/musa_jit_custom_all_reduce.py"
+V2_IMPL = ROOT / (
+    "vllm_musa/distributed/device_communicators/musa_custom_all_reduce_v2_impl.py"
+)
 OBJ = ROOT / (
     "vllm_musa/distributed/device_communicators/musa_custom_all_reduce_v2.py"
 )
@@ -119,31 +122,41 @@ def test_shot_values_are_stable() -> None:
 
 
 def test_env_switch_is_off_by_default() -> None:
-    """Enabling v2 must be an explicit opt-in, and must fail loudly if broken."""
+    """The switch is one explicit opt-in env var, read at construction only."""
     source = _source(COMM)
     assert 'VLLM_MUSA_CUSTOM_AR_V2"' in source
     assert "def _custom_ar_v2_enabled()" in source
-    # Default-off helper: an unset variable must not be truthy.
     helper = source.split("def _custom_ar_v2_enabled()", 1)[1].split("\n\n", 1)[0]
     assert "os.environ.get" in helper
     assert '"1"' in helper
-    # A failed v2 bring-up raises instead of silently degrading to v1.
-    init_v2 = source.split("def _init_custom_ar_v2(self)", 1)[1].split(
-        "def _configure_graph_staging_arena", 1
+    # Both implementations are chosen in the same constructor, exactly like
+    # MR 577's dispatch_custom_allreduce() returns one class and lets the caller
+    # instantiate it; nothing is selected later.
+    ctor = source.split("if _custom_ar_v2_enabled():", 1)[1].split(
+        "except Exception:", 1
     )[0]
-    assert "raise RuntimeError" in init_v2
-    assert "post_init(handles)" in init_v2
+    assert "_MusaCustomAllreduceV2Impl(" in ctor
+    assert "_MusaJitCustomAllreduceImpl(" in ctor
 
 
-def test_push_path_is_capacity_gated() -> None:
-    """Only payloads that fit the push slot may take the v2 path."""
+def test_switch_never_mixes_implementations() -> None:
+    """A v2-on run must not fall back to v1 kernels for larger payloads."""
     source = _source(COMM)
+    assert "_v2_obj" not in source, "v1 impl must not hold a v2 object"
+    assert "_init_custom_ar_v2" not in source
     impl = source.split("def _custom_all_reduce_impl(self", 1)[1].split(
         "\n    def ", 1
     )[0]
-    assert "self._v2_obj is not None" in impl
-    assert "nbytes <= self._v2_push_slot_bytes" in impl
-    assert "AllReduceAlgo.ONE_SHOT_PUSH" in impl
+    assert "nbytes <=" not in impl, "no size gate in the hot path"
+    assert "ONE_SHOT_PUSH" not in impl
+
+    v2_impl = _source(V2_IMPL)
+    assert "_v2_push_slot_bytes" not in v2_impl
+    # Algorithm choice follows the MR's ModeConfig table, including the TP2
+    # rule that the push threshold is 0.
+    assert "mode_configs" in v2_impl
+    assert "def _pick_algo(self, nbytes: int)" in v2_impl
+    assert "ONE_SHOT_PULL" in v2_impl and "TWO_SHOT_PULL" in v2_impl
 
 
 def test_runtime_adapter_maps_upstream_names() -> None:

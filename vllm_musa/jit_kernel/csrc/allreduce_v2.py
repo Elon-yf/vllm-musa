@@ -6,16 +6,24 @@ compiles ``distributed/custom_all_reduce_v2.mu`` into a *separate* shared
 object so both algorithms can be loaded in the same process and selected at
 runtime for A/B validation.
 
-Only the device-descriptor launch entry exists in the v2 kernel:
-``vllm_musa_custom_ar_launch_device_descriptor``.  Pull shots stay on the v1
-module; v2 replaces the push (one-shot push / push-wide) path, which is the
-decode-sized payload path that the MR targets.
+The v2 kernel exposes three launch entries: the TVM-FFI
+``vllm_musa_custom_ar_launch_device_descriptor`` (push shots) and two plain
+``extern "C"`` entry points for the pull shots,
+``vllm_musa_custom_ar_launch_unregistered_raw_nocheck`` and
+``vllm_musa_custom_ar_launch_registered_raw_nocheck``.  Upstream MR 577 binds
+the pull pair through a 60-line pybind11 module
+(``distributed/custom_all_reduce_pybind.cpp``); vllm-musa has no pybind11 JIT
+infrastructure, so the same two symbols are bound here with ``ctypes`` against
+the shared object that ``load_musa_jit`` already produces.  The kernel and its
+arguments are identical; only the binding mechanism differs.
 """
 
 from __future__ import annotations
 
+import ctypes
 import functools
 import os
+from pathlib import Path
 
 import torch
 
@@ -159,3 +167,177 @@ def launch_device_descriptor(
         int(world_size),
         int(shot),
     )
+
+
+# --- pull launch entry points -------------------------------------------------
+#
+# The two ``extern "C"`` symbols below take raw pointers plus the current MUSA
+# stream.  These wrappers mirror upstream's pybind11 bindings one-to-one: the
+# tensor arguments are resolved to ``data_ptr()`` and ``out.numel()`` /
+# ``dtype_code(out)`` are forwarded exactly as the pybind module did.
+
+_DTYPE_CODES = {
+    torch.float16: 0,
+    torch.bfloat16: 1,
+    torch.float32: 2,
+}
+
+_raw_libs: dict[str, ctypes.CDLL] = {}
+
+
+def _raw_symbols(world_size: int, shot: int):
+    """Load the compiled v2 module and return its two raw launch callables."""
+    name = _module_name(int(world_size), int(shot))
+    lib = _raw_libs.get(name)
+    if lib is None:
+        _custom_ar_v2_module(int(world_size), int(shot))  # ensures the .so exists
+        cache_dir = Path(
+            os.environ.get("VLLM_MUSA_JIT_CACHE_DIR")
+            or (Path.home() / ".cache" / "vllm_musa_jit")
+        )
+        so_path = cache_dir / name / f"{name}.so"
+        if not so_path.is_file():
+            raise RuntimeError(
+                f"MUSA custom AR v2 module was not built at {so_path}; "
+                "the pull launch entry points are unavailable"
+            )
+        lib = ctypes.CDLL(str(so_path), mode=ctypes.RTLD_GLOBAL)
+        unregistered = lib.vllm_musa_custom_ar_launch_unregistered_raw_nocheck
+        unregistered.restype = None
+        unregistered.argtypes = [
+            ctypes.c_void_p,  # rank_ptrs
+            ctypes.c_void_p,  # signal_ptrs
+            ctypes.c_void_p,  # inp
+            ctypes.c_void_p,  # out
+            ctypes.c_int64,  # self_signal_ptr
+            ctypes.c_int64,  # self_buffer_ptr
+            ctypes.c_int64,  # push_buffer_bytes
+            ctypes.c_int64,  # numel
+            ctypes.c_int,  # dtype_code
+            ctypes.c_int64,  # stream_value
+            ctypes.c_int64,  # rank
+            ctypes.c_int64,  # world_size
+            ctypes.c_int64,  # shot
+        ]
+        registered = lib.vllm_musa_custom_ar_launch_registered_raw_nocheck
+        registered.restype = None
+        registered.argtypes = [
+            ctypes.c_void_p,  # rank_ptrs
+            ctypes.c_void_p,  # signal_ptrs
+            ctypes.c_void_p,  # out
+            ctypes.c_int64,  # self_signal_ptr
+            ctypes.c_int64,  # numel
+            ctypes.c_int,  # dtype_code
+            ctypes.c_int64,  # stream_value
+            ctypes.c_int64,  # rank
+            ctypes.c_int64,  # world_size
+            ctypes.c_int64,  # shot
+        ]
+        _raw_libs[name] = lib
+    return (
+        lib.vllm_musa_custom_ar_launch_unregistered_raw_nocheck,
+        lib.vllm_musa_custom_ar_launch_registered_raw_nocheck,
+    )
+
+
+def _current_stream_value() -> int:
+    """Raw handle of the current MUSA stream (what ``getCurrentMUSAStream`` gave)."""
+    for module_name in ("musa", "cuda"):
+        module = getattr(torch, module_name, None)
+        current_stream = getattr(module, "current_stream", None)
+        if current_stream is None:
+            continue
+        stream = current_stream()
+        for attr in ("musa_stream", "cuda_stream"):
+            value = getattr(stream, attr, None)
+            if value is None:
+                continue
+            # 0 is the legacy/default stream handle and is a valid value here;
+            # `getCurrentMUSAStream` returns exactly that outside a capture.
+            return int(value)
+    raise RuntimeError(
+        "MUSA custom AR v2 cannot resolve the current stream handle; "
+        "the pull launch path needs it"
+    )
+
+
+def _dtype_code(tensor: torch.Tensor) -> int:
+    code = _DTYPE_CODES.get(tensor.dtype)
+    if code is None:
+        raise TypeError(
+            "MUSA custom AR v2 only supports fp16/bf16/fp32, got "
+            f"{tensor.dtype}"
+        )
+    return code
+
+
+def launch_unregistered_func(world_size: int, shot: int):
+    """Callable equivalent of upstream's ``launch_unregistered`` pybind binding."""
+    symbols = _raw_symbols(int(world_size), int(shot))
+
+    def launch(
+        rank_data: torch.Tensor,
+        signal_ptrs_cpu: torch.Tensor,
+        input: torch.Tensor,
+        out: torch.Tensor,
+        self_signal_ptr: int,
+        self_buffer_ptr: int,
+        push_buffer_bytes: int,
+        rank: int,
+        world_size: int,
+        shot: int,
+    ) -> None:
+        symbols[0](
+            ctypes.c_void_p(rank_data.data_ptr()),
+            ctypes.c_void_p(signal_ptrs_cpu.data_ptr()),
+            ctypes.c_void_p(input.data_ptr()),
+            ctypes.c_void_p(out.data_ptr()),
+            ctypes.c_int64(int(self_signal_ptr)),
+            ctypes.c_int64(int(self_buffer_ptr)),
+            ctypes.c_int64(int(push_buffer_bytes)),
+            ctypes.c_int64(int(out.numel())),
+            ctypes.c_int(_dtype_code(out)),
+            ctypes.c_int64(_current_stream_value()),
+            ctypes.c_int64(int(rank)),
+            ctypes.c_int64(int(world_size)),
+            ctypes.c_int64(int(shot)),
+        )
+
+    return launch
+
+
+def launch_registered_func(world_size: int, shot: int):
+    """Callable equivalent of upstream's ``launch_registered`` pybind binding."""
+    symbols = _raw_symbols(int(world_size), int(shot))
+
+    def launch(
+        rank_data: torch.Tensor,
+        signal_ptrs_cpu: torch.Tensor,
+        out: torch.Tensor,
+        self_signal_ptr: int,
+        rank: int,
+        world_size: int,
+        shot: int,
+    ) -> None:
+        symbols[1](
+            ctypes.c_void_p(rank_data.data_ptr()),
+            ctypes.c_void_p(signal_ptrs_cpu.data_ptr()),
+            ctypes.c_void_p(out.data_ptr()),
+            ctypes.c_int64(int(self_signal_ptr)),
+            ctypes.c_int64(int(out.numel())),
+            ctypes.c_int(_dtype_code(out)),
+            ctypes.c_int64(_current_stream_value()),
+            ctypes.c_int64(int(rank)),
+            ctypes.c_int64(int(world_size)),
+            ctypes.c_int64(int(shot)),
+        )
+
+    return launch
+
+# Names used by the ported v2 object layer.  The object calls
+# ``launch_*_pybind_func(world_size, shot)`` because upstream resolved them from
+# its pybind11 module; here they resolve to the ctypes bindings above.  Aliasing
+# keeps the object layer byte-identical to the MR instead of editing its launch
+# call sites.
+launch_unregistered_pybind_func = launch_unregistered_func
+launch_registered_pybind_func = launch_registered_func
