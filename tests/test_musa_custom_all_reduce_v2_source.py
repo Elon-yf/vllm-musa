@@ -223,3 +223,37 @@ def test_two_stage_keeps_the_tp4_fast_path_and_generic_reduce_scatter() -> None:
     assert "tmp[idx - start] = packed_reduce<P, nranks, A>(ptrs, idx);" in body
     assert "peer[rank * part + idx] = tmp[idx];" in body
     assert "if (data_ptr != nullptr) data = *data_ptr;" in body
+
+
+def test_merged_modules_resolve_every_global() -> None:
+    """Folding modules together must not orphan a name a body still reads.
+
+    ``py_compile`` accepts a module that only fails at call time, so the merge
+    needs a stronger check: every global a function body reads, and that is not
+    assigned in that module, must exist at module level or in builtins.  The
+    first merge attempt left ``Path`` behind in a removed file and the JIT build
+    raised ``NameError`` only when the first kernel was compiled.
+    """
+    import builtins
+    import symtable
+
+    for path in (JIT, COMM):
+        table = symtable.symtable(_source(path), str(path), "exec")
+        declared = set(table.get_identifiers())
+        unresolved: set[str] = set()
+
+        def walk(node) -> None:
+            for symbol in node.get_symbols():
+                name = symbol.get_name()
+                if (
+                    symbol.is_global()
+                    and not symbol.is_assigned()
+                    and name not in declared
+                    and not hasattr(builtins, name)
+                ):
+                    unresolved.add(name)
+            for child in node.get_children():
+                walk(child)
+
+        walk(table)
+        assert not unresolved, f"{path.name} reads undefined globals: {sorted(unresolved)}"
