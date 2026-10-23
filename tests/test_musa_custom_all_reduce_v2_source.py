@@ -24,19 +24,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
 KERNEL = ROOT / "vllm_musa/jit_kernel/csrc/distributed/custom_all_reduce_v2.mu"
-JIT = ROOT / "vllm_musa/jit_kernel/csrc/allreduce_v2.py"
-ALGO = ROOT / "vllm_musa/jit_kernel/csrc/allreduce_algo.py"
+JIT = ROOT / "vllm_musa/jit_kernel/csrc/allreduce.py"
+ALGO = JIT
 COMM = ROOT / "vllm_musa/distributed/device_communicators/musa_jit_custom_all_reduce.py"
-V2_IMPL = ROOT / (
-    "vllm_musa/distributed/device_communicators/musa_custom_all_reduce_v2_impl.py"
-)
-OBJ = ROOT / (
-    "vllm_musa/distributed/device_communicators/musa_custom_all_reduce_v2.py"
-)
-RUNTIME = ROOT / "vllm_musa/distributed/device_communicators/musa_rt_v2.py"
-FUSED = ROOT / (
-    "vllm_musa/distributed/device_communicators/musa_allreduce_rmsnorm_v2.py"
-)
+V2_IMPL = COMM
+OBJ = COMM
+RUNTIME = COMM
+FUSED = COMM
 RESOLVER = ROOT / "vllm_musa/optimization_contract/resolver.py"
 
 _SIGNAL_SLOTS = 512
