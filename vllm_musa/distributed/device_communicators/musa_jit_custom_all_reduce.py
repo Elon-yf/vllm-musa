@@ -1180,10 +1180,16 @@ class _MusaJitCustomAllreduceImpl:
 
     def should_custom_ar(self, inp: torch.Tensor) -> bool:
         use = self._should_custom_ar_gates(inp)
+        capturing = (
+            car_trace.enabled()
+            and self._IS_CAPTURING
+            and self._is_current_stream_capturing()
+        )
         car_trace.record(
             "gate",
             "v1",
-            "car" if use else "fallback",
+            ("capture:" if capturing else "eager:")
+            + ("car" if use else "fallback"),
             inp.numel() * inp.element_size(),
         )
         return use
@@ -2876,10 +2882,16 @@ class _MusaCustomAllreduceV2Impl:
     # -- public surface used by MusaJitCustomAllreduce -----------------------
     def should_custom_ar(self, inp: torch.Tensor) -> bool:
         use = self._should_custom_ar_gates(inp)
+        capturing = (
+            car_trace.enabled()
+            and self._IS_CAPTURING
+            and _is_current_stream_capturing()
+        )
         car_trace.record(
             "gate",
             "v2",
-            "car" if use else "fallback",
+            ("capture:" if capturing else "eager:")
+            + ("car" if use else "fallback"),
             inp.numel() * inp.element_size(),
         )
         return use
