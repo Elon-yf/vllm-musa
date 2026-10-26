@@ -3,8 +3,10 @@ from __future__ import annotations
 import ctypes
 import enum
 import functools
+import hashlib
 import os
 from pathlib import Path
+from typing import Any, Callable
 
 import torch
 
@@ -787,3 +789,269 @@ def launch_device_descriptor_func(world_size: int, shot: int):
                                 int(self_signal_ptr), int(rank), world_size, shot)
 
     return _launch
+
+
+# The fused source snapshot is documented next to its TU in custom_all_reduce_v2.mu.
+# It has a distinct signal allocation and is compiled independently from pure CAR.
+def v2_fused_compile_config(
+    world_size: int,
+    hidden: int,
+    rows: int,
+    *,
+    mp_count: int | None = None,
+    short_rows: bool = False,
+    small_rows: bool = False,
+    cache_policy: int = 0,
+    token_2stage_override: int = -1,
+    row_warp_inv_rms_override: int = -1,
+    graph_rank_data: bool = False,
+) -> Any:
+    """Resolve the actual fused launch flags before forming the JIT cache key."""
+    from vllm_musa.optimization_contract.Fuse_CAR_RMSnorm import (
+        resolve_fused_rmsnorm_compile_config,
+        resolve_token_2stage,
+    )
+
+    if mp_count is None:
+        device_module = getattr(torch, "musa", None)
+        if device_module is None:
+            raise RuntimeError("MUSA fused CAR v2 needs live device properties or mp_count")
+        mp_count = int(
+            device_module.get_device_properties(device_module.current_device()).multi_processor_count
+        )
+    token_2stage = resolve_token_2stage(world_size, hidden, token_2stage_override, rows)
+    threads, blocks, _, _, max_blocks, dynamic_blocks, _ = _v2_compile_config(
+        world_size, SHOT_TWO_STAGE if token_2stage else SHOT_ONE_STAGE
+    )
+    # This revision of the pure policy fixes graph_rank_data=True internally.
+    # Graph-vs-staging affects the FFI entry and module key, not its rule matches.
+    del graph_rank_data
+    return resolve_fused_rmsnorm_compile_config(
+        world_size=int(world_size),
+        mp_count=int(mp_count),
+        row_hidden=int(hidden),
+        row_count=int(rows),
+        short_rows=bool(short_rows),
+        small_rows=bool(small_rows),
+        cache_policy=int(cache_policy),
+        token_2stage=int(token_2stage),
+        row_warp_inv_rms_override=int(row_warp_inv_rms_override),
+        fast_publish_override=int(os.environ.get("VLLM_MUSA_CUSTOM_AR_FUSED_RMSNORM_FAST_PUBLISH", "-1")),
+        base_threads=threads,
+        base_blocks=blocks,
+        base_max_blocks=max_blocks,
+        base_launch_max_blocks=max_blocks,
+        base_dynamic_blocks=dynamic_blocks,
+    )
+
+
+def _v2_fused_cflags(config: Any, cache_policy: int, vector_load: int, atomic_barrier: int) -> tuple[str, ...]:
+    """Merge generic launch fields with every policy-controlled fused switch."""
+    return (
+        "-Wno-error=address-of-temporary",
+        "-fmusa-flush-denormals-to-zero",
+        "-fno-signed-zeros",
+        "-D__MUSA_ARCH_LIST__=310",
+        "-DSGL_CUSTOM_AR_FUSED_RMSNORM=1",
+        f"-DSGL_CUSTOM_AR_THREADS={config.threads}",
+        f"-DSGL_CUSTOM_AR_BLOCKS={config.blocks}",
+        f"-DSGL_CUSTOM_AR_VECTOR_LOAD={vector_load}",
+        f"-DSGL_CUSTOM_AR_ATOMIC_BARRIER={atomic_barrier}",
+        f"-DSGL_CUSTOM_AR_MAX_BLOCKS={config.max_blocks}",
+        f"-DSGL_CUSTOM_AR_DYNAMIC_BLOCKS={config.dynamic_blocks}",
+        f"-DSGL_CUSTOM_AR_FUSED_RMSNORM_CACHE_POLICY={int(cache_policy)}",
+        *config.cflags(),
+        "-mllvm", "-mtgpu-opt-level=1",
+        "-mllvm", "-mtgpu-load-store-opt=1",
+        "-mllvm", "-mtgpu-fold-global-ldst=1",
+    )
+
+
+@functools.lru_cache(maxsize=96)
+def _custom_ar_v2_fused_module(
+    world_size: int, config: Any, cflags: tuple[str, ...], graph_rank_data: bool
+) -> Any:
+    # The complete effective flags are cached, rather than only the shape: env
+    # overrides and policy changes must never silently reuse a different module.
+    digest = hashlib.sha256(repr((config, cflags)).encode()).hexdigest()[:20]
+    name = (
+        f"vllm_musa_car_v2_fused_ws{world_size}_t{config.threads}_b{config.blocks}"
+        f"_g{int(graph_rank_data)}_{digest}"
+    )
+    return load_musa_jit(
+        name, ("distributed/custom_all_reduce_v2.mu",), extra_musa_cflags=cflags
+    )
+
+
+def _v2_fused_factory(
+    world_size: int,
+    hidden: int,
+    short_rows: bool,
+    small_rows: bool,
+    cache_policy: int,
+    token_2stage_override: int,
+    row_warp_inv_rms_override: int,
+    row_count: int,
+    graph_rank_data: bool,
+    row_kernel: bool,
+    *,
+    mp_count: int | None,
+    need_raw: bool,
+    has_residual: bool,
+) -> Callable[..., None]:
+    if need_raw or not has_residual:
+        raise NotImplementedError(
+            "The MR577 cached fused kernel currently exposes residual+RMSNorm "
+            "only; raw all-reduce and norm-only need explicit kernel output support"
+        )
+    config = v2_fused_compile_config(
+        world_size, hidden, row_count, mp_count=mp_count,
+        short_rows=short_rows, small_rows=small_rows, cache_policy=cache_policy,
+        token_2stage_override=token_2stage_override,
+        row_warp_inv_rms_override=row_warp_inv_rms_override,
+        graph_rank_data=graph_rank_data,
+    )
+    _, _, vector_load, atomic_barrier, _, _, _ = _v2_compile_config(
+        world_size, SHOT_TWO_STAGE if config.token_2stage else SHOT_ONE_STAGE
+    )
+    flags = _v2_fused_cflags(config, cache_policy, vector_load, atomic_barrier)
+    module = _custom_ar_v2_fused_module(int(world_size), config, flags, graph_rank_data)
+    suffix = "row_" if row_kernel else ""
+    suffix += "registered" if graph_rank_data else "unregistered"
+    return getattr(module, f"sgl_musa_custom_ar_fused_allreduce_rmsnorm_{suffix}")
+
+
+def v2_launch_fused_allreduce_rmsnorm_unregistered_func(
+    world_size: int, hidden: int = 0, short_rows: bool = False,
+    small_rows: bool = False, cache_policy: int = 0,
+    row_warp_inv_rms_override: int = -1, row_count: int = 0,
+    token_2stage_override: int = -1, graph_rank_data: bool = False, *,
+    mp_count: int | None = None, need_raw: bool = False, has_residual: bool = True,
+) -> Callable[..., None]:
+    if graph_rank_data:
+        raise ValueError("unregistered fused launcher requires graph_rank_data=False")
+    return _v2_fused_factory(
+        world_size, hidden, short_rows, small_rows, cache_policy,
+        token_2stage_override, row_warp_inv_rms_override, row_count, False, False,
+        mp_count=mp_count, need_raw=need_raw, has_residual=has_residual,
+    )
+
+
+def v2_launch_fused_allreduce_rmsnorm_registered_func(
+    world_size: int, hidden: int = 0, short_rows: bool = False,
+    small_rows: bool = False, cache_policy: int = 0,
+    row_warp_inv_rms_override: int = -1, row_count: int = 0,
+    token_2stage_override: int = -1, graph_rank_data: bool = True, *,
+    mp_count: int | None = None, need_raw: bool = False, has_residual: bool = True,
+) -> Callable[..., None]:
+    if not graph_rank_data:
+        raise ValueError("registered fused launcher requires graph_rank_data=True")
+    return _v2_fused_factory(
+        world_size, hidden, short_rows, small_rows, cache_policy,
+        token_2stage_override, row_warp_inv_rms_override, row_count, True, False,
+        mp_count=mp_count, need_raw=need_raw, has_residual=has_residual,
+    )
+
+
+def v2_launch_fused_allreduce_rmsnorm_row_unregistered_func(
+    world_size: int, hidden: int = 0, short_rows: bool = False,
+    small_rows: bool = False, token_2stage_override: int = 1,
+    row_warp_inv_rms_override: int = -1, row_count: int = 0,
+    graph_rank_data: bool = False, *, mp_count: int | None = None,
+    need_raw: bool = False, has_residual: bool = True,
+) -> Callable[..., None]:
+    if graph_rank_data:
+        raise ValueError("unregistered fused launcher requires graph_rank_data=False")
+    return _v2_fused_factory(
+        world_size, hidden, short_rows, small_rows, 0,
+        token_2stage_override, row_warp_inv_rms_override, row_count, False, True,
+        mp_count=mp_count, need_raw=need_raw, has_residual=has_residual,
+    )
+
+
+def v2_launch_fused_allreduce_rmsnorm_row_registered_func(
+    world_size: int, hidden: int = 0, short_rows: bool = False,
+    small_rows: bool = False, token_2stage_override: int = 1,
+    row_warp_inv_rms_override: int = -1, row_count: int = 0,
+    graph_rank_data: bool = True, *, mp_count: int | None = None,
+    need_raw: bool = False, has_residual: bool = True,
+) -> Callable[..., None]:
+    if not graph_rank_data:
+        raise ValueError("registered fused launcher requires graph_rank_data=True")
+    return _v2_fused_factory(
+        world_size, hidden, short_rows, small_rows, 0,
+        token_2stage_override, row_warp_inv_rms_override, row_count, True, True,
+        mp_count=mp_count, need_raw=need_raw, has_residual=has_residual,
+    )
+
+
+def v2_fused_allreduce_rmsnorm_func(
+    world_size: int,
+    hidden: int,
+    rows: int,
+    *,
+    row_kernel: bool = False,
+    graph_rank_data: bool = False,
+    short_rows: bool = False,
+    small_rows: bool = False,
+    cache_policy: int = 0,
+    token_2stage_override: int = -1,
+    row_warp_inv_rms_override: int = -1,
+    mp_count: int | None = None,
+    need_raw: bool = False,
+    has_residual: bool = True,
+) -> Callable[..., None]:
+    """Return one fixed launcher ABI for generic/row and staging/graph paths.
+
+    The returned callable takes ``(rank_data_device, signal_ptrs_cpu, input,
+    residual, residual_out, norm_out, weight, raw_out, self_signal_ptr,
+    self_buffer_ptr, max_size_bytes, rank, world_size_arg, eps)``.  Both pointer
+    tables are owned by the communicator; this adapter never copies or retains
+    input tensors.  Graph callers use their registered device pointer table.
+    """
+    entry = _v2_fused_factory(
+        world_size=world_size, hidden=hidden, short_rows=short_rows,
+        small_rows=small_rows, cache_policy=cache_policy,
+        token_2stage_override=token_2stage_override,
+        row_warp_inv_rms_override=row_warp_inv_rms_override,
+        row_count=rows, graph_rank_data=graph_rank_data, row_kernel=row_kernel,
+        mp_count=mp_count, need_raw=need_raw, has_residual=has_residual,
+    )
+
+    def launch(
+        rank_data_device: torch.Tensor,
+        signal_ptrs_cpu: torch.Tensor,
+        input: torch.Tensor,
+        residual: torch.Tensor | None,
+        residual_out: torch.Tensor,
+        norm_out: torch.Tensor,
+        weight: torch.Tensor,
+        raw_out: torch.Tensor | None,
+        self_signal_ptr: int,
+        self_buffer_ptr: int,
+        max_size_bytes: int,
+        rank: int,
+        world_size_arg: int,
+        eps: float,
+    ) -> None:
+        if int(world_size_arg) != int(world_size):
+            raise ValueError("fused CAR v2 launcher world size does not match its JIT module")
+        if residual is None or raw_out is not None:
+            raise ValueError("this fused CAR v2 module requires residual and no raw output")
+        prefix = (rank_data_device, signal_ptrs_cpu)
+        if graph_rank_data:
+            args = prefix + (residual, residual_out, norm_out, weight, int(self_signal_ptr),
+                             int(rank), int(world_size))
+        elif row_kernel:
+            args = prefix + (input, residual, residual_out, norm_out, weight,
+                             int(self_signal_ptr), int(self_buffer_ptr), int(max_size_bytes),
+                             int(rank), int(world_size))
+        else:
+            args = prefix + (input, norm_out, residual, residual_out, weight,
+                             int(self_signal_ptr), int(self_buffer_ptr), int(max_size_bytes),
+                             int(rank), int(world_size))
+        if row_kernel:
+            args += (int(hidden),)
+        entry(*args, float(eps))
+
+    return launch
