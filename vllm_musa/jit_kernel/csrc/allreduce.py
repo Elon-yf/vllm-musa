@@ -5,6 +5,7 @@ import enum
 import functools
 import hashlib
 import os
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -402,7 +403,7 @@ _V2_SIGNAL_BLOCKS = 512
 _V2_SEMAPHORE_BYTES = 128
 # This is an ABI capability, not a runtime-performance claim.  Promote it only
 # when every fused launch variant writes the pre-residual all-reduce output.
-V2_FUSED_SUPPORTS_RAW = False
+V2_FUSED_SUPPORTS_RAW = True
 
 
 def allreduce_v2_meta_size() -> int:
@@ -889,7 +890,10 @@ def v2_fused_compile_config(
     )
 
 
-def _v2_fused_cflags(config: Any, cache_policy: int, vector_load: int, atomic_barrier: int) -> tuple[str, ...]:
+def _v2_fused_cflags(
+    config: Any, cache_policy: int, vector_load: int, atomic_barrier: int,
+    need_raw: bool, has_residual: bool,
+) -> tuple[str, ...]:
     """Merge generic launch fields with every policy-controlled fused switch."""
     return (
         "-Wno-error=address-of-temporary",
@@ -897,6 +901,8 @@ def _v2_fused_cflags(config: Any, cache_policy: int, vector_load: int, atomic_ba
         "-fno-signed-zeros",
         "-D__MUSA_ARCH_LIST__=310",
         "-DSGL_CUSTOM_AR_FUSED_RMSNORM=1",
+        f"-DVLLM_MUSA_FUSED_WRITE_RAW={int(need_raw)}",
+        f"-DVLLM_MUSA_FUSED_HAS_RESIDUAL={int(has_residual)}",
         f"-DSGL_CUSTOM_AR_THREADS={config.threads}",
         f"-DSGL_CUSTOM_AR_BLOCKS={config.blocks}",
         f"-DSGL_CUSTOM_AR_VECTOR_LOAD={vector_load}",
@@ -943,11 +949,6 @@ def _v2_fused_factory(
     need_raw: bool,
     has_residual: bool,
 ) -> Callable[..., None]:
-    if need_raw or not has_residual:
-        raise NotImplementedError(
-            "The MR577 cached fused kernel currently exposes residual+RMSNorm "
-            "only; raw all-reduce and norm-only need explicit kernel output support"
-        )
     config = v2_fused_compile_config(
         world_size, hidden, row_count, mp_count=mp_count,
         short_rows=short_rows, small_rows=small_rows, cache_policy=cache_policy,
@@ -955,6 +956,20 @@ def _v2_fused_factory(
         row_warp_inv_rms_override=row_warp_inv_rms_override,
         graph_rank_data=graph_rank_data,
     )
+    if need_raw and config.tmp_with_residual:
+        # vLLM exposes raw AR to other graph users. Pre-adding the residual
+        # into shared scratch destroys that value; retain the raw scratch
+        # variant instead of trying to recover it by low-precision subtraction.
+        config = replace(config, tmp_with_residual=0)
+    if has_residual:
+        # vLLM fused_add_rms_norm uses the fp32 residual sum for variance and
+        # normalization, while residual_out alone rounds to T. MR577's typed
+        # cache and pre-added scratch would lose that fp32 value.
+        config = replace(
+            config, tmp_with_residual=0,
+            cache_hidden_limit=max(int(hidden), config.cache_hidden_limit),
+            typed_cache_hidden_limit=0,
+        )
     shot = forced_shot()
     if shot not in (SHOT_ONE_STAGE, SHOT_TWO_STAGE, SHOT_TWO_STAGE_512):
         shot = SHOT_TWO_STAGE if config.token_2stage else SHOT_ONE_STAGE
@@ -963,7 +978,9 @@ def _v2_fused_factory(
         f"VLLM_MUSA_CUSTOM_AR_{shot}SHOT_ATOMIC_BARRIER",
         os.environ.get("VLLM_MUSA_CUSTOM_AR_ATOMIC_BARRIER", int(shot != SHOT_ONE_STAGE)),
     ))
-    flags = _v2_fused_cflags(config, cache_policy, vector_load, atomic_barrier)
+    flags = _v2_fused_cflags(
+        config, cache_policy, vector_load, atomic_barrier, need_raw, has_residual
+    )
     module = _custom_ar_v2_fused_module(int(world_size), config, flags, graph_rank_data)
     suffix = "row_" if row_kernel else ""
     suffix += "registered" if graph_rank_data else "unregistered"
@@ -1096,18 +1113,22 @@ def v2_fused_allreduce_rmsnorm_func(
     ) -> None:
         if int(world_size_arg) != int(world_size):
             raise ValueError("fused CAR v2 launcher world size does not match its JIT module")
-        if residual is None or raw_out is not None:
-            raise ValueError("this fused CAR v2 module requires residual and no raw output")
+        if (residual is not None) != has_residual or (raw_out is not None) != need_raw:
+            raise ValueError("fused CAR v2 outputs do not match the compiled residual/raw contract")
+        # Disabled compile branches never read these placeholders. Keeping the
+        # FFI tensor ABI fixed avoids optional-pointer/capture special cases.
+        residual_arg = residual if has_residual else input
+        raw_arg = raw_out if need_raw else norm_out
         prefix = (rank_data_device, signal_ptrs_cpu)
         if graph_rank_data:
-            args = prefix + (residual, residual_out, norm_out, weight, int(self_signal_ptr),
+            args = prefix + (residual_arg, residual_out, norm_out, raw_arg, weight, int(self_signal_ptr),
                              int(rank), int(world_size))
         elif row_kernel:
-            args = prefix + (input, residual, residual_out, norm_out, weight,
+            args = prefix + (input, residual_arg, residual_out, norm_out, raw_arg, weight,
                              int(self_signal_ptr), int(self_buffer_ptr), int(max_size_bytes),
                              int(rank), int(world_size))
         else:
-            args = prefix + (input, norm_out, residual, residual_out, weight,
+            args = prefix + (input, norm_out, residual_arg, residual_out, raw_arg, weight,
                              int(self_signal_ptr), int(self_buffer_ptr), int(max_size_bytes),
                              int(rank), int(world_size))
         if row_kernel:

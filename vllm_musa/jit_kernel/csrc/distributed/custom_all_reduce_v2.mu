@@ -1217,12 +1217,13 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(
     vllm_musa_custom_ar_launch_device_descriptor);
 
 #else  // SGL_CUSTOM_AR_FUSED_RMSNORM
-// Fused-source checkpoint: cached SGLang MR577 archive, NOT a verified MR head.
-// custom_all_reduce_rmsnorm.mu git blob:
-//   15a28d807346c828c1ca4359a84f78fd7b94108d
-// SHA256: 29c4f4da032607a657e3f7ae4b93ce47831bb924db36cff784327f38b232dd6e
-// The source archive and downloaded 577.diff have different fused blobs; this
-// copy preserves the cache body verbatim pending exact-source reconciliation.
+// Ordinary AR+RMSNorm source reconstructed from MR577 target lines 1-4162
+// and exports at target lines 4455-4469 (Gemma-only section excluded).
+// Source segment SHA256 before the vLLM ABI adaptation:
+// 8508b7bcf849bc362beb09c6431842a99730316709e4dbd3c7c944642ba0fd72
+// The complete target Git blob is not reconstructed; source-map evidence is
+// kept in the MUSA-100062 takeover artifacts. Adaptations: optional raw output,
+// optional residual, and vLLM dtype materialization before RMSNorm.
 #include "../common.h"
 #include "../device_utils.h"
 #include "../norm/common.mu"
@@ -1330,13 +1331,28 @@ namespace {
 #define SGL_CUSTOM_AR_FUSED_RMSNORM_ROW_WARP_INV_RMS 0
 #endif
 
-
 #ifndef SGL_CUSTOM_AR_FUSED_RMSNORM_SUMS_BYPASS_LOAD
 #define SGL_CUSTOM_AR_FUSED_RMSNORM_SUMS_BYPASS_LOAD 0
 #endif
 
 #ifndef SGL_CUSTOM_AR_FUSED_RMSNORM_SMALL_ROWS
 #define SGL_CUSTOM_AR_FUSED_RMSNORM_SMALL_ROWS 0
+#endif
+
+#ifndef SGL_CUSTOM_AR_FUSED_RMSNORM_ROW_SKIP_END_BARRIER
+#define SGL_CUSTOM_AR_FUSED_RMSNORM_ROW_SKIP_END_BARRIER 0
+#endif
+
+#ifndef SGL_CUSTOM_AR_FUSED_RMSNORM_ROW_PEER_PUBLISH
+#define SGL_CUSTOM_AR_FUSED_RMSNORM_ROW_PEER_PUBLISH 0
+#endif
+
+#ifndef SGL_CUSTOM_AR_FUSED_RMSNORM_ROW_SKIP_SELF_SIGNAL
+#define SGL_CUSTOM_AR_FUSED_RMSNORM_ROW_SKIP_SELF_SIGNAL 0
+#endif
+
+#ifndef SGL_CUSTOM_AR_FUSED_RMSNORM_ROW_PUSH
+#define SGL_CUSTOM_AR_FUSED_RMSNORM_ROW_PUSH 0
 #endif
 
 #ifndef SGL_CUSTOM_AR_PUSH_16B_ASM
@@ -1365,7 +1381,6 @@ constexpr bool kRowSharedInvRms = SGL_CUSTOM_AR_FUSED_RMSNORM_ROW_SHARED_INV_RMS
 constexpr bool kRowWarpInvRms = SGL_CUSTOM_AR_FUSED_RMSNORM_ROW_WARP_INV_RMS != 0;
 constexpr int kMaxRanks = 8;
 constexpr int kOneShotMaxToken = 128;
-static_assert(kOneShotMaxToken <= kSignalMaxBlocks);
 using FlagType = uint32_t;
 
 __device__ __host__ __forceinline__ bool rmsnorm_cache_weight_hidden(
@@ -1586,6 +1601,60 @@ __device__ __forceinline__ __mt_bfloat16 downcast_s<__mt_bfloat16>(float value) 
 template <>
 __device__ __forceinline__ float downcast_s<float>(float value) {
   return value;
+}
+
+
+#ifndef VLLM_MUSA_FUSED_HAS_RESIDUAL
+#define VLLM_MUSA_FUSED_HAS_RESIDUAL 1
+#endif
+#ifndef VLLM_MUSA_FUSED_WRITE_RAW
+#define VLLM_MUSA_FUSED_WRITE_RAW 0
+#endif
+#if VLLM_MUSA_FUSED_WRITE_RAW && SGL_CUSTOM_AR_FUSED_RMSNORM_TMP_WITH_RESIDUAL
+#error "raw output requires scratch to retain the pre-residual all-reduce value"
+#endif
+
+// Preserve vLLM IR's materialization points: AR rounds to the model dtype;
+// fused-add RMSNorm accumulates residual in fp32 while storing residual_out
+// separately in T. Raw is never recovered by subtracting rounded residuals.
+template <typename T>
+__device__ __forceinline__ float vllm_fused_norm_value(
+    float reduced, float residual, T* raw_out, int offset) {
+  const T raw = downcast_s<T>(reduced);
+#if VLLM_MUSA_FUSED_WRITE_RAW
+  raw_out[offset] = raw;
+#endif
+#if VLLM_MUSA_FUSED_HAS_RESIDUAL
+  return upcast_s(raw) + residual;
+#else
+  return upcast_s(raw);
+#endif
+}
+
+// The IR casts the normalized value to the weight dtype before multiplying
+// by the weight. This port accepts same-dtype weights, so that dtype is T.
+template <typename T>
+__device__ __forceinline__ T vllm_fused_apply_weight(float normalized, float weight) {
+  return downcast_s<T>(upcast_s(downcast_s<T>(normalized)) * weight);
+}
+
+// The bypass-load implementation uses volatile assembly. Gate the load
+// itself, rather than only its arithmetic consumer, for norm-only modules.
+template <typename T, bool Bypass, typename Offset>
+__device__ __forceinline__ Vec8<T> vllm_fused_load_residual(
+    const T* ptr, Offset offset) {
+#if VLLM_MUSA_FUSED_HAS_RESIDUAL
+  if constexpr (Bypass) {
+    return Vec8<T>::load_byp_slc(ptr, offset);
+  } else {
+    return Vec8<T>::load(ptr, offset);
+  }
+#else
+  Vec8<T> zero;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) zero.val.elem[i] = downcast_s<T>(0.0f);
+  return zero;
+#endif
 }
 
 template <typename T>
@@ -2041,7 +2110,9 @@ __device__ __forceinline__ void multi_rank_barrier(const RankSignals& sg, Signal
   if constexpr (!start) {
     __syncthreads_lm();
   }
-  if (threadIdx.x < nranks) {
+  if (threadIdx.x < nranks &&
+      (!SGL_CUSTOM_AR_FUSED_RMSNORM_ROW_SKIP_SELF_SIGNAL ||
+       threadIdx.x != rank)) {
     const int target_rank = threadIdx.x;
     PullSemaphore* local = &self_sg->pull[blockIdx.x];
     PullSemaphore* target = &sg.signals[target_rank]->pull[blockIdx.x];
@@ -2070,9 +2141,15 @@ __device__ __forceinline__ void multi_rank_start_barrier_no_end(
 template <int nranks>
 __device__ __forceinline__ void row_multi_rank_end_barrier(
     const RankSignals& sg, Signal* self_sg, int rank) {
+#if SGL_CUSTOM_AR_FUSED_RMSNORM_ROW_SKIP_END_BARRIER
+  (void)sg;
+  (void)self_sg;
+  (void)rank;
+#else
   if constexpr (nranks != 4) {
     multi_rank_barrier<nranks, false>(sg, self_sg, rank);
   }
+#endif
 }
 
 template <int nranks>
@@ -2084,7 +2161,9 @@ __device__ __forceinline__ void publish_barrier(
     __musa_fence_rel();
   }
   __syncthreads_lm();
-  if (threadIdx.x < nranks) {
+  if (threadIdx.x < nranks &&
+      (!SGL_CUSTOM_AR_FUSED_RMSNORM_ROW_SKIP_SELF_SIGNAL ||
+       threadIdx.x != rank)) {
     const int target_rank = threadIdx.x;
     PullSemaphore* local = &self_sg->publish[blockIdx.x];
     PullSemaphore* target = &sg.signals[target_rank]->publish[blockIdx.x];
@@ -2103,7 +2182,32 @@ __device__ __forceinline__ void publish_barrier(
 template <int nranks>
 __device__ __forceinline__ void publish_barrier_peer_slots(
     const RankSignals& sg, Signal* self_sg, int rank) {
+#if SGL_CUSTOM_AR_FUSED_RMSNORM_ROW_PEER_PUBLISH
+  __syncthreads_lm();
+  __musa_barrier_slc();
+  if (threadIdx.x == 0) {
+    __musa_fence_rel();
+  }
+  __syncthreads_lm();
+  if (threadIdx.x < nranks) {
+    const int target_rank = threadIdx.x;
+    PullSemaphore* target = &sg.signals[target_rank]->publish[blockIdx.x];
+    if (target_rank == rank) {
+      PullSemaphore* local = &self_sg->publish[blockIdx.x];
+      const FlagType phase = static_cast<FlagType>(nranks);
+      const FlagType base = atomicAdd(&local->counter, phase);
+      atomicAdd(&target->flag, 1);
+      while (static_cast<FlagType>(atomicAdd(&local->flag, 0) - base) < phase) {
+      }
+      __musa_fence_acq();
+    } else {
+      atomicAdd(&target->flag, 1);
+    }
+  }
+  __syncthreads_lm();
+#else
   publish_barrier<nranks>(sg, self_sg, rank);
+#endif
 }
 
 template <typename T, int nranks>
@@ -2115,6 +2219,7 @@ custom_all_reduce_residual_rmsnorm_kernel(
     const T* __restrict__ residual_in,
     T* __restrict__ residual_out,
     T* __restrict__ norm_out,
+    T* __restrict__ raw_out,
     const T* __restrict__ weight,
     int rank,
     int rows,
@@ -2129,9 +2234,13 @@ custom_all_reduce_residual_rmsnorm_kernel(
   }
   __syncthreads_lm();
   const bool cache_float_values =
+#if VLLM_MUSA_FUSED_HAS_RESIDUAL
+      true;
+#else
       hidden <= kCacheHiddenLimit &&
       !(nranks == 2 && hidden == 2048) &&
       !(nranks == 2 && hidden == 4096 && rows < 2048);
+#endif
   const bool cache_t_values =
       !cache_float_values && !(nranks == 2 && hidden == 2048) &&
       hidden != 4096 && hidden <= kTypedCacheHiddenLimit;
@@ -2209,7 +2318,7 @@ custom_all_reduce_residual_rmsnorm_kernel(
           for (int i = 0; i < pack; ++i) {
             float val = upcast_s(local_vec.data[i]);
             val += upcast_s(peer_vec.data[i]);
-            val += upcast_s(residual_vec.data[i]);
+            val = vllm_fused_norm_value<T>(val, upcast_s(residual_vec.data[i]), raw_out, packed_idx * pack + i);
             values[i] = val;
             residual_packet_out.data[i] = downcast_s<T>(val);
             square_sum += val * val;
@@ -2230,7 +2339,7 @@ custom_all_reduce_residual_rmsnorm_kernel(
           for (int i = 0; i < pack; ++i) {
             const float gamma = upcast_s(w.data[i]);
             norm_packet.data[i] =
-                downcast_s<T>(values[i] * scale * gamma);
+                vllm_fused_apply_weight<T>(values[i] * scale, gamma);
           }
           norm_dst[packed_idx] = norm_packet;
         }
@@ -2264,11 +2373,11 @@ custom_all_reduce_residual_rmsnorm_kernel(
               acc[i] += to_float<T>(x.val.elem[i]);
             }
           }
-          Vec8<T> residual_vec = Vec8<T>::load(residual_in + row * hidden, col0);
+          Vec8<T> residual_vec = vllm_fused_load_residual<T, false>(residual_in + row * hidden, col0);
           Vec8<T> residual_vec_out;
 #pragma unroll
           for (int i = 0; i < pack; ++i) {
-            float val = acc[i] + to_float<T>(residual_vec.val.elem[i]);
+            float val = vllm_fused_norm_value<T>(acc[i], to_float<T>(residual_vec.val.elem[i]), raw_out, row * hidden + col0 + i);
             sum_float.val.elem[i] = val;
             residual_vec_out.val.elem[i] = from_float<T>(val);
             square_sum_row += val * val;
@@ -2288,7 +2397,7 @@ custom_all_reduce_residual_rmsnorm_kernel(
           for (int i = 0; i < pack; ++i) {
             const float gamma = to_float<T>(w.val.elem[i]);
             dst.val.elem[i] =
-                from_float<T>(sum_float.val.elem[i] * scale * gamma);
+                vllm_fused_apply_weight<T>(sum_float.val.elem[i] * scale, gamma);
           }
           *(Vec8<T>*)(norm_out + row * hidden + col0) = dst;
         }
@@ -2320,11 +2429,11 @@ custom_all_reduce_residual_rmsnorm_kernel(
               acc[i] += to_float<T>(x.val.elem[i]);
             }
           }
-          Vec8<T> residual_vec = Vec8<T>::load(residual_in + row * hidden, col0);
+          Vec8<T> residual_vec = vllm_fused_load_residual<T, false>(residual_in + row * hidden, col0);
           Vec8<T> residual_vec_out;
 #pragma unroll
           for (int i = 0; i < pack; ++i) {
-            float val = acc[i] + to_float<T>(residual_vec.val.elem[i]);
+            float val = vllm_fused_norm_value<T>(acc[i], to_float<T>(residual_vec.val.elem[i]), raw_out, row * hidden + col0 + i);
             sum_float.val.elem[i] = val;
             residual_vec_out.val.elem[i] = from_float<T>(val);
             square_sum_row += val * val;
@@ -2346,7 +2455,7 @@ custom_all_reduce_residual_rmsnorm_kernel(
           for (int i = 0; i < pack; ++i) {
             const float gamma = to_float<T>(w.val.elem[i]);
             dst.val.elem[i] =
-                from_float<T>(sum_float.val.elem[i] * scale * gamma);
+                vllm_fused_apply_weight<T>(sum_float.val.elem[i] * scale, gamma);
           }
           *(Vec8<T>*)(norm_out + row * hidden + col0) = dst;
         }
@@ -2370,13 +2479,13 @@ custom_all_reduce_residual_rmsnorm_kernel(
         Float8 sum_float;
         Vec8<T> local_vec = Vec8<T>::load(local + base, col0);
         Vec8<T> peer_vec = Vec8<T>::load(peer + base, col0);
-        Vec8<T> residual_vec = Vec8<T>::load(residual_in + base, col0);
+        Vec8<T> residual_vec = vllm_fused_load_residual<T, false>(residual_in + base, col0);
         Vec8<T> residual_vec_out;
 #pragma unroll
         for (int i = 0; i < pack; ++i) {
           float val = to_float<T>(local_vec.val.elem[i]);
           val += to_float<T>(peer_vec.val.elem[i]);
-          val += to_float<T>(residual_vec.val.elem[i]);
+          val = vllm_fused_norm_value<T>(val, to_float<T>(residual_vec.val.elem[i]), raw_out, base + col0 + i);
           sum_float.val.elem[i] = val;
           residual_vec_out.val.elem[i] = from_float<T>(val);
           square_sum += val * val;
@@ -2394,7 +2503,7 @@ custom_all_reduce_residual_rmsnorm_kernel(
 #pragma unroll
         for (int i = 0; i < pack; ++i) {
           const float gamma = to_float<T>(w.val.elem[i]);
-          dst.val.elem[i] = from_float<T>(sum_float.val.elem[i] * inv_rms * gamma);
+          dst.val.elem[i] = vllm_fused_apply_weight<T>(sum_float.val.elem[i] * inv_rms, gamma);
         }
         *(Vec8<T>*)(norm_out + base + col0) = dst;
         if (row + gridDim.x < rows) {
@@ -2410,14 +2519,14 @@ custom_all_reduce_residual_rmsnorm_kernel(
         for (int col0 = tid * pack; col0 < hidden; col0 += blockDim.x * pack) {
           Vec8<T> local_vec = Vec8<T>::load(local + base, col0);
           Vec8<T> peer_vec = Vec8<T>::load(peer + base, col0);
-          Vec8<T> residual_vec = Vec8<T>::load(residual_in + base, col0);
+          Vec8<T> residual_vec = vllm_fused_load_residual<T, false>(residual_in + base, col0);
           Vec8<T> residual_vec_out;
 #pragma unroll
           for (int i = 0; i < pack; ++i) {
             const int col = col0 + i;
             float val = to_float<T>(local_vec.val.elem[i]);
             val += to_float<T>(peer_vec.val.elem[i]);
-            val += to_float<T>(residual_vec.val.elem[i]);
+            val = vllm_fused_norm_value<T>(val, to_float<T>(residual_vec.val.elem[i]), raw_out, base + col0 + i);
             residual_vec_out.val.elem[i] = from_float<T>(val);
             if (cache_float_values) {
               cached[col] = val;
@@ -2442,13 +2551,13 @@ custom_all_reduce_residual_rmsnorm_kernel(
               acc[i] += to_float<T>(x.val.elem[i]);
             }
           }
-          Vec8<T> residual_vec = Vec8<T>::load_byp_slc(residual_in + base, col0);
+          Vec8<T> residual_vec = vllm_fused_load_residual<T, true>(residual_in + base, col0);
           Vec8<T> residual_vec_out;
           Float8 sum_float;
 #pragma unroll
           for (int i = 0; i < pack; ++i) {
             const int col = col0 + i;
-            float val = acc[i] + to_float<T>(residual_vec.val.elem[i]);
+            float val = vllm_fused_norm_value<T>(acc[i], to_float<T>(residual_vec.val.elem[i]), raw_out, base + col0 + i);
             residual_vec_out.val.elem[i] = from_float<T>(val);
             sum_float.val.elem[i] = val;
             if (cache_float_values) {
@@ -2468,7 +2577,7 @@ custom_all_reduce_residual_rmsnorm_kernel(
             const auto* peer = reinterpret_cast<const T*>(data.ptrs[r]);
             ar_sum += to_float(peer[base + col]);
           }
-          const float val = ar_sum + to_float(residual_in[base + col]);
+          const float val = vllm_fused_norm_value<T>(ar_sum, to_float(residual_in[base + col]), raw_out, base + col);
           const T residual_value = from_float<T>(val);
           residual_out[base + col] = residual_value;
           if (cache_float_values) {
@@ -2493,13 +2602,13 @@ custom_all_reduce_residual_rmsnorm_kernel(
             acc[i] += to_float<T>(x.val.elem[i]);
           }
         }
-        Vec8<T> residual_vec = Vec8<T>::load_byp_slc(residual_in + base, col0);
+        Vec8<T> residual_vec = vllm_fused_load_residual<T, true>(residual_in + base, col0);
         Vec8<T> residual_vec_out;
         Float8 sum_float;
 #pragma unroll
         for (int i = 0; i < pack; ++i) {
           const int col = col0 + i;
-          float val = acc[i] + to_float<T>(residual_vec.val.elem[i]);
+          float val = vllm_fused_norm_value<T>(acc[i], to_float<T>(residual_vec.val.elem[i]), raw_out, base + col0 + i);
           residual_vec_out.val.elem[i] = from_float<T>(val);
           sum_float.val.elem[i] = val;
           if (cache_float_values) {
@@ -2531,7 +2640,7 @@ custom_all_reduce_residual_rmsnorm_kernel(
         for (int i = 0; i < pack; ++i) {
           const int col = col0 + i;
           float val = upcast_s(reduced.data[i]);
-          val += upcast_s(residual_packet.data[i]);
+          val = vllm_fused_norm_value<T>(val, upcast_s(residual_packet.data[i]), raw_out, packed_idx * pack + i);
           residual_packet_out.data[i] = downcast_s<T>(val);
           if (cache_float_values) {
             cached[col] = val;
@@ -2554,7 +2663,7 @@ custom_all_reduce_residual_rmsnorm_kernel(
           const auto* peer = reinterpret_cast<const T*>(data.ptrs[r]);
           ar_sum += to_float(peer[base + col]);
         }
-        const float val = ar_sum + to_float(residual_in[base + col]);
+        const float val = vllm_fused_norm_value<T>(ar_sum, to_float(residual_in[base + col]), raw_out, base + col);
         const T residual_value = from_float<T>(val);
         residual_out[base + col] = residual_value;
         if (cache_float_values) {
@@ -2577,12 +2686,12 @@ custom_all_reduce_residual_rmsnorm_kernel(
             acc[i] += to_float<T>(x.val.elem[i]);
           }
         }
-        Vec8<T> residual_vec = Vec8<T>::load_byp_slc(residual_in + base, col0);
+        Vec8<T> residual_vec = vllm_fused_load_residual<T, true>(residual_in + base, col0);
         Vec8<T> residual_vec_out;
 #pragma unroll
         for (int i = 0; i < pack; ++i) {
           const int col = col0 + i;
-          float val = acc[i] + to_float<T>(residual_vec.val.elem[i]);
+          float val = vllm_fused_norm_value<T>(acc[i], to_float<T>(residual_vec.val.elem[i]), raw_out, base + col0 + i);
           residual_vec_out.val.elem[i] = from_float<T>(val);
           if (cache_float_values) {
             cached[col] = val;
@@ -2600,7 +2709,7 @@ custom_all_reduce_residual_rmsnorm_kernel(
           const auto* peer = reinterpret_cast<const T*>(data.ptrs[r]);
           ar_sum += to_float(peer[base + col]);
         }
-        const float val = ar_sum + to_float(residual_in[base + col]);
+        const float val = vllm_fused_norm_value<T>(ar_sum, to_float(residual_in[base + col]), raw_out, base + col);
         const T residual_value = from_float<T>(val);
         residual_out[base + col] = residual_value;
         if (cache_float_values) {
@@ -2637,7 +2746,7 @@ custom_all_reduce_residual_rmsnorm_kernel(
         const int col0 = packed_col << 2;
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
-          vals[i] += upcast_s(residual_src[i]);
+          vals[i] = vllm_fused_norm_value<T>(vals[i], upcast_s(residual_src[i]), raw_out, base + (packed_col << 2) + i);
           dst[i] = downcast_s<T>(vals[i]);
           if (cache_float_values) {
             cached[col0 + i] = vals[i];
@@ -2669,8 +2778,8 @@ custom_all_reduce_residual_rmsnorm_kernel(
         }
         const Vec2 residual_raw = residual2[base2 + packed_col];
         const T* residual_src = reinterpret_cast<const T*>(&residual_raw);
-        vals[0] += upcast_s(residual_src[0]);
-        vals[1] += upcast_s(residual_src[1]);
+        vals[0] = vllm_fused_norm_value<T>(vals[0], upcast_s(residual_src[0]), raw_out, base + (packed_col << 1) + 0);
+        vals[1] = vllm_fused_norm_value<T>(vals[1], upcast_s(residual_src[1]), raw_out, base + (packed_col << 1) + 1);
 
         Vec2 out;
         T* dst = reinterpret_cast<T*>(&out);
@@ -2694,7 +2803,7 @@ custom_all_reduce_residual_rmsnorm_kernel(
           const auto* peer = reinterpret_cast<const T*>(data.ptrs[r]);
           ar_sum += to_float(peer[base + col]);
         }
-        const float val = ar_sum + to_float(residual_in[base + col]);
+        const float val = vllm_fused_norm_value<T>(ar_sum, to_float(residual_in[base + col]), raw_out, base + col);
         const T residual_value = from_float<T>(val);
         residual_out[base + col] = residual_value;
         if (cache_float_values) {
@@ -2736,7 +2845,7 @@ custom_all_reduce_residual_rmsnorm_kernel(
 #pragma unroll
         for (int i = 0; i < pack; ++i) {
           const float gamma = to_float<T>(w.val.elem[i]);
-          dst.val.elem[i] = from_float<T>(sum_float.val.elem[i] * inv_rms * gamma);
+          dst.val.elem[i] = vllm_fused_apply_weight<T>(sum_float.val.elem[i] * inv_rms, gamma);
         }
         *(Vec8<T>*)(norm_out + base + col0) = dst;
       }
@@ -2755,7 +2864,7 @@ custom_all_reduce_residual_rmsnorm_kernel(
           val = to_float(residual_out[base + col]);
         }
         const float gamma = to_float(weight[col]);
-        norm_out[base + col] = from_float<T>(val * inv_rms * gamma);
+        norm_out[base + col] = vllm_fused_apply_weight<T>(val * inv_rms, gamma);
       }
       for (int packed_col = tid; packed_col < aligned_packed_hidden;
            packed_col += blockDim.x) {
@@ -2781,7 +2890,7 @@ custom_all_reduce_residual_rmsnorm_kernel(
 #pragma unroll
         for (int i = 0; i < pack; ++i) {
           const float gamma = to_float<T>(w.val.elem[i]);
-          dst.val.elem[i] = from_float<T>(sum_float.val.elem[i] * inv_rms * gamma);
+          dst.val.elem[i] = vllm_fused_apply_weight<T>(sum_float.val.elem[i] * inv_rms, gamma);
         }
         *(Vec8<T>*)(norm_out + base + col0) = dst;
       }
@@ -2795,7 +2904,7 @@ custom_all_reduce_residual_rmsnorm_kernel(
           val = to_float(residual_out[base + col]);
         }
         const float gamma = to_float(weight[col]);
-        norm_out[base + col] = from_float<T>(val * inv_rms * gamma);
+        norm_out[base + col] = vllm_fused_apply_weight<T>(val * inv_rms, gamma);
       }
     } else if (use_vec4_non8) {
       using Vec4 = int64_t;
@@ -2830,7 +2939,7 @@ custom_all_reduce_residual_rmsnorm_kernel(
         T* dst = reinterpret_cast<T*>(&out);
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
-          dst[i] = downcast_s<T>(vals[i] * inv_rms * upcast_s(weight_src[i]));
+          dst[i] = vllm_fused_apply_weight<T>(vals[i] * inv_rms, upcast_s(weight_src[i]));
         }
         norm_out4[base4 + packed_col] = out;
       }
@@ -2861,8 +2970,8 @@ custom_all_reduce_residual_rmsnorm_kernel(
         const T* weight_src = reinterpret_cast<const T*>(&weight_raw);
         Vec2 out;
         T* dst = reinterpret_cast<T*>(&out);
-        dst[0] = downcast_s<T>(vals[0] * inv_rms * upcast_s(weight_src[0]));
-        dst[1] = downcast_s<T>(vals[1] * inv_rms * upcast_s(weight_src[1]));
+        dst[0] = vllm_fused_apply_weight<T>(vals[0] * inv_rms, upcast_s(weight_src[0]));
+        dst[1] = vllm_fused_apply_weight<T>(vals[1] * inv_rms, upcast_s(weight_src[1]));
         norm_out2[base2 + packed_col] = out;
       }
     } else {
@@ -2876,7 +2985,7 @@ custom_all_reduce_residual_rmsnorm_kernel(
           val = to_float(residual_out[base + col]);
         }
         const float gamma = to_float(weight[col]);
-        norm_out[base + col] = from_float<T>(val * inv_rms * gamma);
+        norm_out[base + col] = vllm_fused_apply_weight<T>(val * inv_rms, gamma);
       }
     }
     if (row + gridDim.x < rows) {
@@ -2896,6 +3005,7 @@ custom_all_reduce_residual_rmsnorm_2stage_kernel(
     const T* __restrict__ residual_in,
     T* __restrict__ residual_out,
     T* __restrict__ norm_out,
+    T* __restrict__ raw_out,
     const T* __restrict__ weight,
     int rank,
     int rows,
@@ -3006,7 +3116,7 @@ custom_all_reduce_residual_rmsnorm_2stage_kernel(
       for (int i = 0; i < pack; ++i) {
         const int col = packed_col * pack + i;
         float val = upcast_s(reduced.data[i]);
-        val += upcast_s(residual_packet.data[i]);
+        val = vllm_fused_norm_value<T>(val, upcast_s(residual_packet.data[i]), raw_out, packed_idx * pack + i);
         T residual_value = downcast_s<T>(val);
         residual_packet_out.data[i] = residual_value;
         if (cache_float_values) {
@@ -3040,7 +3150,7 @@ custom_all_reduce_residual_rmsnorm_2stage_kernel(
           val = upcast_s(residual_out[base + col]);
         }
         const float gamma = upcast_s(weight_packet.data[i]);
-        norm_packet.data[i] = downcast_s<T>(val * inv_rms * gamma);
+        norm_packet.data[i] = vllm_fused_apply_weight<T>(val * inv_rms, gamma);
       }
       norm_out_p[packed_idx] = norm_packet;
     }
@@ -3226,7 +3336,7 @@ custom_all_reduce_residual_sums_direct_kernel(
       const int col0 = packed_col * pack;
       Vec8<T> local_vec = Vec8<T>::load_byp_slc(local + base, col0);
       Vec8<T> peer_vec = Vec8<T>::load_byp_slc(peer + base, col0);
-      Vec8<T> residual_vec = Vec8<T>::load_byp_slc(residual_in + base, col0);
+      Vec8<T> residual_vec = vllm_fused_load_residual<T, true>(residual_in + base, col0);
       Vec8<T> residual_vec_out;
 #pragma unroll
       for (int i = 0; i < pack; ++i) {
@@ -3541,7 +3651,7 @@ custom_all_reduce_residual_2shot_sums_kernel(
 #endif
 #if SGL_CUSTOM_AR_FUSED_RMSNORM_SUMS_BYPASS_LOAD == 1 || \
     SGL_CUSTOM_AR_FUSED_RMSNORM_SUMS_BYPASS_LOAD == 3
-      const Vec8<T> residual_packet = Vec8<T>::load_byp_slc(residual_in, idx * vlen);
+      const Vec8<T> residual_packet = vllm_fused_load_residual<T, true>(residual_in, idx * vlen);
 #else
       const Vec residual_packet = residual[idx];
 #endif
@@ -3597,6 +3707,7 @@ custom_all_reduce_residual_2shot_rmsnorm_row_kernel(
     const T* __restrict__ residual_in,
     T* __restrict__ residual_out,
     T* __restrict__ norm_out,
+    T* __restrict__ raw_out,
     const T* __restrict__ weight,
     int rank,
     int rows,
@@ -3644,9 +3755,63 @@ custom_all_reduce_residual_2shot_rmsnorm_row_kernel(
   } else {
     multi_rank_barrier<nranks, true>(sg, self_sg, rank);
   }
+  if (SGL_CUSTOM_AR_FUSED_RMSNORM_ROW_PUSH && rows == 1 && blockIdx.x == 0 &&
+      blockDim.x >= packed_hidden) {
+    // Push each rank's row into the same slot of every peer's scratch buffer.
+    // The next invocation's entry barrier protects these slots from overwrite.
+    const int packed_col = tid;
+    const Vec *local_input =
+        reinterpret_cast<const Vec *>(data_ptr->ptrs[rank]);
+    if (packed_col < packed_hidden) {
+      const Vec packet = local_input[packed_col];
+#pragma unroll
+      for (int peer = 0; peer < nranks; ++peer) {
+        Vec *peer_scratch = get_tmp_buf<Vec>(sg.signals[peer]);
+        peer_scratch[rank * packed_hidden + packed_col] = packet;
+      }
+    }
+    publish_barrier<nranks>(sg, self_sg, rank);
+
+    float values[vlen] = {0.0f};
+    float square_sum = 0.0f;
+    Vec out;
+    if (packed_col < packed_hidden) {
+      const Vec *local_scratch = get_tmp_buf<Vec>(self_sg);
+#pragma unroll
+      for (int peer = 0; peer < nranks; ++peer) {
+        const Vec packet = local_scratch[peer * packed_hidden + packed_col];
+#pragma unroll
+        for (int i = 0; i < vlen; ++i) {
+          values[i] += upcast_s(reinterpret_cast<const T *>(&packet)[i]);
+        }
+      }
+      const Vec residual_packet =
+          reinterpret_cast<const Vec *>(residual_in)[packed_col];
+#pragma unroll
+      for (int i = 0; i < vlen; ++i) {
+        values[i] = vllm_fused_norm_value<T>(values[i], upcast_s(reinterpret_cast<const T *>(&residual_packet)[i]), raw_out, packed_col * vlen + i);
+        reinterpret_cast<T *>(&out)[i] = downcast_s<T>(values[i]);
+        square_sum += values[i] * values[i];
+      }
+    }
+    const float row_square_sum = block_sum(square_sum, warp_sums);
+    const float scale = fast_rsqrt(row_square_sum * inv_hidden + eps);
+    if (packed_col < packed_hidden) {
+      const Vec w = weight_vec[packed_col];
+      Vec norm_packet;
+#pragma unroll
+      for (int i = 0; i < vlen; ++i) {
+        const float gamma = upcast_s(reinterpret_cast<const T *>(&w)[i]);
+        reinterpret_cast<T *>(&norm_packet)[i] =
+            vllm_fused_apply_weight<T>(values[i] * scale, gamma);
+      }
+      reinterpret_cast<Vec *>(residual_out)[packed_col] = out;
+      reinterpret_cast<Vec *>(norm_out)[packed_col] = norm_packet;
+    }
+    return;
+  }
   if (vlen != packed_t<T>::P::size && (hidden % vlen) == 0 &&
-      blockDim.x >= packed_hidden &&
-      packed_hidden <= kMaxThreadsPerBlock) {
+      blockDim.x >= packed_hidden && packed_hidden <= kMaxThreadsPerBlock) {
     const Vec* residual = reinterpret_cast<const Vec*>(residual_in);
     Vec* residual_dst = reinterpret_cast<Vec*>(residual_out);
     Vec* norm_dst = reinterpret_cast<Vec*>(norm_out);
@@ -3669,7 +3834,7 @@ custom_all_reduce_residual_2shot_rmsnorm_row_kernel(
         const Vec residual_packet = residual[packed_idx];
 #pragma unroll
         for (int i = 0; i < vlen; ++i) {
-          values[i] += upcast_s(reinterpret_cast<const T*>(&residual_packet)[i]);
+          values[i] = vllm_fused_norm_value<T>(values[i], upcast_s(reinterpret_cast<const T*>(&residual_packet)[i]), raw_out, packed_idx * vlen + i);
           reinterpret_cast<T*>(&out)[i] = downcast_s<T>(values[i]);
           square_sum += values[i] * values[i];
         }
@@ -3685,7 +3850,7 @@ custom_all_reduce_residual_2shot_rmsnorm_row_kernel(
         for (int i = 0; i < vlen; ++i) {
           const float gamma = upcast_s(reinterpret_cast<const T*>(&w)[i]);
           reinterpret_cast<T*>(&norm_packet)[i] =
-              downcast_s<T>(values[i] * scale * gamma);
+              vllm_fused_apply_weight<T>(values[i] * scale, gamma);
         }
         residual_dst[packed_idx] = out;
         norm_dst[packed_idx] = norm_packet;
@@ -3721,7 +3886,7 @@ custom_all_reduce_residual_2shot_rmsnorm_row_kernel(
         for (int i = 0; i < vlen; ++i) {
           float val = upcast_s(reinterpret_cast<const T*>(&local0)[i]);
           val += upcast_s(reinterpret_cast<const T*>(&peer0)[i]);
-          val += upcast_s(reinterpret_cast<const T*>(&residual0)[i]);
+          val = vllm_fused_norm_value<T>(val, upcast_s(reinterpret_cast<const T*>(&residual0)[i]), raw_out, packed_idx0 * vlen + i);
           values0[i] = val;
           reinterpret_cast<T*>(&out0)[i] = downcast_s<T>(val);
           square_sum += val * val;
@@ -3735,7 +3900,7 @@ custom_all_reduce_residual_2shot_rmsnorm_row_kernel(
           for (int i = 0; i < vlen; ++i) {
             float val = upcast_s(reinterpret_cast<const T*>(&local1)[i]);
             val += upcast_s(reinterpret_cast<const T*>(&peer1)[i]);
-            val += upcast_s(reinterpret_cast<const T*>(&residual1)[i]);
+            val = vllm_fused_norm_value<T>(val, upcast_s(reinterpret_cast<const T*>(&residual1)[i]), raw_out, packed_idx1 * vlen + i);
             values1[i] = val;
             reinterpret_cast<T*>(&out1)[i] = downcast_s<T>(val);
             square_sum += val * val;
@@ -3753,7 +3918,7 @@ custom_all_reduce_residual_2shot_rmsnorm_row_kernel(
         for (int i = 0; i < vlen; ++i) {
           const float gamma = upcast_s(reinterpret_cast<const T*>(&w0)[i]);
           reinterpret_cast<T*>(&norm0)[i] =
-              downcast_s<T>(values0[i] * scale * gamma);
+              vllm_fused_apply_weight<T>(values0[i] * scale, gamma);
         }
         residual_dst[packed_idx0] = out0;
         norm_dst[packed_idx0] = norm0;
@@ -3767,7 +3932,7 @@ custom_all_reduce_residual_2shot_rmsnorm_row_kernel(
           for (int i = 0; i < vlen; ++i) {
             const float gamma = upcast_s(reinterpret_cast<const T*>(&w1)[i]);
             reinterpret_cast<T*>(&norm1)[i] =
-                downcast_s<T>(values1[i] * scale * gamma);
+                vllm_fused_apply_weight<T>(values1[i] * scale, gamma);
           }
           residual_dst[packed_idx1] = out1;
           norm_dst[packed_idx1] = norm1;
@@ -3777,7 +3942,7 @@ custom_all_reduce_residual_2shot_rmsnorm_row_kernel(
       row_multi_rank_end_barrier<nranks>(sg, self_sg, rank);
       return;
     }
-    if ((hidden == 1536 || hidden == 3072 ||
+    if ((hidden == 1536 || hidden == 2048 || hidden == 3072 ||
          (hidden == 6144 && rows >= 8192)) &&
         (hidden % vlen) == 0 && blockDim.x == packed_hidden) {
       const Vec* local = reinterpret_cast<const Vec*>(data_ptr->ptrs[rank]);
@@ -3797,7 +3962,7 @@ custom_all_reduce_residual_2shot_rmsnorm_row_kernel(
         for (int i = 0; i < vlen; ++i) {
           float val = upcast_s(reinterpret_cast<const T*>(&local_packet)[i]);
           val += upcast_s(reinterpret_cast<const T*>(&peer_packet)[i]);
-          val += upcast_s(reinterpret_cast<const T*>(&residual_packet)[i]);
+          val = vllm_fused_norm_value<T>(val, upcast_s(reinterpret_cast<const T*>(&residual_packet)[i]), raw_out, packed_idx * vlen + i);
           values[i] = val;
           reinterpret_cast<T*>(&out)[i] = downcast_s<T>(val);
           square_sum += val * val;
@@ -3816,7 +3981,7 @@ custom_all_reduce_residual_2shot_rmsnorm_row_kernel(
         for (int i = 0; i < vlen; ++i) {
           const float gamma = upcast_s(reinterpret_cast<const T*>(&w)[i]);
           reinterpret_cast<T*>(&norm_packet)[i] =
-              downcast_s<T>(values[i] * scale * gamma);
+              vllm_fused_apply_weight<T>(values[i] * scale, gamma);
         }
         norm_dst[packed_idx] = norm_packet;
       }
@@ -3867,8 +4032,9 @@ custom_all_reduce_residual_2shot_rmsnorm_row_kernel(
 #pragma unroll
       for (int i = 0; i < vlen; ++i) {
 #if SGL_CUSTOM_AR_FUSED_RMSNORM_TMP_WITH_RESIDUAL
-        const float val =
-            acc[i] + upcast_s(reinterpret_cast<const T*>(&residual_packet)[i]);
+        const float val = vllm_fused_norm_value<T>(
+            acc[i], upcast_s(reinterpret_cast<const T*>(&residual_packet)[i]),
+            raw_out, idx * vlen + i);
         reinterpret_cast<T*>(&res)[i] = downcast_s<T>(val);
 #else
         reinterpret_cast<T*>(&res)[i] = downcast_s<T>(acc[i]);
@@ -3880,7 +4046,8 @@ custom_all_reduce_residual_2shot_rmsnorm_row_kernel(
   } while (idx_base < packed_size);
 
   if constexpr (nranks == 4) {
-    if (hidden == 2048 && rows <= 32) {
+    if ((hidden == 2048 || SGL_CUSTOM_AR_FUSED_RMSNORM_ROW_PEER_PUBLISH) &&
+        rows <= 32) {
       publish_barrier_peer_slots<nranks>(sg, self_sg, rank);
     } else {
       publish_barrier<nranks>(sg, self_sg, rank);
@@ -3894,6 +4061,115 @@ custom_all_reduce_residual_2shot_rmsnorm_row_kernel(
   Vec* norm_dst = reinterpret_cast<Vec*>(norm_out);
 
   if constexpr (nranks == 4 || nranks == 8) {
+    // For non-power-of-two hidden sizes whose CTA covers one packed row,
+    // reduce each row independently.  The strided generic path performs a
+    // block-wide sum over all values assigned to the CTA, which mixes rows
+    // once the launch has fewer CTAs than rows.
+    if (hidden > 2048 && hidden != 4096 &&
+        (hidden != 8192 || rows <= kOneShotMaxToken) &&
+        (packed_hidden & 31) == 0 && blockDim.x == packed_hidden) {
+      const int packed_col = tid;
+      // packed_hidden is a multiple of 32 for this path, so the owner rank
+      // depends only on the packed column, not on the row.  Hoist the signal
+      // lookup out of the row loop to avoid repeating it for long sequences.
+      const int owner_rank = (packed_col >> coalesce_sft) & (nranks - 1);
+      const Vec* owner_tmp = get_tmp_buf<Vec>(sg.signals[owner_rank]);
+      const Vec w = kCacheWeightStatic
+          ? *(reinterpret_cast<const Vec*>(cached_weight) + packed_col)
+          : weight_vec[packed_col];
+      for (int row = blockIdx.x; row < rows; row += gridDim.x) {
+        const int packed_idx = row * packed_hidden + packed_col;
+#if SGL_CUSTOM_AR_FUSED_RMSNORM_SUMS_BYPASS_LOAD == 1 || \
+    SGL_CUSTOM_AR_FUSED_RMSNORM_SUMS_BYPASS_LOAD == 2
+        const Vec8<T> reduced = Vec8<T>::load_byp_slc(
+            reinterpret_cast<const T*>(owner_tmp), packed_idx * vlen);
+#else
+        const Vec reduced = owner_tmp[packed_idx];
+#endif
+#if SGL_CUSTOM_AR_FUSED_RMSNORM_SUMS_BYPASS_LOAD == 1 || \
+    SGL_CUSTOM_AR_FUSED_RMSNORM_SUMS_BYPASS_LOAD == 3
+        const Vec8<T> residual_packet =
+            vllm_fused_load_residual<T, true>(residual_in, packed_idx * vlen);
+#else
+        const Vec residual_packet = residual[packed_idx];
+#endif
+        if constexpr (nranks == 8) {
+          if (rows == 1) {
+            row_multi_rank_end_barrier<nranks>(sg, self_sg, rank);
+          }
+        }
+        float values[vlen] = {0.0f};
+        float square_sum = 0.0f;
+        Vec out;
+#pragma unroll
+        for (int i = 0; i < vlen; ++i) {
+          const float val = vllm_fused_norm_value<T>(
+              upcast_s(reinterpret_cast<const T*>(&reduced)[i]),
+              upcast_s(reinterpret_cast<const T*>(&residual_packet)[i]),
+              raw_out, packed_idx * vlen + i);
+          values[i] = val;
+          reinterpret_cast<T*>(&out)[i] = downcast_s<T>(val);
+          square_sum += val * val;
+        }
+        if constexpr (nranks == 8) {
+          if (rows == 1) {
+            __syncthreads_lm();
+          }
+        }
+        float scale;
+        if constexpr (kSharedInvRms) {
+          scale = row_group_rms_scale_shared(
+              square_sum, warp_sums, &inv_rms, inv_hidden, eps,
+              packed_hidden);
+        } else {
+          float row_square_sum;
+          if (hidden == 2560) {
+            row_square_sum = block_sum_nwarps<10>(square_sum, warp_sums);
+          } else if (hidden == 3072) {
+            row_square_sum = block_sum_12warps(square_sum, warp_sums);
+          } else if (hidden == 3584) {
+            row_square_sum = block_sum_nwarps<14>(square_sum, warp_sums);
+          } else if (hidden == 5120) {
+            row_square_sum = block_sum_nwarps<20>(square_sum, warp_sums);
+          } else if (hidden == 6144) {
+            row_square_sum = block_sum_nwarps<24>(square_sum, warp_sums);
+          } else if (hidden == 7168) {
+            row_square_sum = block_sum_nwarps<28>(square_sum, warp_sums);
+          } else if (hidden == 8192) {
+            row_square_sum = block_sum_nwarps<32>(square_sum, warp_sums);
+          } else {
+            row_square_sum =
+                row_group_sum_all_wide(square_sum, warp_sums, packed_hidden);
+          }
+          if constexpr (kRowWarpInvRms) {
+            scale = lane == 0
+                ? fast_rsqrt(row_square_sum * inv_hidden + eps)
+                : 0.0f;
+            scale = __shfl_sync(0xffffffff, scale, 0, 32);
+          } else {
+            scale = fast_rsqrt(row_square_sum * inv_hidden + eps);
+          }
+        }
+        Vec norm_packet;
+#pragma unroll
+        for (int i = 0; i < vlen; ++i) {
+          const float gamma = upcast_s(reinterpret_cast<const T*>(&w)[i]);
+          reinterpret_cast<T*>(&norm_packet)[i] =
+              vllm_fused_apply_weight<T>(values[i] * scale, gamma);
+        }
+        residual_dst[packed_idx] = out;
+        norm_dst[packed_idx] = norm_packet;
+      }
+      if constexpr (nranks == 8) {
+        if (rows != 1) {
+          row_multi_rank_end_barrier<nranks>(sg, self_sg, rank);
+        }
+      } else {
+        row_multi_rank_end_barrier<nranks>(sg, self_sg, rank);
+      }
+      return;
+    }
+
     if (vlen != packed_t<T>::P::size && (hidden % vlen) == 0 &&
         blockDim.x >= packed_hidden && packed_hidden <= kMaxThreadsPerBlock) {
       const int packed_col = tid;
@@ -3914,7 +4190,7 @@ custom_all_reduce_residual_2shot_rmsnorm_row_kernel(
           for (int i = 0; i < vlen; ++i) {
             float val = upcast_s(reinterpret_cast<const T*>(&reduced)[i]);
 #if !SGL_CUSTOM_AR_FUSED_RMSNORM_TMP_WITH_RESIDUAL
-            val += upcast_s(reinterpret_cast<const T*>(&residual_packet)[i]);
+            val = vllm_fused_norm_value<T>(val, upcast_s(reinterpret_cast<const T*>(&residual_packet)[i]), raw_out, packed_idx * vlen + i);
 #endif
             values[i] = val;
             reinterpret_cast<T*>(&out)[i] = downcast_s<T>(val);
@@ -3933,7 +4209,7 @@ custom_all_reduce_residual_2shot_rmsnorm_row_kernel(
           for (int i = 0; i < vlen; ++i) {
             const float gamma = upcast_s(reinterpret_cast<const T*>(&w)[i]);
             reinterpret_cast<T*>(&norm_packet)[i] =
-                downcast_s<T>(values[i] * scale * gamma);
+                vllm_fused_apply_weight<T>(values[i] * scale, gamma);
           }
           residual_dst[packed_idx] = out;
           norm_dst[packed_idx] = norm_packet;
@@ -3946,7 +4222,7 @@ custom_all_reduce_residual_2shot_rmsnorm_row_kernel(
   }
 
   if (SGL_CUSTOM_AR_FUSED_RMSNORM_SMALL_ROWS &&
-      (hidden == 512 || hidden == 1024 || hidden == 2048) &&
+      (hidden == 512 || hidden == 1024 || hidden == 1536 || hidden == 2048) &&
       blockDim.x == packed_hidden) {
     const int packed_col = tid;
     for (int row = blockIdx.x; row < rows; row += gridDim.x) {
@@ -3959,16 +4235,26 @@ custom_all_reduce_residual_2shot_rmsnorm_row_kernel(
 #if !SGL_CUSTOM_AR_FUSED_RMSNORM_TMP_WITH_RESIDUAL
       const Vec residual_packet = residual[packed_idx];
 #endif
+      if constexpr (nranks == 8) {
+        if (rows == 1) {
+          row_multi_rank_end_barrier<nranks>(sg, self_sg, rank);
+        }
+      }
       Vec out;
 #pragma unroll
       for (int i = 0; i < vlen; ++i) {
         float val = upcast_s(reinterpret_cast<const T*>(&reduced)[i]);
 #if !SGL_CUSTOM_AR_FUSED_RMSNORM_TMP_WITH_RESIDUAL
-        val += upcast_s(reinterpret_cast<const T*>(&residual_packet)[i]);
+        val = vllm_fused_norm_value<T>(val, upcast_s(reinterpret_cast<const T*>(&residual_packet)[i]), raw_out, packed_idx * vlen + i);
 #endif
         values[i] = val;
         reinterpret_cast<T*>(&out)[i] = downcast_s<T>(val);
         square_sum += val * val;
+      }
+      if constexpr (nranks == 8) {
+        if (rows == 1) {
+          __syncthreads_lm();
+        }
       }
       const float scale =
           row_group_rms_scale_shared(square_sum, warp_sums, &inv_rms, inv_hidden,
@@ -3979,13 +4265,19 @@ custom_all_reduce_residual_2shot_rmsnorm_row_kernel(
       for (int i = 0; i < vlen; ++i) {
         const float gamma = upcast_s(reinterpret_cast<const T*>(&w)[i]);
         reinterpret_cast<T*>(&norm_packet)[i] =
-            downcast_s<T>(values[i] * scale * gamma);
+            vllm_fused_apply_weight<T>(values[i] * scale, gamma);
       }
       residual_dst[packed_idx] = out;
       norm_dst[packed_idx] = norm_packet;
     }
 
-    row_multi_rank_end_barrier<nranks>(sg, self_sg, rank);
+    if constexpr (nranks == 8) {
+      if (rows != 1) {
+        row_multi_rank_end_barrier<nranks>(sg, self_sg, rank);
+      }
+    } else {
+      row_multi_rank_end_barrier<nranks>(sg, self_sg, rank);
+    }
     return;
   }
 
@@ -4006,8 +4298,10 @@ custom_all_reduce_residual_2shot_rmsnorm_row_kernel(
       Vec out;
 #pragma unroll
       for (int i = 0; i < vlen; ++i) {
-        const float val = upcast_s(reinterpret_cast<const T*>(&reduced)[i]) +
-                          upcast_s(reinterpret_cast<const T*>(&residual_packet)[i]);
+        const float val = vllm_fused_norm_value<T>(
+                          upcast_s(reinterpret_cast<const T*>(&reduced)[i]),
+                          upcast_s(reinterpret_cast<const T*>(&residual_packet)[i]),
+                          raw_out, packed_idx * vlen + i);
         values[i] = val;
         reinterpret_cast<T*>(&out)[i] = downcast_s<T>(val);
         square_sum += val * val;
@@ -4027,7 +4321,7 @@ custom_all_reduce_residual_2shot_rmsnorm_row_kernel(
       for (int i = 0; i < vlen; ++i) {
         const float gamma = upcast_s(reinterpret_cast<const T*>(&w)[i]);
         reinterpret_cast<T*>(&norm_packet)[i] =
-            downcast_s<T>(values[i] * scale * gamma);
+            vllm_fused_apply_weight<T>(values[i] * scale, gamma);
       }
       norm_dst[packed_idx] = norm_packet;
       return;
@@ -4057,7 +4351,7 @@ custom_all_reduce_residual_2shot_rmsnorm_row_kernel(
         for (int i = 0; i < vlen; ++i) {
           float val = upcast_s(reinterpret_cast<const T*>(&reduced)[i]);
 #if !SGL_CUSTOM_AR_FUSED_RMSNORM_TMP_WITH_RESIDUAL
-          val += upcast_s(reinterpret_cast<const T*>(&residual_packet)[i]);
+          val = vllm_fused_norm_value<T>(val, upcast_s(reinterpret_cast<const T*>(&residual_packet)[i]), raw_out, packed_idx * vlen + i);
 #endif
           values[i] = val;
           reinterpret_cast<T*>(&out)[i] = downcast_s<T>(val);
@@ -4075,7 +4369,7 @@ custom_all_reduce_residual_2shot_rmsnorm_row_kernel(
         for (int i = 0; i < vlen; ++i) {
           const float gamma = upcast_s(reinterpret_cast<const T*>(&w)[i]);
           reinterpret_cast<T*>(&norm_packet)[i] =
-              downcast_s<T>(values[i] * scale * gamma);
+              vllm_fused_apply_weight<T>(values[i] * scale, gamma);
         }
         residual_dst[packed_idx] = out;
         norm_dst[packed_idx] = norm_packet;
@@ -4097,16 +4391,26 @@ custom_all_reduce_residual_2shot_rmsnorm_row_kernel(
 #if !SGL_CUSTOM_AR_FUSED_RMSNORM_TMP_WITH_RESIDUAL
         const Vec residual_packet = residual[packed_idx];
 #endif
+        if constexpr (nranks == 8) {
+          if (rows == 1) {
+            row_multi_rank_end_barrier<nranks>(sg, self_sg, rank);
+          }
+        }
         Vec out;
 #pragma unroll
         for (int i = 0; i < vlen; ++i) {
           float val = upcast_s(reinterpret_cast<const T*>(&reduced)[i]);
 #if !SGL_CUSTOM_AR_FUSED_RMSNORM_TMP_WITH_RESIDUAL
-          val += upcast_s(reinterpret_cast<const T*>(&residual_packet)[i]);
+          val = vllm_fused_norm_value<T>(val, upcast_s(reinterpret_cast<const T*>(&residual_packet)[i]), raw_out, packed_idx * vlen + i);
 #endif
           values[i] = val;
           reinterpret_cast<T*>(&out)[i] = downcast_s<T>(val);
           square_sum += val * val;
+        }
+        if constexpr (nranks == 8) {
+          if (rows == 1) {
+            __syncthreads_lm();
+          }
         }
         const float row_square_sum =
             hidden == 3072 ? block_sum_12warps(square_sum, warp_sums)
@@ -4121,13 +4425,19 @@ custom_all_reduce_residual_2shot_rmsnorm_row_kernel(
         for (int i = 0; i < vlen; ++i) {
           const float gamma = upcast_s(reinterpret_cast<const T*>(&w)[i]);
           reinterpret_cast<T*>(&norm_packet)[i] =
-              downcast_s<T>(values[i] * scale * gamma);
+              vllm_fused_apply_weight<T>(values[i] * scale, gamma);
         }
         residual_dst[packed_idx] = out;
         norm_dst[packed_idx] = norm_packet;
       }
 
-      row_multi_rank_end_barrier<nranks>(sg, self_sg, rank);
+      if constexpr (nranks == 8) {
+        if (rows != 1) {
+          row_multi_rank_end_barrier<nranks>(sg, self_sg, rank);
+        }
+      } else {
+        row_multi_rank_end_barrier<nranks>(sg, self_sg, rank);
+      }
       return;
   }
 
@@ -4149,13 +4459,19 @@ custom_all_reduce_residual_2shot_rmsnorm_row_kernel(
           for (int i = 0; i < vlen; ++i) {
             float val = upcast_s(reinterpret_cast<const T*>(&reduced)[i]);
 #if !SGL_CUSTOM_AR_FUSED_RMSNORM_TMP_WITH_RESIDUAL
-            val += upcast_s(reinterpret_cast<const T*>(&residual_packet)[i]);
+            val = vllm_fused_norm_value<T>(val, upcast_s(reinterpret_cast<const T*>(&residual_packet)[i]), raw_out, packed_idx * vlen + i);
 #endif
             values[i] = val;
             reinterpret_cast<T*>(&out)[i] = downcast_s<T>(val);
             square_sum += val * val;
           }
           residual_dst[packed_idx] = out;
+        }
+        if constexpr (nranks == 8) {
+          if (rows == 1) {
+            row_multi_rank_end_barrier<nranks>(sg, self_sg, rank);
+            __syncthreads_lm();
+          }
         }
         const float row_square_sum =
             hidden == 4096
@@ -4174,13 +4490,19 @@ custom_all_reduce_residual_2shot_rmsnorm_row_kernel(
           for (int i = 0; i < vlen; ++i) {
             const float gamma = upcast_s(reinterpret_cast<const T*>(&w)[i]);
             reinterpret_cast<T*>(&norm_packet)[i] =
-                downcast_s<T>(values[i] * scale * gamma);
+                vllm_fused_apply_weight<T>(values[i] * scale, gamma);
           }
           norm_dst[packed_idx] = norm_packet;
         }
       }
 
-      row_multi_rank_end_barrier<nranks>(sg, self_sg, rank);
+      if constexpr (nranks == 8) {
+        if (rows != 1) {
+          row_multi_rank_end_barrier<nranks>(sg, self_sg, rank);
+        }
+      } else {
+        row_multi_rank_end_barrier<nranks>(sg, self_sg, rank);
+      }
       return;
     }
   }
@@ -4202,7 +4524,7 @@ custom_all_reduce_residual_2shot_rmsnorm_row_kernel(
 #if !SGL_CUSTOM_AR_FUSED_RMSNORM_TMP_WITH_RESIDUAL
 #if SGL_CUSTOM_AR_FUSED_RMSNORM_SUMS_BYPASS_LOAD == 1 || \
     SGL_CUSTOM_AR_FUSED_RMSNORM_SUMS_BYPASS_LOAD == 3
-      const Vec8<T> residual_packet = Vec8<T>::load_byp_slc(residual_in, idx * vlen);
+      const Vec8<T> residual_packet = vllm_fused_load_residual<T, true>(residual_in, idx * vlen);
 #else
       const Vec residual_packet = residual[idx];
 #endif
@@ -4220,16 +4542,16 @@ custom_all_reduce_residual_2shot_rmsnorm_row_kernel(
 #else
 #if SGL_CUSTOM_AR_FUSED_RMSNORM_SUMS_BYPASS_LOAD == 1
         float val = upcast_s(reinterpret_cast<const T*>(&reduced)[i]);
-        val += upcast_s(reinterpret_cast<const T*>(&residual_packet)[i]);
+        val = vllm_fused_norm_value<T>(val, upcast_s(reinterpret_cast<const T*>(&residual_packet)[i]), raw_out, idx * vlen + i);
 #elif SGL_CUSTOM_AR_FUSED_RMSNORM_SUMS_BYPASS_LOAD == 2
         float val = upcast_s(reinterpret_cast<const T*>(&reduced)[i]);
-        val += upcast_s(reinterpret_cast<const T*>(&residual_packet)[i]);
+        val = vllm_fused_norm_value<T>(val, upcast_s(reinterpret_cast<const T*>(&residual_packet)[i]), raw_out, idx * vlen + i);
 #elif SGL_CUSTOM_AR_FUSED_RMSNORM_SUMS_BYPASS_LOAD == 3
         float val = upcast_s(reinterpret_cast<const T*>(&reduced)[i]);
-        val += upcast_s(reinterpret_cast<const T*>(&residual_packet)[i]);
+        val = vllm_fused_norm_value<T>(val, upcast_s(reinterpret_cast<const T*>(&residual_packet)[i]), raw_out, idx * vlen + i);
 #else
         float val = upcast_s(reinterpret_cast<const T*>(&reduced)[i]);
-        val += upcast_s(reinterpret_cast<const T*>(&residual_packet)[i]);
+        val = vllm_fused_norm_value<T>(val, upcast_s(reinterpret_cast<const T*>(&residual_packet)[i]), raw_out, idx * vlen + i);
 #endif
 #endif
         values[i] = val;
@@ -4264,7 +4586,7 @@ custom_all_reduce_residual_2shot_rmsnorm_row_kernel(
       for (int i = 0; i < vlen; ++i) {
         const float gamma = upcast_s(reinterpret_cast<const T*>(&w)[i]);
         reinterpret_cast<T*>(&norm_packet)[i] =
-            downcast_s<T>(values[i] * scale * gamma);
+            vllm_fused_apply_weight<T>(values[i] * scale, gamma);
       }
       norm_dst[idx] = norm_packet;
     }
@@ -4282,6 +4604,7 @@ void launch_fused_ar_rmsnorm(
     const T* residual_in,
     T* residual_out,
     T* norm_out,
+    T* raw_out,
     const T* weight,
     int rank,
     int rows,
@@ -4321,7 +4644,7 @@ void launch_fused_ar_rmsnorm(
     if (packed_size64 <= static_cast<int64_t>(std::numeric_limits<int32_t>::max())) {
       custom_all_reduce_residual_rmsnorm_2stage_kernel<T, nranks>
           <<<blocks, threads, smem_bytes, stream>>>(
-              data_ptr, sg, self_sg, residual_in, residual_out, norm_out, weight,
+              data_ptr, sg, self_sg, residual_in, residual_out, norm_out, raw_out, weight,
               rank, rows, hidden, eps, static_cast<int>(packed_size64));
       return;
     }
@@ -4329,7 +4652,7 @@ void launch_fused_ar_rmsnorm(
 #endif
   custom_all_reduce_residual_rmsnorm_kernel<T, nranks>
       <<<blocks, threads, smem_bytes, stream>>>(
-          data_ptr, sg, self_sg, residual_in, residual_out, norm_out, weight,
+          data_ptr, sg, self_sg, residual_in, residual_out, norm_out, raw_out, weight,
           rank, rows, hidden, eps);
 }
 
@@ -4505,6 +4828,7 @@ bool launch_residual_ar_rmsnorm_row_vlen(
     const T* residual_in,
     T* residual_out,
     T* norm_out,
+    T* raw_out,
     const T* weight,
     int rank,
     int rows,
@@ -4521,7 +4845,7 @@ bool launch_residual_ar_rmsnorm_row_vlen(
   const int packed_hidden = hidden / pack;
   const bool use_direct_512 =
       hidden == 4096 || (nranks == 2 && hidden == 6144) ||
-      ((nranks == 4 || nranks == 8) &&
+       ((nranks == 4 || nranks == 8) &&
        (hidden == 1536 || hidden == 3072) &&
        !(hidden == 1536 && rows <= 128));
   const int threads =
@@ -4584,17 +4908,17 @@ bool launch_residual_ar_rmsnorm_row_vlen(
   if (cache_weight) {
     custom_all_reduce_residual_2shot_rmsnorm_row_kernel<T, nranks, true, true, vlen>
         <<<blocks, threads, smem_bytes, stream>>>(
-            data_ptr, sg, self_sg, residual_in, residual_out, norm_out, weight,
+            data_ptr, sg, self_sg, residual_in, residual_out, norm_out, raw_out, weight,
             rank, rows, hidden, eps, packed_size);
   } else if constexpr (kRowSharedInvRms) {
     custom_all_reduce_residual_2shot_rmsnorm_row_kernel<T, nranks, true, false, vlen>
         <<<blocks, threads, smem_bytes, stream>>>(
-            data_ptr, sg, self_sg, residual_in, residual_out, norm_out, weight,
+            data_ptr, sg, self_sg, residual_in, residual_out, norm_out, raw_out, weight,
             rank, rows, hidden, eps, packed_size);
   } else {
     custom_all_reduce_residual_2shot_rmsnorm_row_kernel<T, nranks, false, false, vlen>
         <<<blocks, threads, smem_bytes, stream>>>(
-            data_ptr, sg, self_sg, residual_in, residual_out, norm_out, weight,
+            data_ptr, sg, self_sg, residual_in, residual_out, norm_out, raw_out, weight,
             rank, rows, hidden, eps, packed_size);
   }
   return true;
@@ -4608,6 +4932,7 @@ bool launch_residual_ar_rmsnorm_row(
     const T* residual_in,
     T* residual_out,
     T* norm_out,
+    T* raw_out,
     const T* weight,
     int rank,
     int rows,
@@ -4616,7 +4941,7 @@ bool launch_residual_ar_rmsnorm_row(
     musaStream_t stream) {
   if ((hidden % 8) == 0) {
     return launch_residual_ar_rmsnorm_row_vlen<T, nranks, 8>(
-        data_ptr, sg, self_sg, residual_in, residual_out, norm_out, weight, rank,
+        data_ptr, sg, self_sg, residual_in, residual_out, norm_out, raw_out, weight, rank,
         rows, hidden, eps, stream);
   }
   return false;
@@ -4630,6 +4955,7 @@ void dispatch_world_size(
     const T* residual_in,
     T* residual_out,
     T* norm_out,
+    T* raw_out,
     const T* weight,
     int rank,
     int world_size,
@@ -4640,22 +4966,22 @@ void dispatch_world_size(
   switch (world_size) {
     case 2:
       launch_fused_ar_rmsnorm<T, 2>(
-          data_ptr, sg, self_sg, residual_in, residual_out, norm_out,
+          data_ptr, sg, self_sg, residual_in, residual_out, norm_out, raw_out,
           weight, rank, rows, hidden, eps, stream);
       break;
     case 4:
       launch_fused_ar_rmsnorm<T, 4>(
-          data_ptr, sg, self_sg, residual_in, residual_out, norm_out,
+          data_ptr, sg, self_sg, residual_in, residual_out, norm_out, raw_out,
           weight, rank, rows, hidden, eps, stream);
       break;
     case 6:
       launch_fused_ar_rmsnorm<T, 6>(
-          data_ptr, sg, self_sg, residual_in, residual_out, norm_out,
+          data_ptr, sg, self_sg, residual_in, residual_out, norm_out, raw_out,
           weight, rank, rows, hidden, eps, stream);
       break;
     case 8:
       launch_fused_ar_rmsnorm<T, 8>(
-          data_ptr, sg, self_sg, residual_in, residual_out, norm_out,
+          data_ptr, sg, self_sg, residual_in, residual_out, norm_out, raw_out,
           weight, rank, rows, hidden, eps, stream);
       break;
     default:
@@ -4740,6 +5066,7 @@ bool dispatch_residual_rmsnorm_row_world_size(
     const T* residual_in,
     T* residual_out,
     T* norm_out,
+    T* raw_out,
     const T* weight,
     int rank,
     int world_size,
@@ -4750,15 +5077,15 @@ bool dispatch_residual_rmsnorm_row_world_size(
   switch (world_size) {
     case 2:
       return launch_residual_ar_rmsnorm_row<T, 2>(
-          data_ptr, sg, self_sg, residual_in, residual_out, norm_out, weight, rank,
+          data_ptr, sg, self_sg, residual_in, residual_out, norm_out, raw_out, weight, rank,
           rows, hidden, eps, stream);
     case 4:
       return launch_residual_ar_rmsnorm_row<T, 4>(
-          data_ptr, sg, self_sg, residual_in, residual_out, norm_out, weight, rank,
+          data_ptr, sg, self_sg, residual_in, residual_out, norm_out, raw_out, weight, rank,
           rows, hidden, eps, stream);
     case 8:
       return launch_residual_ar_rmsnorm_row<T, 8>(
-          data_ptr, sg, self_sg, residual_in, residual_out, norm_out, weight, rank,
+          data_ptr, sg, self_sg, residual_in, residual_out, norm_out, raw_out, weight, rank,
           rows, hidden, eps, stream);
     default:
       return false;
@@ -4774,6 +5101,7 @@ void sgl_musa_custom_ar_fused_allreduce_rmsnorm_unregistered(
     ffi::TensorView norm_out,
     ffi::TensorView residual_in,
     ffi::TensorView residual_out,
+    ffi::TensorView raw_out,
     ffi::TensorView weight,
     int64_t self_signal_ptr,
     int64_t self_buffer_ptr,
@@ -4786,6 +5114,15 @@ void sgl_musa_custom_ar_fused_allreduce_rmsnorm_unregistered(
   CHECK_MUSA_CONTIGUOUS(residual_in);
   CHECK_MUSA_CONTIGUOUS(residual_out);
   CHECK_MUSA_CONTIGUOUS(weight);
+#if VLLM_MUSA_FUSED_WRITE_RAW
+  CHECK_MUSA_CONTIGUOUS(raw_out);
+  CHECK_CONTIGUOUS_2D(raw_out);
+  TVM_FFI_ICHECK_EQ(raw_out.device().device_type, norm_out.device().device_type);
+  TVM_FFI_ICHECK_EQ(raw_out.size(0), norm_out.size(0));
+  TVM_FFI_ICHECK_EQ(raw_out.size(1), norm_out.size(1));
+  TVM_FFI_ICHECK(dtype_equal(raw_out.dtype(), norm_out.dtype()));
+  TVM_FFI_ICHECK_EQ(raw_out.device().device_id, norm_out.device().device_id);
+#endif
   CHECK_CONTIGUOUS_2D(inp);
   CHECK_CONTIGUOUS_2D(norm_out);
   CHECK_CONTIGUOUS_2D(residual_in);
@@ -4844,6 +5181,7 @@ void sgl_musa_custom_ar_fused_allreduce_rmsnorm_unregistered(
         static_cast<const half*>(residual_in.data_ptr()),
         static_cast<half*>(residual_out.data_ptr()),
         static_cast<half*>(norm_out.data_ptr()),
+        static_cast<half*>(raw_out.data_ptr()),
         static_cast<const half*>(weight.data_ptr()),
         static_cast<int>(rank), static_cast<int>(world_size),
         rows, hidden, eps, stream);
@@ -4853,6 +5191,7 @@ void sgl_musa_custom_ar_fused_allreduce_rmsnorm_unregistered(
         static_cast<const __mt_bfloat16*>(residual_in.data_ptr()),
         static_cast<__mt_bfloat16*>(residual_out.data_ptr()),
         static_cast<__mt_bfloat16*>(norm_out.data_ptr()),
+        static_cast<__mt_bfloat16*>(raw_out.data_ptr()),
         static_cast<const __mt_bfloat16*>(weight.data_ptr()),
         static_cast<int>(rank), static_cast<int>(world_size),
         rows, hidden, eps, stream);
@@ -4870,6 +5209,7 @@ void sgl_musa_custom_ar_fused_allreduce_rmsnorm_registered(
     ffi::TensorView residual_in,
     ffi::TensorView residual_out,
     ffi::TensorView norm_out,
+    ffi::TensorView raw_out,
     ffi::TensorView weight,
     int64_t self_signal_ptr,
     int64_t rank,
@@ -4879,6 +5219,15 @@ void sgl_musa_custom_ar_fused_allreduce_rmsnorm_registered(
   CHECK_MUSA_CONTIGUOUS(residual_out);
   CHECK_MUSA_CONTIGUOUS(norm_out);
   CHECK_MUSA_CONTIGUOUS(weight);
+#if VLLM_MUSA_FUSED_WRITE_RAW
+  CHECK_MUSA_CONTIGUOUS(raw_out);
+  CHECK_CONTIGUOUS_2D(raw_out);
+  TVM_FFI_ICHECK_EQ(raw_out.device().device_type, norm_out.device().device_type);
+  TVM_FFI_ICHECK_EQ(raw_out.size(0), norm_out.size(0));
+  TVM_FFI_ICHECK_EQ(raw_out.size(1), norm_out.size(1));
+  TVM_FFI_ICHECK(dtype_equal(raw_out.dtype(), norm_out.dtype()));
+  TVM_FFI_ICHECK_EQ(raw_out.device().device_id, norm_out.device().device_id);
+#endif
   CHECK_CONTIGUOUS_2D(residual_in);
   CHECK_CONTIGUOUS_2D(residual_out);
   CHECK_CONTIGUOUS_2D(norm_out);
@@ -4926,6 +5275,7 @@ void sgl_musa_custom_ar_fused_allreduce_rmsnorm_registered(
         static_cast<const half*>(residual_in.data_ptr()),
         static_cast<half*>(residual_out.data_ptr()),
         static_cast<half*>(norm_out.data_ptr()),
+        static_cast<half*>(raw_out.data_ptr()),
         static_cast<const half*>(weight.data_ptr()), static_cast<int>(rank),
         static_cast<int>(world_size), rows, hidden, eps, stream);
   } else if (dtype_equal(residual_in.dtype(), dl_bfloat16)) {
@@ -4934,6 +5284,7 @@ void sgl_musa_custom_ar_fused_allreduce_rmsnorm_registered(
         static_cast<const __mt_bfloat16*>(residual_in.data_ptr()),
         static_cast<__mt_bfloat16*>(residual_out.data_ptr()),
         static_cast<__mt_bfloat16*>(norm_out.data_ptr()),
+        static_cast<__mt_bfloat16*>(raw_out.data_ptr()),
         static_cast<const __mt_bfloat16*>(weight.data_ptr()),
         static_cast<int>(rank), static_cast<int>(world_size), rows, hidden, eps,
         stream);
@@ -4953,6 +5304,7 @@ void sgl_musa_custom_ar_fused_allreduce_rmsnorm_row_unregistered(
     ffi::TensorView residual_in,
     ffi::TensorView residual_out,
     ffi::TensorView norm_out,
+    ffi::TensorView raw_out,
     ffi::TensorView weight,
     int64_t self_signal_ptr,
     int64_t self_buffer_ptr,
@@ -4966,6 +5318,15 @@ void sgl_musa_custom_ar_fused_allreduce_rmsnorm_row_unregistered(
   CHECK_MUSA_CONTIGUOUS(residual_out);
   CHECK_MUSA_CONTIGUOUS(norm_out);
   CHECK_MUSA_CONTIGUOUS(weight);
+#if VLLM_MUSA_FUSED_WRITE_RAW
+  CHECK_MUSA_CONTIGUOUS(raw_out);
+  CHECK_CONTIGUOUS_2D(raw_out);
+  TVM_FFI_ICHECK_EQ(raw_out.device().device_type, norm_out.device().device_type);
+  TVM_FFI_ICHECK_EQ(raw_out.size(0), norm_out.size(0));
+  TVM_FFI_ICHECK_EQ(raw_out.size(1), norm_out.size(1));
+  TVM_FFI_ICHECK(dtype_equal(raw_out.dtype(), norm_out.dtype()));
+  TVM_FFI_ICHECK_EQ(raw_out.device().device_id, norm_out.device().device_id);
+#endif
   CHECK_CONTIGUOUS_2D(inp);
   CHECK_CONTIGUOUS_2D(residual_in);
   CHECK_CONTIGUOUS_2D(residual_out);
@@ -5032,6 +5393,7 @@ void sgl_musa_custom_ar_fused_allreduce_rmsnorm_row_unregistered(
         static_cast<const half*>(residual_in.data_ptr()),
         static_cast<half*>(residual_out.data_ptr()),
         static_cast<half*>(norm_out.data_ptr()),
+        static_cast<half*>(raw_out.data_ptr()),
         static_cast<const half*>(weight.data_ptr()), rank, world_size, rows,
         hidden, static_cast<float>(eps), stream);
   } else if (dtype_equal(inp.dtype(), dl_bfloat16)) {
@@ -5040,6 +5402,7 @@ void sgl_musa_custom_ar_fused_allreduce_rmsnorm_row_unregistered(
         static_cast<const __mt_bfloat16*>(residual_in.data_ptr()),
         static_cast<__mt_bfloat16*>(residual_out.data_ptr()),
         static_cast<__mt_bfloat16*>(norm_out.data_ptr()),
+        static_cast<__mt_bfloat16*>(raw_out.data_ptr()),
         static_cast<const __mt_bfloat16*>(weight.data_ptr()), rank, world_size,
         rows, hidden, static_cast<float>(eps), stream);
   } else {
@@ -5057,6 +5420,7 @@ void sgl_musa_custom_ar_fused_allreduce_rmsnorm_row_registered(
     ffi::TensorView residual_in,
     ffi::TensorView residual_out,
     ffi::TensorView norm_out,
+    ffi::TensorView raw_out,
     ffi::TensorView weight,
     int64_t self_signal_ptr,
     int rank,
@@ -5067,6 +5431,15 @@ void sgl_musa_custom_ar_fused_allreduce_rmsnorm_row_registered(
   CHECK_MUSA_CONTIGUOUS(residual_out);
   CHECK_MUSA_CONTIGUOUS(norm_out);
   CHECK_MUSA_CONTIGUOUS(weight);
+#if VLLM_MUSA_FUSED_WRITE_RAW
+  CHECK_MUSA_CONTIGUOUS(raw_out);
+  CHECK_CONTIGUOUS_2D(raw_out);
+  TVM_FFI_ICHECK_EQ(raw_out.device().device_type, norm_out.device().device_type);
+  TVM_FFI_ICHECK_EQ(raw_out.size(0), norm_out.size(0));
+  TVM_FFI_ICHECK_EQ(raw_out.size(1), norm_out.size(1));
+  TVM_FFI_ICHECK(dtype_equal(raw_out.dtype(), norm_out.dtype()));
+  TVM_FFI_ICHECK_EQ(raw_out.device().device_id, norm_out.device().device_id);
+#endif
   CHECK_CONTIGUOUS_2D(residual_in);
   CHECK_CONTIGUOUS_2D(residual_out);
   CHECK_CONTIGUOUS_2D(norm_out);
@@ -5110,6 +5483,7 @@ void sgl_musa_custom_ar_fused_allreduce_rmsnorm_row_registered(
         static_cast<const half*>(residual_in.data_ptr()),
         static_cast<half*>(residual_out.data_ptr()),
         static_cast<half*>(norm_out.data_ptr()),
+        static_cast<half*>(raw_out.data_ptr()),
         static_cast<const half*>(weight.data_ptr()), rank, world_size, rows,
         hidden, static_cast<float>(eps), stream);
   } else if (dtype_equal(residual_in.dtype(), dl_bfloat16)) {
@@ -5118,6 +5492,7 @@ void sgl_musa_custom_ar_fused_allreduce_rmsnorm_row_registered(
         static_cast<const __mt_bfloat16*>(residual_in.data_ptr()),
         static_cast<__mt_bfloat16*>(residual_out.data_ptr()),
         static_cast<__mt_bfloat16*>(norm_out.data_ptr()),
+        static_cast<__mt_bfloat16*>(raw_out.data_ptr()),
         static_cast<const __mt_bfloat16*>(weight.data_ptr()), rank, world_size,
         rows, hidden, static_cast<float>(eps), stream);
   } else {

@@ -61,23 +61,29 @@ def jit(monkeypatch):
 
 
 @pytest.mark.parametrize("row,registered", [(False, False), (False, True), (True, False), (True, True)])
-def test_fixed_abi_routes_all_four_source_entries(jit, row, registered):
+@pytest.mark.parametrize("has_residual,need_raw", [(True, False), (True, True), (False, True)])
+def test_fixed_abi_routes_all_four_source_entries(jit, row, registered, has_residual, need_raw):
     module, _, builds, calls = jit
     launcher = module.v2_fused_allreduce_rmsnorm_func(
         4, 2048, 1, mp_count=60, row_kernel=row, graph_rank_data=registered,
+        has_residual=has_residual, need_raw=need_raw,
     )
     tensors = [object() for _ in range(7)]
     rd, sg, inp, residual, rout, norm, weight = tensors
-    launcher(rd, sg, inp, residual, rout, norm, weight, None, 11, 12, 1024, 0, 4, 1e-5)
+    raw = object() if need_raw else None
+    launcher(rd, sg, inp, residual if has_residual else None, rout, norm, weight, raw,
+             11, 12, 1024, 0, 4, 1e-5)
+    residual_arg = residual if has_residual else inp
+    raw_arg = raw if need_raw else norm
     suffix = ("row_" if row else "") + ("registered" if registered else "unregistered")
     symbol, args = calls.pop()
     assert symbol.endswith(suffix)
     if registered:
-        expected = (rd, sg, residual, rout, norm, weight, 11, 0, 4)
+        expected = (rd, sg, residual_arg, rout, norm, raw_arg, weight, 11, 0, 4)
     elif row:
-        expected = (rd, sg, inp, residual, rout, norm, weight, 11, 12, 1024, 0, 4)
+        expected = (rd, sg, inp, residual_arg, rout, norm, raw_arg, weight, 11, 12, 1024, 0, 4)
     else:
-        expected = (rd, sg, inp, norm, residual, rout, weight, 11, 12, 1024, 0, 4)
+        expected = (rd, sg, inp, norm, residual_arg, rout, raw_arg, weight, 11, 12, 1024, 0, 4)
     assert args == expected + ((2048,) if row else ()) + (1e-5,)
     assert builds[0][1] == ("distributed/custom_all_reduce_v2.mu",)
     assert "-DSGL_CUSTOM_AR_FUSED_RMSNORM=1" in builds[0][2]
@@ -88,8 +94,8 @@ def test_fixed_abi_routes_all_four_source_entries(jit, row, registered):
 
 def test_policy_launch_fields_reach_compiler(jit):
     module, _, builds, _ = jit
-    cfg = module.v2_fused_compile_config(4, 2048, 1, mp_count=60)
-    module.v2_fused_allreduce_rmsnorm_func(4, 2048, 1, mp_count=60)
+    launcher = module.v2_fused_allreduce_rmsnorm_func(4, 2048, 1, mp_count=60)
+    cfg = launcher.launch_config
     flags = builds[0][2]
     assert f"-DSGL_CUSTOM_AR_THREADS={cfg.threads}" in flags
     assert f"-DSGL_CUSTOM_AR_BLOCKS={cfg.blocks}" in flags
@@ -116,12 +122,36 @@ def test_complete_effective_config_changes_memory_and_disk_cache(jit, monkeypatc
     assert len(builds) == 4 and builds[2][0] != builds[3][0]
 
 
-@pytest.mark.parametrize("options", [{"need_raw": True}, {"has_residual": False}])
-def test_unsupported_output_abi_fails_before_compile(jit, options):
-    module, _, builds, _ = jit
-    with pytest.raises(NotImplementedError, match="explicit kernel output support"):
-        module.v2_fused_allreduce_rmsnorm_func(4, 2048, 1, mp_count=60, **options)
-    assert not builds
+def test_native_fused_add_preserves_fp32_residual_in_final_compile_config(jit):
+    module, _, _, _ = jit
+    launcher = module.v2_fused_allreduce_rmsnorm_func(2, 5120, 1024, mp_count=60)
+    assert launcher.launch_config.cache_hidden_limit >= 5120
+    assert launcher.launch_config.typed_cache_hidden_limit == 0
+    assert launcher.launch_config.tmp_with_residual == 0
+
+
+def test_raw_output_retains_pre_residual_scratch(jit, monkeypatch):
+    module, _, builds, calls = jit
+    cfg = module.v2_fused_compile_config(4, 2048, 1, mp_count=60)
+    cfg = replace(cfg, tmp_with_residual=1)
+    monkeypatch.setattr(module, "v2_fused_compile_config", lambda *args, **kwargs: cfg)
+    launcher = module.v2_fused_allreduce_rmsnorm_func(4, 2048, 1, mp_count=60, need_raw=True)
+    assert launcher.launch_config.tmp_with_residual == 0
+    assert "-DSGL_CUSTOM_AR_FUSED_RMSNORM_TMP_WITH_RESIDUAL=0" in builds[0][2]
+    assert "-DVLLM_MUSA_FUSED_WRITE_RAW=1" in builds[0][2]
+    assert not calls
+
+
+def test_output_contract_changes_compiled_module_and_rejects_mismatch(jit):
+    module, _, builds, calls = jit
+    factory = module.v2_fused_allreduce_rmsnorm_func
+    for residual, raw in ((True, False), (True, True), (False, True)):
+        factory(4, 2048, 1, mp_count=60, need_raw=raw, has_residual=residual)
+    assert len({build[0] for build in builds}) == 3
+    launcher = factory(4, 2048, 1, mp_count=60, need_raw=True)
+    with pytest.raises(ValueError, match="compiled residual/raw contract"):
+        launcher(*[object() for _ in range(7)], None, 1, 2, 3, 0, 4, 1e-5)
+    assert not calls
 
 
 def test_pure_v2_does_not_select_fused_translation_unit(jit):
