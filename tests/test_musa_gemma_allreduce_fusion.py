@@ -15,6 +15,18 @@ from torch._higher_order_ops.auto_functionalize import auto_functionalized
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 
 PASS = Path(__file__).parents[1] / "vllm_musa/_inductor/musa_allreduce_rms_fusion.py"
+BINDINGS = Path(__file__).parents[1] / "vllm_musa/fused_allreduce_rmsnorm_ops.py"
+
+
+def _production_bindings() -> dict[str, Any]:
+    tree = ast.parse(BINDINGS.read_text())
+    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
+    namespace = {"torch": torch}
+    exec(
+        compile(ast.Module(body=functions, type_ignores=[]), str(BINDINGS), "exec"),
+        namespace,
+    )
+    return namespace
 
 
 def _norm(
@@ -42,13 +54,14 @@ def ops() -> Any:
     library.define(
         "musa_csrc_fused_add_rmsnorm(Tensor(a!) input, Tensor(b!) residual, Tensor weight, float eps, bool gemma=False) -> ()"
     )
-    for name, returns in (
-        ("musa_fused_allreduce_residual_rms_norm", "(Tensor, Tensor, Tensor)"),
-        ("musa_fused_allreduce_residual_rms_norm_no_raw", "(Tensor, Tensor)"),
-    ):
-        library.define(
-            f"{name}(Tensor input, Tensor residual, Tensor weight, float eps, int comm_id, bool gemma=False) -> {returns}"
-        )
+    bindings = _production_bindings()
+    names = (
+        "musa_fused_allreduce_residual_rms_norm",
+        "musa_fused_allreduce_residual_rms_norm_no_raw",
+    )
+    for name in names:
+        schema = torch.library.infer_schema(bindings[f"_{name}_impl"], mutates_args=())
+        library.define(name + schema)
 
     def inplace(
         input: torch.Tensor,
@@ -74,23 +87,18 @@ def ops() -> Any:
 
     library.impl("musa_jit_custom_all_reduce", lambda x, comm_id: x * 2, "CPU")
     library.impl("musa_csrc_fused_add_rmsnorm", inplace, "CPU")
-    library.impl("musa_fused_allreduce_residual_rms_norm", fused, "CPU")
-    library.impl(
-        "musa_fused_allreduce_residual_rms_norm_no_raw",
-        lambda *a, **k: fused(*a, **k)[:2],
-        "CPU",
+    comm = SimpleNamespace(
+        fused_allreduce_residual_rmsnorm=lambda *a, **k: fused(*a, comm_id=0, **k),
+        fused_allreduce_residual_rmsnorm_no_raw=lambda *a, **k: fused(
+            *a, comm_id=0, **k
+        )[:2],
     )
-    for name, count in (
-        ("musa_fused_allreduce_residual_rms_norm", 3),
-        ("musa_fused_allreduce_residual_rms_norm_no_raw", 2),
-    ):
-
-        def fake(
-            input: torch.Tensor, *args: Any, count: int = count, **kwargs: Any
-        ) -> tuple[torch.Tensor, ...]:
-            return tuple(torch.empty_like(input) for _ in range(count))
-
-        torch.library.register_fake(f"{namespace}::{name}", fake, lib=library)
+    bindings["get_musa_jit_custom_allreduce_comm"] = lambda _: comm
+    for name in names:
+        library.impl(name, bindings[f"_{name}_impl"], "CPU")
+        torch.library.register_fake(
+            f"{namespace}::{name}", bindings[f"_{name}_fake"], lib=library
+        )
     yield getattr(torch.ops, namespace)
 
 
