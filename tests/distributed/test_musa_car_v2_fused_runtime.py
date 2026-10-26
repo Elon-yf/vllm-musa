@@ -236,6 +236,17 @@ def _checked(
     return max_error
 
 
+def _execution_mode(dist: Any, group: Any, comm: Any, impl: str) -> str:
+    mode = getattr(comm, "_last_fused_execution", None) if impl == "v2" else "fused"
+    modes: list[Any] = [None] * dist.get_world_size(group)
+    dist.all_gather_object(modes, mode, group=group)
+    if any(value not in ("fused", "fallback") for value in modes):
+        raise AssertionError(f"missing actual fused execution mode: {modes}")
+    if any(value != modes[0] for value in modes):
+        raise AssertionError(f"execution modes differ between ranks: {modes}")
+    return str(modes[0])
+
+
 def _run_case(
     torch: Any,
     dist: Any,
@@ -247,7 +258,8 @@ def _run_case(
 ) -> dict[str, Any]:
     rank = dist.get_rank(group)
     errors: list[float] = []
-    fused = True
+    eager_modes: list[str] = []
+    eligible_call = True
     for step in range(args.iterations):
         original = _inputs(torch, case, rank, step, args.seed)
         expected = _reference(torch, dist, group, original, case.variant, args.eps)
@@ -260,14 +272,17 @@ def _run_case(
             raise AssertionError(
                 f"communicator eligibility differs between ranks: {eligible}"
             )
-        fused = bool(eligible[0])
+        eligible_call = bool(eligible[0])
         expected_fallback = case.impl == "v2" and case.weight_dtype == "float32"
-        if case.impl == "v2" and fused == expected_fallback:
+        if case.impl == "v2" and eligible_call == expected_fallback:
             raise AssertionError(
                 f"v2 eligibility violates supported shape contract: {case}"
             )
-        if fused:
+        if eligible_call:
+            if case.impl == "v2":
+                comm._last_fused_execution = None
             outputs = _call(comm, inputs, case.variant, args.eps)
+            eager_modes.append(_execution_mode(dist, group, comm, case.impl))
         else:
             result = _call(comm, inputs, case.variant, args.eps)
             _consensus(
@@ -276,22 +291,27 @@ def _run_case(
                 None if result is None else "expected None fallback sentinel",
             )
             outputs = _unfused(torch, dist, inputs, case.variant, args.eps)
+            eager_modes.append("fallback")
         errors.append(_checked(torch, dist, group, outputs, expected, inputs, original))
 
     replays = 0
-    if not args.skip_graph and fused:
+    graph_mode = None
+    if not args.skip_graph and eligible_call:
         graph = torch.musa.MUSAGraph()
         stream = torch.musa.Stream()
         stream.wait_stream(torch.musa.current_stream())
-        with torch.musa.stream(stream):
-            # Warm the capture stream before recording graph work.
-            _call(comm, inputs, case.variant, args.eps)
-        torch.musa.current_stream().wait_stream(stream)
-        torch.musa.synchronize()
-        dist.barrier(group=group)
         with comm.capture():
+            with torch.musa.stream(stream):
+                # Prepare graph launch variants without active stream capture.
+                _call(comm, inputs, case.variant, args.eps)
+            torch.musa.current_stream().wait_stream(stream)
+            torch.musa.synchronize()
+            dist.barrier(group=group)
+            if case.impl == "v2":
+                comm._last_fused_execution = None
             with torch.musa.graph(graph, stream=stream):
                 outputs = _call(comm, inputs, case.variant, args.eps)
+        graph_mode = _execution_mode(dist, group, comm, case.impl)
         for replay in range(args.graph_replays):
             original = _inputs(torch, case, rank, args.iterations + replay, args.seed)
             expected = _reference(torch, dist, group, original, case.variant, args.eps)
@@ -305,12 +325,22 @@ def _run_case(
             )
             replays += 1
         torch.musa.synchronize()
+    executed_modes = set(eager_modes)
+    if graph_mode is not None:
+        executed_modes.add(graph_mode)
     return {
         **asdict(case),
         "status": "PASS",
-        "kind": "FUSED" if fused else "FALLBACK",
+        "kind": (
+            next(iter(executed_modes)).upper() if len(executed_modes) == 1 else "MIXED"
+        ),
         "eager_calls": args.iterations,
+        "eager_fused_calls": eager_modes.count("fused"),
+        "eager_fallback_calls": eager_modes.count("fallback"),
         "graph_replays": replays,
+        "graph_execution": graph_mode,
+        "graph_fused_replays": replays if graph_mode == "fused" else 0,
+        "graph_fallback_replays": replays if graph_mode == "fallback" else 0,
         "max_abs_error": max(errors),
     }
 
@@ -520,9 +550,12 @@ def main(argv: list[str] | None = None) -> int:
             row["kind"] == "FALLBACK" for row in report["cases"]
         )
         report["checked_fused_calls"] = sum(
-            row["eager_calls"] + row["graph_replays"]
+            row["eager_fused_calls"] + row["graph_fused_replays"]
             for row in report["cases"]
-            if row["kind"] == "FUSED"
+        )
+        report["checked_fallback_calls"] = len(report["fallbacks"]) + sum(
+            row["eager_fallback_calls"] + row["graph_fallback_replays"]
+            for row in report["cases"]
         )
         checked_replays = sum(row["graph_replays"] for row in report["cases"])
         report["graph_status"] = "PASS" if checked_replays else "NOT_RUN"
@@ -567,6 +600,30 @@ def test_musa_car_v2_fused_runtime() -> None:
     if os.environ.get("RUN_MUSA_CAR_V2_FUSED_RUNTIME") != "1":
         pytest.skip("run this file with torchrun; GPU runtime verification not run")
     assert main([]) == 0
+
+
+def test_execution_mode_uses_actual_v2_dispatch() -> None:
+    from types import SimpleNamespace
+
+    import pytest
+
+    class LocalGroup:
+        @staticmethod
+        def get_world_size(group: Any) -> int:
+            return 2
+
+        @staticmethod
+        def all_gather_object(results: list[Any], value: Any, group: Any) -> None:
+            results[:] = [value, value]
+
+    comm = SimpleNamespace(supports_fused_rmsnorm=True)
+    with pytest.raises(AssertionError, match="missing actual fused execution mode"):
+        _execution_mode(LocalGroup, None, comm, "v2")
+    comm._last_fused_execution = "fallback"
+    assert _execution_mode(LocalGroup, None, comm, "v2") == "fallback"
+    comm._last_fused_execution = "fused"
+    assert _execution_mode(LocalGroup, None, comm, "v2") == "fused"
+    assert _execution_mode(LocalGroup, None, SimpleNamespace(), "v1") == "fused"
 
 
 if __name__ == "__main__":
