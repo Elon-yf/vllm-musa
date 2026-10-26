@@ -892,7 +892,7 @@ def v2_fused_compile_config(
 
 def _v2_fused_cflags(
     config: Any, cache_policy: int, vector_load: int, atomic_barrier: int,
-    need_raw: bool, has_residual: bool,
+    need_raw: bool, has_residual: bool, gemma: bool = False,
 ) -> tuple[str, ...]:
     """Merge generic launch fields with every policy-controlled fused switch."""
     return (
@@ -903,6 +903,7 @@ def _v2_fused_cflags(
         "-DSGL_CUSTOM_AR_FUSED_RMSNORM=1",
         f"-DVLLM_MUSA_FUSED_WRITE_RAW={int(need_raw)}",
         f"-DVLLM_MUSA_FUSED_HAS_RESIDUAL={int(has_residual)}",
+        f"-DVLLM_MUSA_FUSED_GEMMA={int(gemma)}",
         f"-DSGL_CUSTOM_AR_THREADS={config.threads}",
         f"-DSGL_CUSTOM_AR_BLOCKS={config.blocks}",
         f"-DSGL_CUSTOM_AR_VECTOR_LOAD={vector_load}",
@@ -948,6 +949,7 @@ def _v2_fused_factory(
     mp_count: int | None,
     need_raw: bool,
     has_residual: bool,
+    gemma: bool = False,
 ) -> Callable[..., None]:
     config = v2_fused_compile_config(
         world_size, hidden, row_count, mp_count=mp_count,
@@ -979,7 +981,7 @@ def _v2_fused_factory(
         os.environ.get("VLLM_MUSA_CUSTOM_AR_ATOMIC_BARRIER", int(shot != SHOT_ONE_STAGE)),
     ))
     flags = _v2_fused_cflags(
-        config, cache_policy, vector_load, atomic_barrier, need_raw, has_residual
+        config, cache_policy, vector_load, atomic_barrier, need_raw, has_residual, gemma
     )
     module = _custom_ar_v2_fused_module(int(world_size), config, flags, graph_rank_data)
     suffix = "row_" if row_kernel else ""
@@ -995,6 +997,7 @@ def _v2_fused_factory(
     setattr(launch_entry, "launch_config", config)
     setattr(launch_entry, "kernel_symbol", symbol)
     setattr(launch_entry, "jit_cflags", flags)
+    setattr(launch_entry, "gemma", bool(gemma))
     return launch_entry
 
 
@@ -1004,13 +1007,14 @@ def v2_launch_fused_allreduce_rmsnorm_unregistered_func(
     row_warp_inv_rms_override: int = -1, row_count: int = 0,
     token_2stage_override: int = -1, graph_rank_data: bool = False, *,
     mp_count: int | None = None, need_raw: bool = False, has_residual: bool = True,
+    gemma: bool = False,
 ) -> Callable[..., None]:
     if graph_rank_data:
         raise ValueError("unregistered fused launcher requires graph_rank_data=False")
     return _v2_fused_factory(
         world_size, hidden, short_rows, small_rows, cache_policy,
         token_2stage_override, row_warp_inv_rms_override, row_count, False, False,
-        mp_count=mp_count, need_raw=need_raw, has_residual=has_residual,
+        mp_count=mp_count, need_raw=need_raw, has_residual=has_residual, gemma=gemma,
     )
 
 
@@ -1020,13 +1024,14 @@ def v2_launch_fused_allreduce_rmsnorm_registered_func(
     row_warp_inv_rms_override: int = -1, row_count: int = 0,
     token_2stage_override: int = -1, graph_rank_data: bool = True, *,
     mp_count: int | None = None, need_raw: bool = False, has_residual: bool = True,
+    gemma: bool = False,
 ) -> Callable[..., None]:
     if not graph_rank_data:
         raise ValueError("registered fused launcher requires graph_rank_data=True")
     return _v2_fused_factory(
         world_size, hidden, short_rows, small_rows, cache_policy,
         token_2stage_override, row_warp_inv_rms_override, row_count, True, False,
-        mp_count=mp_count, need_raw=need_raw, has_residual=has_residual,
+        mp_count=mp_count, need_raw=need_raw, has_residual=has_residual, gemma=gemma,
     )
 
 
@@ -1036,13 +1041,14 @@ def v2_launch_fused_allreduce_rmsnorm_row_unregistered_func(
     row_warp_inv_rms_override: int = -1, row_count: int = 0,
     graph_rank_data: bool = False, *, mp_count: int | None = None,
     need_raw: bool = False, has_residual: bool = True,
+    gemma: bool = False,
 ) -> Callable[..., None]:
     if graph_rank_data:
         raise ValueError("unregistered fused launcher requires graph_rank_data=False")
     return _v2_fused_factory(
         world_size, hidden, short_rows, small_rows, 0,
         token_2stage_override, row_warp_inv_rms_override, row_count, False, True,
-        mp_count=mp_count, need_raw=need_raw, has_residual=has_residual,
+        mp_count=mp_count, need_raw=need_raw, has_residual=has_residual, gemma=gemma,
     )
 
 
@@ -1052,13 +1058,14 @@ def v2_launch_fused_allreduce_rmsnorm_row_registered_func(
     row_warp_inv_rms_override: int = -1, row_count: int = 0,
     graph_rank_data: bool = True, *, mp_count: int | None = None,
     need_raw: bool = False, has_residual: bool = True,
+    gemma: bool = False,
 ) -> Callable[..., None]:
     if not graph_rank_data:
         raise ValueError("registered fused launcher requires graph_rank_data=True")
     return _v2_fused_factory(
         world_size, hidden, short_rows, small_rows, 0,
         token_2stage_override, row_warp_inv_rms_override, row_count, True, True,
-        mp_count=mp_count, need_raw=need_raw, has_residual=has_residual,
+        mp_count=mp_count, need_raw=need_raw, has_residual=has_residual, gemma=gemma,
     )
 
 
@@ -1077,6 +1084,7 @@ def v2_fused_allreduce_rmsnorm_func(
     mp_count: int | None = None,
     need_raw: bool = False,
     has_residual: bool = True,
+    gemma: bool = False,
 ) -> Callable[..., None]:
     """Return one fixed launcher ABI for generic/row and staging/graph paths.
 
@@ -1092,7 +1100,7 @@ def v2_fused_allreduce_rmsnorm_func(
         token_2stage_override=token_2stage_override,
         row_warp_inv_rms_override=row_warp_inv_rms_override,
         row_count=rows, graph_rank_data=graph_rank_data, row_kernel=row_kernel,
-        mp_count=mp_count, need_raw=need_raw, has_residual=has_residual,
+        mp_count=mp_count, need_raw=need_raw, has_residual=has_residual, gemma=gemma,
     )
 
     def launch(
@@ -1138,4 +1146,5 @@ def v2_fused_allreduce_rmsnorm_func(
     setattr(launch, "launch_config", entry.launch_config)
     setattr(launch, "kernel_symbol", entry.kernel_symbol)
     setattr(launch, "jit_cflags", entry.jit_cflags)
+    setattr(launch, "gemma", entry.gemma)
     return launch

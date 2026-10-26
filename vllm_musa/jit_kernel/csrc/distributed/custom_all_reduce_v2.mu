@@ -1610,6 +1610,9 @@ __device__ __forceinline__ float downcast_s<float>(float value) {
 #ifndef VLLM_MUSA_FUSED_WRITE_RAW
 #define VLLM_MUSA_FUSED_WRITE_RAW 0
 #endif
+#ifndef VLLM_MUSA_FUSED_GEMMA
+#define VLLM_MUSA_FUSED_GEMMA 0
+#endif
 #if VLLM_MUSA_FUSED_WRITE_RAW && SGL_CUSTOM_AR_FUSED_RMSNORM_TMP_WITH_RESIDUAL
 #error "raw output requires scratch to retain the pre-residual all-reduce value"
 #endif
@@ -1631,11 +1634,15 @@ __device__ __forceinline__ float vllm_fused_norm_value(
 #endif
 }
 
-// The IR casts the normalized value to the weight dtype before multiplying
-// by the weight. This port accepts same-dtype weights, so that dtype is T.
+// Gemma applies its zero-centered weight in fp32. Ordinary RMSNorm casts the
+// normalized value to the weight dtype before multiplying by the weight.
 template <typename T>
 __device__ __forceinline__ T vllm_fused_apply_weight(float normalized, float weight) {
+#if VLLM_MUSA_FUSED_GEMMA
+  return downcast_s<T>(normalized * (weight + 1.0f));
+#else
   return downcast_s<T>(upcast_s(downcast_s<T>(normalized)) * weight);
+#endif
 }
 
 // The bypass-load implementation uses volatile assembly. Gate the load
