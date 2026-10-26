@@ -183,7 +183,10 @@ def _reference(
     audit: list[dict[str, Any]] | None = None,
 ) -> tuple[Any, ...]:
     x, residual, weight = values
-    reduced = x.float().contiguous().clone()
+    if x.device.type != "cpu":
+        raise ValueError("the high-precision all-reduce reference requires CPU inputs")
+    # Host fp64 avoids rank-order rounding at activation-dtype midpoints.
+    reduced = x.double().contiguous().clone()
     dist.all_reduce(reduced, group=group)
     reduced = reduced.to(x.dtype)
     result = _reference_from_reduced(torch, reduced, residual, weight, variant, eps)
@@ -233,7 +236,12 @@ def _validate(
         raise AssertionError("fused outputs must not alias inputs or each other")
     for value, snapshot in zip(inputs, original):
         torch.testing.assert_close(value.cpu(), snapshot, rtol=0, atol=0)
-    rtol, atol = (0.016, 1e-3) if inputs[0].dtype == torch.bfloat16 else (0.002, 1e-2)
+    if inputs[0].dtype == torch.bfloat16:
+        rtol, atol = 0.016, 1e-3
+    elif inputs[0].dtype == torch.float16:
+        rtol, atol = 0.002, 1e-2
+    else:
+        rtol, atol = 1.3e-6, 1e-5
     max_error = 0.0
     for value, target in zip(outputs, expected):
         actual = value.cpu()
@@ -686,10 +694,12 @@ def main(argv: list[str] | None = None) -> int:
         "tolerances": {
             "bfloat16": {"rtol": 0.016, "atol": 1e-3},
             "float16": {"rtol": 0.002, "atol": 1e-2},
+            "float32": {"rtol": 1.3e-6, "atol": 1e-5},
         },
         "reference_contract": {
             "vllm_revision": "5df63a7203cdb9328d824a27b682e77c7b9928be",
             "source": "vllm/ir/ops/layernorm.py",
+            "all_reduce": "CPU Gloo fp64 sum, then activation dtype cast",
             "residual_primary": "fused_add_rms_norm",
             "residual_alternative_audit": "add_then_rms_norm",
         },
