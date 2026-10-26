@@ -984,7 +984,7 @@ def _v2_fused_factory(
     module = _custom_ar_v2_fused_module(int(world_size), config, flags, graph_rank_data)
     suffix = "row_" if row_kernel else ""
     suffix += "registered" if graph_rank_data else "unregistered"
-    symbol = f"sgl_musa_custom_ar_fused_allreduce_rmsnorm_{suffix}"
+    symbol = f"vllm_musa_custom_ar_v2_fused_allreduce_rmsnorm_{suffix}"
     entry = getattr(module, symbol)
 
     def launch_entry(*args: Any) -> None:

@@ -5094,7 +5094,7 @@ bool dispatch_residual_rmsnorm_row_world_size(
 
 }  // namespace
 
-void sgl_musa_custom_ar_fused_allreduce_rmsnorm_unregistered(
+void vllm_musa_custom_ar_v2_fused_allreduce_rmsnorm_unregistered(
     ffi::TensorView rank_data,
     ffi::TensorView signal_ptrs_cpu,
     ffi::TensorView inp,
@@ -5203,7 +5203,7 @@ void sgl_musa_custom_ar_fused_allreduce_rmsnorm_unregistered(
   // graph is being captured. Synchronization after replay surfaces failures.
 }
 
-void sgl_musa_custom_ar_fused_allreduce_rmsnorm_registered(
+void vllm_musa_custom_ar_v2_fused_allreduce_rmsnorm_registered(
     ffi::TensorView rank_data,
     ffi::TensorView signal_ptrs_cpu,
     ffi::TensorView residual_in,
@@ -5297,7 +5297,7 @@ void sgl_musa_custom_ar_fused_allreduce_rmsnorm_registered(
   // during capture is rejected by the MUSA runtime.
 }
 
-void sgl_musa_custom_ar_fused_allreduce_rmsnorm_row_unregistered(
+void vllm_musa_custom_ar_v2_fused_allreduce_rmsnorm_row_unregistered(
     ffi::TensorView rank_data,
     ffi::TensorView signal_ptrs_cpu,
     ffi::TensorView inp,
@@ -5414,7 +5414,7 @@ void sgl_musa_custom_ar_fused_allreduce_rmsnorm_row_unregistered(
   // Defer sticky-error queries until after graph replay (see generic path).
 }
 
-void sgl_musa_custom_ar_fused_allreduce_rmsnorm_row_registered(
+void vllm_musa_custom_ar_v2_fused_allreduce_rmsnorm_row_registered(
     ffi::TensorView rank_data,
     ffi::TensorView signal_ptrs_cpu,
     ffi::TensorView residual_in,
@@ -5505,19 +5505,19 @@ void sgl_musa_custom_ar_fused_allreduce_rmsnorm_row_registered(
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(
-    sgl_musa_custom_ar_fused_allreduce_rmsnorm_unregistered,
-    sgl_musa_custom_ar_fused_allreduce_rmsnorm_unregistered);
+    vllm_musa_custom_ar_v2_fused_allreduce_rmsnorm_unregistered,
+    vllm_musa_custom_ar_v2_fused_allreduce_rmsnorm_unregistered);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(
-    sgl_musa_custom_ar_fused_allreduce_rmsnorm_registered,
-    sgl_musa_custom_ar_fused_allreduce_rmsnorm_registered);
+    vllm_musa_custom_ar_v2_fused_allreduce_rmsnorm_registered,
+    vllm_musa_custom_ar_v2_fused_allreduce_rmsnorm_registered);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(
-    sgl_musa_custom_ar_fused_allreduce_rmsnorm_row_unregistered,
-    sgl_musa_custom_ar_fused_allreduce_rmsnorm_row_unregistered);
+    vllm_musa_custom_ar_v2_fused_allreduce_rmsnorm_row_unregistered,
+    vllm_musa_custom_ar_v2_fused_allreduce_rmsnorm_row_unregistered);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(
-    sgl_musa_custom_ar_fused_allreduce_rmsnorm_row_registered,
-    sgl_musa_custom_ar_fused_allreduce_rmsnorm_row_registered);
+    vllm_musa_custom_ar_v2_fused_allreduce_rmsnorm_row_registered,
+    vllm_musa_custom_ar_v2_fused_allreduce_rmsnorm_row_registered);
 
 #endif  // SGL_CUSTOM_AR_FUSED_RMSNORM

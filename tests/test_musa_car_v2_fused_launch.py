@@ -47,7 +47,7 @@ def jit(monkeypatch):
         builds.append((name, sources, extra_musa_cflags))
         result = types.SimpleNamespace()
         for suffix in ("unregistered", "registered", "row_unregistered", "row_registered"):
-            symbol = f"sgl_musa_custom_ar_fused_allreduce_rmsnorm_{suffix}"
+            symbol = f"vllm_musa_custom_ar_v2_fused_allreduce_rmsnorm_{suffix}"
             def invoke(*args, _symbol=symbol):
                 calls.append((_symbol, args))
             setattr(result, symbol, invoke)
