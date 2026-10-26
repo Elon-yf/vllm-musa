@@ -400,6 +400,9 @@ SHOT_PUSH_WIDE = 3
 SHOT_TWO_STAGE_512 = 4
 _V2_SIGNAL_BLOCKS = 512
 _V2_SEMAPHORE_BYTES = 128
+# This is an ABI capability, not a runtime-performance claim.  Promote it only
+# when every fused launch variant writes the pre-residual all-reduce output.
+V2_FUSED_SUPPORTS_RAW = False
 
 
 def allreduce_v2_meta_size() -> int:
@@ -793,6 +796,46 @@ def launch_device_descriptor_func(world_size: int, shot: int):
 
 # The fused source snapshot is documented next to its TU in custom_all_reduce_v2.mu.
 # It has a distinct signal allocation and is compiled independently from pure CAR.
+def _v2_fused_base_config(world_size: int, shot: int, mp_count: int) -> dict[str, int]:
+    """MR577 pull defaults, isolated from the existing pure/v1 defaults."""
+    from vllm_musa.optimization_contract.Fuse_CAR_RMSnorm import resolve_architecture_launch
+
+    if shot == SHOT_TWO_STAGE_512:
+        default_threads, default_blocks = 512, 120 if world_size in (4, 8) else 48
+    elif world_size == 2:
+        default_threads, default_blocks = (1024 if shot == SHOT_TWO_STAGE else 512), 56
+    elif world_size == 4:
+        default_threads, default_blocks = 1024, 40 if shot == SHOT_TWO_STAGE else 60
+    elif world_size == 8:
+        default_threads, default_blocks = 768, 80
+    else:
+        default_threads, default_blocks = 512, 36
+
+    def env(field: str, default: int) -> int:
+        return int(os.environ.get(
+            f"VLLM_MUSA_CUSTOM_AR_{shot}SHOT_{field}",
+            os.environ.get(f"VLLM_MUSA_CUSTOM_AR_{field}", default),
+        ))
+
+    threads, blocks = env("THREADS", default_threads), env("BLOCKS", default_blocks)
+    max_blocks = env("MAX_BLOCKS", max(120, blocks))
+    block_override = any(name in os.environ for name in (
+        f"VLLM_MUSA_CUSTOM_AR_{shot}SHOT_BLOCKS", "VLLM_MUSA_CUSTOM_AR_BLOCKS"
+    ))
+    dynamic = int(not (
+        world_size == 2 or (world_size == 4 and shot != SHOT_ONE_STAGE) or block_override
+    ))
+    return dict(
+        threads=threads, blocks=blocks, max_blocks=max_blocks,
+        launch_max_blocks=env("LAUNCH_MAX_BLOCKS", resolve_architecture_launch(
+            mp_count=mp_count, world_size=world_size, shot=shot, max_blocks=max_blocks
+        )),
+        dynamic_blocks=env("DYNAMIC_BLOCKS", dynamic),
+        atomic_barrier=env("ATOMIC_BARRIER", int(shot != SHOT_ONE_STAGE)),
+        vector_load=int(os.environ.get("VLLM_MUSA_CUSTOM_AR_VECTOR_LOAD", "0")),
+    )
+
+
 def v2_fused_compile_config(
     world_size: int,
     hidden: int,
@@ -820,9 +863,10 @@ def v2_fused_compile_config(
             device_module.get_device_properties(device_module.current_device()).multi_processor_count
         )
     token_2stage = resolve_token_2stage(world_size, hidden, token_2stage_override, rows)
-    threads, blocks, _, _, max_blocks, dynamic_blocks, _ = _v2_compile_config(
-        world_size, SHOT_TWO_STAGE if token_2stage else SHOT_ONE_STAGE
-    )
+    shot = forced_shot()
+    if shot not in (SHOT_ONE_STAGE, SHOT_TWO_STAGE, SHOT_TWO_STAGE_512):
+        shot = SHOT_TWO_STAGE if token_2stage else SHOT_ONE_STAGE
+    base = _v2_fused_base_config(world_size, shot, mp_count)
     # This revision of the pure policy fixes graph_rank_data=True internally.
     # Graph-vs-staging affects the FFI entry and module key, not its rule matches.
     del graph_rank_data
@@ -837,11 +881,11 @@ def v2_fused_compile_config(
         token_2stage=int(token_2stage),
         row_warp_inv_rms_override=int(row_warp_inv_rms_override),
         fast_publish_override=int(os.environ.get("VLLM_MUSA_CUSTOM_AR_FUSED_RMSNORM_FAST_PUBLISH", "-1")),
-        base_threads=threads,
-        base_blocks=blocks,
-        base_max_blocks=max_blocks,
-        base_launch_max_blocks=max_blocks,
-        base_dynamic_blocks=dynamic_blocks,
+        base_threads=base["threads"],
+        base_blocks=base["blocks"],
+        base_max_blocks=base["max_blocks"],
+        base_launch_max_blocks=base["launch_max_blocks"],
+        base_dynamic_blocks=base["dynamic_blocks"],
     )
 
 
@@ -911,14 +955,30 @@ def _v2_fused_factory(
         row_warp_inv_rms_override=row_warp_inv_rms_override,
         graph_rank_data=graph_rank_data,
     )
-    _, _, vector_load, atomic_barrier, _, _, _ = _v2_compile_config(
-        world_size, SHOT_TWO_STAGE if config.token_2stage else SHOT_ONE_STAGE
-    )
+    shot = forced_shot()
+    if shot not in (SHOT_ONE_STAGE, SHOT_TWO_STAGE, SHOT_TWO_STAGE_512):
+        shot = SHOT_TWO_STAGE if config.token_2stage else SHOT_ONE_STAGE
+    vector_load = int(os.environ.get("VLLM_MUSA_CUSTOM_AR_VECTOR_LOAD", "0"))
+    atomic_barrier = int(os.environ.get(
+        f"VLLM_MUSA_CUSTOM_AR_{shot}SHOT_ATOMIC_BARRIER",
+        os.environ.get("VLLM_MUSA_CUSTOM_AR_ATOMIC_BARRIER", int(shot != SHOT_ONE_STAGE)),
+    ))
     flags = _v2_fused_cflags(config, cache_policy, vector_load, atomic_barrier)
     module = _custom_ar_v2_fused_module(int(world_size), config, flags, graph_rank_data)
     suffix = "row_" if row_kernel else ""
     suffix += "registered" if graph_rank_data else "unregistered"
-    return getattr(module, f"sgl_musa_custom_ar_fused_allreduce_rmsnorm_{suffix}")
+    symbol = f"sgl_musa_custom_ar_fused_allreduce_rmsnorm_{suffix}"
+    entry = getattr(module, symbol)
+
+    def launch_entry(*args: Any) -> None:
+        entry(*args)
+
+    # Expose the exact compiled contract to decision tracing.  Device trace is
+    # still required to prove which specialized kernel the FFI entry launches.
+    setattr(launch_entry, "launch_config", config)
+    setattr(launch_entry, "kernel_symbol", symbol)
+    setattr(launch_entry, "jit_cflags", flags)
+    return launch_entry
 
 
 def v2_launch_fused_allreduce_rmsnorm_unregistered_func(
@@ -1054,4 +1114,7 @@ def v2_fused_allreduce_rmsnorm_func(
             args += (int(hidden),)
         entry(*args, float(eps))
 
+    setattr(launch, "launch_config", entry.launch_config)
+    setattr(launch, "kernel_symbol", entry.kernel_symbol)
+    setattr(launch, "jit_cflags", entry.jit_cflags)
     return launch

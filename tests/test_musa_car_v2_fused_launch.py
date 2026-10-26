@@ -81,6 +81,9 @@ def test_fixed_abi_routes_all_four_source_entries(jit, row, registered):
     assert args == expected + ((2048,) if row else ()) + (1e-5,)
     assert builds[0][1] == ("distributed/custom_all_reduce_v2.mu",)
     assert "-DSGL_CUSTOM_AR_FUSED_RMSNORM=1" in builds[0][2]
+    assert launcher.kernel_symbol == symbol
+    assert launcher.jit_cflags == builds[0][2]
+    assert f"-DSGL_CUSTOM_AR_THREADS={launcher.launch_config.threads}" in launcher.jit_cflags
 
 
 def test_policy_launch_fields_reach_compiler(jit):
