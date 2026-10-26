@@ -83,12 +83,13 @@ def _cases(args: argparse.Namespace) -> list[Case]:
             raise ValueError(f"unsupported {name}: {getattr(args, name)}")
         if len(getattr(args, name)) != len(set(getattr(args, name))):
             raise ValueError(f"duplicate {name} entries")
-    if (
-        min(
-            args.iterations, args.graph_replays, args.max_size_mib, args.timeout_seconds
-        )
-        < 1
-    ):
+    counts = (
+        args.iterations,
+        args.graph_replays,
+        args.max_size_mib,
+        args.timeout_seconds,
+    )
+    if min(counts) < 1:
         raise ValueError(
             "iteration, replay, buffer and timeout values must be positive"
         )
@@ -96,17 +97,11 @@ def _cases(args: argparse.Namespace) -> list[Case]:
         raise ValueError("eps must be positive")
     if max(args.rows) * max(args.hidden) * 2 > args.max_size_mib * 1024**2:
         raise ValueError("target shapes exceed --max-size-mib")
-    return [
-        Case(*values)
-        for values in itertools.product(
-            args.impls,
-            args.dtypes,
-            args.weight_dtypes,
-            args.hidden,
-            args.rows,
-            args.variants,
-        )
+    axes = [
+        getattr(args, name)
+        for name in ("impls", "dtypes", "weight_dtypes", "hidden", "rows", "variants")
     ]
+    return [Case(*values) for values in itertools.product(*axes)]
 
 
 def _runtime() -> tuple[Any, Any, Any]:
@@ -294,6 +289,76 @@ def _execution_mode(
     return str(modes[0])
 
 
+def _dispatch_snapshot(
+    comm: Any, case: Case, phase: str, execution: str, required: bool
+) -> dict[str, Any]:
+    if case.impl != "v2" or not required:
+        return {"status": "NOT_AVAILABLE", "backend": case.impl, "phase": phase}
+    snapshot = json.loads(json.dumps(getattr(comm, "_last_fused_dispatch", None)))
+    if not isinstance(snapshot, dict):
+        raise AssertionError("missing v2 dispatch snapshot while tracing")
+    expected = {
+        "backend": "v2",
+        "execution": execution,
+        "rows": case.rows,
+        "hidden": case.hidden,
+        "need_raw": case.variant != "no_raw",
+        "has_residual": case.variant != "norm",
+        "phase": phase,
+    }
+    if any(snapshot.get(key) != value for key, value in expected.items()):
+        raise AssertionError(
+            f"v2 dispatch snapshot contradicts call: {snapshot}, expected {expected}"
+        )
+    if not isinstance(snapshot.get("registered"), bool):
+        raise AssertionError("dispatch snapshot must identify registered/staging mode")
+    if not all(
+        isinstance(snapshot.get(key), str) and snapshot[key]
+        for key in ("policy_label", "launcher_symbol")
+    ):
+        raise AssertionError("dispatch snapshot must name policy and launcher")
+    if not isinstance(snapshot.get("effective_config"), dict) or not isinstance(
+        snapshot.get("jit_cflags"), list
+    ):
+        raise AssertionError(
+            "dispatch snapshot must record effective config and JIT flags"
+        )
+    return snapshot
+
+
+def _record_dispatch(
+    dist: Any,
+    group: Any,
+    comm: Any,
+    case: Case,
+    phase: str,
+    execution: str,
+    snapshots: list[dict[str, Any]],
+) -> None:
+    error = None
+    try:
+        required = os.environ.get("VLLM_MUSA_CAR_TRACE") == "1"
+        snapshot = _dispatch_snapshot(comm, case, phase, execution, required)
+        snapshots.append(snapshot)
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    _consensus(dist, group, error)
+
+
+def _case_label(tp: int, case: Case) -> str:
+    return (
+        f"CAR_CASE:tp{tp}:impl={case.impl}:dtype={case.dtype}:h{case.hidden}:"
+        f"r{case.rows}:variant={case.variant}:weight={case.weight_dtype}"
+    )
+
+
+def _phase_context(
+    torch: Any, tp: int, case: Case, phase: str, index: int, enabled: bool
+) -> Any:
+    label = f"CAR_PHASE:{_case_label(tp, case)}:phase={phase}:index={index}"
+    return torch.profiler.record_function(label) if enabled else nullcontext()
+
+
 def _run_case(
     torch: Any,
     dist: Any,
@@ -302,6 +367,7 @@ def _run_case(
     device: Any,
     case: Case,
     args: argparse.Namespace,
+    snapshots: list[dict[str, Any]],
 ) -> dict[str, Any]:
     rank = dist.get_rank(group)
     errors: list[float] = []
@@ -309,66 +375,10 @@ def _run_case(
     eager_modes: list[str] = []
     eligible_call = True
     for step in range(args.iterations):
-        original = _inputs(torch, case, rank, step, args.seed)
-        expected = _reference(
-            torch, dist, group, original, case.variant, args.eps, audit=reference_audit
-        )
-        inputs = tuple(value.to(device) for value in original)
-        eligible: list[Any] = [None] * dist.get_world_size(group)
-        dist.all_gather_object(
-            eligible, _eligible(comm, inputs, case.variant), group=group
-        )
-        if len(set(eligible)) != 1:
-            raise AssertionError(
-                f"communicator eligibility differs between ranks: {eligible}"
-            )
-        eligible_call = bool(eligible[0])
-        expected_fallback = case.impl == "v2" and case.weight_dtype == "float32"
-        if case.impl == "v2" and not eligible_call:
-            raise AssertionError(
-                f"v2 eligibility violates supported shape contract: {case}"
-            )
-        if eligible_call:
-            if case.impl == "v2":
-                comm._last_fused_execution = None
-            outputs = _call(comm, inputs, case.variant, args.eps)
-            execution = _execution_mode(
-                dist, group, comm, case.impl, "fallback" if expected_fallback else None
-            )
-            eager_modes.append(execution)
-        else:
-            result = _call(comm, inputs, case.variant, args.eps)
-            _consensus(
-                dist,
-                group,
-                None if result is None else "expected None fallback sentinel",
-            )
-            outputs = _unfused(torch, dist, inputs, case.variant, args.eps)
-            eager_modes.append("fallback")
-        errors.append(_checked(torch, dist, group, outputs, expected, inputs, original))
-
-    replays = 0
-    graph_mode = None
-    if not args.skip_graph and eligible_call:
-        graph = torch.musa.MUSAGraph()
-        stream = torch.musa.Stream()
-        stream.wait_stream(torch.musa.current_stream())
-        with comm.capture():
-            with torch.musa.stream(stream):
-                # Prepare graph launch variants without active stream capture.
-                _call(comm, inputs, case.variant, args.eps)
-            torch.musa.current_stream().wait_stream(stream)
-            torch.musa.synchronize()
-            dist.barrier(group=group)
-            if case.impl == "v2":
-                comm._last_fused_execution = None
-            with torch.musa.graph(graph, stream=stream):
-                outputs = _call(comm, inputs, case.variant, args.eps)
-        graph_mode = _execution_mode(
-            dist, group, comm, case.impl, "fallback" if expected_fallback else None
-        )
-        for replay in range(args.graph_replays):
-            original = _inputs(torch, case, rank, args.iterations + replay, args.seed)
+        with _phase_context(
+            torch, dist.get_world_size(group), case, "eager", step, args.profile
+        ):
+            original = _inputs(torch, case, rank, step, args.seed)
             expected = _reference(
                 torch,
                 dist,
@@ -378,15 +388,102 @@ def _run_case(
                 args.eps,
                 audit=reference_audit,
             )
-            for destination, source in zip(inputs, original):
-                destination.copy_(source)
-            torch.musa.synchronize()
-            dist.barrier(group=group)
-            graph.replay()
+            inputs = tuple(value.to(device) for value in original)
+            eligible: list[Any] = [None] * dist.get_world_size(group)
+            dist.all_gather_object(
+                eligible, _eligible(comm, inputs, case.variant), group=group
+            )
+            if len(set(eligible)) != 1:
+                raise AssertionError(
+                    f"communicator eligibility differs between ranks: {eligible}"
+                )
+            eligible_call = bool(eligible[0])
+            expected_fallback = case.impl == "v2" and case.weight_dtype == "float32"
+            if case.impl == "v2" and not eligible_call:
+                raise AssertionError(
+                    f"v2 eligibility violates supported shape contract: {case}"
+                )
+            if eligible_call:
+                if case.impl == "v2":
+                    comm._last_fused_execution = None
+                    comm._last_fused_dispatch = None
+                outputs = _call(comm, inputs, case.variant, args.eps)
+                execution = _execution_mode(
+                    dist,
+                    group,
+                    comm,
+                    case.impl,
+                    "fallback" if expected_fallback else None,
+                )
+                eager_modes.append(execution)
+            else:
+                result = _call(comm, inputs, case.variant, args.eps)
+                _consensus(
+                    dist,
+                    group,
+                    None if result is None else "expected None fallback sentinel",
+                )
+                outputs = _unfused(torch, dist, inputs, case.variant, args.eps)
+                eager_modes.append("fallback")
+            _record_dispatch(
+                dist, group, comm, case, "eager", eager_modes[-1], snapshots
+            )
             errors.append(
                 _checked(torch, dist, group, outputs, expected, inputs, original)
             )
-            replays += 1
+
+    replays = 0
+    graph_mode = None
+    capture_snapshot_index = None
+    if not args.skip_graph and eligible_call:
+        graph = torch.musa.MUSAGraph()
+        stream = torch.musa.Stream()
+        stream.wait_stream(torch.musa.current_stream())
+        with _phase_context(
+            torch, dist.get_world_size(group), case, "capture", 0, args.profile
+        ):
+            with comm.capture():
+                with torch.musa.stream(stream):
+                    # Prepare graph launch variants without active stream capture.
+                    _call(comm, inputs, case.variant, args.eps)
+                torch.musa.current_stream().wait_stream(stream)
+                torch.musa.synchronize()
+                dist.barrier(group=group)
+                if case.impl == "v2":
+                    comm._last_fused_execution = None
+                    comm._last_fused_dispatch = None
+                with torch.musa.graph(graph, stream=stream):
+                    outputs = _call(comm, inputs, case.variant, args.eps)
+        graph_mode = _execution_mode(
+            dist, group, comm, case.impl, "fallback" if expected_fallback else None
+        )
+        capture_snapshot_index = len(snapshots)
+        _record_dispatch(dist, group, comm, case, "capture", graph_mode, snapshots)
+        for replay in range(args.graph_replays):
+            with _phase_context(
+                torch, dist.get_world_size(group), case, "replay", replay, args.profile
+            ):
+                original = _inputs(
+                    torch, case, rank, args.iterations + replay, args.seed
+                )
+                expected = _reference(
+                    torch,
+                    dist,
+                    group,
+                    original,
+                    case.variant,
+                    args.eps,
+                    audit=reference_audit,
+                )
+                for destination, source in zip(inputs, original):
+                    destination.copy_(source)
+                torch.musa.synchronize()
+                dist.barrier(group=group)
+                graph.replay()
+                errors.append(
+                    _checked(torch, dist, group, outputs, expected, inputs, original)
+                )
+                replays += 1
         torch.musa.synchronize()
     executed_modes = set(eager_modes)
     if graph_mode is not None:
@@ -405,6 +502,12 @@ def _run_case(
         "graph_fused_replays": replays if graph_mode == "fused" else 0,
         "graph_fallback_replays": replays if graph_mode == "fallback" else 0,
         "max_abs_error": max(errors),
+        "dispatch_snapshots": snapshots,
+        "graph_replay_dispatch": {
+            "capture_snapshot_index": capture_snapshot_index,
+            "checked_replays": replays,
+            "replay_calls_python_dispatch": False,
+        },
         "add_then_rms_reference_audit": {
             "observations": len(reference_audit),
             "max_abs_norm_difference": max(
@@ -475,15 +578,12 @@ def _run_fallbacks(
         for variant in args.variants:
             original = tuple(value.cpu().clone() for value in inputs)
             expected = _reference(torch, dist, group, original, variant, args.eps)
-            _consensus(
-                dist,
-                group,
-                (
-                    "unsupported input accepted by fused gate"
-                    if _eligible(comm, inputs, variant)
-                    else None
-                ),
+            error = (
+                "unsupported input accepted"
+                if _eligible(comm, inputs, variant)
+                else None
             )
+            _consensus(dist, group, error)
             result = _call(comm, inputs, variant, args.eps)
             _consensus(
                 dist,
@@ -524,27 +624,34 @@ def _profiler(torch: Any, enabled: bool) -> Any:
     )
 
 
+def _save_trace(profiler: Any, path: Path, report: dict[str, Any]) -> None:
+    try:
+        profiler.export_chrome_trace(str(path))
+        report["trace"] = str(path)
+    except Exception as exc:
+        report["trace_export_error"] = f"{type(exc).__name__}: {exc}"
+        if report.get("status") != "FAIL":
+            report["status"] = "FAIL"
+            raise
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     cases = _cases(args)
     fp32_weight_cases = _fp32_weight_cases(args)
     if args.list_cases:
-        print(
-            json.dumps(
-                {
-                    "status": "NOT_RUN",
-                    "planned_cases": len(cases),
-                    "cases": [asdict(case) for case in cases],
-                    "fp32_weight_fallback_cases": [
-                        asdict(case) for case in fp32_weight_cases
-                    ],
-                },
-                indent=2,
-            )
-        )
+        plan = {
+            "status": "NOT_RUN",
+            "planned_cases": len(cases),
+            "cases": [asdict(case) for case in cases],
+            "fp32_weight_fallback_cases": [asdict(case) for case in fp32_weight_cases],
+        }
+        print(json.dumps(plan, indent=2))
         return 0
     os.environ["VLLM_MUSA_CUSTOM_AR_V2"] = "1"
     os.environ["VLLM_MUSA_CAR_FUSED_DISPATCH"] = args.fused_dispatch
+    if args.profile:
+        os.environ["VLLM_MUSA_CAR_TRACE"] = "1"
     torch, dist, custom_ar = _runtime()
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if world_size not in (2, 4):
@@ -588,6 +695,7 @@ def main(argv: list[str] | None = None) -> int:
         },
     }
     report_path.write_text(json.dumps(report, indent=2) + "\n")
+    profiler = None
     try:
         with _profiler(torch, args.profile) as profiler:
             for impl in args.impls:
@@ -604,17 +712,29 @@ def main(argv: list[str] | None = None) -> int:
                     group,
                     "communicator initialization disabled" if comm.disabled else None,
                 )
-                for case in (case for case in cases if case.impl == impl):
+                tagged_cases = [("cases", case) for case in cases] + [
+                    ("fp32_weight_fallbacks", case) for case in fp32_weight_cases
+                ]
+                for bucket, case in tagged_cases:
+                    if case.impl != impl:
+                        continue
                     report["active_case"] = asdict(case)
+                    snapshots: list[dict[str, Any]] = []
+                    report["active_dispatch_snapshots"] = snapshots
+                    label = _case_label(world_size, case)
+                    report["active_trace_label"] = label
                     report_path.write_text(json.dumps(report, indent=2) + "\n")
-                    row = _run_case(torch, dist, group, comm, device, case, args)
-                    report["cases"].append(row)
-                    report_path.write_text(json.dumps(report, indent=2) + "\n")
-                for case in (case for case in fp32_weight_cases if case.impl == impl):
-                    report["active_case"] = asdict(case)
-                    report_path.write_text(json.dumps(report, indent=2) + "\n")
-                    row = _run_case(torch, dist, group, comm, device, case, args)
-                    report["fp32_weight_fallbacks"].append(row)
+                    context = (
+                        torch.profiler.record_function(label)
+                        if args.profile
+                        else nullcontext()
+                    )
+                    with context:
+                        row = _run_case(
+                            torch, dist, group, comm, device, case, args, snapshots
+                        )
+                    row["trace_label"] = label
+                    report[bucket].append(row)
                     report_path.write_text(json.dumps(report, indent=2) + "\n")
                 if not args.skip_fallback:
                     report["fallbacks"].extend(
@@ -624,12 +744,10 @@ def main(argv: list[str] | None = None) -> int:
                 dist.barrier(group=group)
                 comm.close()
             torch.musa.synchronize()
-        if args.profile:
-            trace_path = args.output_dir / f"rank-{rank}.trace.json"
-            profiler.export_chrome_trace(str(trace_path))
-            report["trace"] = str(trace_path)
         report["status"] = "PASS"
         report.pop("active_case", None)
+        report.pop("active_dispatch_snapshots", None)
+        report.pop("active_trace_label", None)
         report["passed_cases"] = len(report["cases"])
         report["passed_fp32_weight_fallbacks"] = len(report["fp32_weight_fallbacks"])
         execution_rows = report["cases"] + report["fp32_weight_fallbacks"]
@@ -651,25 +769,6 @@ def main(argv: list[str] | None = None) -> int:
         report["graph_status"] = "PASS" if checked_replays else "NOT_RUN"
         report["fallback_status"] = "NOT_RUN" if args.skip_fallback else "PASS"
         report_path.write_text(json.dumps(report, indent=2) + "\n")
-        if rank == 0:
-            print(
-                json.dumps(
-                    {
-                        key: report[key]
-                        for key in (
-                            "status",
-                            "world_size",
-                            "passed_fused_cases",
-                            "passed_fallbacks",
-                            "checked_fused_calls",
-                            "graph_status",
-                        )
-                    },
-                    sort_keys=True,
-                ),
-                flush=True,
-            )
-        return 0
     except Exception as exc:
         report.update(
             status="FAIL",
@@ -681,7 +780,34 @@ def main(argv: list[str] | None = None) -> int:
         report_path.write_text(json.dumps(report, indent=2) + "\n")
         raise
     finally:
-        dist.destroy_process_group()
+        try:
+            if args.profile and profiler is not None:
+                _save_trace(
+                    profiler, args.output_dir / f"rank-{rank}.trace.json", report
+                )
+        finally:
+            try:
+                dist.destroy_process_group()
+            except Exception as exc:
+                report["cleanup_error"] = f"{type(exc).__name__}: {exc}"
+                if report.get("status") != "FAIL":
+                    report["status"] = "FAIL"
+                    raise
+            finally:
+                report_path.write_text(json.dumps(report, indent=2) + "\n")
+    if rank == 0:
+        fields = (
+            "status",
+            "world_size",
+            "passed_fused_cases",
+            "passed_fallbacks",
+            "checked_fused_calls",
+            "graph_status",
+        )
+        print(
+            json.dumps({key: report[key] for key in fields}, sort_keys=True), flush=True
+        )
+    return 0
 
 
 def test_musa_car_v2_fused_runtime() -> None:
@@ -691,94 +817,6 @@ def test_musa_car_v2_fused_runtime() -> None:
     if os.environ.get("RUN_MUSA_CAR_V2_FUSED_RUNTIME") != "1":
         pytest.skip("run this file with torchrun; GPU runtime verification not run")
     assert main([]) == 0
-
-
-def test_execution_mode_uses_actual_v2_dispatch() -> None:
-    from types import SimpleNamespace
-
-    import pytest
-
-    class LocalGroup:
-        @staticmethod
-        def get_world_size(group: Any) -> int:
-            return 2
-
-        @staticmethod
-        def all_gather_object(results: list[Any], value: Any, group: Any) -> None:
-            results[:] = [value, value]
-
-    comm = SimpleNamespace(supports_fused_rmsnorm=True)
-    with pytest.raises(AssertionError, match="missing actual fused execution mode"):
-        _execution_mode(LocalGroup, None, comm, "v2")
-    comm._last_fused_execution = "fallback"
-    assert _execution_mode(LocalGroup, None, comm, "v2", "fallback") == "fallback"
-    comm._last_fused_execution = "fused"
-    assert _execution_mode(LocalGroup, None, comm, "v2") == "fused"
-    with pytest.raises(AssertionError, match="expected fallback execution"):
-        _execution_mode(LocalGroup, None, comm, "v2", "fallback")
-    assert _execution_mode(LocalGroup, None, SimpleNamespace(), "v1") == "fused"
-
-
-def test_fp32_weight_fallback_plan_keeps_target_matrix() -> None:
-    args = _parser().parse_args([])
-    assert len(_cases(args)) == 96
-    extras = _fp32_weight_cases(args)
-    assert len(extras) == 3
-    assert {case.variant for case in extras} == {"norm", "residual", "no_raw"}
-    assert all(case.impl == "v2" and case.weight_dtype == "float32" for case in extras)
-    args.skip_fallback = True
-    assert not _fp32_weight_cases(args)
-
-
-def test_reference_uses_ir_rounding_order() -> None:
-    from types import SimpleNamespace
-
-    class Value:
-        def __init__(self, expr: str, dtype: str = "bf16") -> None:
-            self.expr, self.dtype = expr, dtype
-
-        def float(self) -> Any:
-            return Value(f"float({self.expr})", "float32")
-
-        def to(self, dtype: str) -> Any:
-            return Value(f"cast[{dtype}]({self.expr})", dtype)
-
-        def square(self) -> Any:
-            return Value(f"square({self.expr})", self.dtype)
-
-        def mean(self, *args: Any, **kwargs: Any) -> Any:
-            return Value(f"mean({self.expr})", self.dtype)
-
-        def __add__(self, other: Any) -> Any:
-            return Value(
-                f"add({self.expr},{getattr(other, 'expr', other)})", self.dtype
-            )
-
-        def __mul__(self, other: Any) -> Any:
-            return Value(f"mul({self.expr},{other.expr})", self.dtype)
-
-    torch = SimpleNamespace(
-        rsqrt=lambda value: Value(f"rsqrt({value.expr})", "float32")
-    )
-    reduced, residual = Value("reduced"), Value("residual")
-    for dtype in ("bf16", "float32"):
-        weight = Value("weight", dtype)
-        for variant in ("norm", "residual", "no_raw"):
-            out = _reference_from_reduced(
-                torch, reduced, residual, weight, variant, 1e-6
-            )
-            assert out[0].expr.startswith(f"cast[bf16](mul(cast[{dtype}](mul(")
-            assert out[0].expr.endswith(",weight))")
-            if variant != "norm":
-                unrounded = "add(float(reduced),float(residual))"
-                assert f"mean(square({unrounded}))" in out[0].expr
-                assert out[1].expr == f"cast[bf16]({unrounded})"
-                alternate = _reference_from_reduced(
-                    torch, reduced, residual, weight, variant, 1e-6, separate_add=True
-                )
-                assert (
-                    f"mean(square(float(cast[bf16]({unrounded}))))" in alternate[0].expr
-                )
 
 
 if __name__ == "__main__":
