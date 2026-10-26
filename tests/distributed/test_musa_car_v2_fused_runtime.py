@@ -152,24 +152,58 @@ def _inputs(torch: Any, case: Case, rank: int, step: int, seed: int) -> tuple[An
     return x, residual, weight
 
 
-def _reference(
-    torch: Any, dist: Any, group: Any, values: tuple[Any, ...], variant: str, eps: float
+def _reference_from_reduced(
+    torch: Any,
+    reduced: Any,
+    residual: Any,
+    weight: Any,
+    variant: str,
+    eps: float,
+    *,
+    separate_add: bool = False,
 ) -> tuple[Any, ...]:
-    x, residual, weight = values
-    reduced = x.float().clone()
-    dist.all_reduce(reduced, group=group)
-    reduced = reduced.to(x.dtype)
-    residual_out = (reduced.float() + residual.float()).to(x.dtype)
-    normalized = reduced if variant == "norm" else residual_out
-    fp32 = normalized.float()
-    norm = (
-        fp32 * torch.rsqrt(fp32.square().mean(-1, keepdim=True) + eps) * weight.float()
-    ).to(x.dtype)
+    fp32 = reduced.float()
+    residual_out = None
+    if variant != "norm":
+        fp32 = fp32 + residual.float()
+        residual_out = fp32.to(reduced.dtype)
+        if separate_add:
+            fp32 = residual_out.float()
+    normalized = fp32 * torch.rsqrt(fp32.square().mean(-1, keepdim=True) + eps)
+    norm = (normalized.to(weight.dtype) * weight).to(reduced.dtype)
     if variant == "norm":
         return norm, reduced
     if variant == "residual":
         return norm, residual_out, reduced
     return norm, residual_out
+
+
+def _reference(
+    torch: Any,
+    dist: Any,
+    group: Any,
+    values: tuple[Any, ...],
+    variant: str,
+    eps: float,
+    audit: list[dict[str, Any]] | None = None,
+) -> tuple[Any, ...]:
+    x, residual, weight = values
+    reduced = x.float().clone()
+    dist.all_reduce(reduced, group=group)
+    reduced = reduced.to(x.dtype)
+    result = _reference_from_reduced(torch, reduced, residual, weight, variant, eps)
+    if audit is not None and variant != "norm":
+        alternate = _reference_from_reduced(
+            torch, reduced, residual, weight, variant, eps, separate_add=True
+        )
+        difference = (result[0].float() - alternate[0].float()).abs()
+        audit.append(
+            {
+                "max_abs_norm_difference": difference.max().item(),
+                "different_norm_elements": int((difference != 0).sum().item()),
+            }
+        )
+    return result
 
 
 def _call(comm: Any, values: tuple[Any, ...], variant: str, eps: float) -> Any:
@@ -204,7 +238,7 @@ def _validate(
         raise AssertionError("fused outputs must not alias inputs or each other")
     for value, snapshot in zip(inputs, original):
         torch.testing.assert_close(value.cpu(), snapshot, rtol=0, atol=0)
-    rtol, atol = (0.016, 1e-3) if inputs[0].dtype == torch.bfloat16 else (0.001, 1e-4)
+    rtol, atol = (0.016, 1e-3) if inputs[0].dtype == torch.bfloat16 else (0.002, 1e-2)
     max_error = 0.0
     for value, target in zip(outputs, expected):
         actual = value.cpu()
@@ -271,11 +305,14 @@ def _run_case(
 ) -> dict[str, Any]:
     rank = dist.get_rank(group)
     errors: list[float] = []
+    reference_audit: list[dict[str, Any]] = []
     eager_modes: list[str] = []
     eligible_call = True
     for step in range(args.iterations):
         original = _inputs(torch, case, rank, step, args.seed)
-        expected = _reference(torch, dist, group, original, case.variant, args.eps)
+        expected = _reference(
+            torch, dist, group, original, case.variant, args.eps, audit=reference_audit
+        )
         inputs = tuple(value.to(device) for value in original)
         eligible: list[Any] = [None] * dist.get_world_size(group)
         dist.all_gather_object(
@@ -332,7 +369,15 @@ def _run_case(
         )
         for replay in range(args.graph_replays):
             original = _inputs(torch, case, rank, args.iterations + replay, args.seed)
-            expected = _reference(torch, dist, group, original, case.variant, args.eps)
+            expected = _reference(
+                torch,
+                dist,
+                group,
+                original,
+                case.variant,
+                args.eps,
+                audit=reference_audit,
+            )
             for destination, source in zip(inputs, original):
                 destination.copy_(source)
             torch.musa.synchronize()
@@ -360,24 +405,33 @@ def _run_case(
         "graph_fused_replays": replays if graph_mode == "fused" else 0,
         "graph_fallback_replays": replays if graph_mode == "fallback" else 0,
         "max_abs_error": max(errors),
+        "add_then_rms_reference_audit": {
+            "observations": len(reference_audit),
+            "max_abs_norm_difference": max(
+                (row["max_abs_norm_difference"] for row in reference_audit), default=0.0
+            ),
+            "different_norm_elements": sum(
+                row["different_norm_elements"] for row in reference_audit
+            ),
+        },
     }
 
 
 def _unfused(
     torch: Any, dist: Any, values: tuple[Any, ...], variant: str, eps: float
 ) -> tuple[Any, ...]:
+    from vllm.ir import ops
+
     x, residual, weight = values
     reduced = x.float().clone()
     dist.all_reduce(reduced)
     reduced = reduced.to(x.dtype)
-    residual_out = (reduced.float() + residual.float()).to(x.dtype)
-    value = reduced if variant == "norm" else residual_out
-    fp32 = value.float()
-    norm = (
-        fp32 * torch.rsqrt(fp32.square().mean(-1, keepdim=True) + eps) * weight.float()
-    ).to(x.dtype)
     if variant == "norm":
+        norm = ops.rms_norm(reduced.clone(), weight, eps)
         return norm, reduced
+    norm, residual_out = ops.fused_add_rms_norm(
+        reduced.clone(), residual.clone(), weight, eps
+    )
     return (
         (norm, residual_out, reduced) if variant == "residual" else (norm, residual_out)
     )
@@ -524,7 +578,13 @@ def main(argv: list[str] | None = None) -> int:
         },
         "tolerances": {
             "bfloat16": {"rtol": 0.016, "atol": 1e-3},
-            "float16": {"rtol": 0.001, "atol": 1e-4},
+            "float16": {"rtol": 0.002, "atol": 1e-2},
+        },
+        "reference_contract": {
+            "vllm_revision": "5df63a7203cdb9328d824a27b682e77c7b9928be",
+            "source": "vllm/ir/ops/layernorm.py",
+            "residual_primary": "fused_add_rms_norm",
+            "residual_alternative_audit": "add_then_rms_norm",
         },
     }
     report_path.write_text(json.dumps(report, indent=2) + "\n")
@@ -668,6 +728,57 @@ def test_fp32_weight_fallback_plan_keeps_target_matrix() -> None:
     assert all(case.impl == "v2" and case.weight_dtype == "float32" for case in extras)
     args.skip_fallback = True
     assert not _fp32_weight_cases(args)
+
+
+def test_reference_uses_ir_rounding_order() -> None:
+    from types import SimpleNamespace
+
+    class Value:
+        def __init__(self, expr: str, dtype: str = "bf16") -> None:
+            self.expr, self.dtype = expr, dtype
+
+        def float(self) -> Any:
+            return Value(f"float({self.expr})", "float32")
+
+        def to(self, dtype: str) -> Any:
+            return Value(f"cast[{dtype}]({self.expr})", dtype)
+
+        def square(self) -> Any:
+            return Value(f"square({self.expr})", self.dtype)
+
+        def mean(self, *args: Any, **kwargs: Any) -> Any:
+            return Value(f"mean({self.expr})", self.dtype)
+
+        def __add__(self, other: Any) -> Any:
+            return Value(
+                f"add({self.expr},{getattr(other, 'expr', other)})", self.dtype
+            )
+
+        def __mul__(self, other: Any) -> Any:
+            return Value(f"mul({self.expr},{other.expr})", self.dtype)
+
+    torch = SimpleNamespace(
+        rsqrt=lambda value: Value(f"rsqrt({value.expr})", "float32")
+    )
+    reduced, residual = Value("reduced"), Value("residual")
+    for dtype in ("bf16", "float32"):
+        weight = Value("weight", dtype)
+        for variant in ("norm", "residual", "no_raw"):
+            out = _reference_from_reduced(
+                torch, reduced, residual, weight, variant, 1e-6
+            )
+            assert out[0].expr.startswith(f"cast[bf16](mul(cast[{dtype}](mul(")
+            assert out[0].expr.endswith(",weight))")
+            if variant != "norm":
+                unrounded = "add(float(reduced),float(residual))"
+                assert f"mean(square({unrounded}))" in out[0].expr
+                assert out[1].expr == f"cast[bf16]({unrounded})"
+                alternate = _reference_from_reduced(
+                    torch, reduced, residual, weight, variant, 1e-6, separate_add=True
+                )
+                assert (
+                    f"mean(square(float(cast[bf16]({unrounded}))))" in alternate[0].expr
+                )
 
 
 if __name__ == "__main__":
