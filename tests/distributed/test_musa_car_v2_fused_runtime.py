@@ -126,6 +126,15 @@ def _runtime() -> tuple[Any, Any, Any]:
     return torch, dist, musa_jit_custom_all_reduce
 
 
+def _fp32_weight_cases(args: argparse.Namespace) -> list[Case]:
+    if args.skip_fallback or "v2" not in args.impls or "float32" in args.weight_dtypes:
+        return []
+    return [
+        Case("v2", "bfloat16", "float32", 2048, 1, variant)
+        for variant in ("norm", "residual", "no_raw")
+    ]
+
+
 def _inputs(torch: Any, case: Case, rank: int, step: int, seed: int) -> tuple[Any, ...]:
     generator = torch.Generator(device="cpu").manual_seed(
         seed + rank * 1009 + step * 37
@@ -236,7 +245,9 @@ def _checked(
     return max_error
 
 
-def _execution_mode(dist: Any, group: Any, comm: Any, impl: str) -> str:
+def _execution_mode(
+    dist: Any, group: Any, comm: Any, impl: str, expected: str | None = None
+) -> str:
     mode = getattr(comm, "_last_fused_execution", None) if impl == "v2" else "fused"
     modes: list[Any] = [None] * dist.get_world_size(group)
     dist.all_gather_object(modes, mode, group=group)
@@ -244,6 +255,8 @@ def _execution_mode(dist: Any, group: Any, comm: Any, impl: str) -> str:
         raise AssertionError(f"missing actual fused execution mode: {modes}")
     if any(value != modes[0] for value in modes):
         raise AssertionError(f"execution modes differ between ranks: {modes}")
+    if expected is not None and modes[0] != expected:
+        raise AssertionError(f"expected {expected} execution, got {modes[0]}")
     return str(modes[0])
 
 
@@ -274,7 +287,7 @@ def _run_case(
             )
         eligible_call = bool(eligible[0])
         expected_fallback = case.impl == "v2" and case.weight_dtype == "float32"
-        if case.impl == "v2" and eligible_call == expected_fallback:
+        if case.impl == "v2" and not eligible_call:
             raise AssertionError(
                 f"v2 eligibility violates supported shape contract: {case}"
             )
@@ -282,7 +295,10 @@ def _run_case(
             if case.impl == "v2":
                 comm._last_fused_execution = None
             outputs = _call(comm, inputs, case.variant, args.eps)
-            eager_modes.append(_execution_mode(dist, group, comm, case.impl))
+            execution = _execution_mode(
+                dist, group, comm, case.impl, "fallback" if expected_fallback else None
+            )
+            eager_modes.append(execution)
         else:
             result = _call(comm, inputs, case.variant, args.eps)
             _consensus(
@@ -311,7 +327,9 @@ def _run_case(
                 comm._last_fused_execution = None
             with torch.musa.graph(graph, stream=stream):
                 outputs = _call(comm, inputs, case.variant, args.eps)
-        graph_mode = _execution_mode(dist, group, comm, case.impl)
+        graph_mode = _execution_mode(
+            dist, group, comm, case.impl, "fallback" if expected_fallback else None
+        )
         for replay in range(args.graph_replays):
             original = _inputs(torch, case, rank, args.iterations + replay, args.seed)
             expected = _reference(torch, dist, group, original, case.variant, args.eps)
@@ -386,8 +404,6 @@ def _fallback_cases(
         ("noncontiguous-input", (x.t().contiguous().t(), residual, weight)),
         ("oversized-input", (oversized, oversized.clone(), weight)),
     ]
-    if impl == "v2":
-        cases.append(("float32-weight", (x, residual, weight.float())))
     return cases
 
 
@@ -457,6 +473,7 @@ def _profiler(torch: Any, enabled: bool) -> Any:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     cases = _cases(args)
+    fp32_weight_cases = _fp32_weight_cases(args)
     if args.list_cases:
         print(
             json.dumps(
@@ -464,6 +481,9 @@ def main(argv: list[str] | None = None) -> int:
                     "status": "NOT_RUN",
                     "planned_cases": len(cases),
                     "cases": [asdict(case) for case in cases],
+                    "fp32_weight_fallback_cases": [
+                        asdict(case) for case in fp32_weight_cases
+                    ],
                 },
                 indent=2,
             )
@@ -495,7 +515,9 @@ def main(argv: list[str] | None = None) -> int:
         "fused_dispatch": args.fused_dispatch,
         "cases": [],
         "fallbacks": [],
+        "fp32_weight_fallbacks": [],
         "planned_cases": len(cases),
+        "planned_fp32_weight_fallbacks": len(fp32_weight_cases),
         "arguments": {
             key: str(value) if isinstance(value, Path) else value
             for key, value in vars(args).items()
@@ -528,6 +550,12 @@ def main(argv: list[str] | None = None) -> int:
                     row = _run_case(torch, dist, group, comm, device, case, args)
                     report["cases"].append(row)
                     report_path.write_text(json.dumps(report, indent=2) + "\n")
+                for case in (case for case in fp32_weight_cases if case.impl == impl):
+                    report["active_case"] = asdict(case)
+                    report_path.write_text(json.dumps(report, indent=2) + "\n")
+                    row = _run_case(torch, dist, group, comm, device, case, args)
+                    report["fp32_weight_fallbacks"].append(row)
+                    report_path.write_text(json.dumps(report, indent=2) + "\n")
                 if not args.skip_fallback:
                     report["fallbacks"].extend(
                         _run_fallbacks(torch, dist, group, comm, device, impl, args)
@@ -543,21 +571,23 @@ def main(argv: list[str] | None = None) -> int:
         report["status"] = "PASS"
         report.pop("active_case", None)
         report["passed_cases"] = len(report["cases"])
+        report["passed_fp32_weight_fallbacks"] = len(report["fp32_weight_fallbacks"])
+        execution_rows = report["cases"] + report["fp32_weight_fallbacks"]
         report["passed_fused_cases"] = sum(
             row["kind"] == "FUSED" for row in report["cases"]
         )
         report["passed_fallbacks"] = len(report["fallbacks"]) + sum(
-            row["kind"] == "FALLBACK" for row in report["cases"]
+            row["kind"] == "FALLBACK" for row in execution_rows
         )
         report["checked_fused_calls"] = sum(
             row["eager_fused_calls"] + row["graph_fused_replays"]
-            for row in report["cases"]
+            for row in execution_rows
         )
         report["checked_fallback_calls"] = len(report["fallbacks"]) + sum(
             row["eager_fallback_calls"] + row["graph_fallback_replays"]
-            for row in report["cases"]
+            for row in execution_rows
         )
-        checked_replays = sum(row["graph_replays"] for row in report["cases"])
+        checked_replays = sum(row["graph_replays"] for row in execution_rows)
         report["graph_status"] = "PASS" if checked_replays else "NOT_RUN"
         report["fallback_status"] = "NOT_RUN" if args.skip_fallback else "PASS"
         report_path.write_text(json.dumps(report, indent=2) + "\n")
@@ -586,6 +616,7 @@ def main(argv: list[str] | None = None) -> int:
             error=f"{type(exc).__name__}: {exc}",
             passed_cases=len(report["cases"]),
             passed_fallbacks=len(report["fallbacks"]),
+            passed_fp32_weight_fallbacks=len(report["fp32_weight_fallbacks"]),
         )
         report_path.write_text(json.dumps(report, indent=2) + "\n")
         raise
@@ -620,10 +651,23 @@ def test_execution_mode_uses_actual_v2_dispatch() -> None:
     with pytest.raises(AssertionError, match="missing actual fused execution mode"):
         _execution_mode(LocalGroup, None, comm, "v2")
     comm._last_fused_execution = "fallback"
-    assert _execution_mode(LocalGroup, None, comm, "v2") == "fallback"
+    assert _execution_mode(LocalGroup, None, comm, "v2", "fallback") == "fallback"
     comm._last_fused_execution = "fused"
     assert _execution_mode(LocalGroup, None, comm, "v2") == "fused"
+    with pytest.raises(AssertionError, match="expected fallback execution"):
+        _execution_mode(LocalGroup, None, comm, "v2", "fallback")
     assert _execution_mode(LocalGroup, None, SimpleNamespace(), "v1") == "fused"
+
+
+def test_fp32_weight_fallback_plan_keeps_target_matrix() -> None:
+    args = _parser().parse_args([])
+    assert len(_cases(args)) == 96
+    extras = _fp32_weight_cases(args)
+    assert len(extras) == 3
+    assert {case.variant for case in extras} == {"norm", "residual", "no_raw"}
+    assert all(case.impl == "v2" and case.weight_dtype == "float32" for case in extras)
+    args.skip_fallback = True
+    assert not _fp32_weight_cases(args)
 
 
 if __name__ == "__main__":
