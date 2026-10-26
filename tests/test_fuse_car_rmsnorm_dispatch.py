@@ -7,7 +7,7 @@ not drift once the table drives a launch decision:
 * the table stays complete and every rule name stays unique,
 * dispatch is inert unless ``VLLM_MUSA_CAR_FUSED_DISPATCH`` is set,
 * the measured decode shapes still resolve to the pinned launch parameters,
-* the fusion entry point keeps recording the ``fuse_car_rmsnorm_v2`` trace arm.
+* only an actual v2 launcher call records the fused host-launch counter.
 """
 
 from __future__ import annotations
@@ -83,14 +83,36 @@ def test_unmeasured_shape_falls_through() -> None:
     assert config is None
 
 
-def test_fusion_entry_records_the_v2_trace_arm() -> None:
+def test_v2_trace_follows_the_actual_launcher() -> None:
+    import ast
+
     source = COMM.read_text(encoding="utf-8")
-    assert '"fuse_car_rmsnorm_v2"' in source
-    assert "fused_car_policy.dispatch_enabled()" in source
-    # Both serving entry points and the workspace shim must reach the recorder.
-    assert source.count("_record_fused_rmsnorm_decision(") >= 4
-    assert "_record_fused_rmsnorm_decision(input, int(self._jit_comm.world_size))" in source
-    assert "_record_fused_rmsnorm_decision(input, int(workspace.world_size))" in source
+    tree = ast.parse(source)
+    cls = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "MusaCustomAllReduceV2RMSNorm"
+    )
+    run = next(
+        node
+        for node in cls.body
+        if isinstance(node, ast.FunctionDef) and node.name == "run"
+    )
+    calls = [node for node in ast.walk(run) if isinstance(node, ast.Call)]
+    launch_line = next(
+        node.lineno
+        for node in calls
+        if isinstance(node.func, ast.Name) and node.func.id == "launcher"
+    )
+    record_line = next(
+        node.lineno
+        for node in calls
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "record"
+    )
+    assert launch_line < record_line
+    assert '"host_launch"' in ast.get_source_segment(source, run)
+    assert "_record_fused_rmsnorm_decision" not in source
 
 
 def test_rule_table_never_reaches_a_launch_on_its_own() -> None:

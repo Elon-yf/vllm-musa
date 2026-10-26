@@ -16,12 +16,12 @@ from vllm.utils.torch_utils import direct_register_custom_op
 from vllm_musa.distributed.device_communicators import car_decision_trace as car_trace
 from vllm_musa.jit_kernel.csrc import allreduce as jit_ar
 from vllm_musa.jit_kernel.csrc.allreduce import AllReduceAlgo
+from vllm_musa.optimization_contract import Fuse_CAR_RMSnorm as fused_car_policy
 from vllm_musa.optimization_contract import (
     ModelFamily,
     OptimizationFeature,
     resolve_optimization_contract,
 )
-from vllm_musa.optimization_contract import Fuse_CAR_RMSnorm as fused_car_policy
 from vllm_musa.optimization_contract.policy import (
     DeepSeekV4MtpCarGraphStagingPlan,
     deepseek_v4_mtp_car_graph_guard_enabled,
@@ -1181,6 +1181,8 @@ class _MusaJitCustomAllreduceImpl:
 
     def should_custom_ar(self, inp: torch.Tensor) -> bool:
         use = self._should_custom_ar_gates(inp)
+        if _is_torch_compiling():
+            return use
         capturing = (
             car_trace.enabled()
             and self._IS_CAPTURING
@@ -1935,7 +1937,6 @@ class MusaJitCustomAllreduce:
         if self._jit_available and self._jit_comm.should_fused_allreduce_rmsnorm(
             input, weight
         ):
-            _record_fused_rmsnorm_decision(input, int(self._jit_comm.world_size))
             return self._jit_comm.fused_allreduce_rmsnorm(input, weight, eps)
         return None
 
@@ -1961,7 +1962,6 @@ class MusaJitCustomAllreduce:
                 input, residual, weight
             )
         ):
-            _record_fused_rmsnorm_decision(input, int(self._jit_comm.world_size))
             return self._jit_comm.fused_allreduce_residual_rmsnorm(
                 input, residual, weight, eps
             )
@@ -2027,6 +2027,7 @@ def maybe_musa_jit_logits_all_gather(
     if output is not None:
         logger.info_once("Using MUSA JIT IPC all-gather for TP logits.")
     return output
+
 
 # ==========================================================================
 # v2 implementation: runtime bindings, ported object layer, and the
@@ -2218,42 +2219,6 @@ def create_allreduce_fusion_workspace(
     )
 
 
-def _fused_rmsnorm_policy(
-    input: torch.Tensor,
-    world_size: int,
-) -> "fused_car_policy.KernelConfig | None":
-    """Resolve the rule-table launch policy, or None when dispatch is off."""
-    if not fused_car_policy.dispatch_enabled():
-        return None
-    try:
-        device_module = torch.get_device_module()
-        properties = device_module.get_device_properties(device_module.current_device())
-        mp_count = int(properties.multi_processor_count)
-        capturing = bool(device_module.is_current_stream_capturing())
-    except Exception:
-        mp_count = 0
-        capturing = False
-    return fused_car_policy.resolve_fused_car_rmsnorm(
-        mp_count=mp_count,
-        world_size=int(world_size),
-        rows=int(input.shape[0]),
-        hidden_size=int(input.shape[-1]),
-        graph_rank_data=capturing,
-    )
-
-
-def _record_fused_rmsnorm_decision(input: torch.Tensor, world_size: int) -> None:
-    """Count the rule-table decision for one fused call; a no-op when off."""
-    if not fused_car_policy.dispatch_enabled():
-        return
-    car_trace.record(
-        "fused",
-        "fuse_car_rmsnorm_v2",
-        fused_car_policy.decision_label(_fused_rmsnorm_policy(input, world_size)),
-        int(input.numel() * input.element_size()),
-    )
-
-
 def allreduce_fusion(
     *,
     input: torch.Tensor,
@@ -2272,7 +2237,6 @@ def allreduce_fusion(
     del launch_with_pdl, trigger_completion_at_end, use_oneshot, fp32_acc
     if pattern != AllReduceFusionPattern.kARResidualRMSNorm:
         raise ValueError(f"Unsupported MUSA allreduce-fusion pattern: {pattern}")
-    _record_fused_rmsnorm_decision(input, int(workspace.world_size))
     ca_comm = workspace.coordinator.ca_comm
     result = ca_comm.fused_allreduce_rmsnorm(
         input,
@@ -2790,6 +2754,8 @@ class MusaCustomAllReduceV2Obj:
         self._registered_launchers.clear()
         self._unregistered_launchers.clear()
         self._shot_cache.clear()
+        self._fused_rmsnorm._launchers.clear()
+        self._fused_signal_ptrs_cpu = None
         self.disabled = True
         self._closed = True
 
@@ -2922,6 +2888,8 @@ class _MusaCustomAllreduceV2Impl:
     # -- public surface used by MusaJitCustomAllreduce -----------------------
     def should_custom_ar(self, inp: torch.Tensor) -> bool:
         use = self._should_custom_ar_gates(inp)
+        if _is_torch_compiling():
+            return use
         capturing = (
             car_trace.enabled()
             and self._IS_CAPTURING
@@ -3005,31 +2973,60 @@ class _MusaCustomAllreduceV2Impl:
     def close(self) -> None:
         if not getattr(self, "disabled", True) and hasattr(self, "obj"):
             self.obj.free(self.group)
+        comm_id = getattr(self, "_comm_id", None)
+        if comm_id is not None:
+            _COMM_REGISTRY.pop(comm_id, None)
+            self._comm_id = None
+        self.disabled = True
 
-    # -- features the ported kernel surface does not provide -----------------
-    # Fused AR+RMSNorm v2 exists upstream, but its kernel path is not part of
-    # this port; running the v1 fused kernels here would mix barrier protocols.
+    @property
+    def supports_fused_rmsnorm(self) -> bool:
+        return bool(
+            not self.disabled
+            and fused_car_policy.dispatch_enabled()
+            and getattr(jit_ar, "V2_FUSED_SUPPORTS_RAW", False)
+        )
+
+    def _reject_fused_allreduce_rmsnorm_reason(
+        self, inp: torch.Tensor, weight: torch.Tensor
+    ) -> str | None:
+        if not self.supports_fused_rmsnorm:
+            return "v2 fused AR+RMSNorm is unavailable or disabled"
+        return self.obj._fused_rmsnorm.rejection_reason(inp, None, weight)
+
+    def _reject_fused_allreduce_residual_rmsnorm_reason(
+        self, inp: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor
+    ) -> str | None:
+        if not self.supports_fused_rmsnorm:
+            return "v2 fused AR+RMSNorm is unavailable or disabled"
+        return self.obj._fused_rmsnorm.rejection_reason(inp, residual, weight)
+
     def should_fused_allreduce_rmsnorm(
         self, inp: torch.Tensor, weight: torch.Tensor
     ) -> bool:
-        return False
+        return self._reject_fused_allreduce_rmsnorm_reason(inp, weight) is None
 
     def should_fused_allreduce_residual_rmsnorm(
         self, inp: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor
     ) -> bool:
-        return False
-
-    def _reject_fused_allreduce_residual_rmsnorm_reason(
-        self, inp: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor
-    ) -> str:
-        return "fused AR+RMSNorm is not implemented for the v2 kernel path"
+        return (
+            self._reject_fused_allreduce_residual_rmsnorm_reason(inp, residual, weight)
+            is None
+        )
 
     def fused_allreduce_rmsnorm(
         self, input: torch.Tensor, weight: torch.Tensor, eps: float
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        raise NotImplementedError(
-            "fused all-reduce + RMSNorm is not implemented for MUSA custom AR v2"
-        )
+        if not self.should_fused_allreduce_rmsnorm(input, weight):
+            return None
+        if self._IS_CAPTURING and not _is_current_stream_capturing():
+            self.obj._fused_rmsnorm.prepare(input, None, need_raw=True, capturing=True)
+            return torch.empty_like(input), torch.empty_like(input)
+        if self._IS_CAPTURING or _is_torch_compiling():
+            return torch.ops.vllm.musa_jit_fused_allreduce_rmsnorm(
+                input, weight, float(eps), self._comm_id
+            )
+        return self._fused_allreduce_rmsnorm_impl(input, weight, eps)
 
     def fused_allreduce_residual_rmsnorm(
         self,
@@ -3038,10 +3035,18 @@ class _MusaCustomAllreduceV2Impl:
         weight: torch.Tensor,
         eps: float,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
-        raise NotImplementedError(
-            "fused all-reduce + residual + RMSNorm is not implemented for "
-            "MUSA custom AR v2"
-        )
+        if not self.should_fused_allreduce_residual_rmsnorm(input, residual, weight):
+            return None
+        if self._IS_CAPTURING and not _is_current_stream_capturing():
+            self.obj._fused_rmsnorm.prepare(
+                input, residual, need_raw=True, capturing=True
+            )
+            return tuple(torch.empty_like(input) for _ in range(3))
+        if self._IS_CAPTURING or _is_torch_compiling():
+            return torch.ops.vllm.musa_jit_fused_allreduce_residual_rmsnorm(
+                input, residual, weight, float(eps), self._comm_id
+            )
+        return self._fused_allreduce_residual_rmsnorm_impl(input, residual, weight, eps)
 
     def fused_allreduce_residual_rmsnorm_no_raw(
         self,
@@ -3049,11 +3054,85 @@ class _MusaCustomAllreduceV2Impl:
         residual: torch.Tensor,
         weight: torch.Tensor,
         eps: float,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
-        raise NotImplementedError(
-            "fused all-reduce + residual + RMSNorm is not implemented for "
-            "MUSA custom AR v2"
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if not self.should_fused_allreduce_residual_rmsnorm(input, residual, weight):
+            return None
+        if self._IS_CAPTURING and not _is_current_stream_capturing():
+            self.obj._fused_rmsnorm.prepare(
+                input, residual, need_raw=False, capturing=True
+            )
+            return torch.empty_like(input), torch.empty_like(input)
+        if self._IS_CAPTURING or _is_torch_compiling():
+            return torch.ops.vllm.musa_jit_fused_allreduce_residual_rmsnorm_no_raw(
+                input, residual, weight, float(eps), self._comm_id
+            )
+        return self._fused_allreduce_residual_rmsnorm_no_raw_impl(
+            input, residual, weight, eps
         )
+
+    def _fused_result(
+        self,
+        input: torch.Tensor,
+        residual: torch.Tensor | None,
+        weight: torch.Tensor,
+        eps: float,
+        *,
+        need_raw: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        result = self.obj._fused_rmsnorm.run(
+            input, residual, weight, eps, need_raw=need_raw
+        )
+        if result is not None:
+            self._last_fused_execution = "fused"
+            return result
+        self._last_fused_execution = "fallback"
+        # Shape-dependent policy fallback keeps the v2 collective and the
+        # composed operation's dtype boundaries inside the opaque graph op.
+        from vllm import ir
+
+        reduced = self._custom_all_reduce_impl(input.clone())
+        if residual is None:
+            normalized = ir.ops.rms_norm(reduced, weight, eps)
+            residual_out = reduced
+        else:
+            normalized, residual_out = ir.ops.fused_add_rms_norm(
+                reduced, residual, weight, eps
+            )
+        return normalized, residual_out, reduced if need_raw else None
+
+    def _fused_allreduce_rmsnorm_impl(
+        self, input: torch.Tensor, weight: torch.Tensor, eps: float
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        normalized, _, reduced = self._fused_result(
+            input, None, weight, eps, need_raw=True
+        )
+        assert reduced is not None
+        return normalized, reduced
+
+    def _fused_allreduce_residual_rmsnorm_impl(
+        self,
+        input: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        normalized, residual_out, reduced = self._fused_result(
+            input, residual, weight, eps, need_raw=True
+        )
+        assert reduced is not None
+        return normalized, residual_out, reduced
+
+    def _fused_allreduce_residual_rmsnorm_no_raw_impl(
+        self,
+        input: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        normalized, residual_out, _ = self._fused_result(
+            input, residual, weight, eps, need_raw=False
+        )
+        return normalized, residual_out
 
     def should_custom_all_gather(
         self,
@@ -3075,21 +3154,195 @@ class _MusaCustomAllreduceV2Impl:
 
 
 class MusaCustomAllReduceV2RMSNorm:
-    """v2 backend for fused AR+RMSNorm (not ported; calling it raises)."""
+    """Fused v2 launches using communicator-owned IPC and graph registrations."""
 
-    def __init__(self, owner) -> None:
+    def __init__(self, owner: MusaCustomAllReduceV2Obj) -> None:
         self._owner = owner
-
-    def fused_allreduce_rmsnorm(self, *args, **kwargs):
-        raise NotImplementedError(
-            "v2 fused AR+residual+RMSNorm is not ported yet (it needs "
-            "custom_all_reduce_rmsnorm.mu + custom_all_reduce_rmsnorm.py, which "
-            "are planned for a later stage); this stage supports pure "
-            "all-reduce only"
+        device_module = torch.get_device_module()
+        self._mp_count = int(
+            device_module.get_device_properties(owner._device).multi_processor_count
         )
+        self._launchers: dict[tuple, Any] = {}
+
+    def rejection_reason(
+        self, input: torch.Tensor, residual: torch.Tensor | None, weight: torch.Tensor
+    ) -> str | None:
+        owner = self._owner
+        if owner.disabled or not fused_car_policy.dispatch_enabled():
+            return "v2 fused dispatch is disabled"
+        if input.dtype not in (torch.float16, torch.bfloat16):
+            return "v2 fused dispatch requires fp16 or bf16"
+        if input.dim() != 2 or input.shape[0] <= 0:
+            return "v2 fused dispatch requires nonempty two-dimensional input"
+        if input.shape[1] % 8 or input.shape[1] <= 0:
+            return "v2 fused dispatch requires hidden dimension divisible by eight"
+        if not input.is_contiguous() or input.device != owner._device:
+            return "v2 fused input must be contiguous on the communicator device"
+        if (
+            input.numel() > _INT32_MAX
+            or input.numel() * input.element_size() > owner.max_size
+        ):
+            return "v2 fused input exceeds workspace capacity"
+        if weight.dim() != 1 or weight.numel() != input.shape[1]:
+            return "v2 fused weight shape does not match the input"
+        if weight.dtype not in (input.dtype, torch.float32):
+            return "v2 RMSNorm requires a matching or fp32 weight dtype"
+        for tensor in (weight, residual):
+            if tensor is None:
+                continue
+            if tensor.device != input.device:
+                return "v2 fused tensors must share a device"
+            if tensor is residual and tensor.dtype != input.dtype:
+                return "v2 fused residual must match the input dtype"
+            if not tensor.is_contiguous():
+                return "v2 fused tensors must be contiguous"
+        if residual is not None and residual.shape != input.shape:
+            return "v2 fused residual shape does not match the input"
+        return None
+
+    def prepare(
+        self,
+        input: torch.Tensor,
+        residual: torch.Tensor | None,
+        *,
+        need_raw: bool,
+        capturing: bool,
+    ) -> tuple[Any, Any] | None:
+        rows, hidden = map(int, input.shape)
+        token_2stage = fused_car_policy.resolve_token_2stage(
+            self._owner.world_size, hidden, -1, rows
+        )
+        decision = fused_car_policy.resolve_fused_car_rmsnorm(
+            mp_count=self._mp_count,
+            world_size=self._owner.world_size,
+            rows=rows,
+            hidden_size=hidden,
+            token_2stage=bool(token_2stage),
+            graph_rank_data=capturing,
+        )
+        if (
+            decision is None
+            or decision.kernel is fused_car_policy.CustomARKernel.FALLBACK
+        ):
+            return None
+        registered = bool(capturing and decision.graph_rank_data)
+        key = (rows, hidden, decision, registered, residual is not None, need_raw)
+        launcher = self._launchers.get(key)
+        if launcher is None:
+            launcher = jit_ar.v2_fused_allreduce_rmsnorm_func(
+                self._owner.world_size,
+                hidden,
+                rows,
+                row_kernel=decision.kernel
+                is not fused_car_policy.CustomARKernel.GENERIC,
+                graph_rank_data=registered,
+                short_rows=(
+                    decision.tuned_module
+                    if decision.kernel is not fused_car_policy.CustomARKernel.GENERIC
+                    else decision.short_rows_module
+                ),
+                small_rows=decision.small_rows_module,
+                token_2stage_override=int(decision.token_2stage),
+                row_warp_inv_rms_override=decision.row_warp_inv_rms,
+                mp_count=self._mp_count,
+                need_raw=need_raw,
+                has_residual=residual is not None,
+            )
+            self._launchers[key] = launcher
+        return decision, launcher
+
+    def run(
+        self,
+        input: torch.Tensor,
+        residual: torch.Tensor | None,
+        weight: torch.Tensor,
+        eps: float,
+        *,
+        need_raw: bool,
+        norm_out: torch.Tensor | None = None,
+        residual_out: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None:
+        reason = self.rejection_reason(input, residual, weight)
+        if reason is not None:
+            raise ValueError(reason)
+        if weight.dtype != input.dtype:
+            return None
+        capturing = _is_current_stream_capturing()
+        prepared = self.prepare(input, residual, need_raw=need_raw, capturing=capturing)
+        if prepared is None:
+            return None
+        decision, launcher = prepared
+        for output in (norm_out, residual_out):
+            if output is not None and (
+                output.shape != input.shape
+                or output.dtype != input.dtype
+                or output.device != input.device
+                or not output.is_contiguous()
+            ):
+                raise ValueError("v2 fused output must match the contiguous input")
+        if norm_out is None:
+            norm_out = torch.empty_like(input)
+        if residual_out is None:
+            residual_out = torch.empty_like(input)
+        raw_out = torch.empty_like(input) if need_raw else None
+        owner = self._owner
+        registered = bool(capturing and decision.graph_rank_data)
+        rank_data = owner._rank_data_device
+        if registered:
+            index = len(owner._graph_capture_inputs)
+            if index >= owner._graph_input_count:
+                raise RuntimeError("MUSA fused RMSNorm graph pointer table overflow")
+            rank_data = owner._graph_rank_data[index]
+            owner._graph_capture_inputs.append(int(input.data_ptr()))
+        launcher(
+            rank_data,
+            owner._fused_signal_ptrs_cpu,
+            input,
+            residual,
+            residual_out,
+            norm_out,
+            weight,
+            raw_out,
+            owner._self_fused_signal_ptr,
+            owner._self_buffer_ptr,
+            owner.max_size,
+            owner.rank,
+            owner.world_size,
+            float(eps),
+        )
+        if car_trace.enabled():
+            phase = "capture" if capturing else "eager"
+            car_trace.record(
+                "host_launch",
+                "fuse_car_rmsnorm_v2",
+                f"{phase}:registered={int(registered)}:raw={int(need_raw)}:"
+                + getattr(launcher, "kernel_symbol", "unknown")
+                + ":"
+                + getattr(launcher, "launch_config", decision).name_suffix(),
+                input.numel() * input.element_size(),
+            )
+        return norm_out, residual_out, raw_out
+
+    def fused_allreduce_rmsnorm(
+        self,
+        input: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        *,
+        norm_out: torch.Tensor | None = None,
+        residual_out: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        result = self.run(
+            input,
+            residual,
+            weight,
+            eps,
+            need_raw=False,
+            norm_out=norm_out,
+            residual_out=residual_out,
+        )
+        return None if result is None else result[:2]
 
     def fused_allreduce_gemma_dual_rmsnorm(self, *args, **kwargs):
-        raise NotImplementedError(
-            "v2 fused Gemma dual RMSNorm is not ported yet (planned for a "
-            "later stage)"
-        )
+        raise NotImplementedError("v2 Gemma dual RMSNorm is not enabled")
