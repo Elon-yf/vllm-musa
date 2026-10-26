@@ -70,6 +70,7 @@ def _load_pass_init_and_call(comm: Any) -> type:
             ca_comm=SimpleNamespace(disabled=False, _jit_comm=comm)
         ),
     )
+
     class Pattern:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             pass
@@ -105,18 +106,20 @@ def _load_pass_init_and_call(comm: Any) -> type:
         ],
         type_ignores=[],
     )
-    exec(compile(ast.fix_missing_locations(module), str(FUSION_PASS), "exec"), namespace)
+    exec(
+        compile(ast.fix_missing_locations(module), str(FUSION_PASS), "exec"), namespace
+    )
     return namespace["MusaAllReduceRMSNormFusionPass"]
 
 
-def _make_pass(capability: Any = _MISSING) -> Any:
+def _make_pass(capability: Any = _MISSING, gemma_capability: Any = _MISSING) -> Any:
     comm = SimpleNamespace(_comm_id=23, max_size=1024 * 1024)
     if capability is not _MISSING:
         comm.supports_fused_rmsnorm = capability
+    if gemma_capability is not _MISSING:
+        comm.supports_fused_gemma_rmsnorm = gemma_capability
     config = SimpleNamespace(
-        model_config=SimpleNamespace(
-            get_hidden_size=lambda: 4096, dtype="bfloat16"
-        ),
+        model_config=SimpleNamespace(get_hidden_size=lambda: 4096, dtype="bfloat16"),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=128),
     )
     return _load_pass_init_and_call(comm)(config)
@@ -143,10 +146,20 @@ def test_supported_communicator_registers_and_runs_existing_rewrite() -> None:
         assert not fusion.is_applicable_for_range(SimpleNamespace(end=129))
         graph = object()
         fusion(graph)
-        fusion._manual_rewrite_residual_musa_jit_car_rmsnorm.assert_called_once_with(graph)
+        fusion._manual_rewrite_residual_musa_jit_car_rmsnorm.assert_called_once_with(
+            graph
+        )
         fusion.patterns.apply.assert_called_once_with(graph)
         assert fusion.matched_count == 2
 
 
 def test_v2_capability_changes_compilation_cache_key() -> None:
     assert _make_pass(False).uuid() != _make_pass(True).uuid()
+
+
+def test_gemma_rewrite_requires_explicit_capability_and_changes_cache_key() -> None:
+    assert not _make_pass().supports_fused_gemma_rmsnorm
+    assert not _make_pass(True).supports_fused_gemma_rmsnorm
+    assert not _make_pass(True, 1).supports_fused_gemma_rmsnorm
+    assert _make_pass(True, True).supports_fused_gemma_rmsnorm
+    assert _make_pass(True, False).uuid() != _make_pass(True, True).uuid()
