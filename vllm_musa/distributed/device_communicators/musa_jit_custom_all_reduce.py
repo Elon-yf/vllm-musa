@@ -21,6 +21,7 @@ from vllm_musa.optimization_contract import (
     OptimizationFeature,
     resolve_optimization_contract,
 )
+from vllm_musa.optimization_contract import Fuse_CAR_RMSnorm as fused_car_policy
 from vllm_musa.optimization_contract.policy import (
     DeepSeekV4MtpCarGraphStagingPlan,
     deepseek_v4_mtp_car_graph_guard_enabled,
@@ -1934,6 +1935,7 @@ class MusaJitCustomAllreduce:
         if self._jit_available and self._jit_comm.should_fused_allreduce_rmsnorm(
             input, weight
         ):
+            _record_fused_rmsnorm_decision(input, int(self._jit_comm.world_size))
             return self._jit_comm.fused_allreduce_rmsnorm(input, weight, eps)
         return None
 
@@ -1959,6 +1961,7 @@ class MusaJitCustomAllreduce:
                 input, residual, weight
             )
         ):
+            _record_fused_rmsnorm_decision(input, int(self._jit_comm.world_size))
             return self._jit_comm.fused_allreduce_residual_rmsnorm(
                 input, residual, weight, eps
             )
@@ -2215,6 +2218,42 @@ def create_allreduce_fusion_workspace(
     )
 
 
+def _fused_rmsnorm_policy(
+    input: torch.Tensor,
+    world_size: int,
+) -> "fused_car_policy.KernelConfig | None":
+    """Resolve the rule-table launch policy, or None when dispatch is off."""
+    if not fused_car_policy.dispatch_enabled():
+        return None
+    try:
+        device_module = torch.get_device_module()
+        properties = device_module.get_device_properties(device_module.current_device())
+        mp_count = int(properties.multi_processor_count)
+        capturing = bool(device_module.is_current_stream_capturing())
+    except Exception:
+        mp_count = 0
+        capturing = False
+    return fused_car_policy.resolve_fused_car_rmsnorm(
+        mp_count=mp_count,
+        world_size=int(world_size),
+        rows=int(input.shape[0]),
+        hidden_size=int(input.shape[-1]),
+        graph_rank_data=capturing,
+    )
+
+
+def _record_fused_rmsnorm_decision(input: torch.Tensor, world_size: int) -> None:
+    """Count the rule-table decision for one fused call; a no-op when off."""
+    if not fused_car_policy.dispatch_enabled():
+        return
+    car_trace.record(
+        "fused",
+        "fuse_car_rmsnorm_v2",
+        fused_car_policy.decision_label(_fused_rmsnorm_policy(input, world_size)),
+        int(input.numel() * input.element_size()),
+    )
+
+
 def allreduce_fusion(
     *,
     input: torch.Tensor,
@@ -2233,6 +2272,7 @@ def allreduce_fusion(
     del launch_with_pdl, trigger_completion_at_end, use_oneshot, fp32_acc
     if pattern != AllReduceFusionPattern.kARResidualRMSNorm:
         raise ValueError(f"Unsupported MUSA allreduce-fusion pattern: {pattern}")
+    _record_fused_rmsnorm_decision(input, int(workspace.world_size))
     ca_comm = workspace.coordinator.ca_comm
     result = ca_comm.fused_allreduce_rmsnorm(
         input,
