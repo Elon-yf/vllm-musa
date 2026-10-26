@@ -3096,7 +3096,7 @@ class _MusaCustomAllreduceV2Impl:
             residual_out = reduced
         else:
             normalized, residual_out = ir.ops.fused_add_rms_norm(
-                reduced, residual, weight, eps
+                reduced.clone(), residual.clone(), weight, eps
             )
         return normalized, residual_out, reduced if need_raw else None
 
