@@ -304,6 +304,12 @@ class MusaAllReduceRMSNormFusionPass(VllmPatternMatcherPass):
             return
 
         jit_comm = getattr(ca_comm, "_jit_comm", None)
+        if not self._fused_capability_enabled(jit_comm):
+            logger.warning_once(
+                "MUSA allreduce-rmsnorm fusion disabled: the active "
+                "communicator does not support fused AR+RMSNorm."
+            )
+            return
         self.jit_comm_id = getattr(jit_comm, "_comm_id", None)
         if self.jit_comm_id is None:
             logger.warning_once(
@@ -359,6 +365,14 @@ class MusaAllReduceRMSNormFusionPass(VllmPatternMatcherPass):
             self.comm_id,
             self.jit_comm_id,
         )
+
+    @staticmethod
+    def _fused_capability_enabled(comm: Any) -> bool:
+        """Honor the inner communicator's capability, with a compatible v1 default."""
+        if comm is None:
+            return False
+        capability = getattr(comm, "supports_fused_rmsnorm", True)
+        return isinstance(capability, bool) and capability
 
     @staticmethod
     def _max_fusable_tokens(
