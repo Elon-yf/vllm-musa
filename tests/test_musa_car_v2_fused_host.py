@@ -198,3 +198,70 @@ def test_fp32_weight_uses_composed_fallback_without_reserving_graph_slot():
     assert host.rejection_reason(Tensor(), Tensor(), weight) is None
     assert host.run(Tensor(), Tensor(), weight, 1e-6, need_raw=True) is None
     assert not events and not owner._graph_capture_inputs
+
+
+def test_gemma_is_a_distinct_launcher_and_dispatch_semantic():
+    host, _, _, _, events = _host()
+    x, residual, weight = Tensor(), Tensor(), Tensor((2048,))
+    host.run(x, residual, weight, 1e-6, need_raw=False)
+    host.run(x, residual, weight, 1e-6, need_raw=False, gemma=True)
+    factories = [event[2] for event in events if event[0] == "factory"]
+    assert [item["gemma"] for item in factories] == [False, True]
+    assert len(host._launchers) == 2
+    assert host._last_dispatch["gemma"] is True
+    host.run(x, residual, weight, 1e-6, need_raw=False, gemma=True)
+    assert len([event for event in events if event[0] == "factory"]) == 2
+
+
+def test_gemma_capture_prepares_matching_semantics_without_allocating_slot():
+    host, owner, _, state, events = _host()
+    x, residual, weight = Tensor(), Tensor(), Tensor((2048,))
+    host.prepare(x, residual, need_raw=False, capturing=True, gemma=True)
+    assert not owner._graph_capture_inputs
+    state["capturing"] = True
+    host.run(x, residual, weight, 1e-6, need_raw=False, gemma=True)
+    assert owner._graph_capture_inputs == [x.data_ptr()]
+    assert len([event for event in events if event[0] == "factory"]) == 1
+    assert host._last_dispatch["gemma"] is True
+
+
+def test_registered_ops_keep_legacy_calls_and_gate_gemma_capability():
+    tree = ast.parse(COMM.read_text())
+    for suffix, count in [
+        ("rmsnorm", 2),
+        ("residual_rmsnorm", 3),
+        ("residual_rmsnorm_no_raw", 3),
+    ]:
+        name = "_musa_jit_fused_allreduce_" + suffix
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == name
+        )
+        calls = []
+        comm = SimpleNamespace()
+        setattr(
+            comm,
+            "_fused_allreduce_" + suffix + "_impl",
+            lambda *args, **kwargs: calls.append((args, kwargs)),
+        )
+        namespace = {"get_musa_jit_custom_allreduce_comm": lambda _: comm}
+        future = ast.ImportFrom(
+            module="__future__", names=[ast.alias(name="annotations")], level=0
+        )
+        module = ast.fix_missing_locations(
+            ast.Module(body=[future, function], type_ignores=[])
+        )
+        exec(compile(module, str(COMM), "exec"), namespace)
+        args = [Tensor() for _ in range(count)] + [1e-6, 0]
+        namespace[name](*args)
+        assert calls[-1][1] == {}
+        try:
+            namespace[name](*args, gemma=True)
+        except RuntimeError as error:
+            assert "capable v2" in str(error)
+        else:
+            raise AssertionError("Gemma call accepted by legacy v1 communicator")
+        comm.supports_fused_gemma_rmsnorm = True
+        namespace[name](*args, gemma=True)
+        assert calls[-1][1] == {"gemma": True}

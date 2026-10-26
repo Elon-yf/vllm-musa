@@ -319,8 +319,13 @@ def _musa_jit_fused_allreduce_rmsnorm(
     weight: torch.Tensor,
     eps: float,
     comm_id: int,
+    gemma: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     comm = get_musa_jit_custom_allreduce_comm(comm_id)
+    if gemma:
+        if not getattr(comm, "supports_fused_gemma_rmsnorm", False):
+            raise RuntimeError("Gemma AR+RMSNorm requires a capable v2 communicator")
+        return comm._fused_allreduce_rmsnorm_impl(input, weight, float(eps), gemma=True)
     return comm._fused_allreduce_rmsnorm_impl(input, weight, float(eps))
 
 
@@ -329,8 +334,9 @@ def _musa_jit_fused_allreduce_rmsnorm_fake(
     weight: torch.Tensor,
     eps: float,
     comm_id: int,
+    gemma: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    _ = weight, eps, comm_id
+    _ = weight, eps, comm_id, gemma
     return torch.empty_like(input), torch.empty_like(input)
 
 
@@ -347,8 +353,15 @@ def _musa_jit_fused_allreduce_residual_rmsnorm(
     weight: torch.Tensor,
     eps: float,
     comm_id: int,
+    gemma: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     comm = get_musa_jit_custom_allreduce_comm(comm_id)
+    if gemma:
+        if not getattr(comm, "supports_fused_gemma_rmsnorm", False):
+            raise RuntimeError("Gemma AR+RMSNorm requires a capable v2 communicator")
+        return comm._fused_allreduce_residual_rmsnorm_impl(
+            input, residual, weight, float(eps), gemma=True
+        )
     return comm._fused_allreduce_residual_rmsnorm_impl(
         input, residual, weight, float(eps)
     )
@@ -360,8 +373,15 @@ def _musa_jit_fused_allreduce_residual_rmsnorm_no_raw(
     weight: torch.Tensor,
     eps: float,
     comm_id: int,
+    gemma: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     comm = get_musa_jit_custom_allreduce_comm(comm_id)
+    if gemma:
+        if not getattr(comm, "supports_fused_gemma_rmsnorm", False):
+            raise RuntimeError("Gemma AR+RMSNorm requires a capable v2 communicator")
+        return comm._fused_allreduce_residual_rmsnorm_no_raw_impl(
+            input, residual, weight, float(eps), gemma=True
+        )
     return comm._fused_allreduce_residual_rmsnorm_no_raw_impl(
         input, residual, weight, float(eps)
     )
@@ -373,8 +393,9 @@ def _musa_jit_fused_allreduce_residual_rmsnorm_fake(
     weight: torch.Tensor,
     eps: float,
     comm_id: int,
+    gemma: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    _ = residual, weight, eps, comm_id
+    _ = residual, weight, eps, comm_id, gemma
     return torch.empty_like(input), torch.empty_like(input), torch.empty_like(input)
 
 
@@ -384,8 +405,9 @@ def _musa_jit_fused_allreduce_residual_rmsnorm_no_raw_fake(
     weight: torch.Tensor,
     eps: float,
     comm_id: int,
+    gemma: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    _ = residual, weight, eps, comm_id
+    _ = residual, weight, eps, comm_id, gemma
     return torch.empty_like(input), torch.empty_like(input)
 
 
@@ -1191,8 +1213,7 @@ class _MusaJitCustomAllreduceImpl:
         car_trace.record(
             "gate",
             "v1",
-            ("capture:" if capturing else "eager:")
-            + ("car" if use else "fallback"),
+            ("capture:" if capturing else "eager:") + ("car" if use else "fallback"),
             inp.numel() * inp.element_size(),
         )
         return use
@@ -1897,6 +1918,13 @@ class MusaJitCustomAllreduce:
     def should_custom_ar(self, inp: torch.Tensor) -> bool:
         return self._jit_available and self._jit_comm.should_custom_ar(inp)
 
+    @property
+    def supports_fused_gemma_rmsnorm(self) -> bool:
+        return bool(
+            self._jit_available
+            and getattr(self._jit_comm, "supports_fused_gemma_rmsnorm", False)
+        )
+
     def should_fused_allreduce_rmsnorm(
         self, inp: torch.Tensor, weight: torch.Tensor
     ) -> bool:
@@ -1932,8 +1960,14 @@ class MusaJitCustomAllreduce:
         return None
 
     def fused_allreduce_rmsnorm(
-        self, input: torch.Tensor, weight: torch.Tensor, eps: float
+        self, input: torch.Tensor, weight: torch.Tensor, eps: float, gemma: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if gemma:
+            if not self.supports_fused_gemma_rmsnorm:
+                return None
+            return self._jit_comm.fused_allreduce_rmsnorm(
+                input, weight, eps, gemma=True
+            )
         if self._jit_available and self._jit_comm.should_fused_allreduce_rmsnorm(
             input, weight
         ):
@@ -1955,7 +1989,14 @@ class MusaJitCustomAllreduce:
         residual: torch.Tensor,
         weight: torch.Tensor,
         eps: float,
+        gemma: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        if gemma:
+            if not self.supports_fused_gemma_rmsnorm:
+                return None
+            return self._jit_comm.fused_allreduce_residual_rmsnorm(
+                input, residual, weight, eps, gemma=True
+            )
         if (
             self._jit_available
             and self._jit_comm.should_fused_allreduce_residual_rmsnorm(
@@ -1980,7 +2021,14 @@ class MusaJitCustomAllreduce:
         residual: torch.Tensor,
         weight: torch.Tensor,
         eps: float,
+        gemma: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if gemma:
+            if not self.supports_fused_gemma_rmsnorm:
+                return None
+            return self._jit_comm.fused_allreduce_residual_rmsnorm_no_raw(
+                input, residual, weight, eps, gemma=True
+            )
         if (
             self._jit_available
             and self._jit_comm.should_fused_allreduce_residual_rmsnorm(
@@ -2090,7 +2138,9 @@ class _MusaRTLibraryV2(_MusaRTLibrary):
     def cudaIpcCloseMemHandle(self, ptr) -> None:
         self.ipc_close_mem_handle(ptr)
 
-    def cudaMemcpy(self, dst, src, count: int, kind: int = cudaMemcpyHostToDevice) -> None:
+    def cudaMemcpy(
+        self, dst, src, count: int, kind: int = cudaMemcpyHostToDevice
+    ) -> None:
         # The v2 object passes ``ctypes.c_void_p`` for both ends (it builds the
         # host staging buffer itself), while tensors and plain ints also reach
         # this shim.  Normalise instead of re-wrapping, because wrapping an
@@ -2898,8 +2948,7 @@ class _MusaCustomAllreduceV2Impl:
         car_trace.record(
             "gate",
             "v2",
-            ("capture:" if capturing else "eager:")
-            + ("car" if use else "fallback"),
+            ("capture:" if capturing else "eager:") + ("car" if use else "fallback"),
             inp.numel() * inp.element_size(),
         )
         return use
@@ -2987,6 +3036,10 @@ class _MusaCustomAllreduceV2Impl:
             and getattr(jit_ar, "V2_FUSED_SUPPORTS_RAW", False)
         )
 
+    @property
+    def supports_fused_gemma_rmsnorm(self) -> bool:
+        return self.supports_fused_rmsnorm
+
     def _reject_fused_allreduce_rmsnorm_reason(
         self, inp: torch.Tensor, weight: torch.Tensor
     ) -> str | None:
@@ -3015,18 +3068,20 @@ class _MusaCustomAllreduceV2Impl:
         )
 
     def fused_allreduce_rmsnorm(
-        self, input: torch.Tensor, weight: torch.Tensor, eps: float
+        self, input: torch.Tensor, weight: torch.Tensor, eps: float, gemma: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         if not self.should_fused_allreduce_rmsnorm(input, weight):
             return None
         if self._IS_CAPTURING and not _is_current_stream_capturing():
-            self.obj._fused_rmsnorm.prepare(input, None, need_raw=True, capturing=True)
+            self.obj._fused_rmsnorm.prepare(
+                input, None, need_raw=True, capturing=True, gemma=gemma
+            )
             return torch.empty_like(input), torch.empty_like(input)
         if self._IS_CAPTURING or _is_torch_compiling():
             return torch.ops.vllm.musa_jit_fused_allreduce_rmsnorm(
-                input, weight, float(eps), self._comm_id
+                input, weight, float(eps), self._comm_id, gemma
             )
-        return self._fused_allreduce_rmsnorm_impl(input, weight, eps)
+        return self._fused_allreduce_rmsnorm_impl(input, weight, eps, gemma=gemma)
 
     def fused_allreduce_residual_rmsnorm(
         self,
@@ -3034,19 +3089,22 @@ class _MusaCustomAllreduceV2Impl:
         residual: torch.Tensor,
         weight: torch.Tensor,
         eps: float,
+        gemma: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
         if not self.should_fused_allreduce_residual_rmsnorm(input, residual, weight):
             return None
         if self._IS_CAPTURING and not _is_current_stream_capturing():
             self.obj._fused_rmsnorm.prepare(
-                input, residual, need_raw=True, capturing=True
+                input, residual, need_raw=True, capturing=True, gemma=gemma
             )
             return tuple(torch.empty_like(input) for _ in range(3))
         if self._IS_CAPTURING or _is_torch_compiling():
             return torch.ops.vllm.musa_jit_fused_allreduce_residual_rmsnorm(
-                input, residual, weight, float(eps), self._comm_id
+                input, residual, weight, float(eps), self._comm_id, gemma
             )
-        return self._fused_allreduce_residual_rmsnorm_impl(input, residual, weight, eps)
+        return self._fused_allreduce_residual_rmsnorm_impl(
+            input, residual, weight, eps, gemma=gemma
+        )
 
     def fused_allreduce_residual_rmsnorm_no_raw(
         self,
@@ -3054,20 +3112,21 @@ class _MusaCustomAllreduceV2Impl:
         residual: torch.Tensor,
         weight: torch.Tensor,
         eps: float,
+        gemma: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         if not self.should_fused_allreduce_residual_rmsnorm(input, residual, weight):
             return None
         if self._IS_CAPTURING and not _is_current_stream_capturing():
             self.obj._fused_rmsnorm.prepare(
-                input, residual, need_raw=False, capturing=True
+                input, residual, need_raw=False, capturing=True, gemma=gemma
             )
             return torch.empty_like(input), torch.empty_like(input)
         if self._IS_CAPTURING or _is_torch_compiling():
             return torch.ops.vllm.musa_jit_fused_allreduce_residual_rmsnorm_no_raw(
-                input, residual, weight, float(eps), self._comm_id
+                input, residual, weight, float(eps), self._comm_id, gemma
             )
         return self._fused_allreduce_residual_rmsnorm_no_raw_impl(
-            input, residual, weight, eps
+            input, residual, weight, eps, gemma=gemma
         )
 
     def _fused_result(
@@ -3078,9 +3137,10 @@ class _MusaCustomAllreduceV2Impl:
         eps: float,
         *,
         need_raw: bool,
+        gemma: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         result = self.obj._fused_rmsnorm.run(
-            input, residual, weight, eps, need_raw=need_raw
+            input, residual, weight, eps, need_raw=need_raw, gemma=gemma
         )
         if car_trace.enabled():
             self._last_fused_dispatch = self.obj._fused_rmsnorm._last_dispatch
@@ -3093,6 +3153,8 @@ class _MusaCustomAllreduceV2Impl:
         from vllm import ir
 
         reduced = self._custom_all_reduce_impl(input.clone())
+        if gemma:
+            weight = weight.to(torch.float32) + 1.0
         if residual is None:
             normalized = ir.ops.rms_norm(reduced, weight, eps)
             residual_out = reduced
@@ -3103,10 +3165,10 @@ class _MusaCustomAllreduceV2Impl:
         return normalized, residual_out, reduced if need_raw else None
 
     def _fused_allreduce_rmsnorm_impl(
-        self, input: torch.Tensor, weight: torch.Tensor, eps: float
+        self, input: torch.Tensor, weight: torch.Tensor, eps: float, gemma: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor]:
         normalized, _, reduced = self._fused_result(
-            input, None, weight, eps, need_raw=True
+            input, None, weight, eps, need_raw=True, gemma=gemma
         )
         assert reduced is not None
         return normalized, reduced
@@ -3117,9 +3179,10 @@ class _MusaCustomAllreduceV2Impl:
         residual: torch.Tensor,
         weight: torch.Tensor,
         eps: float,
+        gemma: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         normalized, residual_out, reduced = self._fused_result(
-            input, residual, weight, eps, need_raw=True
+            input, residual, weight, eps, need_raw=True, gemma=gemma
         )
         assert reduced is not None
         return normalized, residual_out, reduced
@@ -3130,9 +3193,10 @@ class _MusaCustomAllreduceV2Impl:
         residual: torch.Tensor,
         weight: torch.Tensor,
         eps: float,
+        gemma: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         normalized, residual_out, _ = self._fused_result(
-            input, residual, weight, eps, need_raw=False
+            input, residual, weight, eps, need_raw=False, gemma=gemma
         )
         return normalized, residual_out
 
@@ -3209,6 +3273,7 @@ class MusaCustomAllReduceV2RMSNorm:
         *,
         need_raw: bool,
         capturing: bool,
+        gemma: bool = False,
     ) -> tuple[Any, Any] | None:
         rows, hidden = map(int, input.shape)
         token_2stage = fused_car_policy.resolve_token_2stage(
@@ -3230,7 +3295,15 @@ class MusaCustomAllReduceV2RMSNorm:
         ):
             return None
         registered = bool(capturing and decision.graph_rank_data)
-        key = (rows, hidden, decision, registered, residual is not None, need_raw)
+        key = (
+            rows,
+            hidden,
+            decision,
+            registered,
+            residual is not None,
+            need_raw,
+            gemma,
+        )
         launcher = self._launchers.get(key)
         if launcher is None:
             launcher = jit_ar.v2_fused_allreduce_rmsnorm_func(
@@ -3251,6 +3324,7 @@ class MusaCustomAllReduceV2RMSNorm:
                 mp_count=self._mp_count,
                 need_raw=need_raw,
                 has_residual=residual is not None,
+                gemma=gemma,
             )
             self._launchers[key] = launcher
         return decision, launcher
@@ -3261,6 +3335,7 @@ class MusaCustomAllReduceV2RMSNorm:
         residual: torch.Tensor | None,
         need_raw: bool,
         capturing: bool,
+        gemma: bool = False,
     ) -> dict[str, Any]:
         return {
             "backend": "v2",
@@ -3269,6 +3344,7 @@ class MusaCustomAllReduceV2RMSNorm:
             "hidden": int(input.shape[1]),
             "need_raw": need_raw,
             "has_residual": residual is not None,
+            "gemma": gemma,
             "phase": "capture" if capturing else "eager",
             "registered": False,
             "policy_label": "no-rule",
@@ -3285,6 +3361,7 @@ class MusaCustomAllReduceV2RMSNorm:
         eps: float,
         *,
         need_raw: bool,
+        gemma: bool = False,
         norm_out: torch.Tensor | None = None,
         residual_out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None:
@@ -3294,13 +3371,15 @@ class MusaCustomAllReduceV2RMSNorm:
         capturing = _is_current_stream_capturing()
         if car_trace.enabled():
             self._last_dispatch = self._dispatch_snapshot(
-                input, residual, need_raw, capturing
+                input, residual, need_raw, capturing, gemma
             )
         if weight.dtype != input.dtype:
             if car_trace.enabled():
                 self._last_dispatch["policy_label"] = "fp32_weight"
             return None
-        prepared = self.prepare(input, residual, need_raw=need_raw, capturing=capturing)
+        prepared = self.prepare(
+            input, residual, need_raw=need_raw, capturing=capturing, gemma=gemma
+        )
         if prepared is None:
             if car_trace.enabled():
                 self._last_dispatch["policy_label"] = self._last_policy_label

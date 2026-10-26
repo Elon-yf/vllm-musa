@@ -25,6 +25,7 @@ class Case:
     hidden: int
     rows: int
     variant: str
+    gemma: bool = False
 
 
 def _csv(value: str) -> list[str]:
@@ -46,6 +47,9 @@ def _positive_csv(value: str) -> list[int]:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--gemma", action="store_true", help="raw zero-centered weights; v2 only"
+    )
     parser.add_argument("--impls", type=_csv, default=["v2", "v1"])
     parser.add_argument("--dtypes", type=_csv, default=["bfloat16", "float16"])
     parser.add_argument("--weight-dtypes", type=_csv, default=["same"])
@@ -97,11 +101,13 @@ def _cases(args: argparse.Namespace) -> list[Case]:
         raise ValueError("eps must be positive")
     if max(args.rows) * max(args.hidden) * 2 > args.max_size_mib * 1024**2:
         raise ValueError("target shapes exceed --max-size-mib")
+    if args.gemma and args.impls != ["v2"]:
+        raise ValueError("--gemma requires --impls v2; v1 Gemma fusion is unsupported")
     axes = [
         getattr(args, name)
         for name in ("impls", "dtypes", "weight_dtypes", "hidden", "rows", "variants")
     ]
-    return [Case(*values) for values in itertools.product(*axes)]
+    return [Case(*values, gemma=args.gemma) for values in itertools.product(*axes)]
 
 
 def _runtime() -> tuple[Any, Any, Any]:
@@ -125,7 +131,7 @@ def _fp32_weight_cases(args: argparse.Namespace) -> list[Case]:
     if args.skip_fallback or "v2" not in args.impls or "float32" in args.weight_dtypes:
         return []
     return [
-        Case("v2", "bfloat16", "float32", 2048, 1, variant)
+        Case("v2", "bfloat16", "float32", 2048, 1, variant, args.gemma)
         for variant in ("norm", "residual", "no_raw")
     ]
 
@@ -141,9 +147,10 @@ def _inputs(torch: Any, case: Case, rank: int, step: int, seed: int) -> tuple[An
     # All ranks use the same normalization weights.
     generator.manual_seed(seed + step * 53)
     weight_dtype = dtype if case.weight_dtype == "same" else torch.float32
-    weight = (1 + 0.1 * torch.randn((case.hidden,), generator=generator)).to(
-        weight_dtype
-    )
+    weight = (
+        (0.0 if case.gemma else 1.0)
+        + 0.1 * torch.randn((case.hidden,), generator=generator)
+    ).to(weight_dtype)
     return x, residual, weight
 
 
@@ -156,6 +163,7 @@ def _reference_from_reduced(
     eps: float,
     *,
     separate_add: bool = False,
+    gemma: bool = False,
 ) -> tuple[Any, ...]:
     fp32 = reduced.float()
     residual_out = None
@@ -165,7 +173,11 @@ def _reference_from_reduced(
         if separate_add:
             fp32 = residual_out.float()
     normalized = fp32 * torch.rsqrt(fp32.square().mean(-1, keepdim=True) + eps)
-    norm = (normalized.to(weight.dtype) * weight).to(reduced.dtype)
+    norm = (
+        (normalized * (weight.float() + 1.0)).to(reduced.dtype)
+        if gemma
+        else (normalized.to(weight.dtype) * weight).to(reduced.dtype)
+    )
     if variant == "norm":
         return norm, reduced
     if variant == "residual":
@@ -181,6 +193,7 @@ def _reference(
     variant: str,
     eps: float,
     audit: list[dict[str, Any]] | None = None,
+    gemma: bool = False,
 ) -> tuple[Any, ...]:
     x, residual, weight = values
     if x.device.type != "cpu":
@@ -189,10 +202,19 @@ def _reference(
     reduced = x.double().contiguous().clone()
     dist.all_reduce(reduced, group=group)
     reduced = reduced.to(x.dtype)
-    result = _reference_from_reduced(torch, reduced, residual, weight, variant, eps)
+    result = _reference_from_reduced(
+        torch, reduced, residual, weight, variant, eps, gemma=gemma
+    )
     if audit is not None and variant != "norm":
         alternate = _reference_from_reduced(
-            torch, reduced, residual, weight, variant, eps, separate_add=True
+            torch,
+            reduced,
+            residual,
+            weight,
+            variant,
+            eps,
+            separate_add=True,
+            gemma=gemma,
         )
         difference = (result[0].float() - alternate[0].float()).abs()
         audit.append(
@@ -204,13 +226,18 @@ def _reference(
     return result
 
 
-def _call(comm: Any, values: tuple[Any, ...], variant: str, eps: float) -> Any:
+def _call(
+    comm: Any, values: tuple[Any, ...], variant: str, eps: float, gemma: bool = False
+) -> Any:
     x, residual, weight = values
+    kwargs = {"gemma": True} if gemma else {}
     if variant == "norm":
-        return comm.fused_allreduce_rmsnorm(x, weight, eps)
+        return comm.fused_allreduce_rmsnorm(x, weight, eps, **kwargs)
     if variant == "residual":
-        return comm.fused_allreduce_residual_rmsnorm(x, residual, weight, eps)
-    return comm.fused_allreduce_residual_rmsnorm_no_raw(x, residual, weight, eps)
+        return comm.fused_allreduce_residual_rmsnorm(x, residual, weight, eps, **kwargs)
+    return comm.fused_allreduce_residual_rmsnorm_no_raw(
+        x, residual, weight, eps, **kwargs
+    )
 
 
 def _eligible(comm: Any, values: tuple[Any, ...], variant: str) -> bool:
@@ -312,6 +339,7 @@ def _dispatch_snapshot(
         "hidden": case.hidden,
         "need_raw": case.variant != "no_raw",
         "has_residual": case.variant != "norm",
+        "gemma": case.gemma,
         "phase": phase,
     }
     if any(snapshot.get(key) != value for key, value in expected.items()):
@@ -357,6 +385,7 @@ def _case_label(tp: int, case: Case) -> str:
     return (
         f"CAR_CASE:tp{tp}:impl={case.impl}:dtype={case.dtype}:h{case.hidden}:"
         f"r{case.rows}:variant={case.variant}:weight={case.weight_dtype}"
+        + (":gemma=1" if case.gemma else "")
     )
 
 
@@ -395,6 +424,7 @@ def _run_case(
                 case.variant,
                 args.eps,
                 audit=reference_audit,
+                gemma=case.gemma,
             )
             inputs = tuple(value.to(device) for value in original)
             eligible: list[Any] = [None] * dist.get_world_size(group)
@@ -415,7 +445,7 @@ def _run_case(
                 if case.impl == "v2":
                     comm._last_fused_execution = None
                     comm._last_fused_dispatch = None
-                outputs = _call(comm, inputs, case.variant, args.eps)
+                outputs = _call(comm, inputs, case.variant, args.eps, case.gemma)
                 execution = _execution_mode(
                     dist,
                     group,
@@ -425,7 +455,7 @@ def _run_case(
                 )
                 eager_modes.append(execution)
             else:
-                result = _call(comm, inputs, case.variant, args.eps)
+                result = _call(comm, inputs, case.variant, args.eps, case.gemma)
                 _consensus(
                     dist,
                     group,
@@ -453,7 +483,7 @@ def _run_case(
             with comm.capture():
                 with torch.musa.stream(stream):
                     # Prepare graph launch variants without active stream capture.
-                    _call(comm, inputs, case.variant, args.eps)
+                    _call(comm, inputs, case.variant, args.eps, case.gemma)
                 torch.musa.current_stream().wait_stream(stream)
                 torch.musa.synchronize()
                 dist.barrier(group=group)
@@ -461,7 +491,7 @@ def _run_case(
                     comm._last_fused_execution = None
                     comm._last_fused_dispatch = None
                 with torch.musa.graph(graph, stream=stream):
-                    outputs = _call(comm, inputs, case.variant, args.eps)
+                    outputs = _call(comm, inputs, case.variant, args.eps, case.gemma)
         graph_mode = _execution_mode(
             dist, group, comm, case.impl, "fallback" if expected_fallback else None
         )
@@ -482,6 +512,7 @@ def _run_case(
                     case.variant,
                     args.eps,
                     audit=reference_audit,
+                    gemma=case.gemma,
                 )
                 for destination, source in zip(inputs, original):
                     destination.copy_(source)
@@ -529,11 +560,18 @@ def _run_case(
 
 
 def _unfused(
-    torch: Any, dist: Any, values: tuple[Any, ...], variant: str, eps: float
+    torch: Any,
+    dist: Any,
+    values: tuple[Any, ...],
+    variant: str,
+    eps: float,
+    gemma: bool = False,
 ) -> tuple[Any, ...]:
     from vllm.ir import ops
 
     x, residual, weight = values
+    if gemma:
+        weight = weight.float() + 1.0
     reduced = x.float().contiguous().clone()
     dist.all_reduce(reduced)
     reduced = reduced.to(x.dtype)
@@ -585,20 +623,22 @@ def _run_fallbacks(
     for name, inputs in _fallback_cases(torch, device, impl, args):
         for variant in args.variants:
             original = tuple(value.cpu().clone() for value in inputs)
-            expected = _reference(torch, dist, group, original, variant, args.eps)
+            expected = _reference(
+                torch, dist, group, original, variant, args.eps, gemma=args.gemma
+            )
             error = (
                 "unsupported input accepted"
                 if _eligible(comm, inputs, variant)
                 else None
             )
             _consensus(dist, group, error)
-            result = _call(comm, inputs, variant, args.eps)
+            result = _call(comm, inputs, variant, args.eps, args.gemma)
             _consensus(
                 dist,
                 group,
                 None if result is None else "expected None fallback sentinel",
             )
-            outputs = _unfused(torch, dist, inputs, variant, args.eps)
+            outputs = _unfused(torch, dist, inputs, variant, args.eps, args.gemma)
             error = _checked(torch, dist, group, outputs, expected, inputs, original)
             results.append(
                 {
