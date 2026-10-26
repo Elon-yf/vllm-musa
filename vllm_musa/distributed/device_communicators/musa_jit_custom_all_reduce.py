@@ -3082,6 +3082,8 @@ class _MusaCustomAllreduceV2Impl:
         result = self.obj._fused_rmsnorm.run(
             input, residual, weight, eps, need_raw=need_raw
         )
+        if car_trace.enabled():
+            self._last_fused_dispatch = self.obj._fused_rmsnorm._last_dispatch
         if result is not None:
             self._last_fused_execution = "fused"
             return result
@@ -3220,6 +3222,8 @@ class MusaCustomAllReduceV2RMSNorm:
             token_2stage=bool(token_2stage),
             graph_rank_data=capturing,
         )
+        if car_trace.enabled():
+            self._last_policy_label = fused_car_policy.decision_label(decision)
         if (
             decision is None
             or decision.kernel is fused_car_policy.CustomARKernel.FALLBACK
@@ -3251,6 +3255,28 @@ class MusaCustomAllReduceV2RMSNorm:
             self._launchers[key] = launcher
         return decision, launcher
 
+    def _dispatch_snapshot(
+        self,
+        input: torch.Tensor,
+        residual: torch.Tensor | None,
+        need_raw: bool,
+        capturing: bool,
+    ) -> dict[str, Any]:
+        return {
+            "backend": "v2",
+            "execution": "fallback",
+            "rows": int(input.shape[0]),
+            "hidden": int(input.shape[1]),
+            "need_raw": need_raw,
+            "has_residual": residual is not None,
+            "phase": "capture" if capturing else "eager",
+            "registered": False,
+            "policy_label": "no-rule",
+            "launcher_symbol": "unfused_v2_ir",
+            "effective_config": {},
+            "jit_cflags": [],
+        }
+
     def run(
         self,
         input: torch.Tensor,
@@ -3265,11 +3291,19 @@ class MusaCustomAllReduceV2RMSNorm:
         reason = self.rejection_reason(input, residual, weight)
         if reason is not None:
             raise ValueError(reason)
-        if weight.dtype != input.dtype:
-            return None
         capturing = _is_current_stream_capturing()
+        if car_trace.enabled():
+            self._last_dispatch = self._dispatch_snapshot(
+                input, residual, need_raw, capturing
+            )
+        if weight.dtype != input.dtype:
+            if car_trace.enabled():
+                self._last_dispatch["policy_label"] = "fp32_weight"
+            return None
         prepared = self.prepare(input, residual, need_raw=need_raw, capturing=capturing)
         if prepared is None:
+            if car_trace.enabled():
+                self._last_dispatch["policy_label"] = self._last_policy_label
             return None
         decision, launcher = prepared
         for output in (norm_out, residual_out):
@@ -3311,6 +3345,18 @@ class MusaCustomAllReduceV2RMSNorm:
             float(eps),
         )
         if car_trace.enabled():
+            effective = getattr(launcher, "launch_config", decision)
+            self._last_dispatch.update(
+                execution="fused",
+                registered=registered,
+                policy_label=fused_car_policy.decision_label(decision),
+                launcher_symbol=getattr(launcher, "kernel_symbol", "unknown"),
+                effective_config={
+                    key: getattr(value, "value", value)
+                    for key, value in vars(effective).items()
+                },
+                jit_cflags=list(getattr(launcher, "jit_cflags", ())),
+            )
             phase = "capture" if capturing else "eager"
             car_trace.record(
                 "host_launch",

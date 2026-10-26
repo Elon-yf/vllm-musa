@@ -130,6 +130,13 @@ def test_eager_uses_fused_signals_and_preserves_three_output_contracts():
         assert args[2] is input and args[3] is residual_arg
         assert args[8:10] == (1000, 2000)
         assert events[-1][0] == "record"
+        assert host._last_dispatch["execution"] == "fused"
+        assert host._last_dispatch["need_raw"] == need_raw
+        assert host._last_dispatch["has_residual"] == (residual_arg is not None)
+        assert host._last_dispatch["phase"] == "eager"
+        import json
+
+        json.dumps(host._last_dispatch)
     assert not owner._graph_capture_inputs
 
 
@@ -143,6 +150,8 @@ def test_prepare_does_not_reserve_graph_slots_and_capture_uses_actual_input():
     assert owner._graph_capture_inputs == [input.data_ptr()]
     args = next(event[1] for event in events if event[0] == "launch")
     assert args[0] is owner._graph_rank_data[0]
+    assert host._last_dispatch["registered"] is True
+    assert host._last_dispatch["phase"] == "capture"
     assert events[0][2]["graph_rank_data"] is True
 
 
@@ -155,6 +164,7 @@ def test_fallback_does_not_allocate_graph_slot_or_record_fused_launch():
     assert host.run(Tensor(), Tensor(), Tensor((2048,)), 1e-6, need_raw=False) is None
     assert owner._graph_capture_inputs == []
     assert events == []
+    assert host._last_dispatch["execution"] == "fallback"
 
 
 def test_disabled_and_invalid_inputs_are_rejected_before_any_launch():
