@@ -183,7 +183,7 @@ def _reference(
     audit: list[dict[str, Any]] | None = None,
 ) -> tuple[Any, ...]:
     x, residual, weight = values
-    reduced = x.float().clone()
+    reduced = x.float().contiguous().clone()
     dist.all_reduce(reduced, group=group)
     reduced = reduced.to(x.dtype)
     result = _reference_from_reduced(torch, reduced, residual, weight, variant, eps)
@@ -526,7 +526,7 @@ def _unfused(
     from vllm.ir import ops
 
     x, residual, weight = values
-    reduced = x.float().clone()
+    reduced = x.float().contiguous().clone()
     dist.all_reduce(reduced)
     reduced = reduced.to(x.dtype)
     if variant == "norm":
