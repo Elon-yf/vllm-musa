@@ -9,3 +9,4 @@ tokenizers==0.23.3
 einops
 ray>=2.47.1,<=2.48.0
 click==8.4.2
+mineru-vl-utils==2.0.7
