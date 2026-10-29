@@ -1,19 +1,20 @@
 """Source-level regression test for the MUSA ViT backend timing fix."""
 
+import ast
 from pathlib import Path
-
 
 PLATFORM = Path(__file__).parents[1] / "vllm_musa" / "platform.py"
 
 
-def test_vit_selector_registers_musa_backends_before_candidate_walk():
-    source = PLATFORM.read_text(encoding="utf-8")
-    start = source.index("    def get_vit_attn_backend(")
-    end = source.index("    @classmethod", start + 10)
-    body = source[start:end]
-    assert body.index("register_attention_backends()") < body.index(
-        "if backend is not None"
+def test_vit_selector_registers_musa_backends_before_candidate_walk() -> None:
+    tree = ast.parse(PLATFORM.read_text(encoding="utf-8"))
+    selector = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "get_vit_attn_backend"
     )
-    assert body.index("register_attention_backends()") < body.index(
-        "for vit_attn_backend in cls.get_supported_vit_attn_backends()"
-    )
+    first = selector.body[0]
+    assert isinstance(first, ast.Expr)
+    assert isinstance(first.value, ast.Call)
+    assert isinstance(first.value.func, ast.Name)
+    assert first.value.func.id == "register_attention_backends"
