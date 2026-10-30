@@ -913,24 +913,8 @@ class MUSAPlatformBase(Platform):
             logger.info_once(f"Using backend {backend} for vit attention")
             return backend
 
-        from vllm.config import get_current_vllm_config_or_none
-
-        config = get_current_vllm_config_or_none()
-        model_config = getattr(config, "model_config", None)
-        hf_config = getattr(model_config, "hf_config", None)
-        architectures = getattr(hf_config, "architectures", None) or ()
-        candidates = cls.get_supported_vit_attn_backends()
-        if "DeepseekOCRForCausalLM" in architectures:
-            # DeepSeek-OCR's MUSA vision tower runs in FP32. Prefer Triton,
-            # while retaining compatible fallback candidates.
-            dtype = torch.float32
-            candidates = sorted(
-                candidates,
-                key=lambda candidate: candidate != AttentionBackendEnum.TRITON_ATTN,
-            )
-
         cc = cls.get_device_capability()
-        for vit_attn_backend in candidates:
+        for vit_attn_backend in cls.get_supported_vit_attn_backends():
             if vit_attn_backend == AttentionBackendEnum.TORCH_SDPA:
                 continue
             try:
