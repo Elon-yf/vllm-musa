@@ -36,21 +36,13 @@ def test_model_backend_configuration(is_musa: bool, backend: str | None) -> None
         )
     )
     config = SimpleNamespace(mm_encoder_attn_backend=backend)
-    warnings = []
     namespace = {
         "_is_musa_runtime": lambda: is_musa,
         "multimodal_config": config,
-        "logger": SimpleNamespace(warning=warnings.append),
         "AttentionBackendEnum": SimpleNamespace(
             FLASH_ATTN="FLASH_ATTN", TRITON_ATTN="TRITON_ATTN"
         ),
     }
     exec(compile(block, str(PATCH), "exec"), namespace)
-    expected = "TRITON_ATTN" if is_musa and backend in (None, "FLASH_ATTN") else backend
+    expected = "TRITON_ATTN" if is_musa and backend is None else backend
     assert config.mm_encoder_attn_backend == expected
-    if is_musa and backend == "FLASH_ATTN":
-        assert len(warnings) == 1
-        assert "float32" in warnings[0]
-        assert "Falling back to TRITON_ATTN" in warnings[0]
-    else:
-        assert not warnings

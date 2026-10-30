@@ -321,7 +321,7 @@ source-level and MUSA long-context graph/model regression before inclusion.
 | `0206-MUSA-size-the-dedicated-Mamba-pool-per-align-mode-sn.patch` | v0.32 upstream update | size the dedicated Mamba pool per align-mode snapshot |
 | `0207-MUSA-optimize-hybrid-attention-page-size-fastpath.patch` | v0.32 upstream update | optimize hybrid attention page-size fastpath |
 | `0208-MUSA-handle-expandable-segments-around-graph-capture.patch` | v0.32 upstream update | handle expandable segments around graph capture |
-| `0209-MUSA-default-DeepSeek-OCR-vision-attention-to-Triton.patch` | v0.28 0194 follow-up | DeepSeek-OCR defaults to Triton on MUSA; explicit FLASH_ATTN warns and falls back to Triton for its FP32 vision encoder. Other explicit choices and non-MUSA behavior are preserved. |
+| `0209-MUSA-default-DeepSeek-OCR-vision-attention-to-Triton.patch` | v0.28 0194 follow-up | DeepSeek-OCR defaults to Triton on MUSA only when no encoder backend is configured. All explicit backend choices and non-MUSA behavior are preserved. |
 
 Currently **209 patches** and **0 upstream entries** in `upstream/`.
 
@@ -333,8 +333,10 @@ result predates `0209` and is not a MUSA runtime-readiness claim. Offline replay
 round-trip, metadata and source-contract validation must be repeated after edits.
 
 `0209` applies after `0117` and sets the encoder backend in
-`DeepseekOCRForCausalLM.__init__` before constructing the vision tower. It
-retains `0117`'s FP32 vision conversion and delegates backend selection and
+`DeepseekOCRForCausalLM.__init__` before constructing the vision tower, only
+when `mm_encoder_attn_backend` is unset on MUSA. Explicit choices, including
+`FLASH_ATTN`, are not overridden or rejected by this model patch. It retains
+`0117`'s FP32 vision conversion and delegates backend selection and
 logging to the existing `MMEncoderAttention` path. It does not add another
 ViT selector call or change platform-wide policy.
 
