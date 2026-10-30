@@ -1,4 +1,4 @@
-"""Source contract for model-local DeepSeek-OCR backend priority."""
+"""Source contract for model-local DeepSeek-OCR backend selection."""
 
 from pathlib import Path
 
@@ -11,21 +11,16 @@ PATCH = (
 )
 
 
-def test_route_is_model_config_scoped() -> None:
+def test_route_is_model_local() -> None:
     source = PATCH.read_text(encoding="utf-8")
-    assert "vllm/model_executor/models/config.py" in source
-    assert "class DeepseekOCRForCausalLMConfig" in source
-    assert '"DeepseekOCRForCausalLM": DeepseekOCRForCausalLMConfig' in source
+    assert "vllm/model_executor/models/deepseek_ocr.py" in source
+    assert "self.attn_backend = get_vit_attn_backend" in source
+    assert "vllm/model_executor/models/config.py" not in source
     assert "vllm_musa/platform.py" not in source
 
 
-def test_model_priority_preserves_explicit_override_and_fallback() -> None:
+def test_preserves_override_and_selects_triton_on_musa() -> None:
     source = PATCH.read_text(encoding="utf-8")
-    assert "mm_encoder_attn_backend is not None" in source
-    assert "candidates = [AttentionBackendEnum.TRITON_ATTN]" in source
-    assert 'vision_config.width' in source
-    assert 'clip-l-14-224' in source
-    assert "supports_head_size" in source
-    assert "supports_dtype(torch.float32)" in source
-    assert "supports_compute_capability" in source
-    assert "multimodal_config.mm_encoder_attn_backend = fallback" in source
+    assert "mm_encoder_attn_backend is None" in source
+    assert "AttentionBackendEnum.TRITON_ATTN" in source
+    assert "dtype=torch.float32" in source or "torch.float32" in source
