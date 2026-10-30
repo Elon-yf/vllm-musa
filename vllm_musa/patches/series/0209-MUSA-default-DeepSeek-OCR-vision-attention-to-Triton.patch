@@ -34,16 +34,16 @@ index 902fc87355..75ed3c894b 100644
 @@ -74,6 +76,8 @@ from vllm.v1.worker.encoder_cudagraph_defs import (
  from .deepencoder import DeepCLIPVisionTransformer, build_sam_vit_b
  from .deepseek_vl2 import MlpProjector
-
+ 
 +logger = init_logger(__name__)
 +
  # The image token id may be various
  _IMAGE_TOKEN = "<image>"
-
+ 
 @@ -393,6 +397,23 @@ class DeepseekOCRForCausalLM(
          quant_config = vllm_config.quant_config
          multimodal_config = vllm_config.model_config.multimodal_config
-
+ 
 +        if _is_musa_runtime():
 +            if (
 +                multimodal_config.mm_encoder_attn_backend
