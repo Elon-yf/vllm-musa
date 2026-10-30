@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: musa <musa@local>
+Date: Fri, 30 Oct 2026 11:57:36 +0800
+Subject: [PATCH] MUSA: default DeepSeek-OCR vision attention to Triton
+
+Configure the MUSA FP32 vision encoder in the model constructor. Use
+Triton when no backend is configured, and warn and fall back to Triton
+when FLASH_ATTN is explicitly selected. Preserve other explicit choices
+and leave backend selection and logging to MMEncoderAttention.
+---
+ vllm/model_executor/models/deepseek_ocr.py | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/vllm/model_executor/models/deepseek_ocr.py b/vllm/model_executor/models/deepseek_ocr.py
+index 902fc87355..75ed3c894b 100644
+--- a/vllm/model_executor/models/deepseek_ocr.py
++++ b/vllm/model_executor/models/deepseek_ocr.py
+@@ -13,6 +13,7 @@ from transformers import BatchFeature, CLIPVisionConfig
+ from vllm.config import VllmConfig
+ from vllm.config.multimodal import MultiModalDummyOptions
+ from vllm.inputs import MultiModalDataDict
++from vllm.logger import init_logger
+ from vllm.model_executor.models.interfaces import (
+     MultiModalEmbeddings,
+     SupportsEncoderCudaGraph,
+@@ -59,6 +60,7 @@ from vllm.transformers_utils.processors.deepseek_ocr import (
+     count_tiles,
+ )
+ from vllm.utils.tensor_schema import TensorSchema, TensorShape
++from vllm.v1.attention.backends.registry import AttentionBackendEnum
+ from vllm.v1.sample.logits_processor import (
+     AdapterLogitsProcessor,
+     RequestLogitsProcessor,
+@@ -74,6 +76,8 @@ from vllm.v1.worker.encoder_cudagraph_defs import (
+ from .deepencoder import DeepCLIPVisionTransformer, build_sam_vit_b
+ from .deepseek_vl2 import MlpProjector
+
++logger = init_logger(__name__)
++
+ # The image token id may be various
+ _IMAGE_TOKEN = "<image>"
+
+@@ -393,6 +397,23 @@ class DeepseekOCRForCausalLM(
+         quant_config = vllm_config.quant_config
+         multimodal_config = vllm_config.model_config.multimodal_config
+
++        if _is_musa_runtime():
++            if (
++                multimodal_config.mm_encoder_attn_backend
++                == AttentionBackendEnum.FLASH_ATTN
++            ):
++                logger.warning(
++                    "FLASH_ATTN does not support DeepSeek-OCR's float32 vision "
++                    "encoder on MUSA. Falling back to TRITON_ATTN."
++                )
++                multimodal_config.mm_encoder_attn_backend = (
++                    AttentionBackendEnum.TRITON_ATTN
++                )
++            elif multimodal_config.mm_encoder_attn_backend is None:
++                multimodal_config.mm_encoder_attn_backend = (
++                    AttentionBackendEnum.TRITON_ATTN
++                )
++
+         self.config = config
+         self.model_config = vllm_config.model_config
+         self.multimodal_config = multimodal_config
